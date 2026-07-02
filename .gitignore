@@ -1,0 +1,40 @@
+# ── 配置密钥（禁止提交）──────────────────────────────────
+configs/config.local.yaml
+configs/sandbox.local.yaml
+configs/.env
+products/enterprise/web/node_modules
+products/enterprise/web/dist
+products/enterprise/web/.git
+products/enterprise/web/.github
+products/desktop/web/node_modules
+products/desktop/web/dist
+products/desktop/web/.git
+products/desktop/web/.github
+# ── 本地运行数据（含加密密钥文件与连接配置）──────────────
+/data/
+
+# ── Go ────────────────────────────────────────────────────
+*.exe
+*.test
+*.out
+.gocache
+.gomodcache
+vendor/
+
+# ── 构建产物 ───────────────────────────────────────────────
+/bin/
+/dist/
+
+# ── IDE ────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ── 操作系统 ────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.gocache
+
+
+
