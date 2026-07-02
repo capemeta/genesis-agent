@@ -1,0 +1,31 @@
+# 本地开发配置模板（含密钥）
+# 复制此文件为 configs/config.local.yaml 并填写实际值
+# config.local.yaml 已加入 .gitignore，不会提交到版本库
+# 此文件中的值会覆盖 config.yaml 中的对应值
+
+llm:
+  providers:
+    qwen:
+      auth:
+        api_key: "your-qwen-api-key"
+
+    openai:
+      auth:
+        api_key: "your-openai-api-key"
+
+    deepseek:
+      auth:
+        api_key: "your-deepseek-api-key"
+
+    claude:
+      auth:
+        api_key: "your-claude-api-key"
+
+  # 如需临时切换默认聊天模型：
+  # router:
+  #   chat: local
+  #   coding: coder
+
+# 兼容旧写法：llm.api_key 仍会作为 chat/default provider 的 API Key fallback。
+# llm:
+#   api_key: "legacy-api-key"
