@@ -49,21 +49,22 @@ func (r *fakeRegistry) Names() []string {
 	return names
 }
 
-type fakeTool struct{ name string }
+type fakeTool struct {
+	name   string
+	traits tool.ToolTraits
+}
 
-func (t fakeTool) GetInfo() *tool.Info                             { return &tool.Info{Name: t.name} }
-func (t fakeTool) Execute(context.Context, string) (string, error) { return "ok:" + t.name, nil }
+func (t fakeTool) GetInfo() *tool.Info { return &tool.Info{Name: t.name, Traits: t.traits} }
+func (t fakeTool) Execute(context.Context, string) (string, error) {
+	return "ok:" + t.name, nil
+}
 
 func TestGatewayAllowsConfiguredBuiltinTools(t *testing.T) {
-	g := New(newFakeRegistry(), profilemodel.ToolSet{
-		Enabled: []string{"current_time", "calculator", "http_request"},
-	})
-
+	g := New(newFakeRegistry(), profilemodel.ToolSet{Enabled: []string{"current_time", "calculator", "http_request"}})
 	infos := g.ListInfos()
 	if len(infos) != 3 {
 		t.Fatalf("ListInfos() length = %d, want 3", len(infos))
 	}
-
 	got, err := g.Execute(context.Background(), "http_request", `{}`)
 	if err != nil {
 		t.Fatalf("Execute(http_request) error = %v", err)
@@ -74,11 +75,7 @@ func TestGatewayAllowsConfiguredBuiltinTools(t *testing.T) {
 }
 
 func TestGatewayDeniedToolIsNotVisibleOrExecutable(t *testing.T) {
-	g := New(newFakeRegistry(), profilemodel.ToolSet{
-		Enabled:  []string{"*"},
-		Disabled: []string{"http_request"},
-	})
-
+	g := New(newFakeRegistry(), profilemodel.ToolSet{Enabled: []string{"*"}, Disabled: []string{"http_request"}})
 	if got := g.Get("http_request"); got != nil {
 		t.Fatal("Get(http_request) returned tool, want nil")
 	}
@@ -93,10 +90,7 @@ func TestGatewayDeniedToolIsNotVisibleOrExecutable(t *testing.T) {
 }
 
 func TestGatewayFilterInfosAppliesPolicy(t *testing.T) {
-	g := New(newFakeRegistry(), profilemodel.ToolSet{
-		Enabled: []string{"calculator"},
-	})
-
+	g := New(newFakeRegistry(), profilemodel.ToolSet{Enabled: []string{"calculator"}})
 	infos := g.FilterInfos([]string{"calculator", "http_request"})
 	if len(infos) != 1 || infos[0].Name != "calculator" {
 		t.Fatalf("FilterInfos() = %#v, want only calculator", infos)

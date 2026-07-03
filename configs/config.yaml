@@ -160,6 +160,46 @@ secrets:
   data_dir: data
   # 主密钥只读取环境变量值，不写入配置文件。
   master_key_env: GENESIS_MASTER_KEY
+
+policy:
+  defaults:
+    unknown: ask
+    dangerous: ask
+    critical: deny
+    deny_overrides_allow: true
+    allowed_grant_scopes: [once, turn, session, project]
+  files:
+    default: ask
+    workspace:
+      read: allow
+      list: allow
+      walk: allow
+      write: allow
+      edit: allow
+      delete: ask
+    external:
+      read: ask
+      list: ask
+      walk: ask
+      write: ask
+      edit: ask
+      delete: deny
+    protected:
+      default: deny
+    workspace_metadata:
+      write: deny
+      paths: [.git, .agents, .codex]
+  # commands/web/sandbox 第一批仅解析默认值，运行时治理在对应 matcher 接入后生效。
+  commands:
+    default: ask
+  web:
+    search:
+      default: ask
+    fetch:
+      default: ask
+  sandbox:
+    default_mode: disabled
+
 agent:
   # ReAct Loop 最大迭代次数（防止无限循环）
   max_iterations: 10

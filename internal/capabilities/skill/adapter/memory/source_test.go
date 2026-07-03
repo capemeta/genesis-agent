@@ -1,0 +1,29 @@
+package memory
+
+import (
+	"context"
+	"testing"
+
+	"genesis-agent/internal/capabilities/skill/contract"
+	"genesis-agent/internal/capabilities/skill/model"
+)
+
+func TestSourceListReadSearch(t *testing.T) {
+	meta := model.Metadata{Name: "review", QualifiedName: "review", Description: "Review", Enabled: true, PromptVisible: true, Authority: model.Authority{Kind: model.SourceKindEmbedded, ID: "test"}, PackageID: "review", MainResource: "review/SKILL.md"}.Normalize()
+	source := NewSource(meta.Authority, []Skill{{Metadata: meta, Body: "Body", Resources: map[model.ResourceID]string{"review/references/guide.md": "alpha beta"}}})
+	list, err := source.List(context.Background(), contract.ListQuery{})
+	if err != nil || len(list.Entries) != 1 {
+		t.Fatalf("list=%+v err=%v", list, err)
+	}
+	if list.Entries[0].ID != "embedded:test:review" {
+		t.Fatalf("id = %q", list.Entries[0].ID)
+	}
+	read, err := source.Read(context.Background(), contract.ReadRequest{PackageID: "review"})
+	if err != nil || read.Content != "Body" {
+		t.Fatalf("read=%+v err=%v", read, err)
+	}
+	search, err := source.Search(context.Background(), contract.SearchRequest{PackageID: "review", Query: "alpha"})
+	if err != nil || len(search.Matches) != 1 {
+		t.Fatalf("search=%+v err=%v", search, err)
+	}
+}

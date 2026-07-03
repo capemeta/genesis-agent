@@ -1,0 +1,79 @@
+// Package contract 定义 Skill 能力契约。
+package contract
+
+import (
+	"context"
+	"time"
+
+	profilemodel "genesis-agent/internal/capabilities/profile/model"
+	"genesis-agent/internal/capabilities/skill/model"
+)
+
+// Source 是 Skill 来源。List/Read/Search 必须由同一 Authority 路由。
+type Source interface {
+	Authority() model.Authority
+	List(ctx context.Context, query ListQuery) (ListResult, error)
+	Read(ctx context.Context, req ReadRequest) (ReadResult, error)
+	Search(ctx context.Context, req SearchRequest) (SearchResult, error)
+}
+
+// Watcher 是可选的本地变更监听器，不强加给 DB/远程 source。
+type Watcher interface {
+	Watch(ctx context.Context, roots []WatchRoot) (<-chan ChangeEvent, error)
+}
+
+type WatchRoot struct {
+	Path      string
+	Scope     model.Scope
+	Recursive bool
+}
+
+type ChangeEvent struct {
+	Root      WatchRoot
+	Path      string
+	ChangedAt time.Time
+}
+
+type ListQuery struct {
+	Product     profilemodel.ChannelType
+	TenantID    string
+	ProjectID   string
+	AgentID     string
+	UserID      string
+	RoleIDs     []string
+	Environment profilemodel.RuntimeEnvironment
+}
+
+type ListResult struct {
+	Entries  []model.Metadata
+	Errors   []model.Error
+	Warnings []string
+	Version  string
+}
+
+type ReadRequest struct {
+	Authority model.Authority
+	PackageID model.PackageID
+	Resource  model.ResourceID
+	Version   string
+	MaxBytes  int
+}
+
+type ReadResult struct {
+	Metadata  model.Metadata
+	Resource  model.ResourceID
+	Content   string
+	Version   string
+	Truncated bool
+}
+
+type SearchRequest struct {
+	Authority model.Authority
+	PackageID model.PackageID
+	Query     string
+	Limit     int
+}
+
+type SearchResult struct {
+	Matches []model.SearchMatch
+}

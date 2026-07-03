@@ -9,13 +9,21 @@ import (
 	"github.com/spf13/cobra"
 
 	"genesis-agent/internal/app"
+	clisandbox "genesis-agent/products/cli/internal/sandbox"
 )
 
 // defaultConfigDir 默认配置目录（相对于工作目录）
 const defaultConfigDir = "configs"
 
+// ServiceOptions 描述 CLI 命令初始化 AgentService 时需要传给产品 bootstrap 的参数。
+type ServiceOptions struct {
+	ConfigDirRef *string
+	Quiet        bool
+	Sandbox      clisandbox.Config
+}
+
 // ServiceFactory 由产品分发层注入 AgentService 构建方式。
-type ServiceFactory func(ctx context.Context, configDirRef *string, quiet bool) (app.AgentService, error)
+type ServiceFactory func(ctx context.Context, opts ServiceOptions) (app.AgentService, error)
 
 // ExecuteWithFactory 使用产品分发层注入的 service factory 执行 CLI。
 func ExecuteWithFactory(factory ServiceFactory) error {
@@ -25,8 +33,15 @@ func ExecuteWithFactory(factory ServiceFactory) error {
 	return newRootCmd(factory).Execute()
 }
 
-func initService(ctx context.Context, factory ServiceFactory, configDirRef *string, quiet bool) (app.AgentService, error) {
-	svc, err := factory(ctx, configDirRef, quiet)
+func initService(ctx context.Context, factory ServiceFactory, configDirRef *string, quiet bool, sandboxModeRef *string) (app.AgentService, error) {
+	sandboxCfg, err := clisandbox.ParseFlag("")
+	if sandboxModeRef != nil {
+		sandboxCfg, err = clisandbox.ParseFlag(*sandboxModeRef)
+	}
+	if err != nil {
+		return nil, err
+	}
+	svc, err := factory(ctx, ServiceOptions{ConfigDirRef: configDirRef, Quiet: quiet, Sandbox: sandboxCfg})
 	if err != nil {
 		return nil, err
 	}
@@ -38,9 +53,10 @@ func initService(ctx context.Context, factory ServiceFactory, configDirRef *stri
 
 // newRootCmd 构建 Cobra 根命令树，注册全局 flag 和所有子命令
 func newRootCmd(factory ServiceFactory) *cobra.Command {
-	// configDir 由 --config 持久 flag 控制
-	// 传递指针给各子命令，保证 flag 解析后子命令执行时读取的是最新值
+	// configDir / sandboxMode 由持久 flag 控制。
+	// 传递指针给各子命令，保证 flag 解析后子命令执行时读取的是最新值。
 	configDir := defaultConfigDir
+	sandboxMode := string(clisandbox.DefaultConfig().Execution)
 
 	root := &cobra.Command{
 		Use:   "genesis-cli",
@@ -71,13 +87,17 @@ func newRootCmd(factory ServiceFactory) *cobra.Command {
 		&configDir, "config", "c", defaultConfigDir,
 		"配置目录路径（含 config.yaml 和可选的 config.local.yaml）",
 	)
+	root.PersistentFlags().StringVar(
+		&sandboxMode, "sandbox", sandboxMode,
+		"命令执行沙箱策略：disabled、optional 或 required",
+	)
 
-	// 注册所有子命令，统一传入 configDir 指针
+	// 注册所有子命令，统一传入 configDir / sandboxMode 指针
 	root.AddCommand(
-		newChatCmd(&configDir, factory),
-		newRunCmd(&configDir, factory),
+		newChatCmd(&configDir, &sandboxMode, factory),
+		newRunCmd(&configDir, &sandboxMode, factory),
 		newConfigCmd(&configDir),
-		newToolsCmd(&configDir, factory),
+		newToolsCmd(&configDir, &sandboxMode, factory),
 		newVersionCmd(),
 	)
 

@@ -3,10 +3,11 @@ package contract
 
 // ResolveOptions 控制路径解析行为。
 type ResolveOptions struct {
-	Operation        string
-	MustExist        bool
-	AllowDirectory   bool
-	RequireDirectory bool
+	Operation            string
+	MustExist            bool
+	AllowDirectory       bool
+	RequireDirectory     bool
+	PreserveFinalSymlink bool
 }
 
 // ReadOptions 控制文件读取。
@@ -39,4 +40,9 @@ type WalkOptions struct {
 // MkdirOptions 控制目录创建。
 type MkdirOptions struct {
 	Parents bool
+}
+
+// RemoveOptions 控制文件删除。
+type RemoveOptions struct {
+	ExpectedHash string
 }

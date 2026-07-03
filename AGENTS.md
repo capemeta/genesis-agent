@@ -126,4 +126,8 @@ shared/local → internal/capabilities/* contract/model
 ## shell命令执行
 
 - 当前是window环境，你要使用PowerShell/cmd的语法，而不是使用linux的语法
+- 执行 Go 构建、测试、工具命令时，必须显式使用仓库内缓存路径：`GOCACHE=D:\workspace\go\genesis-agent\.gocache`，`GOMODCACHE=D:\workspace\go\genesis-agent\.gomodcache`。PowerShell 示例：`$env:GOCACHE='D:\workspace\go\genesis-agent\.gocache'; $env:GOMODCACHE='D:\workspace\go\genesis-agent\.gomodcache'; go test ./...`
+- 编辑 Windows 路径、PowerShell 示例或包含 `$env:` 的文档时，必须注意字符串转义：优先使用单引号、here-string 或 `apply_patch`；不要在 PowerShell 双引号字符串里直接写 `$env:` 示例，避免变量插值把文本改坏。修改后必须读回相关片段确认。
+
+
 

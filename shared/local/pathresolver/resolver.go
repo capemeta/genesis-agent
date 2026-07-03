@@ -71,7 +71,7 @@ func (r *Resolver) Resolve(ctx context.Context, ref model.PathRef, opts fscontra
 	}
 	abs = filepath.Clean(abs)
 
-	real, err := r.realPath(abs, opts.MustExist)
+	real, err := r.realPath(abs, opts.MustExist, opts.PreserveFinalSymlink)
 	if err != nil {
 		return model.ResolvedPath{}, err
 	}
@@ -131,7 +131,18 @@ func validateKind(real string, raw string, opts fscontract.ResolveOptions) error
 	return nil
 }
 
-func (r *Resolver) realPath(abs string, mustExist bool) (string, error) {
+func (r *Resolver) realPath(abs string, mustExist bool, preserveFinalSymlink bool) (string, error) {
+	if preserveFinalSymlink && mustExist {
+		parent := filepath.Dir(abs)
+		realParent, err := filepath.EvalSymlinks(parent)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return "", fscontract.NewError(fscontract.ErrCodeNotFound, abs, err)
+			}
+			return "", fscontract.NewError(fscontract.ErrCodeInvalidPath, abs, err)
+		}
+		return filepath.Clean(filepath.Join(realParent, filepath.Base(abs))), nil
+	}
 	if mustExist {
 		real, err := filepath.EvalSymlinks(abs)
 		if err != nil {

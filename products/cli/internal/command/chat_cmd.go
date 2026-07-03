@@ -12,7 +12,7 @@ import (
 
 // newChatCmd 创建 chat 子命令
 // 启动基于 Bubble Tea + Lip Gloss 的全功能 TUI 对话界面
-func newChatCmd(configDirRef *string, factory ServiceFactory) *cobra.Command {
+func newChatCmd(configDirRef *string, sandboxModeRef *string, factory ServiceFactory) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "chat",
 		Short: "启动交互式 TUI 对话（推荐）",
@@ -40,7 +40,7 @@ func newChatCmd(configDirRef *string, factory ServiceFactory) *cobra.Command {
 			ctx := context.Background()
 
 			// TUI 模式：禁用 stdout 日志/Trace，避免污染 Bubble Tea 画面
-			svc, err := initService(ctx, factory, configDirRef, true)
+			svc, err := initService(ctx, factory, configDirRef, true, sandboxModeRef)
 			if err != nil {
 				return fmt.Errorf("初始化失败: %w\n\n请检查配置文件或 API Key 是否正确", err)
 			}

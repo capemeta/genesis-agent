@@ -27,6 +27,7 @@ type Profile struct {
 	Description string
 	Scope       CapabilityScope
 	Tools       ToolSet
+	Skills      SkillSet
 }
 
 // CapabilityScope 描述能力适用范围。第一轮只落模型，不做租户/角色持久化。
@@ -44,4 +45,20 @@ type CapabilityScope struct {
 type ToolSet struct {
 	Enabled  []string
 	Disabled []string
+}
+
+// SkillSet 描述 Skill 启停策略和来源策略。Disabled 优先级高于 Enabled。
+type SkillSet struct {
+	Enabled       []string
+	Disabled      []string
+	Sources       []SkillSourceRef
+	AllowImplicit bool
+}
+
+// SkillSourceRef 是产品 profile 中声明的 Skill 来源。
+type SkillSourceRef struct {
+	Kind  string
+	ID    string
+	Scope string
+	Path  string
 }

@@ -19,4 +19,5 @@ type FileSystemBackend interface {
 	Walk(ctx context.Context, path model.ResolvedPath, opts WalkOptions) (*model.WalkOutcome, error)
 	Stat(ctx context.Context, path model.ResolvedPath) (*model.FileStat, error)
 	MkdirAll(ctx context.Context, path model.ResolvedPath, opts MkdirOptions) error
+	Remove(ctx context.Context, path model.ResolvedPath, opts RemoveOptions) error
 }

@@ -13,11 +13,12 @@ import (
 type Operation string
 
 const (
-	OperationRead  Operation = "read"
-	OperationWrite Operation = "write"
-	OperationEdit  Operation = "edit"
-	OperationList  Operation = "list"
-	OperationWalk  Operation = "walk"
+	OperationRead   Operation = "read"
+	OperationWrite  Operation = "write"
+	OperationEdit   Operation = "edit"
+	OperationDelete Operation = "delete"
+	OperationList   Operation = "list"
+	OperationWalk   Operation = "walk"
 )
 
 // BuildApprovalRequest 将文件系统上下文转换成通用审批请求。
@@ -40,6 +41,9 @@ func BuildApprovalRequest(toolName string, op Operation, path model.ResolvedPath
 		metadata["workspace_metadata_write"] = "true"
 		metadata["critical"] = "true"
 		metadata["deny_reason"] = "workspace metadata write protected"
+	}
+	if op == OperationDelete {
+		metadata["destructive"] = "true"
 	}
 
 	risk := approvalmodel.RiskLow
@@ -75,6 +79,8 @@ func actionOf(op Operation) approvalmodel.Action {
 		return approvalmodel.ActionFileWrite
 	case OperationEdit:
 		return approvalmodel.ActionFileEdit
+	case OperationDelete:
+		return approvalmodel.Action("file.delete")
 	case OperationList:
 		return approvalmodel.ActionFileList
 	case OperationWalk:
@@ -126,7 +132,7 @@ func isProtected(path model.ResolvedPath) bool {
 }
 
 func isWorkspaceMetadataWrite(op Operation, path model.ResolvedPath) bool {
-	if op != OperationWrite && op != OperationEdit {
+	if op != OperationWrite && op != OperationEdit && op != OperationDelete {
 		return false
 	}
 	rel := strings.ToLower(strings.ReplaceAll(path.WorkspaceRel, "\\", "/"))

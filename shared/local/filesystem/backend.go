@@ -244,6 +244,32 @@ func (b *Backend) MkdirAll(ctx context.Context, path model.ResolvedPath, _ fscon
 	return nil
 }
 
+func (b *Backend) Remove(ctx context.Context, path model.ResolvedPath, opts fscontract.RemoveOptions) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if opts.ExpectedHash != "" {
+		currentHash, err := hashFile(path.BackendPath)
+		if err != nil {
+			return mapOSError(path.DisplayPath, err)
+		}
+		if currentHash != opts.ExpectedHash {
+			return fscontract.NewError(fscontract.ErrCodeModifiedExternally, path.DisplayPath, fmt.Errorf("expected_hash不匹配"))
+		}
+	}
+	info, err := os.Lstat(path.BackendPath)
+	if err != nil {
+		return mapOSError(path.DisplayPath, err)
+	}
+	if info.IsDir() {
+		return fscontract.NewError(fscontract.ErrCodeInvalidInput, path.DisplayPath, fmt.Errorf("不能删除目录"))
+	}
+	if err := os.Remove(path.BackendPath); err != nil {
+		return mapOSError(path.DisplayPath, err)
+	}
+	return nil
+}
+
 // HashBytes 返回 sha256 hex。
 func HashBytes(data []byte) string {
 	sum := sha256.Sum256(data)

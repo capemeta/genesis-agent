@@ -24,7 +24,7 @@ type runResult struct {
 
 // newRunCmd 创建 run 子命令
 // run 命令执行单次 Agent 推理并输出结果，适合脚本调用和非交互场景
-func newRunCmd(configDirRef *string, factory ServiceFactory) *cobra.Command {
+func newRunCmd(configDirRef *string, sandboxModeRef *string, factory ServiceFactory) *cobra.Command {
 	var (
 		jsonOutput bool
 		quiet      bool
@@ -53,7 +53,7 @@ func newRunCmd(configDirRef *string, factory ServiceFactory) *cobra.Command {
 
 			// JSON/quiet 模式不能出现交互式审批提示，避免污染机器可读输出。
 			serviceQuiet := quiet || jsonOutput
-			svc, err := initService(ctx, factory, configDirRef, serviceQuiet)
+			svc, err := initService(ctx, factory, configDirRef, serviceQuiet, sandboxModeRef)
 			if err != nil {
 				return fmt.Errorf("初始化失败: %w", err)
 			}

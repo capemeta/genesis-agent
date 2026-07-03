@@ -130,3 +130,25 @@ func TestResolverMarksSSHDirectoryItselfProtected(t *testing.T) {
 		t.Fatalf("Scope = %q, want protected", got.Scope)
 	}
 }
+
+func TestResolverCanPreserveFinalSymlink(t *testing.T) {
+	root := tempWorkspace(t)
+	if err := os.WriteFile(filepath.Join(root, "target.txt"), []byte("ok"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "link.txt")
+	if err := os.Symlink(filepath.Join(root, "target.txt"), link); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	resolver, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := resolver.Resolve(context.Background(), model.PathRef{Raw: "link.txt"}, fscontract.ResolveOptions{MustExist: true, PreserveFinalSymlink: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Clean(got.BackendPath) != filepath.Clean(link) {
+		t.Fatalf("BackendPath=%q, want link path %q", got.BackendPath, link)
+	}
+}

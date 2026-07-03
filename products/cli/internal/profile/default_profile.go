@@ -21,9 +21,17 @@ func DefaultProfile() profilemodel.Profile {
 				"read_file",
 				"write_file",
 				"edit_file",
+				"apply_patch",
 				"list_dir",
 				"walk_dir",
+				"glob",
+				"grep",
+				"run_command",
+				"load_skill",
+				"read_skill_resource",
+				"search_skill_resources",
 			},
 		},
+		Skills: profilemodel.SkillSet{AllowImplicit: true},
 	}
 }

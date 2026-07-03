@@ -10,7 +10,7 @@ import (
 
 // newToolsCmd 创建 tools 子命令
 // tools 命令列出所有已注册的工具及其描述，方便用户了解 Agent 可用能力
-func newToolsCmd(configDirRef *string, factory ServiceFactory) *cobra.Command {
+func newToolsCmd(configDirRef *string, sandboxModeRef *string, factory ServiceFactory) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "tools",
 		Short: "列出已注册的可用工具",
@@ -19,7 +19,7 @@ func newToolsCmd(configDirRef *string, factory ServiceFactory) *cobra.Command {
 			ctx := context.Background()
 
 			// tools 命令不需要 TUI，保持 stdout 输出
-			svc, err := initService(ctx, factory, configDirRef, false)
+			svc, err := initService(ctx, factory, configDirRef, false, sandboxModeRef)
 			if err != nil {
 				return fmt.Errorf("初始化失败: %w", err)
 			}

@@ -8,6 +8,8 @@ import (
 	"strings"
 
 	"genesis-agent/internal/app"
+	auditmemory "genesis-agent/internal/capabilities/audit/adapter/memory"
+	auditcontract "genesis-agent/internal/capabilities/audit/contract"
 	connectionfile "genesis-agent/internal/capabilities/connection/adapter/file"
 	connectioncontract "genesis-agent/internal/capabilities/connection/contract"
 	connectionservice "genesis-agent/internal/capabilities/connection/service"
@@ -17,20 +19,26 @@ import (
 	llmadapter "genesis-agent/internal/capabilities/llm/adapter"
 	"genesis-agent/internal/capabilities/memory/adapter/inmemory"
 	memorycontract "genesis-agent/internal/capabilities/memory/contract"
+	"genesis-agent/internal/capabilities/plan/service"
 	profilemodel "genesis-agent/internal/capabilities/profile/model"
 	"genesis-agent/internal/capabilities/tool/adapter/builtin"
 	"genesis-agent/internal/capabilities/tool/adapter/registry"
 	toolcontract "genesis-agent/internal/capabilities/tool/contract"
 	"genesis-agent/internal/capabilities/tool/gateway"
+	"genesis-agent/internal/capabilities/tool/scheduler"
 	consoletrace "genesis-agent/internal/capabilities/trace/adapter"
 	tracecontract "genesis-agent/internal/capabilities/trace/contract"
+	usagememory "genesis-agent/internal/capabilities/usage/adapter/memory"
+	usagecontract "genesis-agent/internal/capabilities/usage/contract"
 	"genesis-agent/internal/domain"
 	"genesis-agent/internal/platform/config"
+	"genesis-agent/internal/platform/contextutil"
 	platformhttp "genesis-agent/internal/platform/httpclient"
 	loggercontract "genesis-agent/internal/platform/logger"
 	sloglogger "genesis-agent/internal/platform/logger"
 	promptbuilder "genesis-agent/internal/runtime/prompt"
 	"genesis-agent/internal/runtime/strategy/react"
+	localplan "genesis-agent/shared/local/plan"
 )
 
 const (
@@ -49,6 +57,9 @@ type BuildOptions struct {
 	DefaultAgentName string
 	Profile          profilemodel.Profile
 	AdditionalTools  []toolcontract.Tool
+	PromptInjectors  []promptbuilder.ContextInjector
+	AuditSink        auditcontract.Sink
+	UsageSink        usagecontract.Sink
 }
 
 // RuntimeBundle 聚合 shared builder 构建出的运行时依赖。
@@ -58,6 +69,8 @@ type RuntimeBundle struct {
 	Tracer       tracecontract.Tracer
 	ToolRegistry toolcontract.Registry
 	MemoryStore  memorycontract.ShortTermStore
+	AuditSink    auditcontract.Sink
+	UsageSink    usagecontract.Sink
 	DefaultAgent *domain.Agent
 	AgentService app.AgentService
 }
@@ -128,16 +141,35 @@ func BuildAgentService(ctx context.Context, opts BuildOptions) (*RuntimeBundle, 
 		return nil, err
 	}
 
+	// ── 初始化 Plan 本地存储与应用服务 ───────────────────────────
+	planRepoDir := filepath.Join(filepath.Dir(configDir), ".genesis", "plans")
+	planRepo, err := localplan.NewFileRepository(planRepoDir)
+	if err != nil {
+		return nil, fmt.Errorf("初始化 Plan 本地存储失败: %w", err)
+	}
+	planSvc := service.NewPlanService(planRepo, nil, 3)
+
 	baseRegistry := registry.NewRegistry()
 	baseRegistry.Register(builtin.NewCurrentTimeTool())
 	baseRegistry.Register(builtin.NewCalculatorTool())
 	baseRegistry.Register(builtin.NewHTTPRequestTool(httpClient, connectionSvc))
+	baseRegistry.Register(builtin.NewTodoReadTool(planSvc))
+	baseRegistry.Register(builtin.NewTodoWriteTool(planSvc))
+	baseRegistry.Register(builtin.NewTodoUpdateStepTool(planSvc))
 	for _, t := range opts.AdditionalTools {
 		if t != nil {
 			baseRegistry.Register(t)
 		}
 	}
-	toolGateway := gateway.New(baseRegistry, toolSet)
+	auditSink := opts.AuditSink
+	if auditSink == nil {
+		auditSink = auditmemory.NewSink()
+	}
+	usageSink := opts.UsageSink
+	if usageSink == nil {
+		usageSink = usagememory.NewSink()
+	}
+	toolGateway := gateway.New(baseRegistry, toolSet, gateway.Options{Locker: scheduler.NewMemoryResourceLocker(), Tracer: tracer, AuditSink: auditSink, UsageSink: usageSink})
 
 	resolvedLLM, err := cfg.LLM.ResolveRoute(routeName)
 	if err != nil {
@@ -149,12 +181,39 @@ func BuildAgentService(ctx context.Context, opts BuildOptions) (*RuntimeBundle, 
 		return nil, fmt.Errorf("初始化 LLM 客户端失败: %w", err)
 	}
 
+	// 动态注入 Plan 待办进度被动提醒
+	planReminderInjector := promptbuilder.ContextInjectorFunc(func(c context.Context, req promptbuilder.BuildRequest) (promptbuilder.Fragment, error) {
+		sessionID := req.Run.SessionID
+		if sessionID == "" {
+			sessionID = req.Run.ID
+		}
+		stepCount := len(req.Run.Steps)
+
+		c = contextutil.WithSessionID(c, sessionID)
+		c = contextutil.WithTenantID(c, req.Run.TenantID)
+
+		reminder, needed, err := planSvc.GeneratePromptReminder(c, sessionID, stepCount)
+		if err != nil {
+			return promptbuilder.Fragment{}, err
+		}
+		if !needed {
+			return promptbuilder.Fragment{}, nil
+		}
+
+		return promptbuilder.Fragment{
+			Name:     "plan_reminder",
+			Contents: reminder,
+		}, nil
+	})
+
+	injectors := append([]promptbuilder.ContextInjector{planReminderInjector}, opts.PromptInjectors...)
+
 	memStore := inmemory.NewInMemoryStore()
 	runEngine := react.NewReactLoopEngine(
 		llmClient,
 		toolGateway,
 		memStore,
-		promptbuilder.New(),
+		promptbuilder.New(injectors...),
 		log,
 		tracer,
 	)
@@ -178,6 +237,8 @@ func BuildAgentService(ctx context.Context, opts BuildOptions) (*RuntimeBundle, 
 		Tracer:       tracer,
 		ToolRegistry: toolGateway,
 		MemoryStore:  memStore,
+		AuditSink:    auditSink,
+		UsageSink:    usageSink,
 		DefaultAgent: defaultAgent,
 		AgentService: svc,
 	}, nil

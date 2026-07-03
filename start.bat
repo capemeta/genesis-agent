@@ -2,8 +2,9 @@
 chcp 65001 >nul
 title Genesis Agent - TUI 对话
 
-set GOCACHE=D:\gocache
-set GOTMPDIR=D:\gotmp
+set GOCACHE=%~dp0.gocache
+set GOMODCACHE=%~dp0.gomodcache
+set GOTMPDIR=%~dp0.gotmp
 
 echo.
 echo  正在启动 Genesis Agent...

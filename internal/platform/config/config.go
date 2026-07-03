@@ -20,6 +20,7 @@ type Config struct {
 	LLM        LLMConfig        `mapstructure:"llm"`
 	HTTPClient HTTPClientConfig `mapstructure:"http_client"`
 	Secrets    SecretsConfig    `mapstructure:"secrets"`
+	Policy     PolicyConfig     `mapstructure:"policy"`
 	Agent      AgentConfig      `mapstructure:"agent"`
 	Log        LogConfig        `mapstructure:"log"`
 	Server     ServerConfig     `mapstructure:"server"`
@@ -171,6 +172,80 @@ type HTTPClientRetryConfig struct {
 type SecretsConfig struct {
 	DataDir      string `mapstructure:"data_dir"`
 	MasterKeyEnv string `mapstructure:"master_key_env"`
+}
+
+// PolicyConfig 描述统一权限与审批治理配置。第一批仅 files/defaults 参与运行时策略，
+// commands/web/sandbox 先作为配置预留，等待对应 matcher 接入。
+type PolicyConfig struct {
+	Defaults PolicyDefaultsConfig `mapstructure:"defaults"`
+	Files    PolicyFilesConfig    `mapstructure:"files"`
+	Commands PolicyCommandsConfig `mapstructure:"commands"`
+	Web      PolicyWebConfig      `mapstructure:"web"`
+	Sandbox  PolicySandboxConfig  `mapstructure:"sandbox"`
+}
+
+// PolicyDefaultsConfig 描述策略默认决策。
+type PolicyDefaultsConfig struct {
+	Unknown            string   `mapstructure:"unknown"`
+	Dangerous          string   `mapstructure:"dangerous"`
+	Critical           string   `mapstructure:"critical"`
+	DenyOverridesAllow bool     `mapstructure:"deny_overrides_allow"`
+	AllowedGrantScopes []string `mapstructure:"allowed_grant_scopes"`
+}
+
+// PolicyFilesConfig 描述文件系统策略配置。
+type PolicyFilesConfig struct {
+	Default           string                  `mapstructure:"default"`
+	Workspace         PolicyFileOperations    `mapstructure:"workspace"`
+	External          PolicyFileOperations    `mapstructure:"external"`
+	Protected         PolicyDefaultDecision   `mapstructure:"protected"`
+	AllowPaths        []PolicyPathRuleConfig  `mapstructure:"allow_paths"`
+	DenyPaths         []PolicyPathRuleConfig  `mapstructure:"deny_paths"`
+	WorkspaceMetadata PolicyWorkspaceMetadata `mapstructure:"workspace_metadata"`
+}
+
+// PolicyFileOperations 描述文件操作到策略决策的映射。
+type PolicyFileOperations struct {
+	Read   string `mapstructure:"read"`
+	List   string `mapstructure:"list"`
+	Walk   string `mapstructure:"walk"`
+	Write  string `mapstructure:"write"`
+	Edit   string `mapstructure:"edit"`
+	Delete string `mapstructure:"delete"`
+}
+
+// PolicyDefaultDecision 描述只包含 default 字段的策略片段。
+type PolicyDefaultDecision struct {
+	Default string `mapstructure:"default"`
+}
+
+// PolicyPathRuleConfig 描述路径级 allow/deny 规则。
+type PolicyPathRuleConfig struct {
+	Path       string   `mapstructure:"path"`
+	Operations []string `mapstructure:"operations"`
+	Scope      string   `mapstructure:"scope"`
+}
+
+// PolicyWorkspaceMetadata 描述工作区元数据目录策略。
+type PolicyWorkspaceMetadata struct {
+	Write string   `mapstructure:"write"`
+	Paths []string `mapstructure:"paths"`
+}
+
+// PolicyCommandsConfig 描述命令执行策略配置。第一批仅解析 default。
+type PolicyCommandsConfig struct {
+	Default string `mapstructure:"default"`
+}
+
+// PolicyWebConfig 描述网络搜索与获取策略配置。第一批仅解析 default。
+type PolicyWebConfig struct {
+	Search PolicyDefaultDecision `mapstructure:"search"`
+	Fetch  PolicyDefaultDecision `mapstructure:"fetch"`
+}
+
+// PolicySandboxConfig 描述沙箱策略配置。第一批仅解析 default_mode。
+type PolicySandboxConfig struct {
+	DefaultMode string `mapstructure:"default_mode"`
 }
 
 // AgentConfig Agent 运行时策略。
@@ -358,6 +433,11 @@ func validate(cfg *Config) error {
 		cfg.LLM.Timeout = 60 * time.Second
 	}
 	applyHTTPClientDefaults(&cfg.HTTPClient)
+	applySecretsDefaults(&cfg.Secrets)
+	applyPolicyDefaults(&cfg.Policy)
+	if err := validatePolicyConfig(cfg.Policy); err != nil {
+		return err
+	}
 	if len(cfg.LLM.Providers) == 0 {
 		return fmt.Errorf("llm.providers 不能为空")
 	}
@@ -435,6 +515,136 @@ func applySecretsDefaults(cfg *SecretsConfig) {
 		cfg.MasterKeyEnv = "GENESIS_MASTER_KEY"
 	}
 }
+
+func applyPolicyDefaults(cfg *PolicyConfig) {
+	if strings.TrimSpace(cfg.Defaults.Unknown) == "" {
+		cfg.Defaults.Unknown = "ask"
+	}
+	if strings.TrimSpace(cfg.Defaults.Dangerous) == "" {
+		cfg.Defaults.Dangerous = "ask"
+	}
+	if strings.TrimSpace(cfg.Defaults.Critical) == "" {
+		cfg.Defaults.Critical = "deny"
+	}
+	cfg.Defaults.DenyOverridesAllow = true
+	if len(cfg.Defaults.AllowedGrantScopes) == 0 {
+		cfg.Defaults.AllowedGrantScopes = []string{"once", "turn", "session", "project"}
+	}
+	if strings.TrimSpace(cfg.Files.Default) == "" {
+		cfg.Files.Default = "ask"
+	}
+	defaultFileOps(&cfg.Files.Workspace, "allow", "allow", "allow", "allow", "allow", "ask")
+	defaultFileOps(&cfg.Files.External, "ask", "ask", "ask", "ask", "ask", "deny")
+	if strings.TrimSpace(cfg.Files.Protected.Default) == "" {
+		cfg.Files.Protected.Default = "deny"
+	}
+	if strings.TrimSpace(cfg.Files.WorkspaceMetadata.Write) == "" {
+		cfg.Files.WorkspaceMetadata.Write = "deny"
+	}
+	if len(cfg.Files.WorkspaceMetadata.Paths) == 0 {
+		cfg.Files.WorkspaceMetadata.Paths = []string{".git", ".agents", ".codex"}
+	}
+	if strings.TrimSpace(cfg.Commands.Default) == "" {
+		cfg.Commands.Default = "ask"
+	}
+	if strings.TrimSpace(cfg.Web.Search.Default) == "" {
+		cfg.Web.Search.Default = "ask"
+	}
+	if strings.TrimSpace(cfg.Web.Fetch.Default) == "" {
+		cfg.Web.Fetch.Default = "ask"
+	}
+	if strings.TrimSpace(cfg.Sandbox.DefaultMode) == "" {
+		cfg.Sandbox.DefaultMode = "disabled"
+	}
+}
+
+func defaultFileOps(cfg *PolicyFileOperations, read, list, walk, write, edit, delete string) {
+	if strings.TrimSpace(cfg.Read) == "" {
+		cfg.Read = read
+	}
+	if strings.TrimSpace(cfg.List) == "" {
+		cfg.List = list
+	}
+	if strings.TrimSpace(cfg.Walk) == "" {
+		cfg.Walk = walk
+	}
+	if strings.TrimSpace(cfg.Write) == "" {
+		cfg.Write = write
+	}
+	if strings.TrimSpace(cfg.Edit) == "" {
+		cfg.Edit = edit
+	}
+	if strings.TrimSpace(cfg.Delete) == "" {
+		cfg.Delete = delete
+	}
+}
+
+func validatePolicyConfig(cfg PolicyConfig) error {
+	decisions := map[string]bool{"allow": true, "ask": true, "deny": true}
+	checks := map[string]string{
+		"policy.defaults.unknown":               cfg.Defaults.Unknown,
+		"policy.defaults.dangerous":             cfg.Defaults.Dangerous,
+		"policy.defaults.critical":              cfg.Defaults.Critical,
+		"policy.files.default":                  cfg.Files.Default,
+		"policy.files.workspace.read":           cfg.Files.Workspace.Read,
+		"policy.files.workspace.list":           cfg.Files.Workspace.List,
+		"policy.files.workspace.walk":           cfg.Files.Workspace.Walk,
+		"policy.files.workspace.write":          cfg.Files.Workspace.Write,
+		"policy.files.workspace.edit":           cfg.Files.Workspace.Edit,
+		"policy.files.workspace.delete":         cfg.Files.Workspace.Delete,
+		"policy.files.external.read":            cfg.Files.External.Read,
+		"policy.files.external.list":            cfg.Files.External.List,
+		"policy.files.external.walk":            cfg.Files.External.Walk,
+		"policy.files.external.write":           cfg.Files.External.Write,
+		"policy.files.external.edit":            cfg.Files.External.Edit,
+		"policy.files.external.delete":          cfg.Files.External.Delete,
+		"policy.files.protected.default":        cfg.Files.Protected.Default,
+		"policy.files.workspace_metadata.write": cfg.Files.WorkspaceMetadata.Write,
+		"policy.commands.default":               cfg.Commands.Default,
+		"policy.web.search.default":             cfg.Web.Search.Default,
+		"policy.web.fetch.default":              cfg.Web.Fetch.Default,
+	}
+	for name, value := range checks {
+		if !decisions[strings.ToLower(strings.TrimSpace(value))] {
+			return fmt.Errorf("%s 必须是 allow、ask 或 deny", name)
+		}
+	}
+	for _, scope := range cfg.Defaults.AllowedGrantScopes {
+		switch strings.ToLower(strings.TrimSpace(scope)) {
+		case "once", "turn", "session", "project":
+		case "tenant", "global":
+			return fmt.Errorf("policy.defaults.allowed_grant_scopes 不允许普通交互 scope %q", scope)
+		default:
+			return fmt.Errorf("policy.defaults.allowed_grant_scopes 包含未知 scope %q", scope)
+		}
+	}
+	for i, rule := range append(append([]PolicyPathRuleConfig{}, cfg.Files.AllowPaths...), cfg.Files.DenyPaths...) {
+		if strings.TrimSpace(rule.Path) == "" {
+			return fmt.Errorf("policy.files path rule[%d].path 不能为空", i)
+		}
+		for _, op := range rule.Operations {
+			if !validPolicyFileOperation(op) {
+				return fmt.Errorf("policy.files path rule[%d].operations 包含未知操作 %q", i, op)
+			}
+		}
+	}
+	switch strings.ToLower(strings.TrimSpace(cfg.Sandbox.DefaultMode)) {
+	case "disabled", "optional", "required":
+	default:
+		return fmt.Errorf("policy.sandbox.default_mode 必须是 disabled、optional 或 required")
+	}
+	return nil
+}
+
+func validPolicyFileOperation(op string) bool {
+	switch strings.ToLower(strings.TrimSpace(op)) {
+	case "read", "list", "walk", "write", "edit", "delete":
+		return true
+	default:
+		return false
+	}
+}
+
 func inferProviderKind(name string, configuredType string) string {
 	if configuredType != "" {
 		return strings.ToLower(configuredType)

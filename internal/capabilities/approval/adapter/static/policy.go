@@ -22,6 +22,9 @@ func (e *PolicyEngine) Evaluate(ctx context.Context, req model.Request) (model.P
 	if metadata["critical"] == "true" || metadata["protected"] == "true" || metadata["scope"] == "protected" || metadata["workspace_metadata_write"] == "true" {
 		return model.PolicyResult{Type: model.PolicyDeny, Reason: denyReason(metadata), Risk: model.RiskCritical}, nil
 	}
+	if metadata["trusted"] == "true" {
+		return model.PolicyResult{Type: model.PolicyAllow, Reason: "trusted resource", Risk: riskOrDefault(req.Risk)}, nil
+	}
 	if metadata["dangerous"] == "true" || metadata["destructive"] == "true" {
 		return askOnce("dangerous operation requires approval", model.RiskHigh), nil
 	}

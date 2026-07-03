@@ -5,14 +5,16 @@ package model
 type Action string
 
 const (
-	ActionFileRead    Action = "file.read"
-	ActionFileWrite   Action = "file.write"
-	ActionFileEdit    Action = "file.edit"
-	ActionFileList    Action = "file.list"
-	ActionFileWalk    Action = "file.walk"
-	ActionCommandExec Action = "command.exec"
-	ActionHTTPRequest Action = "http.request"
-	ActionMCPCall     Action = "mcp.call"
+	ActionFileRead          Action = "file.read"
+	ActionFileWrite         Action = "file.write"
+	ActionFileEdit          Action = "file.edit"
+	ActionFileList          Action = "file.list"
+	ActionFileWalk          Action = "file.walk"
+	ActionCommandExec       Action = "command.exec"
+	ActionHTTPRequest       Action = "http.request"
+	ActionMCPCall           Action = "mcp.call"
+	ActionSkillLoad         Action = "skill.load"
+	ActionSkillResourceRead Action = "skill.resource.read"
 )
 
 // Resource 描述动作作用的资源。

@@ -183,3 +183,141 @@ server:
 		t.Fatalf("Retry.MaxAttempts = %d, want 3", cfg.HTTPClient.Retry.MaxAttempts)
 	}
 }
+
+func TestLoadPolicyDefaults(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(minimalConfig("", "")), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if cfg.Policy.Defaults.Unknown != "ask" || cfg.Policy.Defaults.Critical != "deny" {
+		t.Fatalf("policy defaults = %+v", cfg.Policy.Defaults)
+	}
+	if cfg.Policy.Files.Workspace.Write != "allow" || cfg.Policy.Files.External.Delete != "deny" {
+		t.Fatalf("file policy defaults = %+v", cfg.Policy.Files)
+	}
+	if cfg.Policy.Commands.Default != "ask" || cfg.Policy.Web.Fetch.Default != "ask" || cfg.Policy.Sandbox.DefaultMode != "disabled" {
+		t.Fatalf("reserved policy defaults = %+v", cfg.Policy)
+	}
+}
+
+func TestLoadPolicyFromYAML(t *testing.T) {
+	dir := t.TempDir()
+	policy := `
+policy:
+  defaults:
+    unknown: deny
+    allowed_grant_scopes: [once, session]
+  files:
+    workspace:
+      write: ask
+    external:
+      read: deny
+    allow_paths:
+      - path: D:\tmp
+        operations: [read, list]
+  sandbox:
+    default_mode: optional
+`
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(minimalConfig(policy, "")), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Policy.Defaults.Unknown != "deny" {
+		t.Fatalf("Unknown = %q, want deny", cfg.Policy.Defaults.Unknown)
+	}
+	if cfg.Policy.Files.Workspace.Write != "ask" || cfg.Policy.Files.External.Read != "deny" {
+		t.Fatalf("file overrides = %+v", cfg.Policy.Files)
+	}
+	if len(cfg.Policy.Files.AllowPaths) != 1 || cfg.Policy.Files.AllowPaths[0].Path != `D:\tmp` {
+		t.Fatalf("allow paths = %+v", cfg.Policy.Files.AllowPaths)
+	}
+	if cfg.Policy.Sandbox.DefaultMode != "optional" {
+		t.Fatalf("sandbox default mode = %q", cfg.Policy.Sandbox.DefaultMode)
+	}
+}
+
+func TestLoadPolicyRejectsInvalidDecision(t *testing.T) {
+	dir := t.TempDir()
+	policy := `
+policy:
+  files:
+    workspace:
+      write: maybe
+`
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(minimalConfig(policy, "")), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	if _, err := Load(dir); err == nil {
+		t.Fatal("Load() expected invalid policy decision error")
+	}
+}
+
+func TestLoadPolicyRejectsTenantGlobalGrantScope(t *testing.T) {
+	dir := t.TempDir()
+	policy := `
+policy:
+  defaults:
+    allowed_grant_scopes: [once, tenant]
+`
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(minimalConfig(policy, "")), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	if _, err := Load(dir); err == nil {
+		t.Fatal("Load() expected invalid grant scope error")
+	}
+}
+
+func TestLoadSecretsDefaults(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(minimalConfig("", "")), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Secrets.DataDir != "data" || cfg.Secrets.MasterKeyEnv != "GENESIS_MASTER_KEY" {
+		t.Fatalf("secrets defaults = %+v", cfg.Secrets)
+	}
+}
+
+func minimalConfig(extraPolicy string, extraSecrets string) string {
+	return `
+llm:
+  providers:
+    qwen:
+      base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+      auth:
+        type: api_key
+        api_key: ${GENESIS_TEST_QWEN_KEY}
+  models:
+    default:
+      provider: qwen
+      model: qwen-plus
+      strategy: balanced
+  router:
+    chat: default
+` + extraSecrets + extraPolicy + `
+agent:
+  max_iterations: 10
+  system_prompt: test
+log:
+  level: info
+server:
+  host: 127.0.0.1
+  port: 8080
+`
+}

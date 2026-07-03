@@ -16,6 +16,7 @@ import (
 	"genesis-agent/internal/capabilities/llm/contract"
 	"genesis-agent/internal/capabilities/memory/contract"
 	"genesis-agent/internal/capabilities/tool/contract"
+	"genesis-agent/internal/capabilities/tool/scheduler"
 	"genesis-agent/internal/capabilities/trace/contract"
 	"genesis-agent/internal/domain"
 	"genesis-agent/internal/platform/logger"
@@ -99,10 +100,15 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 
 	// ── 步骤1: 获取工具定义（tool.Info，与外部框架无关）─────────
 	toolInfos := e.getToolInfos(agent)
+	activeToolNames := namesOfToolInfos(toolInfos)
 
 	// ── 步骤2: 构建初始消息列表 ───────────────────────────────
 	// System消息（注入提示词 + 当前时间）
-	rc.Messages = append(rc.Messages, domain.NewSystemMessage(e.prompt.BuildSystem(agent)))
+	systemPrompt, err := e.prompt.BuildSystem(ctx, prompt.BuildRequest{Agent: agent, Run: rc.Run})
+	if err != nil {
+		return err
+	}
+	rc.Messages = append(rc.Messages, domain.NewSystemMessage(systemPrompt))
 
 	// 加载Session历史对话
 	history, err := e.memory.GetHistory(ctx, req.SessionID)
@@ -157,29 +163,14 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 				iterLog.Info("LLM思考内容", "thought", llmResp.Content)
 			}
 
-			// 执行所有工具调用
-			for _, tc := range llmResp.ToolCalls {
-				toolLog := iterLog.With("tool", tc.Function.Name, "call_id", tc.ID)
-				toolLog.Info("执行工具调用", "args", tc.Function.Arguments)
-
-				toolSpanID := fmt.Sprintf("%s-tool-%s", rc.Run.ID, tc.ID)
-				toolSpan := e.tracer.StartSpan(ctx, "tool:"+tc.Function.Name, toolSpanID)
-
-				result, toolErr := e.registry.Execute(ctx, tc.Function.Name, tc.Function.Arguments)
-
-				var toolResult string
-				if toolErr != nil {
-					toolResult = fmt.Sprintf("工具执行失败: %s", toolErr.Error())
-					toolLog.Warn("工具执行失败", "error", toolErr)
-					e.tracer.EndSpan(ctx, toolSpan, toolErr)
-				} else {
-					toolResult = result
-					toolLog.Info("工具执行成功", "result", result)
-					e.tracer.EndSpan(ctx, toolSpan, nil)
+			toolResults := e.executeToolCalls(ctx, rc.Run.ID, llmResp.ToolCalls, iterLog)
+			for _, toolResult := range toolResults {
+				rc.Messages = append(rc.Messages, domain.NewToolResultMessage(toolResult.ID, toolResult.Content))
+				if injection, ok := parseSkillInjection(toolResult); ok {
+					rc.Messages = append(rc.Messages, domain.NewSystemMessage(renderSkillInjection(injection)))
+					activeToolNames = narrowToolNames(activeToolNames, injection.AllowedTools)
+					toolInfos = filterToolInfosByName(e.registry.ListInfos(), activeToolNames)
 				}
-
-				// 将工具结果加入消息上下文（role=tool，关联 ToolCallID）
-				rc.Messages = append(rc.Messages, domain.NewToolResultMessage(tc.ID, toolResult))
 			}
 
 			payload, _ := json.Marshal(llmResp.ToolCalls)
@@ -228,6 +219,78 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 	return fmt.Errorf("超过最大迭代次数 %d，Loop未能得出最终答案", maxIter)
 }
 
+type toolExecutionResult struct {
+	ID      string
+	Name    string
+	Content string
+}
+
+func (e *ReactLoopEngine) executeToolCalls(ctx context.Context, runID string, calls []domain.ToolCall, log logger.Logger) []toolExecutionResult {
+	if skillIndex := indexOfLoadSkill(calls); skillIndex >= 0 && len(calls) > 1 {
+		out := make([]toolExecutionResult, len(calls))
+		for i, call := range calls {
+			out[i] = toolExecutionResult{ID: call.ID, Name: call.Function.Name, Content: "跳过：load_skill 必须作为本轮唯一工具调用；Skill 注入后请在下一轮重新选择工具。"}
+		}
+		out[skillIndex] = e.executeOneToolCall(ctx, runID, calls[skillIndex], log)
+		return out
+	}
+
+	tasks := make([]scheduler.Task, 0, len(calls))
+	for _, tc := range calls {
+		tc := tc
+		traits := tool.TraitsOf(nil)
+		if registered := e.registry.Get(tc.Function.Name); registered != nil {
+			traits = tool.TraitsOf(registered.GetInfo())
+		}
+		tasks = append(tasks, scheduler.Task{ID: tc.ID, Name: tc.Function.Name, Params: tc.Function.Arguments, Traits: traits, Run: func(taskCtx context.Context) (string, error) {
+			return e.runToolCall(taskCtx, runID, tc, log)
+		}})
+	}
+	results := scheduler.NewQueue().Run(ctx, tasks)
+	out := make([]toolExecutionResult, 0, len(results))
+	for _, result := range results {
+		content := result.Output
+		if result.Err != nil {
+			content = fmt.Sprintf("工具执行失败: %s", result.Err.Error())
+		}
+		out = append(out, toolExecutionResult{ID: result.ID, Name: result.Name, Content: content})
+	}
+	return out
+}
+
+func (e *ReactLoopEngine) executeOneToolCall(ctx context.Context, runID string, tc domain.ToolCall, log logger.Logger) toolExecutionResult {
+	content, err := e.runToolCall(ctx, runID, tc, log)
+	if err != nil {
+		content = fmt.Sprintf("工具执行失败: %s", err.Error())
+	}
+	return toolExecutionResult{ID: tc.ID, Name: tc.Function.Name, Content: content}
+}
+
+func (e *ReactLoopEngine) runToolCall(ctx context.Context, runID string, tc domain.ToolCall, log logger.Logger) (string, error) {
+	toolLog := log.With("tool", tc.Function.Name, "call_id", tc.ID)
+	toolLog.Info("执行工具调用", "args", tc.Function.Arguments)
+	toolSpanID := fmt.Sprintf("%s-tool-%s", runID, tc.ID)
+	toolSpan := e.tracer.StartSpan(ctx, "tool:"+tc.Function.Name, toolSpanID)
+	result, toolErr := e.registry.Execute(ctx, tc.Function.Name, tc.Function.Arguments)
+	if toolErr != nil {
+		toolLog.Warn("工具执行失败", "error", toolErr)
+		e.tracer.EndSpan(ctx, toolSpan, toolErr)
+		return "", toolErr
+	}
+	toolLog.Info("工具执行成功", "result", result)
+	e.tracer.EndSpan(ctx, toolSpan, nil)
+	return result, nil
+}
+
+func indexOfLoadSkill(calls []domain.ToolCall) int {
+	for i, call := range calls {
+		if call.Function.Name == "load_skill" {
+			return i
+		}
+	}
+	return -1
+}
+
 // ==================== 辅助函数 ====================
 
 // getToolInfos 根据Agent配置获取可用工具列表
@@ -255,4 +318,89 @@ func truncate(s string, maxLen int) string {
 		return s
 	}
 	return string(runes[:maxLen]) + "..."
+}
+
+type skillInjectionOutput struct {
+	Type          string   `json:"type"`
+	QualifiedName string   `json:"qualified_name"`
+	Content       string   `json:"content"`
+	AllowedTools  []string `json:"allowed_tools"`
+	Truncated     bool     `json:"truncated"`
+}
+
+func parseSkillInjection(result toolExecutionResult) (skillInjectionOutput, bool) {
+	if result.Name != "load_skill" || result.Content == "" {
+		return skillInjectionOutput{}, false
+	}
+	var out skillInjectionOutput
+	if err := json.Unmarshal([]byte(result.Content), &out); err != nil {
+		return skillInjectionOutput{}, false
+	}
+	return out, out.Type == "skill_injection" && out.Content != ""
+}
+
+func renderSkillInjection(injection skillInjectionOutput) string {
+	var sb strings.Builder
+	sb.WriteString("<skill_injection>\n")
+	sb.WriteString("Skill: ")
+	sb.WriteString(injection.QualifiedName)
+	sb.WriteString("\n\n")
+	sb.WriteString(injection.Content)
+	if injection.Truncated {
+		sb.WriteString("\n\n[skill上下文已截断，必要时用 read_skill_resource/search_skill_resources 读取引用资源]")
+	}
+	sb.WriteString("\n</skill_injection>")
+	return sb.String()
+}
+
+func namesOfToolInfos(infos []*tool.Info) []string {
+	out := make([]string, 0, len(infos))
+	for _, info := range infos {
+		if info != nil && info.Name != "" {
+			out = append(out, info.Name)
+		}
+	}
+	return out
+}
+
+func narrowToolNames(current []string, allowed []string) []string {
+	if len(allowed) == 0 {
+		return current
+	}
+	allowedSet := map[string]struct{}{}
+	for _, name := range allowed {
+		name = strings.TrimSpace(name)
+		if name != "" {
+			allowedSet[name] = struct{}{}
+		}
+	}
+	// load_skill 保持可用，允许后续继续渐进加载其他技能。
+	allowedSet["load_skill"] = struct{}{}
+	out := make([]string, 0, len(current))
+	for _, name := range current {
+		if _, ok := allowedSet[name]; ok {
+			out = append(out, name)
+		}
+	}
+	if len(out) == 0 {
+		return current
+	}
+	return out
+}
+
+func filterToolInfosByName(infos []*tool.Info, names []string) []*tool.Info {
+	allowed := map[string]struct{}{}
+	for _, name := range names {
+		allowed[name] = struct{}{}
+	}
+	out := make([]*tool.Info, 0, len(infos))
+	for _, info := range infos {
+		if info == nil {
+			continue
+		}
+		if _, ok := allowed[info.Name]; ok {
+			out = append(out, info)
+		}
+	}
+	return out
 }
