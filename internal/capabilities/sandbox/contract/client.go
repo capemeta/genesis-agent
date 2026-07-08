@@ -3,6 +3,7 @@ package contract
 
 import (
 	"context"
+	"io"
 
 	execcontract "genesis-agent/internal/capabilities/execution/contract"
 	execmodel "genesis-agent/internal/capabilities/execution/model"
@@ -81,4 +82,36 @@ type FileSystemClient interface {
 // CommandClient 是 sandbox/workspace 命令执行端口。
 type CommandClient interface {
 	RunCommand(ctx context.Context, req CommandRequest) (*execmodel.Result, error)
+}
+
+// StageInputRequest 描述要上传到 sandbox job 输入目录的本地或内存文件。
+type StageInputRequest struct {
+	Workspace WorkspaceRef      `json:"workspace"`
+	Name      string            `json:"name"`
+	Content   io.Reader         `json:"-"`
+	Metadata  map[string]string `json:"metadata,omitempty"`
+}
+
+// StageInputResult 描述 sandbox 服务返回的输入 artifact。
+type StageInputResult struct {
+	Artifact execmodel.InputArtifactRef `json:"artifact"`
+}
+
+// SessionOptions 描述长会话 sandbox 打开参数。
+type SessionOptions struct {
+	Workspace WorkspaceRef             `json:"workspace"`
+	Sandbox   execmodel.SandboxProfile `json:"sandbox"`
+	Options   execcontract.RunOptions  `json:"options"`
+}
+
+// SandboxSession 是多 job 共享同一 /workspace 根目录的长会话端口。
+type SandboxSession interface {
+	StageInput(ctx context.Context, req StageInputRequest) (*StageInputResult, error)
+	Run(ctx context.Context, req CommandRequest) (*execmodel.Result, error)
+	Close(ctx context.Context) error
+}
+
+// SessionClient 打开长会话 sandbox。
+type SessionClient interface {
+	OpenSession(ctx context.Context, opts SessionOptions) (SandboxSession, error)
 }

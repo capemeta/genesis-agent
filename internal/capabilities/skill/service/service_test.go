@@ -2,10 +2,12 @@ package service
 
 import (
 	"context"
+	capmodel "genesis-agent/internal/capabilities/capability/model"
 	"strings"
 	"testing"
 	"time"
 
+	capcontract "genesis-agent/internal/capabilities/capability/contract"
 	profilemodel "genesis-agent/internal/capabilities/profile/model"
 	"genesis-agent/internal/capabilities/skill/contract"
 	"genesis-agent/internal/capabilities/skill/model"
@@ -38,6 +40,69 @@ func TestServiceResolveLoadAndRender(t *testing.T) {
 	}
 }
 
+type fakeCapabilityRegistry struct {
+	records []capmodel.CapabilityIndexRecord
+}
+
+func (r fakeCapabilityRegistry) ListCapabilities(context.Context, capmodel.CapabilityQuery) ([]capmodel.CapabilityIndexRecord, error) {
+	return append([]capmodel.CapabilityIndexRecord(nil), r.records...), nil
+}
+
+func (r fakeCapabilityRegistry) SetCapabilityEnabled(context.Context, string, bool) (capmodel.CapabilityIndexRecord, error) {
+	return capmodel.CapabilityIndexRecord{}, nil
+}
+
+var _ capcontract.Registry = fakeCapabilityRegistry{}
+
+func TestServiceFiltersDisabledSkillCapabilities(t *testing.T) {
+	meta := model.Metadata{Name: "review", QualifiedName: "review", Description: "Review things", Enabled: true, PromptVisible: true, Authority: model.Authority{Kind: model.SourceKindHost, ID: "fake"}, PackageID: "review", MainResource: "review/SKILL.md"}.Normalize()
+	source := fakeSource{meta: meta, body: "Body"}
+	visibility := fakeCapabilityRegistry{records: []capmodel.CapabilityIndexRecord{{ID: "review-id", Type: capmodel.CapabilityTypeSkill, Name: "review", Package: "review", ResourcePath: "./skills/review", Enabled: false}}}
+	svc := New([]contract.Source{source}, Options{Visibility: visibility})
+	req := contract.CatalogRequest{Product: profilemodel.ChannelCLI, Environment: profilemodel.EnvironmentLocal}
+	catalog, err := svc.Catalog(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(catalog.Entries) != 0 {
+		t.Fatalf("expected disabled skill hidden: %+v", catalog.Entries)
+	}
+	if _, err := svc.Load(context.Background(), contract.LoadRequest{ResolveRequest: contract.ResolveRequest{CatalogRequest: req, Name: "review", ModelCall: true}}); err == nil {
+		t.Fatal("expected load_skill to fail for disabled capability")
+	}
+	rendered, err := svc.RenderAvailableSkills(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rendered != "" {
+		t.Fatalf("expected disabled skill omitted from prompt, got %q", rendered)
+	}
+}
+
+func TestServiceDoesNotHideNonPluginSkillWithSameName(t *testing.T) {
+	meta := model.Metadata{Name: "review", QualifiedName: "review", Description: "Local review", Enabled: true, PromptVisible: true, Authority: model.Authority{Kind: model.SourceKindHost, ID: "local"}, Scope: model.ScopeUser, PackageID: "local-review", MainResource: "local-review/SKILL.md"}.Normalize()
+	visibility := fakeCapabilityRegistry{records: []capmodel.CapabilityIndexRecord{{ID: "plugin-review", Type: capmodel.CapabilityTypeSkill, Name: "review", Package: "plugin-review", ResourcePath: "./skills/review", Enabled: false}}}
+	svc := New([]contract.Source{fakeSource{meta: meta, body: "Body"}}, Options{Visibility: visibility})
+	catalog, err := svc.Catalog(context.Background(), contract.CatalogRequest{Product: profilemodel.ChannelCLI, Environment: profilemodel.EnvironmentLocal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(catalog.Entries) != 1 || catalog.Entries[0].PackageID != "local-review" {
+		t.Fatalf("local skill should remain visible: %+v", catalog.Entries)
+	}
+}
+func TestServiceKeepsSkillsWithoutCapabilityIndex(t *testing.T) {
+	meta := model.Metadata{Name: "local", QualifiedName: "local", Description: "Local", Enabled: true, PromptVisible: true, Authority: model.Authority{Kind: model.SourceKindHost, ID: "fake"}, PackageID: "local", MainResource: "local/SKILL.md"}.Normalize()
+	svc := New([]contract.Source{fakeSource{meta: meta, body: "Body"}}, Options{Visibility: fakeCapabilityRegistry{}})
+	catalog, err := svc.Catalog(context.Background(), contract.CatalogRequest{Product: profilemodel.ChannelCLI, Environment: profilemodel.EnvironmentLocal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(catalog.Entries) != 1 || catalog.Entries[0].Name != "local" {
+		t.Fatalf("expected non-indexed local skill visible: %+v", catalog.Entries)
+	}
+}
+
 type fakeSource struct {
 	meta      model.Metadata
 	body      string
@@ -53,6 +118,13 @@ func (f fakeSource) Read(_ context.Context, req contract.ReadRequest) (contract.
 		return contract.ReadResult{Metadata: f.meta, Resource: req.Resource, Content: f.resources[req.Resource]}, nil
 	}
 	return contract.ReadResult{Metadata: f.meta, Resource: f.meta.MainResource, Content: f.body}, nil
+}
+func (f fakeSource) ListResources(context.Context, contract.SourceListResourcesRequest) (contract.ListResourcesResult, error) {
+	resources := make([]model.ResourceInfo, 0, len(f.resources))
+	for resource, content := range f.resources {
+		resources = append(resources, model.ResourceInfo{Resource: resource, Kind: model.ResourceKindReference, Name: string(resource), Size: int64(len(content)), Text: true})
+	}
+	return contract.ListResourcesResult{Metadata: f.meta, Resources: resources}, nil
 }
 func (f fakeSource) Search(context.Context, contract.SearchRequest) (contract.SearchResult, error) {
 	matches := make([]model.SearchMatch, 0, len(f.resources))
@@ -83,6 +155,18 @@ func TestServiceReadAndSearchResources(t *testing.T) {
 	}
 }
 
+func TestServiceListResources(t *testing.T) {
+	meta := model.Metadata{Name: "review", QualifiedName: "review", Description: "Review things", Enabled: true, PromptVisible: true, Authority: model.Authority{Kind: model.SourceKindHost, ID: "fake"}, PackageID: "review", MainResource: "review/SKILL.md"}.Normalize()
+	source := fakeSource{meta: meta, body: "Body", resources: map[model.ResourceID]string{"review/references/guide.md": "alpha beta"}}
+	svc := New([]contract.Source{source}, Options{})
+	listed, err := svc.ListResources(context.Background(), contract.ListResourcesRequest{ResolveRequest: contract.ResolveRequest{CatalogRequest: contract.CatalogRequest{Product: profilemodel.ChannelCLI, Environment: profilemodel.EnvironmentLocal}, Name: "review"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed.Resources) != 1 || listed.Resources[0].Resource != "review/references/guide.md" {
+		t.Fatalf("listed = %+v", listed)
+	}
+}
 func TestServiceSelectForTurnSkillURIAndAmbiguousName(t *testing.T) {
 	metaA := model.Metadata{Name: "review", QualifiedName: "a:review", Description: "Review A", Enabled: true, PromptVisible: true, Authority: model.Authority{Kind: model.SourceKindHost, ID: "a"}, PackageID: "review-a", MainResource: "review-a/SKILL.md"}.Normalize()
 	metaB := model.Metadata{Name: "review", QualifiedName: "b:review", Description: "Review B", Enabled: true, PromptVisible: true, Authority: model.Authority{Kind: model.SourceKindHost, ID: "b"}, PackageID: "review-b", MainResource: "review-b/SKILL.md"}.Normalize()
@@ -121,6 +205,9 @@ func (s slowSource) List(ctx context.Context, query contract.ListQuery) (contrac
 }
 func (s slowSource) Read(context.Context, contract.ReadRequest) (contract.ReadResult, error) {
 	return contract.ReadResult{}, nil
+}
+func (s slowSource) ListResources(context.Context, contract.SourceListResourcesRequest) (contract.ListResourcesResult, error) {
+	return contract.ListResourcesResult{}, nil
 }
 func (s slowSource) Search(context.Context, contract.SearchRequest) (contract.SearchResult, error) {
 	return contract.SearchResult{}, nil
@@ -161,6 +248,9 @@ func (f *flakySource) List(context.Context, contract.ListQuery) (contract.ListRe
 }
 func (f *flakySource) Read(context.Context, contract.ReadRequest) (contract.ReadResult, error) {
 	return contract.ReadResult{Metadata: f.meta, Resource: f.meta.MainResource, Content: "body"}, nil
+}
+func (f *flakySource) ListResources(context.Context, contract.SourceListResourcesRequest) (contract.ListResourcesResult, error) {
+	return contract.ListResourcesResult{}, nil
 }
 func (f *flakySource) Search(context.Context, contract.SearchRequest) (contract.SearchResult, error) {
 	return contract.SearchResult{}, nil

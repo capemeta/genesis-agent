@@ -294,6 +294,195 @@ func TestLoadSecretsDefaults(t *testing.T) {
 	}
 }
 
+func TestLoadSandboxDefaultsDisabled(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(minimalConfig("", "")), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Sandbox.Enabled || cfg.Sandbox.Mode != "local_host" || cfg.Sandbox.DefaultExecution != "disabled" {
+		t.Fatalf("sandbox defaults = %+v", cfg.Sandbox)
+	}
+	if cfg.Sandbox.APIKeyEnv != "GENESIS_SANDBOX_API_KEY" || cfg.Sandbox.DefaultRuntimeProfile != "code-polyglot-basic" {
+		t.Fatalf("sandbox defaults = %+v", cfg.Sandbox)
+	}
+}
+
+func TestLoadSandboxExternalConfig(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("GENESIS_TEST_SANDBOX_KEY", "sandbox-key")
+	content := minimalConfig("", "") + `
+sandbox:
+  enabled: true
+  mode: docker_sandbox
+  default_execution: optional
+  allow_session_override: true
+  base_url: http://127.0.0.1:18010
+  api_key_env: GENESIS_TEST_SANDBOX_KEY
+  workspace_id: dev-workspace
+  default_runtime_profile: code-polyglot-basic
+`
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(content), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !cfg.Sandbox.Enabled || cfg.Sandbox.Mode != "docker_sandbox" || cfg.Sandbox.APIKey != "sandbox-key" {
+		t.Fatalf("sandbox config = %+v", cfg.Sandbox)
+	}
+	if cfg.Sandbox.WorkspaceID != "dev-workspace" || cfg.Sandbox.DefaultExecution != "optional" {
+		t.Fatalf("sandbox config = %+v", cfg.Sandbox)
+	}
+}
+
+func TestLoadSandboxExternalRequiresBaseURL(t *testing.T) {
+	dir := t.TempDir()
+	content := minimalConfig("", "") + `
+sandbox:
+  enabled: true
+  mode: remote_sandbox
+`
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(content), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	if _, err := Load(dir); err == nil {
+		t.Fatal("Load() expected sandbox base_url validation error")
+	}
+}
+
+func TestLoadProductUserConfigOverridesLocal(t *testing.T) {
+	dir := t.TempDir()
+	configHome := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(minimalConfig("", "")), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	local := `
+web:
+  tavily_api_key: local-key
+`
+	if err := os.WriteFile(filepath.Join(dir, "config.local.yaml"), []byte(local), 0644); err != nil {
+		t.Fatalf("write local config: %v", err)
+	}
+	userDir := filepath.Join(configHome, "cli")
+	if err := os.MkdirAll(userDir, 0755); err != nil {
+		t.Fatalf("mkdir user config: %v", err)
+	}
+	user := `
+web:
+  tavily_api_key: user-key
+skills:
+  sources:
+    - scope: user
+      path: ${GENESIS_TEST_SKILL_ROOT}
+`
+	t.Setenv("GENESIS_TEST_SKILL_ROOT", `D:\skills`)
+	if err := os.WriteFile(filepath.Join(userDir, "config.yaml"), []byte(user), 0644); err != nil {
+		t.Fatalf("write user config: %v", err)
+	}
+
+	cfg, err := LoadWithOptions(dir, LoadOptions{Product: "cli", ConfigHome: configHome})
+	if err != nil {
+		t.Fatalf("LoadWithOptions() error = %v", err)
+	}
+	if cfg.Web.TavilyAPIKey != "user-key" {
+		t.Fatalf("tavily key = %q, want user-key", cfg.Web.TavilyAPIKey)
+	}
+	if len(cfg.Skills.Sources) != 1 || cfg.Skills.Sources[0].Path != `D:\skills` {
+		t.Fatalf("skill sources = %+v", cfg.Skills.Sources)
+	}
+}
+
+func TestLoadAgentEnvOverridesUserConfig(t *testing.T) {
+	dir := t.TempDir()
+	configHome := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(minimalConfig("", "")), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	userDir := filepath.Join(configHome, "cli")
+	if err := os.MkdirAll(userDir, 0755); err != nil {
+		t.Fatalf("mkdir user config: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(userDir, "config.yaml"), []byte("web:\n  brave_api_key: user-key\n"), 0644); err != nil {
+		t.Fatalf("write user config: %v", err)
+	}
+	t.Setenv("AGENT_WEB_BRAVE_API_KEY", "agent-env-key")
+
+	cfg, err := LoadWithOptions(dir, LoadOptions{Product: "cli", ConfigHome: configHome})
+	if err != nil {
+		t.Fatalf("LoadWithOptions() error = %v", err)
+	}
+	if cfg.Web.BraveAPIKey != "agent-env-key" {
+		t.Fatalf("brave key = %q, want agent-env-key", cfg.Web.BraveAPIKey)
+	}
+}
+
+func TestLoadWebEnvPlaceholders(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("TAVILY_API_KEY", "script-env-key")
+	content := minimalConfig("", "") + `
+web:
+  tavily_api_key: ${TAVILY_API_KEY}
+`
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(content), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := LoadWithOptions(dir, LoadOptions{Product: "cli", ConfigHome: t.TempDir()})
+	if err != nil {
+		t.Fatalf("LoadWithOptions() error = %v", err)
+	}
+	if cfg.Web.TavilyAPIKey != "script-env-key" {
+		t.Fatalf("tavily key = %q, want script-env-key", cfg.Web.TavilyAPIKey)
+	}
+}
+func TestLoadEnsuresProductUserConfig(t *testing.T) {
+	dir := t.TempDir()
+	configHome := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(minimalConfig("", "")), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := LoadWithOptions(dir, LoadOptions{Product: "cli", ConfigHome: configHome, EnsureUserConfig: true})
+	if err != nil {
+		t.Fatalf("LoadWithOptions() error = %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("LoadWithOptions() returned nil config")
+	}
+	if _, err := os.Stat(filepath.Join(configHome, "cli", "config.yaml")); err != nil {
+		t.Fatalf("cli user config was not created: %v", err)
+	}
+	if info, err := os.Stat(filepath.Join(configHome, "cli", "skills")); err != nil || !info.IsDir() {
+		t.Fatalf("cli skills dir was not created: info=%v err=%v", info, err)
+	}
+}
+
+func TestLoadEnsuresDesktopUserConfig(t *testing.T) {
+	dir := t.TempDir()
+	configHome := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(minimalConfig("", "")), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	_, err := LoadWithOptions(dir, LoadOptions{Product: "desktop", ConfigHome: configHome, EnsureUserConfig: true})
+	if err != nil {
+		t.Fatalf("LoadWithOptions() error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(configHome, "desktop", "config.yaml")); err != nil {
+		t.Fatalf("desktop user config was not created: %v", err)
+	}
+	if info, err := os.Stat(filepath.Join(configHome, "desktop", "skills")); err != nil || !info.IsDir() {
+		t.Fatalf("desktop skills dir was not created: info=%v err=%v", info, err)
+	}
+}
 func minimalConfig(extraPolicy string, extraSecrets string) string {
 	return `
 llm:

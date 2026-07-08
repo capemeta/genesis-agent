@@ -72,3 +72,14 @@ func TestBuildApprovalRequestMarksSSHDirectoryItselfProtected(t *testing.T) {
 		t.Fatalf("metadata = %#v, want protected critical", req.Metadata)
 	}
 }
+
+func TestBuildApprovalRequestIncludesWorkspaceRel(t *testing.T) {
+	req := BuildApprovalRequest("read_file", OperationRead, model.ResolvedPath{
+		Scope:        model.PathScopeWorkspace,
+		WorkspaceRel: "internal/app.go",
+		BackendPath:  "D:/workspace/internal/app.go",
+	})
+	if req.Metadata["workspace_rel"] != "internal/app.go" {
+		t.Fatalf("workspace_rel = %q, want internal/app.go", req.Metadata["workspace_rel"])
+	}
+}

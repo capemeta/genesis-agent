@@ -1,14 +1,17 @@
 // Package config 应用配置加载与管理
 //
 // 配置优先级（从低到高）：
-//  1. configs/config.yaml       — 默认值，提交到版本库（不含密钥）
-//  2. configs/config.local.yaml — 本地覆盖，含 API Key，已加入 .gitignore
-//  3. 环境变量（前缀 AGENT_）    — CI/生产环境注入，优先级最高
+//  1. configs/config.yaml                         — 默认值，提交到版本库（不含密钥）
+//  2. 启动脚本/普通环境变量占位，例如 ${TAVILY_API_KEY} — 仅通过配置文件占位展开
+//  3. configs/config.local.yaml                   — 项目本地覆盖，已加入 .gitignore
+//  4. ~/.genesis-agent/<product>/config.yaml      — 产品级用户配置
+//  5. AGENT_ 环境变量                              — CI/部署/临时强制覆盖，优先级最高
 package config
 
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -21,9 +24,50 @@ type Config struct {
 	HTTPClient HTTPClientConfig `mapstructure:"http_client"`
 	Secrets    SecretsConfig    `mapstructure:"secrets"`
 	Policy     PolicyConfig     `mapstructure:"policy"`
+	Sandbox    SandboxConfig    `mapstructure:"sandbox"`
+	Skills     SkillsConfig     `mapstructure:"skills"`
 	Agent      AgentConfig      `mapstructure:"agent"`
 	Log        LogConfig        `mapstructure:"log"`
 	Server     ServerConfig     `mapstructure:"server"`
+	Web        WebConfig        `mapstructure:"web"`
+}
+
+// SandboxConfig 描述外部 sandbox API 和产品默认沙箱执行配置。
+type SandboxConfig struct {
+	Enabled               bool          `mapstructure:"enabled"`
+	Mode                  string        `mapstructure:"mode"`
+	DefaultExecution      string        `mapstructure:"default_execution"`
+	AllowSessionOverride  bool          `mapstructure:"allow_session_override"`
+	BaseURL               string        `mapstructure:"base_url"`
+	APIKey                string        `mapstructure:"api_key"`
+	APIKeyEnv             string        `mapstructure:"api_key_env"`
+	WorkspaceID           string        `mapstructure:"workspace_id"`
+	DefaultRuntimeProfile string        `mapstructure:"default_runtime_profile"`
+	Timeout               time.Duration `mapstructure:"timeout"`
+}
+
+// WebConfig 包含网络搜索和获取工具的常用密钥与端点配置
+type WebConfig struct {
+	BraveAPIKey    string `mapstructure:"brave_api_key"`
+	SearXNGBaseURL string `mapstructure:"searxng_base_url"`
+	TavilyAPIKey   string `mapstructure:"tavily_api_key"`
+	ExaAPIKey      string `mapstructure:"exa_api_key"`
+	SerpAPIKey     string `mapstructure:"serpapi_api_key"`
+}
+
+// SkillsConfig 描述本地 Skill 目录和启停配置。
+type SkillsConfig struct {
+	Enabled  []string            `mapstructure:"enabled"`
+	Disabled []string            `mapstructure:"disabled"`
+	Sources  []SkillSourceConfig `mapstructure:"sources"`
+}
+
+// SkillSourceConfig 描述一个可扫描的 Skill 来源。
+type SkillSourceConfig struct {
+	Kind  string `mapstructure:"kind"`
+	ID    string `mapstructure:"id"`
+	Scope string `mapstructure:"scope"`
+	Path  string `mapstructure:"path"`
 }
 
 // LLMConfig 描述 Provider 层、Model Pool 和路由规则。
@@ -265,15 +309,69 @@ type ServerConfig struct {
 	Port int    `mapstructure:"port"`
 }
 
-// Load 加载配置，依次读取 config.yaml → config.local.yaml → 环境变量。
+const defaultConfigTemplate = `# Genesis Agent CLI User Configuration
+# Generated automatically by Genesis CLI
+
+web:
+  brave_api_key: ""
+  searxng_base_url: ""
+  tavily_api_key: ""
+  exa_api_key: ""
+  serpapi_api_key: ""
+
+sandbox:
+  enabled: false
+  mode: local_host
+  default_execution: disabled
+  allow_session_override: true
+  base_url: ""
+  api_key_env: GENESIS_SANDBOX_API_KEY
+  workspace_id: ""
+
+llm:
+  providers:
+    qwen:
+      auth:
+        api_key: "" # Or set via AGENT_LLM_PROVIDERS_QWEN_AUTH_API_KEY env var
+
+skills:
+  # Extra local skill roots scanned by CLI.
+  # Project default .genesis/skills and user default ~/.genesis-agent/cli/skills
+  # are added automatically; configure additional roots here when needed.
+  sources: []
+`
+
+// Load 加载 CLI 配置，保留旧调用点兼容。
 func Load(configDir string) (*Config, error) {
+	return LoadForProduct(configDir, "cli")
+}
+
+// LoadForProduct 加载指定产品配置。
+func LoadForProduct(configDir string, product string) (*Config, error) {
+	return LoadWithOptions(configDir, LoadOptions{Product: product})
+}
+
+// LoadOptions 描述配置加载选项。ConfigHome 主要用于测试或产品自定义用户目录。
+type LoadOptions struct {
+	Product          string
+	ConfigHome       string
+	EnsureUserConfig bool
+}
+
+// LoadWithOptions 加载配置，依次读取 config.yaml、config.local.yaml、产品级用户配置和 AGENT_ 环境变量。
+func LoadWithOptions(configDir string, opts LoadOptions) (*Config, error) {
+	product := strings.TrimSpace(opts.Product)
+	if product == "" {
+		product = "cli"
+	}
 	v := viper.New()
 	v.SetConfigName("config")
 	v.SetConfigType("yaml")
 	v.AddConfigPath(configDir)
 
-	if err := v.ReadInConfig(); err != nil {
-		return nil, fmt.Errorf("读取 config.yaml 失败: %w", err)
+	hasBaseConfig := false
+	if err := v.ReadInConfig(); err == nil {
+		hasBaseConfig = true
 	}
 
 	local := viper.New()
@@ -286,6 +384,28 @@ func Load(configDir string) (*Config, error) {
 		}
 	}
 
+	userPath, hasUserPath := userConfigPath(opts, product)
+	if hasUserPath {
+		if opts.EnsureUserConfig || !hasBaseConfig {
+			if err := ensureProductUserConfig(userPath); err != nil {
+				return nil, err
+			}
+		}
+		userV := viper.New()
+		userV.SetConfigFile(userPath)
+		if err := userV.ReadInConfig(); err == nil {
+			for _, key := range userV.AllKeys() {
+				v.Set(key, userV.Get(key))
+			}
+		}
+	}
+
+	if !hasBaseConfig && hasUserPath {
+		if _, err := os.Stat(userPath); os.IsNotExist(err) {
+			return nil, fmt.Errorf("读取 config.yaml 失败: base config not found and user config not generated")
+		}
+	}
+
 	v.SetEnvPrefix("AGENT")
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 	v.AutomaticEnv()
@@ -294,6 +414,9 @@ func Load(configDir string) (*Config, error) {
 	if err := v.Unmarshal(&cfg); err != nil {
 		return nil, fmt.Errorf("解析配置失败: %w", err)
 	}
+
+	cfg.applyExplicitEnvOverrides()
+	cfg.decryptDPAPISecrets()
 	cfg.expandEnv()
 	cfg.applyLegacyLLM()
 
@@ -301,6 +424,135 @@ func Load(configDir string) (*Config, error) {
 		return nil, fmt.Errorf("配置校验失败: %w", err)
 	}
 	return &cfg, nil
+}
+
+func ensureProductUserConfig(configPath string) error {
+	configPath = filepath.Clean(configPath)
+	configDir := filepath.Dir(configPath)
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		return fmt.Errorf("创建用户配置目录失败: %w", err)
+	}
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		if err := os.WriteFile(configPath, []byte(defaultConfigTemplate), 0600); err != nil {
+			return fmt.Errorf("创建用户默认配置文件失败: %w", err)
+		}
+	} else if err != nil {
+		return fmt.Errorf("检查用户配置文件失败: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Join(configDir, "skills"), 0755); err != nil {
+		return fmt.Errorf("创建用户 skills 目录失败: %w", err)
+	}
+	return nil
+}
+func userConfigPath(opts LoadOptions, product string) (string, bool) {
+	root := strings.TrimSpace(opts.ConfigHome)
+	if root == "" {
+		home, err := os.UserHomeDir()
+		if err != nil || home == "" {
+			return "", false
+		}
+		root = filepath.Join(home, ".genesis-agent")
+	}
+	return filepath.Join(root, product, "config.yaml"), true
+}
+func (c *Config) applyExplicitEnvOverrides() {
+	for name, provider := range c.LLM.Providers {
+		prefix := "AGENT_LLM_PROVIDERS_" + envNamePart(name)
+		if value := strings.TrimSpace(os.Getenv(prefix + "_TYPE")); value != "" {
+			provider.Type = value
+		}
+		if value := strings.TrimSpace(os.Getenv(prefix + "_BASE_URL")); value != "" {
+			provider.BaseURL = value
+		}
+		if value := strings.TrimSpace(os.Getenv(prefix + "_API_VERSION")); value != "" {
+			provider.APIVersion = value
+		}
+		if value := strings.TrimSpace(os.Getenv(prefix + "_AUTH_TYPE")); value != "" {
+			provider.Auth.Type = value
+		}
+		if value := strings.TrimSpace(os.Getenv(prefix + "_AUTH_API_KEY")); value != "" {
+			provider.Auth.APIKey = value
+		}
+		if value := strings.TrimSpace(os.Getenv(prefix + "_AUTH_ACCESS_KEY")); value != "" {
+			provider.Auth.AccessKey = value
+		}
+		if value := strings.TrimSpace(os.Getenv(prefix + "_AUTH_SECRET_KEY")); value != "" {
+			provider.Auth.SecretKey = value
+		}
+		c.LLM.Providers[name] = provider
+	}
+	if value := strings.TrimSpace(os.Getenv("AGENT_WEB_BRAVE_API_KEY")); value != "" {
+		c.Web.BraveAPIKey = value
+	}
+	if value := strings.TrimSpace(os.Getenv("AGENT_WEB_SEARXNG_BASE_URL")); value != "" {
+		c.Web.SearXNGBaseURL = value
+	}
+	if value := strings.TrimSpace(os.Getenv("AGENT_WEB_TAVILY_API_KEY")); value != "" {
+		c.Web.TavilyAPIKey = value
+	}
+	if value := strings.TrimSpace(os.Getenv("AGENT_WEB_EXA_API_KEY")); value != "" {
+		c.Web.ExaAPIKey = value
+	}
+	if value := strings.TrimSpace(os.Getenv("AGENT_WEB_SERPAPI_API_KEY")); value != "" {
+		c.Web.SerpAPIKey = value
+	}
+	if value := strings.TrimSpace(os.Getenv("AGENT_SANDBOX_ENABLED")); value != "" {
+		c.Sandbox.Enabled = strings.EqualFold(value, "true") || value == "1" || strings.EqualFold(value, "yes")
+	}
+	if value := strings.TrimSpace(os.Getenv("AGENT_SANDBOX_MODE")); value != "" {
+		c.Sandbox.Mode = value
+	}
+	if value := strings.TrimSpace(os.Getenv("AGENT_SANDBOX_DEFAULT_EXECUTION")); value != "" {
+		c.Sandbox.DefaultExecution = value
+	}
+	if value := strings.TrimSpace(os.Getenv("AGENT_SANDBOX_BASE_URL")); value != "" {
+		c.Sandbox.BaseURL = value
+	}
+	if value := strings.TrimSpace(os.Getenv("AGENT_SANDBOX_API_KEY")); value != "" {
+		c.Sandbox.APIKey = value
+	}
+	if value := strings.TrimSpace(os.Getenv("AGENT_SANDBOX_WORKSPACE_ID")); value != "" {
+		c.Sandbox.WorkspaceID = value
+	}
+}
+
+func envNamePart(value string) string {
+	value = strings.ToUpper(strings.TrimSpace(value))
+	value = strings.NewReplacer("-", "_", ".", "_", " ", "_").Replace(value)
+	return value
+}
+func (c *Config) decryptDPAPISecrets() {
+	decryptField := func(field *string) {
+		if strings.HasPrefix(*field, "dpapi:") {
+			ciphertext := strings.TrimPrefix(*field, "dpapi:")
+			if plaintext, err := Decrypt(ciphertext); err == nil {
+				*field = plaintext
+			}
+		}
+	}
+
+	// Decrypt LLM key fields
+	for name, prov := range c.LLM.Providers {
+		auth := prov.Auth
+		decryptField(&auth.APIKey)
+		decryptField(&auth.AccessKey)
+		decryptField(&auth.SecretKey)
+		prov.Auth = auth
+		c.LLM.Providers[name] = prov
+	}
+
+	// Decrypt Web key fields
+	decryptField(&c.Web.BraveAPIKey)
+	decryptField(&c.Web.TavilyAPIKey)
+	decryptField(&c.Web.ExaAPIKey)
+	decryptField(&c.Web.SerpAPIKey)
+	decryptField(&c.Sandbox.APIKey)
+
+	// Decrypt Legacy key fields
+	decryptField(&c.LLM.LegacyAPIKey)
+	decryptField(&c.LLM.LegacyArkAPIKey)
+	decryptField(&c.LLM.LegacyArkAccessKey)
+	decryptField(&c.LLM.LegacyArkSecretKey)
 }
 
 // ResolveRoute 根据用途路由解析模型；未知用途回退 chat/default。
@@ -373,6 +625,20 @@ func (c *Config) expandEnv() {
 	c.LLM.LegacyArkAPIKey = os.ExpandEnv(c.LLM.LegacyArkAPIKey)
 	c.LLM.LegacyArkAccessKey = os.ExpandEnv(c.LLM.LegacyArkAccessKey)
 	c.LLM.LegacyArkSecretKey = os.ExpandEnv(c.LLM.LegacyArkSecretKey)
+	c.Web.BraveAPIKey = os.ExpandEnv(c.Web.BraveAPIKey)
+	c.Web.SearXNGBaseURL = os.ExpandEnv(c.Web.SearXNGBaseURL)
+	c.Web.TavilyAPIKey = os.ExpandEnv(c.Web.TavilyAPIKey)
+	c.Web.ExaAPIKey = os.ExpandEnv(c.Web.ExaAPIKey)
+	c.Web.SerpAPIKey = os.ExpandEnv(c.Web.SerpAPIKey)
+	c.Sandbox.BaseURL = os.ExpandEnv(c.Sandbox.BaseURL)
+	c.Sandbox.APIKey = os.ExpandEnv(c.Sandbox.APIKey)
+	c.Sandbox.WorkspaceID = os.ExpandEnv(c.Sandbox.WorkspaceID)
+	if strings.TrimSpace(c.Sandbox.APIKey) == "" && strings.TrimSpace(c.Sandbox.APIKeyEnv) != "" {
+		c.Sandbox.APIKey = strings.TrimSpace(os.Getenv(strings.TrimSpace(c.Sandbox.APIKeyEnv)))
+	}
+	for i := range c.Skills.Sources {
+		c.Skills.Sources[i].Path = os.ExpandEnv(c.Skills.Sources[i].Path)
+	}
 }
 
 func (c *Config) applyLegacyLLM() {
@@ -434,8 +700,12 @@ func validate(cfg *Config) error {
 	}
 	applyHTTPClientDefaults(&cfg.HTTPClient)
 	applySecretsDefaults(&cfg.Secrets)
+	applySandboxDefaults(&cfg.Sandbox)
 	applyPolicyDefaults(&cfg.Policy)
 	if err := validatePolicyConfig(cfg.Policy); err != nil {
+		return err
+	}
+	if err := validateSandboxConfig(cfg.Sandbox); err != nil {
 		return err
 	}
 	if len(cfg.LLM.Providers) == 0 {
@@ -516,6 +786,24 @@ func applySecretsDefaults(cfg *SecretsConfig) {
 	}
 }
 
+func applySandboxDefaults(cfg *SandboxConfig) {
+	if strings.TrimSpace(cfg.Mode) == "" {
+		cfg.Mode = "local_host"
+	}
+	if strings.TrimSpace(cfg.DefaultExecution) == "" {
+		cfg.DefaultExecution = "disabled"
+	}
+	if strings.TrimSpace(cfg.APIKeyEnv) == "" {
+		cfg.APIKeyEnv = "GENESIS_SANDBOX_API_KEY"
+	}
+	if strings.TrimSpace(cfg.DefaultRuntimeProfile) == "" {
+		cfg.DefaultRuntimeProfile = "code-polyglot-basic"
+	}
+	if cfg.Timeout <= 0 {
+		cfg.Timeout = 60 * time.Second
+	}
+}
+
 func applyPolicyDefaults(cfg *PolicyConfig) {
 	if strings.TrimSpace(cfg.Defaults.Unknown) == "" {
 		cfg.Defaults.Unknown = "ask"
@@ -577,6 +865,28 @@ func defaultFileOps(cfg *PolicyFileOperations, read, list, walk, write, edit, de
 	if strings.TrimSpace(cfg.Delete) == "" {
 		cfg.Delete = delete
 	}
+}
+
+func validateSandboxConfig(cfg SandboxConfig) error {
+	switch strings.ToLower(strings.TrimSpace(cfg.Mode)) {
+	case "local_host", "local_platform_sandbox", "docker_sandbox", "remote_sandbox":
+	default:
+		return fmt.Errorf("sandbox.mode 必须是 local_host、local_platform_sandbox、docker_sandbox 或 remote_sandbox")
+	}
+	switch strings.ToLower(strings.TrimSpace(cfg.DefaultExecution)) {
+	case "disabled", "optional", "required":
+	default:
+		return fmt.Errorf("sandbox.default_execution 必须是 disabled、optional 或 required")
+	}
+	if cfg.Enabled {
+		switch strings.ToLower(strings.TrimSpace(cfg.Mode)) {
+		case "docker_sandbox", "remote_sandbox":
+			if strings.TrimSpace(cfg.BaseURL) == "" {
+				return fmt.Errorf("sandbox.enabled=true 且 mode=%s 时 sandbox.base_url 不能为空", cfg.Mode)
+			}
+		}
+	}
+	return nil
 }
 
 func validatePolicyConfig(cfg PolicyConfig) error {

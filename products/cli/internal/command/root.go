@@ -5,6 +5,7 @@ package command
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -34,12 +35,13 @@ func ExecuteWithFactory(factory ServiceFactory) error {
 }
 
 func initService(ctx context.Context, factory ServiceFactory, configDirRef *string, quiet bool, sandboxModeRef *string) (app.AgentService, error) {
-	sandboxCfg, err := clisandbox.ParseFlag("")
-	if sandboxModeRef != nil {
+	var sandboxCfg clisandbox.Config
+	var err error
+	if sandboxModeRef != nil && strings.TrimSpace(*sandboxModeRef) != "" {
 		sandboxCfg, err = clisandbox.ParseFlag(*sandboxModeRef)
-	}
-	if err != nil {
-		return nil, err
+		if err != nil {
+			return nil, err
+		}
 	}
 	svc, err := factory(ctx, ServiceOptions{ConfigDirRef: configDirRef, Quiet: quiet, Sandbox: sandboxCfg})
 	if err != nil {
@@ -56,7 +58,7 @@ func newRootCmd(factory ServiceFactory) *cobra.Command {
 	// configDir / sandboxMode 由持久 flag 控制。
 	// 传递指针给各子命令，保证 flag 解析后子命令执行时读取的是最新值。
 	configDir := defaultConfigDir
-	sandboxMode := string(clisandbox.DefaultConfig().Execution)
+	sandboxMode := ""
 
 	root := &cobra.Command{
 		Use:   "genesis-cli",
@@ -89,7 +91,7 @@ func newRootCmd(factory ServiceFactory) *cobra.Command {
 	)
 	root.PersistentFlags().StringVar(
 		&sandboxMode, "sandbox", sandboxMode,
-		"命令执行沙箱策略：disabled、optional 或 required",
+		"本次会话命令执行沙箱策略覆盖：disabled、optional 或 required；空值使用配置文件 sandbox.default_execution",
 	)
 
 	// 注册所有子命令，统一传入 configDir / sandboxMode 指针
@@ -97,7 +99,12 @@ func newRootCmd(factory ServiceFactory) *cobra.Command {
 		newChatCmd(&configDir, &sandboxMode, factory),
 		newRunCmd(&configDir, &sandboxMode, factory),
 		newConfigCmd(&configDir),
+		newConfigureCmd(),
 		newToolsCmd(&configDir, &sandboxMode, factory),
+		newSkillCmd(),
+		newPackageCmd(),
+		newCapabilityCmd(),
+		newPluginCmd(),
 		newVersionCmd(),
 	)
 

@@ -75,6 +75,8 @@ func DefaultTraits(name string) ToolTraits {
 	switch name {
 	case "current_time", "calculator", "read_file", "list_dir", "walk_dir", "glob", "grep":
 		return ToolTraits{Exposure: ToolExposureDirect, ReadOnly: true, ConcurrencySafe: true}
+	case "web_search", "web_fetch":
+		return ToolTraits{Exposure: ToolExposureDirect, ReadOnly: true, ConcurrencySafe: true, NeedsPermission: true}
 	case "search_skill_resources":
 		return ToolTraits{Exposure: ToolExposureDirect, ReadOnly: true, ConcurrencySafe: true, NeedsPermission: true}
 	case "write_file", "edit_file", "apply_patch":

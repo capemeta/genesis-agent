@@ -2,6 +2,8 @@ package command
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
@@ -23,7 +25,7 @@ func newConfigCmd(configDirRef *string) *cobra.Command {
 API Key 等敏感信息仅显示已配置/未配置状态，不打印实际值。
 使用 --validate 仅校验配置有效性（适合 CI/部署前检查）。`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := config.Load(*configDirRef)
+			cfg, err := config.LoadWithOptions(*configDirRef, config.LoadOptions{Product: "cli", EnsureUserConfig: true})
 			if err != nil {
 				return fmt.Errorf("配置加载失败: %w", err)
 			}
@@ -112,6 +114,31 @@ func printConfig(cfg *config.Config) {
 	}
 
 	fmt.Println()
+	fmt.Println()
+	fmt.Println(sectionStyle.Render("▸ Web 搜索/获取"))
+	fmt.Println(divider)
+	row("Brave API Key", masked(cfg.Web.BraveAPIKey))
+	row("Tavily API Key", masked(cfg.Web.TavilyAPIKey))
+	row("Exa API Key", masked(cfg.Web.ExaAPIKey))
+	row("SerpAPI Key", masked(cfg.Web.SerpAPIKey))
+	if cfg.Web.SearXNGBaseURL != "" {
+		row("SearXNG Base URL", cfg.Web.SearXNGBaseURL)
+	} else {
+		row("SearXNG Base URL", "未配置")
+	}
+
+	fmt.Println()
+	fmt.Println(sectionStyle.Render("▸ Skills 配置"))
+	fmt.Println(divider)
+	row("用户配置文件", defaultUserConfigPath())
+	row("用户 Skills 目录", filepath.Join(defaultConfigHome(), "cli", "skills"))
+	row("额外来源数量", fmt.Sprintf("%d", len(cfg.Skills.Sources)))
+	if len(cfg.Skills.Enabled) > 0 {
+		row("显式启用", strings.Join(cfg.Skills.Enabled, ", "))
+	}
+	if len(cfg.Skills.Disabled) > 0 {
+		row("显式禁用", strings.Join(cfg.Skills.Disabled, ", "))
+	}
 	fmt.Println(sectionStyle.Render("▸ 基础设施"))
 	fmt.Println(divider)
 	row("日志级别", cfg.Log.Level)
@@ -119,4 +146,16 @@ func printConfig(cfg *config.Config) {
 		row("HTTP 服务（预留）", fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port))
 	}
 	fmt.Println()
+}
+
+func defaultConfigHome() string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return filepath.Join("~", ".genesis-agent")
+	}
+	return filepath.Join(home, ".genesis-agent")
+}
+
+func defaultUserConfigPath() string {
+	return filepath.Join(defaultConfigHome(), "cli", "config.yaml")
 }

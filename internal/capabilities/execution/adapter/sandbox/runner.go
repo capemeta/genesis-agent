@@ -21,9 +21,6 @@ func NewRunner(client sandboxcontract.CommandClient, workspace sandboxcontract.W
 	if client == nil {
 		return nil, fmt.Errorf("sandbox CommandClient未配置")
 	}
-	if workspace.ID == "" {
-		return nil, fmt.Errorf("sandbox workspace id不能为空")
-	}
 	return &Runner{client: client, workspace: workspace}, nil
 }
 

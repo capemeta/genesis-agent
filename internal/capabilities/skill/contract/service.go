@@ -13,6 +13,7 @@ type Service interface {
 	Resolve(ctx context.Context, req ResolveRequest) (model.Metadata, error)
 	Load(ctx context.Context, req LoadRequest) (model.Injection, error)
 	ReadResource(ctx context.Context, req ResourceRequest) (model.ResourceContent, error)
+	ListResources(ctx context.Context, req ListResourcesRequest) (model.ResourceList, error)
 	SearchResources(ctx context.Context, req SearchResourcesRequest) (model.SearchResult, error)
 	SelectForTurn(ctx context.Context, req SelectionRequest) ([]model.Metadata, error)
 	RenderAvailableSkills(ctx context.Context, req CatalogRequest) (string, error)
@@ -49,6 +50,11 @@ type ResourceRequest struct {
 	PackageID model.PackageID
 	Resource  model.ResourceID
 	MaxBytes  int
+}
+
+type ListResourcesRequest struct {
+	ResolveRequest
+	PackageID model.PackageID
 }
 
 type SearchResourcesRequest struct {

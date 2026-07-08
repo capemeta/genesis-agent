@@ -1,6 +1,6 @@
 # Genesis Agent — AI 编程助手上下文
 
-本文件是项目级全局上下文，只保留稳定原则和硬约束。完整架构、数据模型、路线图以 `docs/agent loop设计.md` 为准；多 Agent 模式参考 `docs/Agent设计模式与多Agent协作空间设计.md`。
+本文件是项目级全局上下文，只保留稳定原则和硬约束。完整架构、数据模型、路线图以 `docs/agent loop设计.md` 为准；多 Agent 模式参考 `docs/Agent设计模式与多Agent协作空间设计.md`；当前目录职责、依赖方向和产品边界以 `docs/项目目录与边界说明.md` 为准。
 
 ## 项目定位
 
@@ -23,67 +23,9 @@
 
 
 
-## 目标目录原则
+## 目录与产品边界
 
-后端目标分层：
-
-```text
-internal/
-  bootstrap/      # 产品无关 shared builder
-  app/            # 少量跨域应用编排；不要继续无边界扩张
-  platform/       # config / db / cache / idgen / httpclient / errors / observability
-  runtime/        # Agent Runtime：action / context / stop / strategy / session
-  capabilities/   # llm / tool / memory / sandbox / trace / usage / profile 等能力域
-  domain/         # 当前保留的核心领域模型
-
-products/
-  cli/            # CLI 产品：bootstrap、command、tui、profile、approval
-  desktop/        # Desktop 产品：bootstrap、native、wails、本地前端
-  enterprise/     # Enterprise 产品：bootstrap、http/sse、auth/rbac/audit、web
-
-shared/
-  local/          # CLI/Desktop 共享的本地主机适配：filesystem/pathresolver/execution/sandbox
-```
-
-依赖方向：
-
-```text
-cmd/<product> → products/<product>/bootstrap
-products/<product>/bootstrap → internal / products/<product>/internal / shared/local（仅 CLI/Desktop）
-internal/app → runtime / capabilities / domain
-capabilities → domain / platform
-shared/local → internal/capabilities/* contract/model
-```
-
-约束：
-
-- `domain` 不依赖外部框架。
-- `runtime` 不直接依赖 Eino、OpenAI、具体工具、MCP Client、Docker/WASM、PostgreSQL/Redis 或 HTTP/CLI。
-- `platform` 放跨域可复用基础设施，不承载具体业务能力。
-- `capabilities` 内部可按 `contract / adapter / service / model` 继续细分，但应优先域内聚合，避免重新散落回全局横切目录。
-- `app` 只保留跨能力域 orchestration；各能力自己的应用服务优先进入对应 `capabilities/*/service`。
-- `bootstrap` 保留顶层，不下沉到某个能力域。
-- 产品接入面不放 `internal/interfaces`；CLI command/TUI、Enterprise HTTP/SSE、Desktop Wails/Native 均放各自 `products/<product>/internal`。
-- Enterprise Web 前端放 `products/enterprise/web`；Desktop 前端未来放 `products/desktop/web`。
-- `sandbox` 能力由独立仓库 `genesis-sandbox` 提供；主平台不要直接依赖其 `internal/...`，后续统一通过 HTTP/gRPC/SDK/MCP 适配层调用。
-
-
-
-## 产品分发架构约束
-
-当前产品目录架构以 `docs/产品目录彻底迁移计划.md` 为准。后续编码默认必须遵守以下边界：
-
-- 正式产品入口只通过 `cmd/genesis-cli`、`cmd/genesis-desktop`、`cmd/genesis-enterprise` 等 `cmd/<product>` 进入；不要恢复旧兼容入口。
-- 产品入口必须是薄壳，只 import 自己的 `products/<product>/bootstrap` 和标准库，不直接装配 internal 具体实现，不直接 import 产品 internal 包。
-- `products/<product>/bootstrap` 是产品级 Composition Root，负责选择产品 Profile、持久化、Trace、Auth、Sandbox、工具适配、外部接口等具体实现。
-- `products/<product>/internal` 放产品私有实现，其他产品和 `cmd` 不得 import。
-- `internal/bootstrap` 只保留产品无关 shared builder，不 import `products/*` 或 `shared/local/*`，不承载 CLI/Desktop/Enterprise 的产品语义。
-- `internal/...` 不能反向 import `products/...` 或 `shared/local/...`。
-- `shared/local` 只放 CLI/Desktop 共享的本地主机适配实现；不得 import `products/*`，不得引入 Wails、PostgreSQL、企业 OIDC/RBAC。
-- CLI 默认不引入 PostgreSQL、Wails、企业 OIDC、企业 sandbox client；Enterprise 默认不引入 `shared/local` 本地主机执行/文件系统实现。
-- 新增产品、入口或产品特有能力后，必须同步维护 `scripts/check_product_isolation.ps1`，用 import graph 检查边界，而不是只靠目录约定。
-
-目录结构不是永久不可变。如果后续开发中发现当前目录不优雅、边界不清晰或影响扩展，可以提出调整；但在改目录前必须先说明：问题现象、为什么现有结构不适合、候选方案、影响范围、迁移步骤、验证方式，并经过用户确认后再实施。
+当前目录职责、目标分层、依赖方向、产品分发边界和目录调整流程集中维护在 `docs/项目目录与边界说明.md`。后续编码默认必须遵守该文档；如果发现目录不优雅、边界不清晰或影响扩展，必须先按该文档的“文档与目录变更规则”说明方案，并经过用户确认后再实施。
 
 ## 工具、文件系统与沙箱边界
 
@@ -128,6 +70,7 @@ shared/local → internal/capabilities/* contract/model
 - 当前是window环境，你要使用PowerShell/cmd的语法，而不是使用linux的语法
 - 执行 Go 构建、测试、工具命令时，必须显式使用仓库内缓存路径：`GOCACHE=D:\workspace\go\genesis-agent\.gocache`，`GOMODCACHE=D:\workspace\go\genesis-agent\.gomodcache`。PowerShell 示例：`$env:GOCACHE='D:\workspace\go\genesis-agent\.gocache'; $env:GOMODCACHE='D:\workspace\go\genesis-agent\.gomodcache'; go test ./...`
 - 编辑 Windows 路径、PowerShell 示例或包含 `$env:` 的文档时，必须注意字符串转义：优先使用单引号、here-string 或 `apply_patch`；不要在 PowerShell 双引号字符串里直接写 `$env:` 示例，避免变量插值把文本改坏。修改后必须读回相关片段确认。
+
 
 
 

@@ -9,6 +9,7 @@ import (
 	"net/http"
 
 	"genesis-agent/internal/app"
+	execmodel "genesis-agent/internal/capabilities/execution/model"
 )
 
 // AgentHandler Agent 相关 HTTP 处理器
@@ -25,8 +26,9 @@ func NewAgentHandler(svc app.AgentService) *AgentHandler {
 
 // RunRequest POST /v1/runs 请求体
 type RunRequest struct {
-	SessionID string `json:"session_id"` // 可选：指定会话 ID，否则自动创建新会话
-	Input     string `json:"input"`      // 必填：用户输入内容
+	SessionID string                    `json:"session_id"` // 可选：指定会话 ID，否则自动创建新会话
+	Input     string                    `json:"input"`      // 必填：用户输入内容
+	Sandbox   *execmodel.SandboxProfile `json:"sandbox,omitempty"`
 }
 
 // RunResponse POST /v1/runs 响应体
@@ -82,6 +84,7 @@ func (h *AgentHandler) Run(w http.ResponseWriter, r *http.Request) {
 		SessionID: sessionID,
 		TenantID:  "dev", // Phase 1A 硬编码租户，Phase 1B 从 JWT 解析
 		Input:     req.Input,
+		Sandbox:   req.Sandbox,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("推理失败: %v", err))

@@ -24,13 +24,14 @@ const (
 // BuildApprovalRequest 将文件系统上下文转换成通用审批请求。
 func BuildApprovalRequest(toolName string, op Operation, path model.ResolvedPath) approvalmodel.Request {
 	metadata := map[string]string{
-		"scope":      string(path.Scope),
-		"operation":  string(op),
-		"workspace":  path.WorkspaceID,
-		"raw_path":   path.RawPath,
-		"backend":    path.BackendPath,
-		"resource":   resourceType(op),
-		"path_scope": string(path.Scope),
+		"scope":         string(path.Scope),
+		"operation":     string(op),
+		"workspace":     path.WorkspaceID,
+		"raw_path":      path.RawPath,
+		"backend":       path.BackendPath,
+		"resource":      resourceType(op),
+		"path_scope":    string(path.Scope),
+		"workspace_rel": path.WorkspaceRel,
 	}
 	if path.Scope == model.PathScopeProtected || isProtected(path) {
 		metadata["protected"] = "true"

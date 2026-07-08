@@ -13,6 +13,7 @@ import (
 
 	connection "genesis-agent/internal/capabilities/connection/contract"
 	credential "genesis-agent/internal/capabilities/credential/contract"
+	execmodel "genesis-agent/internal/capabilities/execution/model"
 	memory "genesis-agent/internal/capabilities/memory/contract"
 	tool "genesis-agent/internal/capabilities/tool/contract"
 	"genesis-agent/internal/domain"
@@ -57,6 +58,7 @@ type RunRequest struct {
 	TenantID  string        // 租户 ID（隔离租户数据）
 	Input     string        // 用户输入内容
 	Agent     *domain.Agent // 可选：指定 Agent 配置；nil 时使用 DefaultAgent
+	Sandbox   *execmodel.SandboxProfile
 }
 
 // RunResult RunOnce 的执行结果

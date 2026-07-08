@@ -39,7 +39,7 @@ func (m *Matcher) Match(ctx context.Context, req approvalmodel.Request) (approva
 	if metadata["critical"] == "true" || metadata["protected"] == "true" || metadata["scope"] == "protected" || metadata["path_scope"] == "protected" {
 		return resultOf(m.files.Protected.Default, "protected file resource", approvalmodel.RiskCritical, req.SuggestedScopes), true, nil
 	}
-	if metadata["workspace_metadata_write"] == "true" {
+	if metadata["workspace_metadata_write"] == "true" || (isWorkspaceMetadataOperation(op) && m.matchesWorkspaceMetadataPath(workspaceRel(req, metadata))) {
 		return resultOf(m.files.WorkspaceMetadata.Write, "workspace metadata write policy", approvalmodel.RiskCritical, req.SuggestedScopes), true, nil
 	}
 	if rule, ok := m.matchPathRule(path, op, m.files.DenyPaths); ok {
@@ -62,6 +62,49 @@ func (m *Matcher) Match(ctx context.Context, req approvalmodel.Request) (approva
 	}
 }
 
+func (m *Matcher) matchesWorkspaceMetadataPath(rel string) bool {
+	rel = normalizeWorkspaceRel(rel)
+	if rel == "" {
+		return false
+	}
+	for _, candidate := range m.files.WorkspaceMetadata.Paths {
+		root := normalizeWorkspaceRel(candidate)
+		if root == "" {
+			continue
+		}
+		if rel == root || strings.HasPrefix(rel, root+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+func workspaceRel(req approvalmodel.Request, metadata map[string]string) string {
+	if rel := strings.TrimSpace(metadata["workspace_rel"]); rel != "" {
+		return rel
+	}
+	if strings.HasPrefix(req.Resource.URI, "workspace://") {
+		return strings.TrimPrefix(req.Resource.URI, "workspace://")
+	}
+	return ""
+}
+
+func normalizeWorkspaceRel(rel string) string {
+	rel = strings.TrimSpace(strings.ReplaceAll(rel, "\\", "/"))
+	rel = strings.TrimPrefix(rel, "./")
+	rel = strings.TrimPrefix(rel, "/")
+	rel = strings.TrimSuffix(rel, "/")
+	return strings.ToLower(rel)
+}
+
+func isWorkspaceMetadataOperation(op string) bool {
+	switch strings.ToLower(strings.TrimSpace(op)) {
+	case "write", "edit", "delete":
+		return true
+	default:
+		return false
+	}
+}
 func (m *Matcher) matchPathRule(path string, op string, rules []config.PolicyPathRuleConfig) (config.PolicyPathRuleConfig, bool) {
 	if path == "" {
 		return config.PolicyPathRuleConfig{}, false

@@ -30,6 +30,8 @@ func DefaultProfile() profilemodel.Profile {
 				"load_skill",
 				"read_skill_resource",
 				"search_skill_resources",
+				"web_search",
+				"web_fetch",
 			},
 		},
 		Skills: profilemodel.SkillSet{AllowImplicit: true},

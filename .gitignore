@@ -2,6 +2,7 @@
 configs/config.local.yaml
 configs/sandbox.local.yaml
 configs/.env
+start.local.bat
 products/enterprise/web/node_modules
 products/enterprise/web/dist
 products/enterprise/web/.git
@@ -46,4 +47,5 @@ Thumbs.db
 
 # env file
 .env
+**/__pycache__/
 

@@ -47,10 +47,16 @@ func TestLocalSourceReadsAndSearchesPackageResources(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(dir, "references"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.MkdirAll(filepath.Join(dir, "assets"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte("---\nname: review\ndescription: Review carefully\n---\nBody"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "references", "guide.md"), []byte("alpha beta gamma"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "assets", "logo.bin"), []byte{0xff, 0x00, 0x01}, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	source, err := NewSource(model.Authority{Kind: model.SourceKindHost, ID: "local-test"}, []Root{{Path: root, Scope: model.ScopeProject}}, parser.New())
@@ -70,5 +76,18 @@ func TestLocalSourceReadsAndSearchesPackageResources(t *testing.T) {
 	}
 	if len(searched.Matches) != 1 || searched.Matches[0].Resource != "review/references/guide.md" {
 		t.Fatalf("searched = %+v", searched)
+	}
+	resources, err := source.ListResources(context.Background(), contract.SourceListResourcesRequest{PackageID: "review"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resources.Resources) != 2 {
+		t.Fatalf("resources = %+v", resources)
+	}
+	if resources.Resources[0].Resource != "review/assets/logo.bin" || resources.Resources[0].Text {
+		t.Fatalf("binary resource = %+v", resources.Resources[0])
+	}
+	if resources.Resources[1].Resource != "review/references/guide.md" || !resources.Resources[1].Text {
+		t.Fatalf("text resource = %+v", resources.Resources[1])
 	}
 }

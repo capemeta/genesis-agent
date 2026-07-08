@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sync"
 
 	"genesis-agent/internal/capabilities/plan/contract"
@@ -39,6 +40,11 @@ func (r *FileRepository) getHistoryPath(sessionID string) string {
 
 // GetPlan 获取指定 Session 的最新计划快照
 func (r *FileRepository) GetPlan(ctx context.Context, sessionID string) (*model.Plan, error) {
+	safeID := sessionIDSafe(sessionID)
+	if safeID == "" {
+		return nil, fmt.Errorf("invalid session id: %q", sessionID)
+	}
+
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
@@ -59,6 +65,11 @@ func (r *FileRepository) GetPlan(ctx context.Context, sessionID string) (*model.
 
 // SavePlan 保存最新计划，且追加审计变更记录（解耦读写膨胀风险）
 func (r *FileRepository) SavePlan(ctx context.Context, plan *model.Plan, revision *model.RevisionLog) error {
+	safeID := sessionIDSafe(plan.SessionID)
+	if safeID == "" {
+		return fmt.Errorf("invalid session id: %q", plan.SessionID)
+	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -112,6 +123,11 @@ func (r *FileRepository) SavePlan(ctx context.Context, plan *model.Plan, revisio
 
 // GetHistory 获取变更日志记录
 func (r *FileRepository) GetHistory(ctx context.Context, sessionID string) ([]model.RevisionLog, error) {
+	safeID := sessionIDSafe(sessionID)
+	if safeID == "" {
+		return nil, fmt.Errorf("invalid session id: %q", sessionID)
+	}
+
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
@@ -130,7 +146,9 @@ func (r *FileRepository) GetHistory(ctx context.Context, sessionID string) ([]mo
 	return history, nil
 }
 
+var sessionIDRegex = regexp.MustCompile(`[^a-zA-Z0-9_-]`)
+
 func sessionIDSafe(raw string) string {
-	// 移除非法路径字符，防注入
-	return filepath.Clean(raw)
+	// 使用正则表达式仅保留字母、数字、破折号和下划线
+	return sessionIDRegex.ReplaceAllString(raw, "")
 }

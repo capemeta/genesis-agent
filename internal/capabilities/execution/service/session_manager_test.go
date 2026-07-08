@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	approvalmodel "genesis-agent/internal/capabilities/approval/model"
 	"genesis-agent/internal/capabilities/execution/contract"
 	"genesis-agent/internal/capabilities/execution/model"
 )
@@ -195,5 +196,60 @@ func TestSessionManager_DynamicScanner(t *testing.T) {
 
 	if !errors.Is(err, ErrLineScanDeny) && !strings.Contains(err.Error(), "violates policy") {
 		t.Errorf("Expected LineScanDeny error, got: %v", err)
+	}
+}
+
+type mockApproval struct {
+	decideFunc func(req approvalmodel.Request) (approvalmodel.Decision, error)
+}
+
+func (m *mockApproval) Authorize(ctx context.Context, req approvalmodel.Request) (approvalmodel.Decision, error) {
+	return m.decideFunc(req)
+}
+
+func TestSessionManager_DynamicScannerWithApproval(t *testing.T) {
+	runner := newMockRunner()
+	
+	ctx := context.Background()
+	sessionID := "approved_session"
+
+	// 1. 测试审批通过的场景
+	approvedApproval := &mockApproval{
+		decideFunc: func(req approvalmodel.Request) (approvalmodel.Decision, error) {
+			return approvalmodel.Decision{Type: approvalmodel.DecisionApproved}, nil
+		},
+	}
+	mgr1 := NewSessionManager(runner).WithApproval(approvedApproval)
+	err := mgr1.StartSession(ctx, sessionID, model.Command{Command: "bash"}, contract.RunOptions{})
+	if err != nil {
+		t.Fatalf("StartSession failed: %v", err)
+	}
+	defer func() { _ = mgr1.KillSession(ctx, sessionID) }()
+
+	err = mgr1.WriteStdin(ctx, sessionID, []byte("rm -rf /\n"))
+	if err != nil {
+		t.Errorf("Expected WriteStdin to succeed since user approved, but got error: %v", err)
+	}
+
+	// 2. 测试审批拒绝的场景
+	sessionID2 := "denied_session"
+	deniedApproval := &mockApproval{
+		decideFunc: func(req approvalmodel.Request) (approvalmodel.Decision, error) {
+			return approvalmodel.Decision{Type: approvalmodel.DecisionDenied}, nil
+		},
+	}
+	mgr2 := NewSessionManager(runner).WithApproval(deniedApproval)
+	err = mgr2.StartSession(ctx, sessionID2, model.Command{Command: "bash"}, contract.RunOptions{})
+	if err != nil {
+		t.Fatalf("StartSession failed: %v", err)
+	}
+	defer func() { _ = mgr2.KillSession(ctx, sessionID2) }()
+
+	err = mgr2.WriteStdin(ctx, sessionID2, []byte("rm -rf /\n"))
+	if err == nil {
+		t.Error("Expected WriteStdin to fail since user denied approval")
+	}
+	if !errors.Is(err, ErrLineScanDeny) {
+		t.Errorf("Expected LineScanDeny, got: %v", err)
 	}
 }

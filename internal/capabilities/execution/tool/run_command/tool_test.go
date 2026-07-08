@@ -13,6 +13,7 @@ import (
 	fscontract "genesis-agent/internal/capabilities/filesystem/contract"
 	fsmodel "genesis-agent/internal/capabilities/filesystem/model"
 	"genesis-agent/internal/capabilities/tool/scheduler"
+	"genesis-agent/internal/platform/contextutil"
 )
 
 type fakeResolver struct {
@@ -102,6 +103,29 @@ func TestToolExecuteEnvMarksReadOnlyCommandDangerous(t *testing.T) {
 	}
 	if !strings.Contains(approval.lastReq.Reason, "environment") {
 		t.Fatalf("Reason = %q, want environment", approval.lastReq.Reason)
+	}
+}
+
+func TestToolExecuteUsesContextSandboxOverride(t *testing.T) {
+	approval := &fakeApproval{decision: approvalmodel.Decision{Type: approvalmodel.DecisionApproved}}
+	runner := &fakeRunner{}
+	tool := newTestTool(t, approval, runner, execmodel.SandboxProfile{Mode: execmodel.SandboxDisabled})
+	override := execmodel.SandboxProfile{
+		Mode:           execmodel.SandboxRequired,
+		Provider:       "genesis-sandbox",
+		RuntimeProfile: execmodel.RuntimeProfileCodePythonIsolated,
+		TaskType:       execmodel.SandboxTaskShell,
+		Operation:      execmodel.SandboxOperationRunShell,
+		Language:       "shell",
+	}
+	ctx := contextutil.WithSandboxProfileOverride(context.Background(), override)
+	if _, err := tool.Execute(ctx, `{"command":"echo hi"}`); err != nil {
+		t.Fatal(err)
+	}
+	if runner.opts.Sandbox.Mode != execmodel.SandboxRequired ||
+		runner.opts.Sandbox.Provider != "genesis-sandbox" ||
+		runner.opts.Sandbox.RuntimeProfile != execmodel.RuntimeProfileCodePythonIsolated {
+		t.Fatalf("sandbox override = %+v", runner.opts.Sandbox)
 	}
 }
 

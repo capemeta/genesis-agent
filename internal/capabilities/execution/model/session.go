@@ -19,6 +19,8 @@ const (
 type TerminalSession struct {
 	ID        string        `json:"id"`
 	Command   string        `json:"command"`
+	Cwd       string        `json:"cwd,omitempty"`
+	PathScope string        `json:"path_scope,omitempty"` // 保存工作目录的 Scope (例如 workspace, protected, external)
 	Status    SessionStatus `json:"status"`
 	PID       int           `json:"pid"`
 	LogPath   string        `json:"log_path"`

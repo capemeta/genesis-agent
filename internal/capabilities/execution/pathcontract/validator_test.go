@@ -1,0 +1,239 @@
+package pathcontract
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	execcontract "genesis-agent/internal/capabilities/execution/contract"
+	execmodel "genesis-agent/internal/capabilities/execution/model"
+)
+
+func TestValidateCommandAllowsLogicalDirsInStrictMode(t *testing.T) {
+	err := ValidateCommand(execmodel.Command{
+		Command: `python -c "open('${INPUT_DIR}/data.csv').read(); open('${OUTPUT_DIR}/result.csv','w').write('ok')"`,
+	}, execcontract.RunOptions{
+		Workspace: execmodel.ExecutionWorkspace{PathPolicy: execmodel.PathPolicyStrictWorkspace},
+	})
+	if err != nil {
+		t.Fatalf("ValidateCommand() error = %v", err)
+	}
+}
+
+func TestValidateCommandRejectsHostPathsInStrictMode(t *testing.T) {
+	err := ValidateCommand(execmodel.Command{
+		Command: `python process.py D:\data\input.xlsx --out /Users/alice/out.pdf`,
+	}, execcontract.RunOptions{
+		Workspace: execmodel.ExecutionWorkspace{PathPolicy: execmodel.PathPolicyStrictWorkspace},
+	})
+	if code := execcontract.CodeOf(err); code != execcontract.ErrCodeInvalidInput {
+		t.Fatalf("CodeOf(err)=%s err=%v", code, err)
+	}
+	if !strings.Contains(err.Error(), "D:\\data\\input.xlsx") || !strings.Contains(err.Error(), "/Users/alice/out.pdf") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestValidateCommandRejectsTmpOutputInStrictMode(t *testing.T) {
+	err := ValidateCommand(execmodel.Command{
+		Command: `python -c "open('/tmp/result.csv','w').write('bad')"`,
+	}, execcontract.RunOptions{
+		Workspace: execmodel.ExecutionWorkspace{PathPolicy: execmodel.PathPolicyStrictWorkspace},
+	})
+	if code := execcontract.CodeOf(err); code != execcontract.ErrCodeInvalidInput {
+		t.Fatalf("CodeOf(err)=%s err=%v", code, err)
+	}
+	if !strings.Contains(err.Error(), "TMPDIR") || !strings.Contains(err.Error(), "OUTPUT_DIR") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestValidateCommandRejectsNonWorkspaceAbsolutePath(t *testing.T) {
+	err := ValidateCommand(execmodel.Command{
+		Command: `python -c "open('/var/logs/result.txt','w').write('bad')"`,
+	}, execcontract.RunOptions{
+		Workspace: execmodel.ExecutionWorkspace{PathPolicy: execmodel.PathPolicyStrictWorkspace},
+	})
+	if code := execcontract.CodeOf(err); code != execcontract.ErrCodeInvalidInput {
+		t.Fatalf("CodeOf(err)=%s err=%v", code, err)
+	}
+}
+
+func TestValidateCommandRejectsGenericUnixAbsolutePath(t *testing.T) {
+	err := ValidateCommand(execmodel.Command{
+		Command: `python -c "open('/etc/passwd').read()"`,
+	}, execcontract.RunOptions{
+		Workspace: execmodel.ExecutionWorkspace{PathPolicy: execmodel.PathPolicyStrictWorkspace},
+	})
+	if code := execcontract.CodeOf(err); code != execcontract.ErrCodeInvalidInput {
+		t.Fatalf("CodeOf(err)=%s err=%v", code, err)
+	}
+	if !strings.Contains(err.Error(), "/etc/passwd") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestValidateCommandRejectsUNCPath(t *testing.T) {
+	err := ValidateCommand(execmodel.Command{
+		Command: `python process.py \\server\share\data.csv`,
+	}, execcontract.RunOptions{
+		Workspace: execmodel.ExecutionWorkspace{PathPolicy: execmodel.PathPolicyStrictWorkspace},
+	})
+	if code := execcontract.CodeOf(err); code != execcontract.ErrCodeInvalidInput {
+		t.Fatalf("CodeOf(err)=%s err=%v", code, err)
+	}
+	if !strings.Contains(err.Error(), `\\server\share\data.csv`) {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestValidateCommandDoesNotTreatURLAsFilePath(t *testing.T) {
+	err := ValidateCommand(execmodel.Command{
+		Command: `python -c "print('https://example.com/report.csv')"`,
+	}, execcontract.RunOptions{
+		Workspace: execmodel.ExecutionWorkspace{PathPolicy: execmodel.PathPolicyStrictWorkspace},
+	})
+	if err != nil {
+		t.Fatalf("ValidateCommand() error = %v", err)
+	}
+}
+
+func TestValidateCommandDoesNotTreatSedDelimiterAsFilePath(t *testing.T) {
+	err := ValidateCommand(execmodel.Command{
+		Command: `sed "s/foo/bar/" ${INPUT_DIR}/data.txt`,
+	}, execcontract.RunOptions{
+		Workspace: execmodel.ExecutionWorkspace{PathPolicy: execmodel.PathPolicyStrictWorkspace},
+	})
+	if err != nil {
+		t.Fatalf("ValidateCommand() error = %v", err)
+	}
+}
+
+func TestValidateCommandRejectsAbsolutePathAfterEquals(t *testing.T) {
+	err := ValidateCommand(execmodel.Command{
+		Command: `python tool.py --config=/etc/app/config.yaml`,
+	}, execcontract.RunOptions{
+		Workspace: execmodel.ExecutionWorkspace{PathPolicy: execmodel.PathPolicyStrictWorkspace},
+	})
+	if code := execcontract.CodeOf(err); code != execcontract.ErrCodeInvalidInput {
+		t.Fatalf("CodeOf(err)=%s err=%v", code, err)
+	}
+}
+
+func TestValidateCommandAllowsSandboxWorkspacePath(t *testing.T) {
+	err := ValidateCommand(execmodel.Command{
+		Command: `python -c "open('/workspace/output/result.txt','w').write('ok')"`,
+	}, execcontract.RunOptions{
+		Workspace: execmodel.ExecutionWorkspace{PathPolicy: execmodel.PathPolicyStrictWorkspace},
+	})
+	if err != nil {
+		t.Fatalf("ValidateCommand() error = %v", err)
+	}
+}
+
+func TestValidateCommandPermissionOnlyAllowsLocalCodingPaths(t *testing.T) {
+	err := ValidateCommand(execmodel.Command{
+		Command: `type D:\workspace\go\genesis-agent\go.mod`,
+	}, execcontract.RunOptions{
+		Workspace: execmodel.ExecutionWorkspace{
+			Mode:       execmodel.WorkspaceModeLocalCoding,
+			PathPolicy: execmodel.PathPolicyPermissionOnly,
+		},
+	})
+	if err != nil {
+		t.Fatalf("ValidateCommand() error = %v", err)
+	}
+}
+
+func TestEffectivePathPolicyRemoteDefaultsStrict(t *testing.T) {
+	got := EffectivePathPolicy(execcontract.RunOptions{
+		Sandbox: execmodel.SandboxProfile{Mode: execmodel.SandboxRequired, Provider: "genesis-sandbox"},
+	})
+	if got != execmodel.PathPolicyStrictWorkspace {
+		t.Fatalf("EffectivePathPolicy()=%s", got)
+	}
+}
+
+func TestValidateCommandRejectsPathInsidePythonScriptFile(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "process.py")
+	if err := os.WriteFile(script, []byte(`from pathlib import Path
+Path("/var/logs/result.txt").write_text("bad")
+`), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	err := ValidateCommand(execmodel.Command{
+		Command: `python process.py`,
+		Cwd:     dir,
+	}, execcontract.RunOptions{
+		Workspace: execmodel.ExecutionWorkspace{PathPolicy: execmodel.PathPolicyStrictWorkspace},
+	})
+	if code := execcontract.CodeOf(err); code != execcontract.ErrCodeInvalidInput {
+		t.Fatalf("CodeOf(err)=%s err=%v", code, err)
+	}
+	if !strings.Contains(err.Error(), script) || !strings.Contains(err.Error(), "/var/logs/result.txt") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestValidateCommandAllowsPythonScriptUsingLogicalDirs(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "process.py")
+	if err := os.WriteFile(script, []byte(`import os
+input_path = os.path.join(os.environ["INPUT_DIR"], "data.csv")
+output_path = os.path.join(os.environ["OUTPUT_DIR"], "result.csv")
+open(input_path).read()
+open(output_path, "w").write("ok")
+`), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	err := ValidateCommand(execmodel.Command{
+		Command: `python process.py`,
+		Cwd:     dir,
+	}, execcontract.RunOptions{
+		Workspace: execmodel.ExecutionWorkspace{PathPolicy: execmodel.PathPolicyStrictWorkspace},
+	})
+	if err != nil {
+		t.Fatalf("ValidateCommand() error = %v", err)
+	}
+}
+
+func TestCustomRegistryAnalyzerCanExtendPreflight(t *testing.T) {
+	registry := NewRegistry(staticAnalyzer{violations: []Violation{{
+		Fragment: "custom://bad",
+		Reason:   "自定义分析器发现违规",
+		Fix:      "按自定义规则修复",
+	}}})
+	violations, err := registry.Analyze(AnalysisInput{Command: execmodel.Command{Command: "noop"}})
+	if err != nil {
+		t.Fatalf("Analyze() error = %v", err)
+	}
+	if len(violations) != 1 || violations[0].Analyzer != "static" || violations[0].Severity != SeverityError {
+		t.Fatalf("violations=%+v", violations)
+	}
+}
+
+func TestEmptyRegistryUsesDefaultAnalyzers(t *testing.T) {
+	violations, err := NewRegistry().Analyze(AnalysisInput{Command: execmodel.Command{
+		Command: `python -c "open('/etc/passwd').read()"`,
+	}})
+	if err != nil {
+		t.Fatalf("Analyze() error = %v", err)
+	}
+	if len(violations) == 0 {
+		t.Fatal("empty registry should keep default analyzers enabled")
+	}
+}
+
+type staticAnalyzer struct {
+	violations []Violation
+}
+
+func (staticAnalyzer) Name() string { return "static" }
+
+func (a staticAnalyzer) Analyze(AnalysisInput) ([]Violation, error) {
+	return a.violations, nil
+}

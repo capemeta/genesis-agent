@@ -104,12 +104,36 @@ func TestFileRepository_CleanPathSafety(t *testing.T) {
 		t.Fatalf("Init repo failed: %v", err)
 	}
 
-	// 模拟黑客注入相对路径进行路径穿越
+	// 1. 验证被安全过滤的情况：/ 和 . 以及 \ 被自动剔除，仅保留安全字符
 	hackSessionID := "../../../hack_session"
 	safePath := repo.getPlanPath(hackSessionID)
-
-	// 确认 filepath.Clean 处理了穿越字符
 	if filepath.Base(safePath) != "hack_session_plan.json" {
 		t.Errorf("Expected filename to be cleaned to hack_session_plan.json, got path: %s", safePath)
+	}
+
+	backslashSessionID := `\\some_session`
+	safePath2 := repo.getPlanPath(backslashSessionID)
+	if filepath.Base(safePath2) != "some_session_plan.json" {
+		t.Errorf("Expected filename to be cleaned to some_session_plan.json, got path: %s", safePath2)
+	}
+
+	// 2. 验证报错的情况：仅传入 ../ 或 \\ 过滤后为空，应报错拒绝
+	_, err = repo.GetPlan(context.Background(), "../")
+	if err == nil {
+		t.Error("Expected error when sessionID is empty after filtering (../), got nil")
+	}
+
+	_, err = repo.GetPlan(context.Background(), `\\`)
+	if err == nil {
+		t.Error("Expected error when sessionID is empty after filtering (\\\\), got nil")
+	}
+
+	plan := &model.Plan{
+		SessionID: "../",
+		Version:   1,
+	}
+	err = repo.SavePlan(context.Background(), plan, &model.RevisionLog{Version: 1})
+	if err == nil {
+		t.Error("Expected error when saving plan with invalid sessionID, got nil")
 	}
 }

@@ -231,6 +231,30 @@ type ResourceContent struct {
 	Truncated bool       `json:"truncated"`
 }
 
+// ResourceKind 描述 Skill 包内资源所属目录语义。
+type ResourceKind string
+
+const (
+	ResourceKindReference ResourceKind = "reference"
+	ResourceKindScript    ResourceKind = "script"
+	ResourceKindAsset     ResourceKind = "asset"
+)
+
+// ResourceInfo 是 Skill 包内资源的可发现元数据。
+type ResourceInfo struct {
+	Resource ResourceID   `json:"resource"`
+	Kind     ResourceKind `json:"kind"`
+	Name     string       `json:"name"`
+	Size     int64        `json:"size,omitempty"`
+	Text     bool         `json:"text"`
+}
+
+// ResourceList 是某个 Skill 包内可发现资源清单。
+type ResourceList struct {
+	Skill     Metadata       `json:"skill"`
+	Resources []ResourceInfo `json:"resources"`
+}
+
 // SearchResult 是 Skill 资源搜索结果。
 type SearchResult struct {
 	Skill   Metadata      `json:"skill"`

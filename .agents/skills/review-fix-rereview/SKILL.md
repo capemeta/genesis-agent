@@ -1,6 +1,6 @@
 ---
 name: review-fix-rereview
-description: Manual-only workflow for iterative review and closure of engineering work products, including code, architecture designs, implementation plans, specs, and docs. Use only for explicit manual trigger phrases such as $review-fix-rereview, "调用审查技能", "使用审查技能", naming this skill, or asking to use the "review-fix-rereview" / "审查-修复-再审查" loop. Do not use for ordinary coding, review, design, refactor, or debugging requests unless the user explicitly asks to invoke this skill.
+description: Manual-only workflow for iterative review and closure of engineering work products, including code, architecture designs, implementation plans, specs, and docs, with explicit first-principles analysis ("从第一性原理分析") before judging fixes. Use only for explicit manual trigger phrases such as $review-fix-rereview, "调用审查技能", "使用审查技能", "从第一性原理分析", naming this skill, or asking to use the "review-fix-rereview" / "审查-修复-再审查" loop. Do not use for ordinary coding, review, design, refactor, or debugging requests unless the user explicitly asks to invoke this skill.
 ---
 
 # Review Fix Rereview
@@ -9,8 +9,9 @@ description: Manual-only workflow for iterative review and closure of engineerin
 
 1. Run an iterative "review -> fix -> re-review" loop until no actionable issues remain, within a bounded iteration budget.
 2. **Manual trigger only**: Do not start this closed loop automatically after ordinary coding, design, refactoring, or documentation work. Use it only when the user explicitly invokes this skill or asks for a review-fix-rereview cycle.
-3. An actionable issue is one that materially affects correctness, requirement fit, safety, architecture boundaries, maintainability, extensibility, feasibility, verification, or the user's stated goal. Style preferences, tiny wording choices, speculative improvements, and low-value polish do not keep the loop alive unless they block understanding, consistency, or acceptance.
-4. Do not stop after the first fix or revision when material issues remain. Also do not chase endless perfection: once remaining items are non-actionable polish or accepted residual risk, stop and report them clearly.
+3. **First-principles analysis**: Before deciding whether something is correct or worth fixing, reduce the artifact to its essential goal, invariants, constraints, user value, and failure conditions. Use this "从第一性原理分析" step to avoid inheriting flawed assumptions from the current implementation, plan, or wording.
+4. An actionable issue is one that materially affects correctness, requirement fit, safety, architecture boundaries, maintainability, extensibility, feasibility, verification, or the user's stated goal. Style preferences, tiny wording choices, speculative improvements, and low-value polish do not keep the loop alive unless they block understanding, consistency, or acceptance.
+5. Do not stop after the first fix or revision when material issues remain. Also do not chase endless perfection: once remaining items are non-actionable polish or accepted residual risk, stop and report them clearly.
 
 ## Iteration Budget
 
@@ -21,16 +22,19 @@ description: Manual-only workflow for iterative review and closure of engineerin
 
 1. **Establish scope.**
    Identify the artifact under review, the user's intent, relevant context, constraints, existing patterns, project instructions, and the evidence needed to judge completeness.
+   - **From first principles**: State the core problem, the minimum necessary outcome, non-negotiable constraints, key invariants, and what would make the artifact fail in practice. Use this baseline to challenge inherited assumptions before applying repository or artifact-specific criteria.
    - **Design-implementation alignment**: If reviewing implementation work, check whether it diverges from the accepted design, implementation plan, requirements, or task constraints.
    - **Single-artifact focus**: Unless the user asks otherwise, stay focused on the artifact type under review. For example, when reviewing a design, do not default to reviewing code.
 
 2. **Choose the review lens.**
    Adapt the criteria to the artifact:
    - **Design & Architecture Review**:
+     - **First-principles problem framing**: Is the design solving the real root problem instead of optimizing around incidental current structure, legacy assumptions, or premature implementation choices?
      - **Problem fit & tradeoffs**: Does the design solve the core problem, are assumptions explicit, and are tradeoffs reasonable?
      - **Module boundaries & decoupling**: Are responsibilities clear, and does the design follow the current repository's architecture boundaries, dependency direction, module/product isolation rules, and established abstraction style? Use project-level instructions, design documents, and existing patterns as the source of truth.
      - **Data flow, feasibility & failure modes**: Are control/data flows coherent, and are error handling, concurrency, rollout, migration, and failure scenarios considered where relevant?
    - **Code Review**:
+     - **First-principles correctness**: Does the code preserve the essential invariants and contract of the problem, independent of how the previous code happened to be shaped?
      - **Completeness & alignment**: Does the implementation satisfy the accepted requirements, design, or task plan without important omissions?
      - **Architecture & directory structure**: Is code placed according to the current project's package/module conventions, and are dependency boundaries respected?
      - **Maintainability & extensibility**: Are modules cohesive, coupling controlled, abstractions justified, and future changes reasonably easy?
@@ -41,7 +45,7 @@ description: Manual-only workflow for iterative review and closure of engineerin
    - **Specs or docs**: Check clarity, consistency, missing cases, contract accuracy, ambiguity, reader workflow, and alignment with implementation intent.
 
 3. **Review for material risk.**
-   Prioritize correctness, completeness, elegant design, best practices, clear contracts, maintainable structure, and future extensibility. Classify findings as actionable, optional polish, or residual risk. Only actionable findings drive another fix cycle.
+   Prioritize correctness, completeness, elegant design, best practices, clear contracts, maintainable structure, and future extensibility. When uncertain, reason from first principles: what must be true for this artifact to satisfy the user's goal, and what concrete failure would occur if it does not? Classify findings as actionable, optional polish, or residual risk. Only actionable findings drive another fix cycle.
 
 4. **Apply contextual judgment.**
    Add deeper checks only when the artifact calls for them: security for untrusted input or external execution; permissions/auth/tenancy/sandboxing for access-control or tool/file/command paths; observability for long-running, distributed, operational, or hard-to-debug flows; performance for hot or blocking paths; API/data/docs impact when contracts or persistence change.

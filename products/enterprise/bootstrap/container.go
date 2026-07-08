@@ -33,6 +33,7 @@ func (c *Container) Init(ctx context.Context) error {
 			configDir = *c.configDirRef
 		}
 		c.bundle, c.initErr = shared.BuildAgentService(ctx, shared.BuildOptions{
+			Product:          "enterprise",
 			ConfigDir:        configDir,
 			Quiet:            c.quiet,
 			RouteName:        "chat",

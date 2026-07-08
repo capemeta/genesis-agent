@@ -9,9 +9,12 @@ import (
 	"sync/atomic"
 	"time"
 
+	approvalcontract "genesis-agent/internal/capabilities/approval/contract"
+	approvalmodel "genesis-agent/internal/capabilities/approval/model"
 	"genesis-agent/internal/capabilities/execution/contract"
 	"genesis-agent/internal/capabilities/execution/model"
 	"genesis-agent/internal/capabilities/execution/policy"
+	fsmodel "genesis-agent/internal/capabilities/filesystem/model"
 )
 
 var (
@@ -25,6 +28,7 @@ var globalSubCounter int64
 // SessionManager 统筹伪终端交互会话生命周期管理与安全防线
 type SessionManager struct {
 	runner       contract.InteractiveSessionRunner
+	approval     approvalcontract.Service // 新增：可选的审批服务
 	sessions     map[string]*model.TerminalSession
 	broadcasters map[string]*multicastBroadcaster
 	mu           sync.RWMutex
@@ -39,6 +43,12 @@ func NewSessionManager(runner contract.InteractiveSessionRunner) *SessionManager
 	}
 }
 
+// WithApproval 链式设置审批服务支持人审交互确认
+func (m *SessionManager) WithApproval(approval approvalcontract.Service) *SessionManager {
+	m.approval = approval
+	return m
+}
+
 // StartSession 启动一个 PTY 交互式/后台会话
 func (m *SessionManager) StartSession(ctx context.Context, sessionID string, cmd model.Command, opts contract.RunOptions) error {
 	m.mu.Lock()
@@ -51,10 +61,15 @@ func (m *SessionManager) StartSession(ctx context.Context, sessionID string, cmd
 	placeholder := &model.TerminalSession{
 		ID:        sessionID,
 		Command:   cmd.Command,
-		Status:    model.SessionStatusPending,
+		Cwd:       cmd.Cwd,
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
 	}
+	if opts.Sandbox.Metadata != nil {
+		placeholder.PathScope = opts.Sandbox.Metadata["path_scope"]
+	}
+	placeholder.Status = model.SessionStatusPending
+
 	m.sessions[sessionID] = placeholder
 	m.mu.Unlock()
 
@@ -135,9 +150,47 @@ func (m *SessionManager) WriteStdin(ctx context.Context, sessionID string, data 
 			}
 
 			cls := policy.Classify(lineCmd)
-			// 如果动态分类为高危/破坏性操作，予以拦截阻断，防范 AI 注入绕过
+			// 如果动态分类为高危/破坏性操作，予以拦截阻断，或触发人机交互审批
 			if cls.Dangerous || cls.Destructive || cls.Critical {
-				return contract.NewError(contract.ErrCodePermissionDenied, fmt.Errorf("%w: command [%s] violates policy [%s]", ErrLineScanDeny, lineCmd, cls.Reason))
+				if m.approval != nil {
+					// 构造交互命令以进行安全策略评估
+					interactiveCmd := model.Command{
+						Command: lineCmd,
+						Cwd:     session.Cwd,
+						Shell:   model.ShellAuto,
+					}
+					// 构造简易的 ResolvedPath 供策略和审批展示使用
+					pathScope := fsmodel.PathScopeWorkspace
+					if session.PathScope != "" {
+						pathScope = fsmodel.PathScope(session.PathScope)
+					}
+					resolvedPath := fsmodel.ResolvedPath{
+						Scope:       pathScope,
+						DisplayPath: session.Cwd,
+						BackendPath: session.Cwd,
+						RawPath:     session.Cwd,
+					}
+					req := policy.BuildApprovalRequest("write_stdin", interactiveCmd, resolvedPath, cls)
+
+					// 释放 session 锁，防止同步阻塞人机审批时锁死当前会话
+					session.Mu.Unlock()
+					decision, err := m.approval.Authorize(ctx, req)
+					session.Mu.Lock()
+
+					// 重新检查会话运行状态，确保等待人机审批期间会话未被销毁
+					if session.Status != model.SessionStatusRunning || !bExists {
+						return contract.NewError(contract.ErrCodeRunnerFailed, ErrSessionClosed)
+					}
+
+					if err != nil {
+						return err
+					}
+					if decision.Type != approvalmodel.DecisionApproved && decision.Type != approvalmodel.DecisionApprovedForScope {
+						return contract.NewError(contract.ErrCodePermissionDenied, fmt.Errorf("%w: command [%s] violates policy [%s] (approval denied)", ErrLineScanDeny, lineCmd, cls.Reason))
+					}
+				} else {
+					return contract.NewError(contract.ErrCodePermissionDenied, fmt.Errorf("%w: command [%s] violates policy [%s]", ErrLineScanDeny, lineCmd, cls.Reason))
+				}
 			}
 		}
 	}

@@ -61,9 +61,12 @@ func CodeOf(err error) ErrorCode {
 
 // RunOptions 控制命令执行。
 type RunOptions struct {
-	Timeout        time.Duration
-	MaxOutputBytes int64
-	Sandbox        model.SandboxProfile
+	Timeout                  time.Duration
+	MaxOutputBytes           int64
+	Sandbox                  model.SandboxProfile
+	Workspace                model.ExecutionWorkspace
+	InputArtifacts           []model.InputArtifactRef
+	ArtifactCollectionPolicy model.ArtifactCollectionPolicy
 }
 
 // CommandRunner 是不带沙箱编排语义的直接命令执行端口。

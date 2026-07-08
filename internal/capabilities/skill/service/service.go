@@ -4,6 +4,7 @@ package service
 import (
 	"context"
 	"fmt"
+	capmodel "genesis-agent/internal/capabilities/capability/model"
 	"sort"
 	"strings"
 	"sync"
@@ -12,6 +13,7 @@ import (
 
 	auditcontract "genesis-agent/internal/capabilities/audit/contract"
 	auditmodel "genesis-agent/internal/capabilities/audit/model"
+	capcontract "genesis-agent/internal/capabilities/capability/contract"
 	"genesis-agent/internal/capabilities/skill/contract"
 	"genesis-agent/internal/capabilities/skill/model"
 	usagecontract "genesis-agent/internal/capabilities/usage/contract"
@@ -25,6 +27,7 @@ type Options struct {
 	SourceTimeout  time.Duration
 	AuditSink      auditcontract.Sink
 	UsageSink      usagecontract.Sink
+	Visibility     capcontract.Registry
 }
 
 // Service 是产品无关的 Skill 编排服务。
@@ -59,7 +62,7 @@ func New(sources []contract.Source, opts Options) *Service {
 func (s *Service) Catalog(ctx context.Context, req contract.CatalogRequest) (model.Catalog, error) {
 	started := time.Now()
 	key := cacheKey(req)
-	if !req.ForceReload {
+	if !req.ForceReload && s.opts.Visibility == nil {
 		s.mu.RLock()
 		if cached, ok := s.cache[key]; ok {
 			s.mu.RUnlock()
@@ -102,6 +105,7 @@ func (s *Service) Catalog(ctx context.Context, req contract.CatalogRequest) (mod
 			catalog.Entries = append(catalog.Entries, entry)
 		}
 	}
+	catalog.Entries = s.filterVisibleSkills(ctx, catalog.Entries)
 	sort.SliceStable(catalog.Entries, func(i, j int) bool {
 		li, lj := scopeRank(catalog.Entries[i].Scope), scopeRank(catalog.Entries[j].Scope)
 		if li != lj {
@@ -110,7 +114,7 @@ func (s *Service) Catalog(ctx context.Context, req contract.CatalogRequest) (mod
 		return catalog.Entries[i].QualifiedName < catalog.Entries[j].QualifiedName
 	})
 
-	if len(catalog.Errors) == 0 {
+	if len(catalog.Errors) == 0 && s.opts.Visibility == nil {
 		s.mu.Lock()
 		s.cache[key] = cloneCatalog(catalog)
 		s.mu.Unlock()
@@ -119,6 +123,59 @@ func (s *Service) Catalog(ctx context.Context, req contract.CatalogRequest) (mod
 	meta["source_count"] = fmt.Sprintf("%d", len(s.sources))
 	s.record(ctx, "catalog.list", true, started, meta)
 	return catalog, nil
+}
+
+func (s *Service) filterVisibleSkills(ctx context.Context, entries []model.Metadata) []model.Metadata {
+	if s.opts.Visibility == nil || len(entries) == 0 {
+		return entries
+	}
+	records, err := s.opts.Visibility.ListCapabilities(ctx, capmodel.CapabilityQuery{Types: []capmodel.CapabilityType{capmodel.CapabilityTypeSkill}, IncludeDisabled: true})
+	if err != nil || len(records) == 0 {
+		return entries
+	}
+	out := make([]model.Metadata, 0, len(entries))
+	for _, entry := range entries {
+		matched := false
+		visible := false
+		for _, record := range records {
+			if !matchesSkillCapability(entry, record) {
+				continue
+			}
+			matched = true
+			if record.Enabled {
+				visible = true
+				break
+			}
+		}
+		if !matched || visible {
+			out = append(out, entry)
+		}
+	}
+	return out
+}
+
+func matchesSkillCapability(entry model.Metadata, record capmodel.CapabilityIndexRecord) bool {
+	if record.Type != capmodel.CapabilityTypeSkill {
+		return false
+	}
+	if record.Package != "" && (record.Package == string(entry.PackageID) || record.Spec == string(entry.PackageID)) {
+		return true
+	}
+	if entry.Scope == model.ScopePlugin && record.Name != "" && (record.Name == entry.Name || record.Name == entry.QualifiedName || record.Name == entry.ID) {
+		return true
+	}
+	resource := normalizeVisibilityPath(record.ResourcePath)
+	main := normalizeVisibilityPath(string(entry.MainResource))
+	return resource != "" && (resource == main || strings.HasSuffix(resource, "/"+main) || strings.HasSuffix(main, "/"+resource))
+}
+
+func normalizeVisibilityPath(value string) string {
+	value = strings.TrimSpace(strings.ReplaceAll(value, "\\", "/"))
+	value = strings.TrimPrefix(value, "./")
+	if idx := strings.Index(value, "skills/"); idx >= 0 {
+		value = value[idx+len("skills/"):]
+	}
+	return strings.Trim(value, "/")
 }
 
 type sourceSnapshot struct {
@@ -225,6 +282,27 @@ func (s *Service) ReadResource(ctx context.Context, req contract.ResourceRequest
 	return out, nil
 }
 
+func (s *Service) ListResources(ctx context.Context, req contract.ListResourcesRequest) (model.ResourceList, error) {
+	started := time.Now()
+	meta, err := s.resolveResourceOwner(ctx, req.ResolveRequest, req.PackageID)
+	if err != nil {
+		s.record(ctx, "resource.list", false, started, nil)
+		return model.ResourceList{}, err
+	}
+	source := s.sourceFor(meta.Authority)
+	if source == nil {
+		return model.ResourceList{}, fmt.Errorf("skill source不可用: %s", meta.Authority.String())
+	}
+	result, err := source.ListResources(ctx, contract.SourceListResourcesRequest{PackageID: meta.PackageID})
+	if err != nil {
+		s.record(ctx, "resource.list", false, started, skillMetadata(meta))
+		return model.ResourceList{}, err
+	}
+	metadata := skillMetadata(meta)
+	metadata["resource_count"] = fmt.Sprintf("%d", len(result.Resources))
+	s.record(ctx, "resource.list", true, started, metadata)
+	return model.ResourceList{Skill: result.Metadata, Resources: result.Resources}, nil
+}
 func (s *Service) SearchResources(ctx context.Context, req contract.SearchResourcesRequest) (model.SearchResult, error) {
 	started := time.Now()
 	meta, err := s.resolveResourceOwner(ctx, req.ResolveRequest, req.PackageID)

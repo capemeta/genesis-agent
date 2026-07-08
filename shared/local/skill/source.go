@@ -4,6 +4,7 @@ package skill
 import (
 	"context"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -128,6 +129,54 @@ func (s *Source) Read(ctx context.Context, req contract.ReadRequest) (contract.R
 	return contract.ReadResult{}, fmt.Errorf("未找到skill package: %s", pkg)
 }
 
+func (s *Source) ListResources(ctx context.Context, req contract.SourceListResourcesRequest) (contract.ListResourcesResult, error) {
+	select {
+	case <-ctx.Done():
+		return contract.ListResourcesResult{}, ctx.Err()
+	default:
+	}
+	pkg := strings.TrimSpace(string(req.PackageID))
+	if pkg == "" {
+		return contract.ListResourcesResult{}, fmt.Errorf("package_id不能为空")
+	}
+	for _, root := range s.roots {
+		meta, _, baseDir, err := s.readFull(root, pkg)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return contract.ListResourcesResult{}, err
+		}
+		resources := make([]model.ResourceInfo, 0)
+		err = filepath.WalkDir(baseDir, func(path string, entry fs.DirEntry, walkErr error) error {
+			if walkErr != nil || entry.IsDir() {
+				return walkErr
+			}
+			if entry.Type()&os.ModeSymlink != 0 {
+				return nil
+			}
+			resource, ok := resourceIDForPath(baseDir, pkg, path)
+			if !ok || !isAllowedResource(resource) {
+				return nil
+			}
+			info := model.ResourceInfo{Resource: resource, Kind: resourceKind(resource), Name: filepath.Base(path)}
+			if stat, err := entry.Info(); err == nil {
+				info.Size = stat.Size()
+			}
+			if data, err := os.ReadFile(path); err == nil && utf8.Valid(data) {
+				info.Text = true
+			}
+			resources = append(resources, info)
+			return nil
+		})
+		if err != nil {
+			return contract.ListResourcesResult{}, err
+		}
+		sort.SliceStable(resources, func(i, j int) bool { return resources[i].Resource < resources[j].Resource })
+		return contract.ListResourcesResult{Metadata: meta, Resources: resources, Version: meta.Version}, nil
+	}
+	return contract.ListResourcesResult{}, fmt.Errorf("未找到skill package: %s", pkg)
+}
 func (s *Source) Search(ctx context.Context, req contract.SearchRequest) (contract.SearchResult, error) {
 	pkg := strings.TrimSpace(string(req.PackageID))
 	query := strings.TrimSpace(req.Query)
@@ -304,6 +353,36 @@ func isAllowedResource(resource model.ResourceID) bool {
 	}
 }
 
+const textProbeBytes = 8 * 1024
+
+func isTextFile(path string) (bool, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, textProbeBytes+1))
+	if err != nil {
+		return false, err
+	}
+	return utf8.Valid(data), nil
+}
+func resourceKind(resource model.ResourceID) model.ResourceKind {
+	parts := strings.Split(filepath.ToSlash(strings.TrimSpace(string(resource))), "/")
+	if len(parts) < 2 {
+		return ""
+	}
+	switch parts[1] {
+	case "references":
+		return model.ResourceKindReference
+	case "scripts":
+		return model.ResourceKindScript
+	case "assets":
+		return model.ResourceKindAsset
+	default:
+		return ""
+	}
+}
 func pathForResource(baseDir, pkg string, resource model.ResourceID) (string, error) {
 	value := filepath.ToSlash(strings.TrimSpace(string(resource)))
 	prefix := pkg + "/"

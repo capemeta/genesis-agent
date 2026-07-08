@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"path"
 	"sort"
@@ -103,6 +104,45 @@ func (s *Source) Read(ctx context.Context, req contract.ReadRequest) (contract.R
 	return contract.ReadResult{Metadata: meta, Resource: model.ResourceID(resource), Content: content, Truncated: truncated, Version: meta.Version}, nil
 }
 
+func (s *Source) ListResources(ctx context.Context, req contract.SourceListResourcesRequest) (contract.ListResourcesResult, error) {
+	select {
+	case <-ctx.Done():
+		return contract.ListResourcesResult{}, ctx.Err()
+	default:
+	}
+	pkg := strings.TrimSpace(string(req.PackageID))
+	if pkg == "" {
+		return contract.ListResourcesResult{}, fmt.Errorf("package_id不能为空")
+	}
+	meta, _, err := s.readFull(pkg)
+	if err != nil {
+		return contract.ListResourcesResult{}, err
+	}
+	resources := make([]model.ResourceInfo, 0)
+	err = fs.WalkDir(s.root, pkg, func(p string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil || entry.IsDir() {
+			return walkErr
+		}
+		resource := model.ResourceID(p)
+		if !isAllowedResource(resource) {
+			return nil
+		}
+		info := model.ResourceInfo{Resource: resource, Kind: resourceKind(resource), Name: path.Base(p)}
+		if stat, err := entry.Info(); err == nil {
+			info.Size = stat.Size()
+		}
+		if data, err := fs.ReadFile(s.root, p); err == nil && utf8.Valid(data) {
+			info.Text = true
+		}
+		resources = append(resources, info)
+		return nil
+	})
+	if err != nil {
+		return contract.ListResourcesResult{}, err
+	}
+	sort.SliceStable(resources, func(i, j int) bool { return resources[i].Resource < resources[j].Resource })
+	return contract.ListResourcesResult{Metadata: meta, Resources: resources, Version: meta.Version}, nil
+}
 func (s *Source) Search(ctx context.Context, req contract.SearchRequest) (contract.SearchResult, error) {
 	select {
 	case <-ctx.Done():
@@ -213,6 +253,36 @@ func isAllowedResource(resource model.ResourceID) bool {
 	}
 }
 
+const textProbeBytes = 8 * 1024
+
+func (s *Source) isTextResource(p string) (bool, error) {
+	file, err := s.root.Open(p)
+	if err != nil {
+		return false, err
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, textProbeBytes+1))
+	if err != nil {
+		return false, err
+	}
+	return utf8.Valid(data), nil
+}
+func resourceKind(resource model.ResourceID) model.ResourceKind {
+	parts := strings.Split(path.Clean(strings.TrimSpace(string(resource))), "/")
+	if len(parts) < 2 {
+		return ""
+	}
+	switch parts[1] {
+	case "references":
+		return model.ResourceKindReference
+	case "scripts":
+		return model.ResourceKindScript
+	case "assets":
+		return model.ResourceKindAsset
+	default:
+		return ""
+	}
+}
 func truncateUTF8(value string, maxBytes int) (string, bool) {
 	if maxBytes <= 0 || len(value) <= maxBytes {
 		return value, false

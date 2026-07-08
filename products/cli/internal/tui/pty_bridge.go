@@ -6,7 +6,65 @@ import (
 	"os"
 
 	"golang.org/x/term"
+	execcontract "genesis-agent/internal/capabilities/execution/contract"
 )
+
+// SessionWriter 将 WriteStdin 包装为 io.Writer。
+type SessionWriter struct {
+	Ctx       context.Context
+	Manager   execcontract.InteractiveSessionRunner
+	SessionID string
+}
+
+func (w *SessionWriter) Write(p []byte) (n int, err error) {
+	err = w.Manager.WriteStdin(w.Ctx, w.SessionID, p)
+	if err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+// SessionReader 将 SubscribeOutput 包装为 io.Reader。
+type SessionReader struct {
+	Ctx      context.Context
+	Ch       <-chan []byte
+	Leftover []byte
+}
+
+func (r *SessionReader) Read(p []byte) (n int, err error) {
+	if len(r.Leftover) > 0 {
+		n = copy(p, r.Leftover)
+		r.Leftover = r.Leftover[n:]
+		return n, nil
+	}
+	select {
+	case <-r.Ctx.Done():
+		return 0, r.Ctx.Err()
+	case data, ok := <-r.Ch:
+		if !ok {
+			return 0, io.EOF
+		}
+		n = copy(p, data)
+		if n < len(data) {
+			r.Leftover = data[n:]
+		}
+		return n, nil
+	}
+}
+
+// BridgeSession 物理双向桥接特定的 PTY 会话到系统终端。
+func BridgeSession(ctx context.Context, sessionID string, manager execcontract.InteractiveSessionRunner) error {
+	outputCh, cancel, err := manager.SubscribeOutput(ctx, sessionID)
+	if err != nil {
+		return err
+	}
+	defer cancel()
+
+	w := &SessionWriter{Ctx: ctx, Manager: manager, SessionID: sessionID}
+	r := &SessionReader{Ctx: ctx, Ch: outputCh}
+
+	return BridgeRawTerminal(ctx, w, r)
+}
 
 // BridgeRawTerminal 临时使当前终端进入 RAW 模式，物理桥接宿主 Stdin 和 Stdout。
 // 此接管机制提供 0 延迟、100% 原生的终端体验，支持 Tab 补全及 Vim 输入。

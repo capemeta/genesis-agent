@@ -104,6 +104,25 @@ func (s *Source) Read(ctx context.Context, req contract.ReadRequest) (contract.R
 	return contract.ReadResult{Metadata: skill.Metadata, Resource: resource, Content: content, Truncated: truncated, Version: skill.Metadata.Version}, nil
 }
 
+func (s *Source) ListResources(ctx context.Context, req contract.SourceListResourcesRequest) (contract.ListResourcesResult, error) {
+	select {
+	case <-ctx.Done():
+		return contract.ListResourcesResult{}, ctx.Err()
+	default:
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	skill, ok := s.skills[req.PackageID]
+	if !ok {
+		return contract.ListResourcesResult{}, fmt.Errorf("未找到skill package: %s", req.PackageID)
+	}
+	resources := make([]model.ResourceInfo, 0, len(skill.Resources))
+	for resource, content := range skill.Resources {
+		resources = append(resources, model.ResourceInfo{Resource: resource, Kind: resourceKind(resource), Name: resourceName(resource), Size: int64(len(content)), Text: utf8.ValidString(content)})
+	}
+	sort.SliceStable(resources, func(i, j int) bool { return resources[i].Resource < resources[j].Resource })
+	return contract.ListResourcesResult{Metadata: skill.Metadata, Resources: resources, Version: skill.Metadata.Version}, nil
+}
 func (s *Source) Search(ctx context.Context, req contract.SearchRequest) (contract.SearchResult, error) {
 	select {
 	case <-ctx.Done():
@@ -138,6 +157,30 @@ func (s *Source) Search(ctx context.Context, req contract.SearchRequest) (contra
 	return contract.SearchResult{Matches: matches}, nil
 }
 
+func resourceKind(resource model.ResourceID) model.ResourceKind {
+	parts := strings.Split(strings.TrimSpace(string(resource)), "/")
+	if len(parts) < 2 {
+		return ""
+	}
+	switch parts[1] {
+	case "references":
+		return model.ResourceKindReference
+	case "scripts":
+		return model.ResourceKindScript
+	case "assets":
+		return model.ResourceKindAsset
+	default:
+		return ""
+	}
+}
+
+func resourceName(resource model.ResourceID) string {
+	parts := strings.Split(strings.TrimSpace(string(resource)), "/")
+	if len(parts) == 0 {
+		return string(resource)
+	}
+	return parts[len(parts)-1]
+}
 func truncateUTF8(value string, maxBytes int) (string, bool) {
 	if maxBytes <= 0 || len(value) <= maxBytes {
 		return value, false

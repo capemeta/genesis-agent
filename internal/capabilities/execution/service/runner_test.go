@@ -8,20 +8,28 @@ import (
 	execmodel "genesis-agent/internal/capabilities/execution/model"
 )
 
-type fakeDirectRunner struct{ called bool }
+type fakeDirectRunner struct {
+	called bool
+	cmd    execmodel.Command
+}
 
 func (r *fakeDirectRunner) Run(ctx context.Context, cmd execmodel.Command, opts execcontract.RunOptions) (*execmodel.Result, error) {
 	r.called = true
+	r.cmd = cmd
 	return &execmodel.Result{Command: cmd.Command, Environment: execmodel.EnvironmentLocal}, nil
 }
 
 type fakeSandboxRunner struct {
 	called bool
 	result *execmodel.Result
+	err    error
 }
 
 func (r *fakeSandboxRunner) RunInSandbox(ctx context.Context, cmd execmodel.Command, sandbox execmodel.SandboxProfile, opts execcontract.RunOptions) (*execmodel.Result, error) {
 	r.called = true
+	if r.err != nil {
+		return nil, r.err
+	}
 	if r.result != nil {
 		return r.result, nil
 	}
@@ -47,6 +55,36 @@ func TestRunnerUsesDirectWhenSandboxDisabled(t *testing.T) {
 	}
 }
 
+func TestRunnerInjectsLocalWorkspaceEnvWithoutChangingCwd(t *testing.T) {
+	direct := &fakeDirectRunner{}
+	runner, err := NewRunner(direct, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = runner.Run(context.Background(), execmodel.Command{
+		Command: "go test ./...",
+		Cwd:     `D:\workspace\go\genesis-agent`,
+		Env:     map[string]string{"A": "B"},
+	}, execcontract.RunOptions{
+		Workspace: execmodel.ExecutionWorkspace{
+			Mode:       execmodel.WorkspaceModeLocalCoding,
+			PathPolicy: execmodel.PathPolicyPermissionOnly,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if direct.cmd.Cwd != `D:\workspace\go\genesis-agent` {
+		t.Fatalf("cwd changed: %q", direct.cmd.Cwd)
+	}
+	if direct.cmd.Env["WORK_DIR"] != `D:\workspace\go\genesis-agent` || direct.cmd.Env["GENESIS_WORKSPACE"] != `D:\workspace\go\genesis-agent` || direct.cmd.Env["TMPDIR"] == "" || direct.cmd.Env["A"] != "B" {
+		t.Fatalf("env=%+v", direct.cmd.Env)
+	}
+	if _, ok := direct.cmd.Env["OUTPUT_DIR"]; ok {
+		t.Fatalf("local coding mode should not invent OUTPUT_DIR: %+v", direct.cmd.Env)
+	}
+}
+
 func TestRunnerUsesSandboxWhenRequired(t *testing.T) {
 	direct := &fakeDirectRunner{}
 	sandbox := &fakeSandboxRunner{}
@@ -63,6 +101,63 @@ func TestRunnerUsesSandboxWhenRequired(t *testing.T) {
 	}
 	if result.Environment != execmodel.EnvironmentSandbox || result.SandboxProvider != "genesis-sandbox" {
 		t.Fatalf("result = %+v", result)
+	}
+}
+
+func TestRunnerStrictRemoteRejectsHostAbsolutePath(t *testing.T) {
+	direct := &fakeDirectRunner{}
+	sandbox := &fakeSandboxRunner{}
+	runner, err := NewRunner(direct, sandbox)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = runner.Run(context.Background(), execmodel.Command{Command: `python read.py D:\data\input.xlsx`}, execcontract.RunOptions{
+		Sandbox: execmodel.SandboxProfile{Mode: execmodel.SandboxRequired, Provider: "genesis-sandbox"},
+	})
+	if code := execcontract.CodeOf(err); code != execcontract.ErrCodeInvalidInput {
+		t.Fatalf("CodeOf(err)=%s err=%v", code, err)
+	}
+	if direct.called || sandbox.called {
+		t.Fatalf("runner should not execute after preflight failure: direct=%t sandbox=%t", direct.called, sandbox.called)
+	}
+}
+
+func TestRunnerUsesInjectedPathValidator(t *testing.T) {
+	direct := &fakeDirectRunner{}
+	validator := &fakePathValidator{err: execcontract.NewError(execcontract.ErrCodeInvalidInput, nil)}
+	runner, err := NewRunner(direct, nil, WithPathValidator(validator))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = runner.Run(context.Background(), execmodel.Command{Command: "echo hi"}, execcontract.RunOptions{})
+	if code := execcontract.CodeOf(err); code != execcontract.ErrCodeInvalidInput {
+		t.Fatalf("CodeOf(err)=%s err=%v", code, err)
+	}
+	if !validator.called {
+		t.Fatal("injected validator was not called")
+	}
+	if direct.called {
+		t.Fatal("direct runner should not execute after injected validator failure")
+	}
+}
+
+func TestRunnerPermissionOnlyAllowsLocalCodingAbsolutePath(t *testing.T) {
+	direct := &fakeDirectRunner{}
+	runner, err := NewRunner(direct, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = runner.Run(context.Background(), execmodel.Command{Command: `type D:\workspace\go\genesis-agent\go.mod`}, execcontract.RunOptions{
+		Workspace: execmodel.ExecutionWorkspace{
+			Mode:       execmodel.WorkspaceModeLocalCoding,
+			PathPolicy: execmodel.PathPolicyPermissionOnly,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !direct.called {
+		t.Fatal("direct runner was not called")
 	}
 }
 
@@ -84,6 +179,41 @@ func TestRunnerOptionalSandboxFallbackAddsWarning(t *testing.T) {
 	}
 	if len(result.Warnings) != 1 || result.Warnings[0] != sandboxFallbackWarning {
 		t.Fatalf("Warnings = %+v", result.Warnings)
+	}
+}
+
+func TestRunnerOptionalSandboxUnavailableFallsBack(t *testing.T) {
+	direct := &fakeDirectRunner{}
+	sandbox := &fakeSandboxRunner{err: execcontract.NewError(execcontract.ErrCodeSandboxUnavailable, nil)}
+	runner, err := NewRunner(direct, sandbox)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := runner.Run(context.Background(), execmodel.Command{Command: "echo hi"}, execcontract.RunOptions{Sandbox: execmodel.SandboxProfile{Mode: execmodel.SandboxOptional}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sandbox.called || !direct.called {
+		t.Fatalf("sandbox=%t direct=%t", sandbox.called, direct.called)
+	}
+	if result.Environment != execmodel.EnvironmentLocal || len(result.Warnings) != 1 {
+		t.Fatalf("result=%+v", result)
+	}
+}
+
+func TestRunnerOptionalSandboxPermissionDeniedDoesNotFallback(t *testing.T) {
+	direct := &fakeDirectRunner{}
+	sandbox := &fakeSandboxRunner{err: execcontract.NewError(execcontract.ErrCodePermissionDenied, nil)}
+	runner, err := NewRunner(direct, sandbox)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = runner.Run(context.Background(), execmodel.Command{Command: "echo hi"}, execcontract.RunOptions{Sandbox: execmodel.SandboxProfile{Mode: execmodel.SandboxOptional}})
+	if code := execcontract.CodeOf(err); code != execcontract.ErrCodePermissionDenied {
+		t.Fatalf("CodeOf(err)=%s err=%v", code, err)
+	}
+	if direct.called {
+		t.Fatal("permission denied should not fall back to direct runner")
 	}
 }
 
@@ -114,4 +244,14 @@ func TestRunnerFailsWhenSandboxRequiredButMissing(t *testing.T) {
 	if code := execcontract.CodeOf(err); code != execcontract.ErrCodeSandboxUnavailable {
 		t.Fatalf("CodeOf(err) = %s, want %s", code, execcontract.ErrCodeSandboxUnavailable)
 	}
+}
+
+type fakePathValidator struct {
+	called bool
+	err    error
+}
+
+func (v *fakePathValidator) ValidateCommand(cmd execmodel.Command, opts execcontract.RunOptions) error {
+	v.called = true
+	return v.err
 }

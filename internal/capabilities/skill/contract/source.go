@@ -14,6 +14,7 @@ type Source interface {
 	Authority() model.Authority
 	List(ctx context.Context, query ListQuery) (ListResult, error)
 	Read(ctx context.Context, req ReadRequest) (ReadResult, error)
+	ListResources(ctx context.Context, req SourceListResourcesRequest) (ListResourcesResult, error)
 	Search(ctx context.Context, req SearchRequest) (SearchResult, error)
 }
 
@@ -65,6 +66,18 @@ type ReadResult struct {
 	Content   string
 	Version   string
 	Truncated bool
+}
+
+type SourceListResourcesRequest struct {
+	Authority model.Authority
+	PackageID model.PackageID
+	Version   string
+}
+
+type ListResourcesResult struct {
+	Metadata  model.Metadata
+	Resources []model.ResourceInfo
+	Version   string
 }
 
 type SearchRequest struct {

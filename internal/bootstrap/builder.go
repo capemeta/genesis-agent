@@ -19,6 +19,8 @@ import (
 	llmadapter "genesis-agent/internal/capabilities/llm/adapter"
 	"genesis-agent/internal/capabilities/memory/adapter/inmemory"
 	memorycontract "genesis-agent/internal/capabilities/memory/contract"
+	planmemory "genesis-agent/internal/capabilities/plan/adapter/memory"
+	plancontract "genesis-agent/internal/capabilities/plan/contract"
 	"genesis-agent/internal/capabilities/plan/service"
 	profilemodel "genesis-agent/internal/capabilities/profile/model"
 	"genesis-agent/internal/capabilities/tool/adapter/builtin"
@@ -38,7 +40,10 @@ import (
 	sloglogger "genesis-agent/internal/platform/logger"
 	promptbuilder "genesis-agent/internal/runtime/prompt"
 	"genesis-agent/internal/runtime/strategy/react"
-	localplan "genesis-agent/shared/local/plan"
+
+	webcontract "genesis-agent/internal/capabilities/web/contract"
+	webfetchtool "genesis-agent/internal/capabilities/web/tool/web_fetch"
+	websearchtool "genesis-agent/internal/capabilities/web/tool/web_search"
 )
 
 const (
@@ -47,9 +52,19 @@ const (
 	defaultAgentDisplayName = "Genesis Agent"
 )
 
+// WebBuildOptions 描述 web_search 和 web_fetch 的构建参数
+type WebBuildOptions struct {
+	Enabled        bool
+	Searcher       webcontract.Searcher
+	Fetcher        webcontract.FetchService
+	RegisterSearch bool
+	RegisterFetch  bool
+}
+
 // BuildOptions 描述产品无关运行时构建参数。
 // 产品分发层只能通过这些显式参数覆盖默认装配行为。
 type BuildOptions struct {
+	Product          string
 	ConfigDir        string
 	Quiet            bool
 	RouteName        string
@@ -60,6 +75,8 @@ type BuildOptions struct {
 	PromptInjectors  []promptbuilder.ContextInjector
 	AuditSink        auditcontract.Sink
 	UsageSink        usagecontract.Sink
+	Web              WebBuildOptions
+	PlanRepository   plancontract.Repository
 }
 
 // RuntimeBundle 聚合 shared builder 构建出的运行时依赖。
@@ -95,7 +112,11 @@ func BuildAgentService(ctx context.Context, opts BuildOptions) (*RuntimeBundle, 
 	}
 	toolSet := opts.Profile.Tools
 
-	cfg, err := config.Load(configDir)
+	product := strings.TrimSpace(opts.Product)
+	if product == "" {
+		product = "cli"
+	}
+	cfg, err := config.LoadForProduct(configDir, product)
 	if err != nil {
 		return nil, fmt.Errorf("%w\n提示: 检查 %s/config.yaml，或通过 AGENT_LLM_API_KEY 注入 API Key", err, configDir)
 	}
@@ -141,11 +162,10 @@ func BuildAgentService(ctx context.Context, opts BuildOptions) (*RuntimeBundle, 
 		return nil, err
 	}
 
-	// ── 初始化 Plan 本地存储与应用服务 ───────────────────────────
-	planRepoDir := filepath.Join(filepath.Dir(configDir), ".genesis", "plans")
-	planRepo, err := localplan.NewFileRepository(planRepoDir)
-	if err != nil {
-		return nil, fmt.Errorf("初始化 Plan 本地存储失败: %w", err)
+	// ── 初始化 Plan 应用服务 ───────────────────────────
+	planRepo := opts.PlanRepository
+	if planRepo == nil {
+		planRepo = planmemory.New()
 	}
 	planSvc := service.NewPlanService(planRepo, nil, 3)
 
@@ -156,6 +176,30 @@ func BuildAgentService(ctx context.Context, opts BuildOptions) (*RuntimeBundle, 
 	baseRegistry.Register(builtin.NewTodoReadTool(planSvc))
 	baseRegistry.Register(builtin.NewTodoWriteTool(planSvc))
 	baseRegistry.Register(builtin.NewTodoUpdateStepTool(planSvc))
+
+	if opts.Web.Enabled {
+		if opts.Web.RegisterSearch {
+			if opts.Web.Searcher == nil {
+				return nil, fmt.Errorf("RegisterSearch is true but Searcher is nil")
+			}
+			searchTool, err := websearchtool.New(opts.Web.Searcher)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create web_search tool: %w", err)
+			}
+			baseRegistry.Register(searchTool)
+		}
+		if opts.Web.RegisterFetch {
+			if opts.Web.Fetcher == nil {
+				return nil, fmt.Errorf("RegisterFetch is true but Fetcher is nil")
+			}
+			fetchTool, err := webfetchtool.New(opts.Web.Fetcher)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create web_fetch tool: %w", err)
+			}
+			baseRegistry.Register(fetchTool)
+		}
+	}
+
 	for _, t := range opts.AdditionalTools {
 		if t != nil {
 			baseRegistry.Register(t)

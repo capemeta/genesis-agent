@@ -5,10 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	capmodel "genesis-agent/internal/capabilities/capability/model"
 	"strings"
 
 	approvalcontract "genesis-agent/internal/capabilities/approval/contract"
 	approvalmodel "genesis-agent/internal/capabilities/approval/model"
+	capcontract "genesis-agent/internal/capabilities/capability/contract"
 	skillcontract "genesis-agent/internal/capabilities/skill/contract"
 	"genesis-agent/internal/capabilities/skill/model"
 	tool "genesis-agent/internal/capabilities/tool/contract"
@@ -18,6 +20,7 @@ type Deps struct {
 	Service        skillcontract.Service
 	Approval       approvalcontract.Service
 	CatalogRequest skillcontract.CatalogRequest
+	Registry       capcontract.Registry
 }
 
 type Tool struct{ deps Deps }
@@ -47,7 +50,7 @@ func New(deps Deps) (tool.Tool, error) {
 }
 
 func (t *Tool) GetInfo() *tool.Info {
-	return &tool.Info{Name: "read_skill_resource", Description: "读取已加载或已发现 Skill 包内 references/assets/scripts 资源。resource 是不透明ID，不能当本地路径使用。", Parameters: &tool.ParameterSchema{Type: "object", Properties: map[string]*tool.ParameterSchema{"name": {Type: "string", Description: "Skill 名称或 qualified_name"}, "package": {Type: "string", Description: "可选 package id，用于直接定位 skill"}, "resource": {Type: "string", Description: "Skill ResourceID，例如 review/references/guide.md"}, "max_bytes": {Type: "integer", Description: "最大读取字节数"}}, Required: []string{"resource"}}, Traits: tool.ToolTraits{Exposure: tool.ToolExposureDirect, ReadOnly: true, ConcurrencySafe: true, NeedsPermission: true}}
+	return &tool.Info{Name: "read_skill_resource", Description: "读取已加载或已发现 Skill 包内 references、scripts、assets 的 UTF-8 文本资源。二进制 assets 只能先通过 list_skill_resources 发现，不能用本工具直接读取。resource 是不透明ID，不能当本地路径使用。", Parameters: &tool.ParameterSchema{Type: "object", Properties: map[string]*tool.ParameterSchema{"name": {Type: "string", Description: "Skill 名称或 qualified_name"}, "package": {Type: "string", Description: "可选 package id，用于直接定位 skill"}, "resource": {Type: "string", Description: "Skill ResourceID，例如 review/references/guide.md"}, "max_bytes": {Type: "integer", Description: "最大读取字节数"}}, Required: []string{"resource"}}, Traits: tool.ToolTraits{Exposure: tool.ToolExposureDirect, ReadOnly: true, ConcurrencySafe: true, NeedsPermission: true}}
 }
 
 func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
@@ -63,6 +66,9 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 	if err := t.authorize(ctx, pkg, resource); err != nil {
 		return "", err
 	}
+	if err := t.ensureIndexed(ctx, pkg, strings.TrimSpace(in.Name), resource); err != nil {
+		return "", err
+	}
 	content, err := t.deps.Service.ReadResource(ctx, skillcontract.ResourceRequest{ResolveRequest: skillcontract.ResolveRequest{CatalogRequest: t.deps.CatalogRequest, Name: strings.TrimSpace(in.Name)}, PackageID: pkg, Resource: resource, MaxBytes: in.MaxBytes})
 	if err != nil {
 		return "", err
@@ -74,6 +80,53 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 	return string(data), nil
 }
 
+func (t *Tool) ensureIndexed(ctx context.Context, pkg model.PackageID, name string, resource model.ResourceID) error {
+	if t.deps.Registry == nil {
+		return nil
+	}
+	records, err := t.deps.Registry.ListCapabilities(ctx, capmodel.CapabilityQuery{Types: []capmodel.CapabilityType{capmodel.CapabilityTypeSkillResource}})
+	if err != nil {
+		return err
+	}
+	needle := normalizeResourcePath(string(resource))
+	matchedScope := false
+	for _, record := range records {
+		if !matchesPackageOrSkill(record, pkg, name) {
+			continue
+		}
+		matchedScope = true
+		if normalizeResourcePath(record.ResourcePath) == needle {
+			return nil
+		}
+	}
+	if !matchedScope {
+		return nil
+	}
+	return fmt.Errorf("skill resource %q 未在CapabilityIndex中启用或不存在", resource)
+}
+
+func matchesPackageOrSkill(record capmodel.CapabilityIndexRecord, pkg model.PackageID, name string) bool {
+	if pkg != "" {
+		value := string(pkg)
+		if record.Package != value && record.Spec != value {
+			return false
+		}
+	}
+	if strings.TrimSpace(name) == "" {
+		return true
+	}
+	needle := strings.ToLower(strings.TrimSpace(name))
+	return strings.Contains(strings.ToLower(record.Name), needle) || strings.Contains(strings.ToLower(record.ResourcePath), "/"+needle+"/")
+}
+
+func normalizeResourcePath(value string) string {
+	value = strings.TrimSpace(strings.ReplaceAll(value, "\\", "/"))
+	value = strings.TrimPrefix(value, "./")
+	if idx := strings.Index(value, "skills/"); idx >= 0 {
+		value = value[idx+len("skills/"):]
+	}
+	return strings.Trim(value, "/")
+}
 func (t *Tool) authorize(ctx context.Context, pkg model.PackageID, resource model.ResourceID) error {
 	decision, err := t.deps.Approval.Authorize(ctx, approvalmodel.Request{ToolName: "read_skill_resource", Action: approvalmodel.ActionSkillResourceRead, Resource: approvalmodel.Resource{Type: "skill_resource", URI: string(pkg) + ":" + string(resource), Display: string(resource), Metadata: map[string]string{"trusted": "true", "package": string(pkg), "resource": string(resource)}}, Reason: "读取Skill包内资源", Risk: approvalmodel.RiskLow})
 	if err != nil {

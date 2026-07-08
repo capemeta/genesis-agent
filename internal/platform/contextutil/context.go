@@ -6,11 +6,13 @@ import "context"
 type tenantKey struct{}
 type userKey struct{}
 type sessionKey struct{}
+type sandboxProfileKey struct{}
 
 var (
-	tenantIDKey  = tenantKey{}
-	userIDKey    = userKey{}
-	sessionIDKey = sessionKey{}
+	tenantIDKey        = tenantKey{}
+	userIDKey          = userKey{}
+	sessionIDKey       = sessionKey{}
+	sandboxOverrideKey = sandboxProfileKey{}
 )
 
 // WithTenantID 将租户 ID 注入 context
@@ -44,4 +46,18 @@ func WithSessionID(ctx context.Context, sessionID string) context.Context {
 func GetSessionID(ctx context.Context) (string, bool) {
 	val, ok := ctx.Value(sessionIDKey).(string)
 	return val, ok
+}
+
+// WithSandboxProfileOverride 将会话级 sandbox 执行意图注入 context。
+func WithSandboxProfileOverride(ctx context.Context, profile any) context.Context {
+	return context.WithValue(ctx, sandboxOverrideKey, profile)
+}
+
+// GetSandboxProfileOverride 从 context 提取会话级 sandbox 执行意图。
+func GetSandboxProfileOverride(ctx context.Context) (any, bool) {
+	val := ctx.Value(sandboxOverrideKey)
+	if val == nil {
+		return nil, false
+	}
+	return val, true
 }

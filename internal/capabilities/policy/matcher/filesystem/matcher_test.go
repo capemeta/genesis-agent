@@ -103,3 +103,33 @@ func fileReq(action approvalmodel.Action, scope string, op string, path string) 
 	metadata := map[string]string{"scope": scope, "path_scope": scope, "operation": op, "backend": path}
 	return approvalmodel.Request{Action: action, Resource: approvalmodel.Resource{Type: "file", URI: "file://" + path, Metadata: metadata}, Metadata: metadata, SuggestedScopes: []approvalmodel.GrantScope{approvalmodel.GrantScopeOnce, approvalmodel.GrantScopeSession}}
 }
+
+func TestMatcherConfiguredWorkspaceMetadataPathDenied(t *testing.T) {
+	cfg := files()
+	cfg.WorkspaceMetadata.Paths = []string{".genesis", ".custom/meta"}
+	matcher := New(defaults(), cfg)
+	req := fileReq(approvalmodel.ActionFileWrite, "workspace", "write", `D:\work\.genesis\config.yaml`)
+	req.Metadata["workspace_rel"] = `.genesis\config.yaml`
+	result, ok, err := matcher.Match(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || result.Type != approvalmodel.PolicyDeny || result.Risk != approvalmodel.RiskCritical {
+		t.Fatalf("result=%+v ok=%v, want configured metadata deny", result, ok)
+	}
+}
+
+func TestMatcherConfiguredWorkspaceMetadataReadAllowed(t *testing.T) {
+	cfg := files()
+	cfg.WorkspaceMetadata.Paths = []string{".genesis"}
+	matcher := New(defaults(), cfg)
+	req := fileReq(approvalmodel.ActionFileRead, "workspace", "read", `D:\work\.genesis\config.yaml`)
+	req.Metadata["workspace_rel"] = `.genesis/config.yaml`
+	result, ok, err := matcher.Match(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || result.Type != approvalmodel.PolicyAllow {
+		t.Fatalf("result=%+v ok=%v, want read allowed by workspace policy", result, ok)
+	}
+}

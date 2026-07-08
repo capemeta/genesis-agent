@@ -36,6 +36,7 @@ type Deps struct {
 	Approval       approvalcontract.Service
 	Locker         scheduler.ResourceLocker
 	Sandbox        execmodel.SandboxProfile
+	BridgeTerminal func(ctx context.Context, sessionID string) error // 桥接终端交互回调 (可选)
 }
 
 // Validate 校验依赖。
@@ -162,8 +163,12 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 	runOpts := execcontract.RunOptions{
 		Timeout:        timeoutOf(in.TimeoutMS),
 		MaxOutputBytes: outputLimitOf(in.MaxOutputBytes),
-		Sandbox:        sandboxProfile(t.deps.Sandbox),
+		Sandbox:        sandboxProfile(ctx, t.deps.Sandbox),
 	}
+	if runOpts.Sandbox.Metadata == nil {
+		runOpts.Sandbox.Metadata = make(map[string]string)
+	}
+	runOpts.Sandbox.Metadata["path_scope"] = string(cwd.Scope)
 
 	// 如果指定了后台运行或伪终端，则交由 SessionManager 管理
 	if in.Background || in.UsePTY {
@@ -190,6 +195,23 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 			}
 			data, _ := json.MarshalIndent(res, "", "  ")
 			return string(data), nil
+		}
+
+		// 如果是同步 PTY 模式且配置了终端物理桥接回调，则直接调用物理接管桥接
+		if t.deps.BridgeTerminal != nil {
+			err = t.deps.BridgeTerminal(ctx, sessionID)
+			if err != nil {
+				_ = t.deps.SessionManager.KillSession(context.Background(), sessionID)
+				return "", err
+			}
+			res := &execmodel.Result{
+				Command:     cmd.Command,
+				Cwd:         cmd.Cwd,
+				Shell:       cmd.Shell,
+				ExitCode:    0,
+				Environment: execmodel.EnvironmentLocal,
+			}
+			return toJSON(res)
 		}
 
 		// 同步 PTY 交互模式：订阅日志并同步等待会话运行结束
@@ -258,7 +280,17 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 	return toJSON(result)
 }
 
-func sandboxProfile(profile execmodel.SandboxProfile) execmodel.SandboxProfile {
+func sandboxProfile(ctx context.Context, profile execmodel.SandboxProfile) execmodel.SandboxProfile {
+	if override, ok := contextutil.GetSandboxProfileOverride(ctx); ok {
+		switch v := override.(type) {
+		case execmodel.SandboxProfile:
+			profile = v
+		case *execmodel.SandboxProfile:
+			if v != nil {
+				profile = *v
+			}
+		}
+	}
 	if profile.Mode == "" {
 		profile.Mode = execmodel.SandboxDisabled
 	}
