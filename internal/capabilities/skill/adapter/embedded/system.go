@@ -5,7 +5,7 @@ import (
 	"io/fs"
 )
 
-//go:embed skills/*
+//go:embed all:skills
 var systemSkills embed.FS
 
 func SystemFS() (fs.FS, error) {

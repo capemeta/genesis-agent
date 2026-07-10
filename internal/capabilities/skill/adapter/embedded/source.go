@@ -64,9 +64,14 @@ func (s *Source) List(ctx context.Context, query contract.ListQuery) (contract.L
 		if !entry.IsDir() {
 			continue
 		}
-		meta, err := s.readMetadata(entry.Name())
+		name := entry.Name()
+		// 以下划线开头的目录是共享资源包（如 _office_common），不是可加载 Skill。
+		if strings.HasPrefix(name, "_") {
+			continue
+		}
+		meta, err := s.readMetadata(name)
 		if err != nil {
-			result.Errors = append(result.Errors, model.Error{Source: s.authority, Path: entry.Name(), Message: err.Error()})
+			result.Errors = append(result.Errors, model.Error{Source: s.authority, Path: name, Message: err.Error()})
 			continue
 		}
 		result.Entries = append(result.Entries, meta)
@@ -119,6 +124,7 @@ func (s *Source) ListResources(ctx context.Context, req contract.SourceListResou
 		return contract.ListResourcesResult{}, err
 	}
 	resources := make([]model.ResourceInfo, 0)
+	seen := map[model.ResourceID]struct{}{}
 	err = fs.WalkDir(s.root, pkg, func(p string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil || entry.IsDir() {
 			return walkErr
@@ -135,9 +141,13 @@ func (s *Source) ListResources(ctx context.Context, req contract.SourceListResou
 			info.Text = true
 		}
 		resources = append(resources, info)
+		seen[resource] = struct{}{}
 		return nil
 	})
 	if err != nil {
+		return contract.ListResourcesResult{}, err
+	}
+	if err := s.appendSharedOfficeResources(pkg, seen, &resources); err != nil {
 		return contract.ListResourcesResult{}, err
 	}
 	sort.SliceStable(resources, func(i, j int) bool { return resources[i].Resource < resources[j].Resource })
@@ -217,6 +227,12 @@ func (s *Source) readResource(pkg string, resource model.ResourceID, maxBytes in
 	}
 	data, err := fs.ReadFile(s.root, value)
 	if err != nil {
+		// office-* 可回退到共享 _office_common/scripts/...
+		if alt, ok := sharedOfficePhysicalPath(pkg, value); ok {
+			data, err = fs.ReadFile(s.root, alt)
+		}
+	}
+	if err != nil {
 		return "", false, err
 	}
 	if !utf8.Valid(data) {
@@ -224,6 +240,61 @@ func (s *Source) readResource(pkg string, resource model.ResourceID, maxBytes in
 	}
 	content, truncated := truncateUTF8(string(data), maxBytes)
 	return content, truncated, nil
+}
+
+// appendSharedOfficeResources 把 _office_common/scripts 叠加为 office-*/scripts 资源视图。
+func (s *Source) appendSharedOfficeResources(pkg string, seen map[model.ResourceID]struct{}, resources *[]model.ResourceInfo) error {
+	if !strings.HasPrefix(pkg, "office-") {
+		return nil
+	}
+	commonRoot := OfficeCommonPackage + "/scripts"
+	return fs.WalkDir(s.root, commonRoot, func(p string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			if errorsIsNotExist(walkErr) {
+				return nil
+			}
+			return walkErr
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		rel := strings.TrimPrefix(p, commonRoot+"/")
+		if rel == p || rel == "" || strings.Contains(rel, "..") {
+			return nil
+		}
+		resource := model.ResourceID(pkg + "/scripts/" + rel)
+		if !isAllowedResource(resource) {
+			return nil
+		}
+		if _, ok := seen[resource]; ok {
+			return nil
+		}
+		info := model.ResourceInfo{Resource: resource, Kind: resourceKind(resource), Name: path.Base(p)}
+		if stat, err := entry.Info(); err == nil {
+			info.Size = stat.Size()
+		}
+		if data, err := fs.ReadFile(s.root, p); err == nil && utf8.Valid(data) {
+			info.Text = true
+		}
+		*resources = append(*resources, info)
+		seen[resource] = struct{}{}
+		return nil
+	})
+}
+
+func sharedOfficePhysicalPath(pkg, logical string) (string, bool) {
+	if !strings.HasPrefix(pkg, "office-") {
+		return "", false
+	}
+	prefix := pkg + "/scripts/"
+	if !strings.HasPrefix(logical, prefix) {
+		return "", false
+	}
+	rel := strings.TrimPrefix(logical, prefix)
+	if rel == "" || strings.Contains(rel, "..") {
+		return "", false
+	}
+	return OfficeCommonPackage + "/scripts/" + rel, true
 }
 
 func readSkillFile(root fs.FS, pkg string, maxBytes int) ([]byte, error) {
@@ -244,6 +315,11 @@ func isAllowedResource(resource model.ResourceID) bool {
 	parts := strings.Split(value, "/")
 	if len(parts) < 3 || parts[0] == "" || strings.Contains(parts[0], "..") {
 		return false
+	}
+	for _, part := range parts {
+		if part == "__pycache__" || strings.HasSuffix(part, ".pyc") {
+			return false
+		}
 	}
 	switch parts[1] {
 	case "references", "assets", "scripts":

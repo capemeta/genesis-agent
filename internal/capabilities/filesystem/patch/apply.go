@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"genesis-agent/internal/capabilities/filesystem/binarygate"
 	fscontract "genesis-agent/internal/capabilities/filesystem/contract"
 	"genesis-agent/internal/capabilities/filesystem/model"
 	"genesis-agent/internal/capabilities/filesystem/permission"
@@ -135,6 +136,9 @@ func (s *Service) applyAdd(ctx context.Context, hunk Hunk, path model.ResolvedPa
 		return err
 	}
 	content := []byte(hunk.Content)
+	if err := binarygate.RejectFakeOfficeBinary(path.DisplayPath, content); err != nil {
+		return err
+	}
 	if err := s.deps.Backend.Write(ctx, path, content, fscontract.WriteOptions{CreateParents: true, Overwrite: true, Atomic: true, ExpectedHash: expectedHash}); err != nil {
 		return err
 	}
@@ -173,6 +177,9 @@ func (s *Service) applyUpdate(ctx context.Context, hunk Hunk, source model.Resol
 		if err != nil {
 			return err
 		}
+		if err := binarygate.RejectFakeOfficeBinary(dest.DisplayPath, []byte(next)); err != nil {
+			return err
+		}
 		if err := s.deps.Backend.Write(ctx, dest, []byte(next), fscontract.WriteOptions{CreateParents: true, Overwrite: true, Atomic: true, ExpectedHash: destHash}); err != nil {
 			return err
 		}
@@ -180,6 +187,9 @@ func (s *Service) applyUpdate(ctx context.Context, hunk Hunk, source model.Resol
 			return err
 		}
 		return s.recordWrite(ctx, dest, []byte(next))
+	}
+	if err := binarygate.RejectFakeOfficeBinary(source.DisplayPath, []byte(next)); err != nil {
+		return err
 	}
 	if err := s.deps.Backend.Write(ctx, source, []byte(next), fscontract.WriteOptions{Overwrite: true, Atomic: true, ExpectedHash: hash}); err != nil {
 		return err

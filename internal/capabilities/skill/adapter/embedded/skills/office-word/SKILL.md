@@ -7,14 +7,15 @@ allowed-tools:
   - read_file
   - write_file
   - edit_file
-  - run_command
+  - run_skill_script
+  - list_skill_resources
   - read_skill_resource
   - search_skill_resources
 dependencies:
   tools:
     - type: tool
-      value: run_command
-      description: 在受控执行环境中运行 Word/OpenXML/LibreOffice 脚本
+      value: run_skill_script
+      description: 在受控执行环境中 materialize 并运行 Word/OpenXML/LibreOffice 脚本
     - type: command
       value: python
       description: 执行 docx 检查脚本
@@ -49,16 +50,23 @@ products:
 - 内嵌扫描页、截图、拍照材料并需要识别图片文字：`runtime_profile=office-ocr`。
 - 脚本来自 Skill 只记录 `metadata.source=skill`；不要因此降级为 `skill-polyglot-basic`。
 
+## 硬约束（必须遵守）
+
+1. **执行脚本必须用 `run_skill_script`**，不要用 `run_command` 拼 `python scripts/...`，也不要用 `python -c`。
+2. **禁止用 `write_file` 写入 `.docx/.pptx/.xlsx/.pdf` 冒充交付物**。
+3. `script` 参数必须是 resource id（如 `office-word/scripts/inspect_docx.py`）。
+
 ## 推荐流程
 
 1. 确认交付格式、纸张尺寸、语言、模板、品牌规范和是否要保留现有样式。
 2. 读取 `references/validation-checklist.md`，先建立验收点。
-3. 对已有 `.docx` 先运行 `python scripts/inspect_docx.py <file.docx>`，再决定是 OpenXML 编辑、库生成还是 LibreOffice 转换。
+3. 对已有 `.docx` 先运行：
+   `run_skill_script(skill="office-word", script="office-word/scripts/inspect_docx.py", args=["file.docx"], inputs=["path/to/file.docx"])`
 4. 创建新文档时优先使用结构化库或模板，不要把复杂版式拼成纯文本。
 5. 修改现有文档时优先保留原模板的样式、编号、页眉页脚和表格宽度。
 6. 输入文件默认从 `INPUT_DIR` 解析，只传文件名即可；最终产物默认写入 `OUTPUT_DIR`。
-7. 需要视觉验证时运行 `python scripts/convert_docx_to_pdf.py <file.docx> [output_dir]` 转 PDF；不传 `output_dir` 时写入 `OUTPUT_DIR`。
-8. 生成后必须验证：可打开性、标题层级、目录、表格、图片、页眉页脚、关键文本和 PDF 预览。
+7. 需要视觉验证时运行 `run_skill_script` 调用 `convert_docx_to_pdf.py`。
+8. 生成后必须验证：可打开性、标题层级、目录、表格、图片、页眉页脚、关键文本和 PDF 预览；检查返回的 `ok` 与 `artifacts`。
 
 ## 模型提示
 

@@ -73,10 +73,15 @@ type BuildOptions struct {
 	Profile          profilemodel.Profile
 	AdditionalTools  []toolcontract.Tool
 	PromptInjectors  []promptbuilder.ContextInjector
+	// Logger 由产品层注入；非 nil 时 builder 不再自建文件日志（禁止双 Writer）。
+	Logger           loggercontract.Logger
 	AuditSink        auditcontract.Sink
 	UsageSink        usagecontract.Sink
 	Web              WebBuildOptions
 	PlanRepository   plancontract.Repository
+	SkillNameMatcher react.SkillNameMatcher
+	SkillMentionSelector react.SkillMentionSelector
+	AutoRewriteSkillCollision *bool
 }
 
 // RuntimeBundle 聚合 shared builder 构建出的运行时依赖。
@@ -123,11 +128,17 @@ func BuildAgentService(ctx context.Context, opts BuildOptions) (*RuntimeBundle, 
 
 	var log loggercontract.Logger
 	var tracer tracecontract.Tracer
-	if opts.Quiet {
+	if opts.Logger != nil {
+		log = opts.Logger
+	} else if opts.Quiet {
+		// 产品层未注入 Logger 时 Quiet 仅用 Nop，避免与产品 RuntimeLogging 双开文件。
 		log = sloglogger.NewNop()
-		tracer = consoletrace.NewNopTracer()
 	} else {
 		log = sloglogger.New(sloglogger.ParseLevel(cfg.Log.Level))
+	}
+	if opts.Quiet {
+		tracer = consoletrace.NewNopTracer()
+	} else {
 		tracer = consoletrace.NewConsoleTracer()
 	}
 
@@ -260,6 +271,14 @@ func BuildAgentService(ctx context.Context, opts BuildOptions) (*RuntimeBundle, 
 		promptbuilder.New(injectors...),
 		log,
 		tracer,
+		react.WithSkillNameMatcher(opts.SkillNameMatcher),
+		react.WithSkillMentionSelector(opts.SkillMentionSelector),
+		func() react.EngineOption {
+			if opts.AutoRewriteSkillCollision == nil {
+				return nil
+			}
+			return react.WithAutoRewriteSkillCollision(*opts.AutoRewriteSkillCollision)
+		}(),
 	)
 
 	defaultAgent := &domain.Agent{

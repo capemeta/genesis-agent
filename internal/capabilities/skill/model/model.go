@@ -16,6 +16,8 @@ const (
 	MaxDescriptionLen      = 1024
 	MaxPromptBytes         = 8 * 1024
 	MaxAvailableSkillsSize = 8 * 1024
+	// MaxAvailableSkillsTokens 是 catalog 列表的近似 token 上限（按 rune/4 估算，与字节上限取更严者）。
+	MaxAvailableSkillsTokens = 2000
 )
 
 var skillNamePattern = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
@@ -114,7 +116,25 @@ type Interface struct {
 
 // Dependencies 描述 Skill 依赖。
 type Dependencies struct {
-	Tools []ToolDependency `json:"tools,omitempty"`
+	Tools        []ToolDependency `json:"tools,omitempty"`
+	Runtime      RuntimeDeps      `json:"runtime,omitempty"`
+	InstallHints []string         `json:"install_hints,omitempty"` // 可选提示；真正安装须走 install 通道
+}
+
+// RuntimeDeps 描述脚本运行时第三方包/系统命令依赖（对话期装包白名单来源）。
+type RuntimeDeps struct {
+	Python []RuntimePackage `json:"python,omitempty"`
+	Node   []RuntimePackage `json:"node,omitempty"`
+	System []RuntimePackage `json:"system,omitempty"`
+}
+
+// RuntimePackage 是单个 runtime 依赖声明。
+type RuntimePackage struct {
+	Name        string `json:"name"`
+	Import      string `json:"import,omitempty"`  // Python import 名
+	Require     string `json:"require,omitempty"` // Node require 名
+	Command     string `json:"command,omitempty"` // system LookPath 命令
+	Description string `json:"description,omitempty"`
 }
 
 // ToolDependency 描述工具、MCP、连接等依赖。
@@ -125,6 +145,33 @@ type ToolDependency struct {
 	Transport   string `json:"transport,omitempty"`
 	Command     string `json:"command,omitempty"`
 	URL         string `json:"url,omitempty"`
+}
+
+// RuntimeWhitelist 返回 (manager, name) 白名单；manager 为 pip/npm/system。
+func (d Dependencies) RuntimeWhitelist() map[string]RuntimePackage {
+	out := make(map[string]RuntimePackage)
+	for _, p := range d.Runtime.Python {
+		name := strings.TrimSpace(p.Name)
+		if name == "" {
+			continue
+		}
+		out["pip:"+strings.ToLower(name)] = p
+	}
+	for _, p := range d.Runtime.Node {
+		name := strings.TrimSpace(p.Name)
+		if name == "" {
+			continue
+		}
+		out["npm:"+strings.ToLower(name)] = p
+	}
+	for _, p := range d.Runtime.System {
+		name := strings.TrimSpace(p.Name)
+		if name == "" {
+			continue
+		}
+		out["system:"+strings.ToLower(name)] = p
+	}
+	return out
 }
 
 // LocatorScheme 是显式 Skill 资源定位器前缀。

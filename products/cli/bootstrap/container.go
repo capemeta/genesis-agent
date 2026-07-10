@@ -11,11 +11,11 @@ import (
 
 	"genesis-agent/internal/app"
 	shared "genesis-agent/internal/bootstrap"
-	approvaldeny "genesis-agent/internal/capabilities/approval/adapter/deny"
 	approvalmemory "genesis-agent/internal/capabilities/approval/adapter/memory"
 	approvalcontract "genesis-agent/internal/capabilities/approval/contract"
 	approvalservice "genesis-agent/internal/capabilities/approval/service"
 	auditmemory "genesis-agent/internal/capabilities/audit/adapter/memory"
+	auditfile "genesis-agent/internal/capabilities/audit/adapter/file"
 	auditcontract "genesis-agent/internal/capabilities/audit/contract"
 	capcontract "genesis-agent/internal/capabilities/capability/contract"
 	execsandbox "genesis-agent/internal/capabilities/execution/adapter/sandbox"
@@ -40,20 +40,27 @@ import (
 	sandboxhttp "genesis-agent/internal/capabilities/sandbox/adapter/http"
 	sandboxcontract "genesis-agent/internal/capabilities/sandbox/contract"
 	skillembedded "genesis-agent/internal/capabilities/skill/adapter/embedded"
+	skillcollision "genesis-agent/internal/capabilities/skill/collision"
 	skillcontract "genesis-agent/internal/capabilities/skill/contract"
 	skillmodel "genesis-agent/internal/capabilities/skill/model"
 	skillparser "genesis-agent/internal/capabilities/skill/parser"
 	skillservice "genesis-agent/internal/capabilities/skill/service"
+	scriptservice "genesis-agent/internal/capabilities/skill/script/service"
 	listskillresources "genesis-agent/internal/capabilities/skill/tool/list_skill_resources"
-	loadskill "genesis-agent/internal/capabilities/skill/tool/load_skill"
+	installskilldeps "genesis-agent/internal/capabilities/skill/tool/install_skill_dependencies"
+	runskillscript "genesis-agent/internal/capabilities/skill/tool/run_skill_script"
+	skilltool "genesis-agent/internal/capabilities/skill/tool/skill"
 	readskillresource "genesis-agent/internal/capabilities/skill/tool/read_skill_resource"
 	searchskillresources "genesis-agent/internal/capabilities/skill/tool/search_skill_resources"
 	toolcapability "genesis-agent/internal/capabilities/tool/adapter/capability"
 	toolcontract "genesis-agent/internal/capabilities/tool/contract"
 	"genesis-agent/internal/capabilities/tool/scheduler"
 	usagememory "genesis-agent/internal/capabilities/usage/adapter/memory"
+	usagefile "genesis-agent/internal/capabilities/usage/adapter/file"
 	usagecontract "genesis-agent/internal/capabilities/usage/contract"
 	platformconfig "genesis-agent/internal/platform/config"
+	"genesis-agent/internal/platform/logger"
+	"genesis-agent/internal/runtime/strategy/react"
 	promptbuilder "genesis-agent/internal/runtime/prompt"
 	cliapproval "genesis-agent/products/cli/internal/approval"
 	"genesis-agent/products/cli/internal/command"
@@ -89,13 +96,18 @@ type Container struct {
 	once    sync.Once
 	initErr error
 	bundle  *shared.RuntimeBundle
+	logging *logger.RuntimeLogging
 }
 
 type productRuntime struct {
-	tools           []toolcontract.Tool
-	promptInjectors []promptbuilder.ContextInjector
-	auditSink       auditcontract.Sink
-	usageSink       usagecontract.Sink
+	tools                []toolcontract.Tool
+	promptInjectors      []promptbuilder.ContextInjector
+	logger               logger.Logger
+	logging              *logger.RuntimeLogging
+	auditSink            auditcontract.Sink
+	usageSink            usagecontract.Sink
+	skillNameMatcher     react.SkillNameMatcher
+	skillMentionSelector react.SkillMentionSelector
 }
 
 // Execute 执行 CLI 产品命令树。
@@ -137,19 +149,24 @@ func (c *Container) Init(ctx context.Context) error {
 		sandboxCfg = clisandbox.MergeSessionOverride(sandboxCfg, c.sandbox)
 		c.sandbox = sandboxCfg
 		prof := profile.DefaultProfile()
-		runtime, err := buildProductRuntime(ctx, configDir, cfg, c.quiet, sandboxCfg, prof)
+		runtime, log, err := buildProductRuntime(ctx, configDir, cfg, c.quiet, sandboxCfg, prof)
 		if err != nil {
 			c.initErr = err
 			return
 		}
-		webOpts, err := buildWebOptions(cfg)
+		c.logging = runtime.logging
+		webOpts, err := buildWebOptions(cfg, log)
 		if err != nil {
+			_ = c.logging.Close()
+			c.logging = nil
 			c.initErr = err
 			return
 		}
 		planRepoDir := filepath.Join(filepath.Dir(configDir), ".genesis", "plans")
 		planRepo, err := localplan.NewFileRepository(planRepoDir)
 		if err != nil {
+			_ = c.logging.Close()
+			c.logging = nil
 			c.initErr = fmt.Errorf("初始化CLI Plan本地存储失败: %w", err)
 			return
 		}
@@ -163,11 +180,18 @@ func (c *Container) Init(ctx context.Context) error {
 			Profile:          prof,
 			AdditionalTools:  runtime.tools,
 			PromptInjectors:  runtime.promptInjectors,
+			Logger:           runtime.logger,
 			AuditSink:        runtime.auditSink,
 			UsageSink:        runtime.usageSink,
 			Web:              webOpts,
-			PlanRepository:   planRepo,
+			PlanRepository:            planRepo,
+			SkillNameMatcher:          runtime.skillNameMatcher,
+			SkillMentionSelector:      runtime.skillMentionSelector,
 		})
+		if c.initErr != nil {
+			_ = c.logging.Close()
+			c.logging = nil
+		}
 	})
 	return c.initErr
 }
@@ -201,64 +225,148 @@ func NewServiceWithOptions(ctx context.Context, opts command.ServiceOptions) (ap
 	return c.Service(), nil
 }
 
-func buildProductRuntime(ctx context.Context, configDir string, cfg *platformconfig.Config, quiet bool, sandboxCfg clisandbox.Config, prof profilemodel.Profile) (productRuntime, error) {
+func buildProductRuntime(ctx context.Context, configDir string, cfg *platformconfig.Config, quiet bool, sandboxCfg clisandbox.Config, prof profilemodel.Profile) (productRuntime, logger.Logger, error) {
 	if cfg == nil {
 		loaded, err := platformconfig.LoadWithOptions(configDir, platformconfig.LoadOptions{Product: "cli", EnsureUserConfig: true})
 		if err != nil {
-			return productRuntime{}, fmt.Errorf("加载CLI产品配置失败: %w", err)
+			return productRuntime{}, nil, fmt.Errorf("加载CLI产品配置失败: %w", err)
 		}
 		cfg = loaded
 	}
-	auditSink := auditmemory.NewSink()
-	usageSink := usagememory.NewSink()
-	baseApprovalSvc, err := buildBaseApprovalService(quiet, cfg.Policy)
+	runtimeLogging, err := logger.NewRuntimeLogging(cfg.Log, logger.RuntimeLoggingOptions{
+		ConfigDir: configDir,
+		Quiet:     quiet,
+	})
 	if err != nil {
-		return productRuntime{}, err
+		return productRuntime{}, nil, fmt.Errorf("初始化运行日志失败: %w", err)
 	}
-	tools, err := buildProductTools(sandboxCfg, baseApprovalSvc)
+	log := runtimeLogging.AgentLogger
+
+	var auditSink auditcontract.Sink
+	if runtimeLogging.AuditWriter != nil {
+		auditSink = auditfile.NewSink(runtimeLogging.AuditWriter)
+	} else {
+		auditSink = auditmemory.NewSink()
+	}
+	var usageSink usagecontract.Sink
+	if runtimeLogging.UsageWriter != nil {
+		usageSink = usagefile.NewSink(runtimeLogging.UsageWriter)
+	} else {
+		usageSink = usagememory.NewSink()
+	}
+	baseApprovalSvc, err := buildBaseApprovalService(quiet, cfg.Policy, log, auditSink)
 	if err != nil {
-		return productRuntime{}, err
+		_ = runtimeLogging.Close()
+		return productRuntime{}, nil, err
 	}
+
+	productTools, execStack, err := buildProductTools(sandboxCfg, baseApprovalSvc, log)
+	if err != nil {
+		_ = runtimeLogging.Close()
+		return productRuntime{}, nil, err
+	}
+	tools := productTools
 	capabilityRegistry, _, err := cliskill.NewMarketplaceService()
 	if err != nil {
-		return productRuntime{}, err
+		_ = runtimeLogging.Close()
+		return productRuntime{}, nil, err
 	}
 	capabilityTools, err := buildCapabilityTools(ctx, capabilityRegistry)
 	if err != nil {
-		return productRuntime{}, err
+		_ = runtimeLogging.Close()
+		return productRuntime{}, nil, err
 	}
 	tools = append(tools, capabilityTools...)
 	skillSvc, roots, err := buildSkillService(configDir, cfg.Skills, prof, auditSink, usageSink, capabilityRegistry)
 	if err != nil {
-		return productRuntime{}, err
+		_ = runtimeLogging.Close()
+		return productRuntime{}, nil, err
 	}
 	startSkillWatcher(ctx, roots, skillSvc)
 	catalogReq := skillcontract.CatalogRequest{Product: profilemodel.ChannelCLI, Environment: profilemodel.EnvironmentLocal, EnabledSkills: prof.Skills.Enabled, DisabledSkills: prof.Skills.Disabled}
-	loadSkill, err := loadskill.New(loadskill.Deps{Service: skillSvc, Approval: baseApprovalSvc, CatalogRequest: catalogReq, EnabledTools: toolNames(tools)})
+	// 依赖预检以 Profile 可见工具集为准（含 shared builder 注册的 builtin/web），不是仅 AdditionalTools。
+	enabledToolInventory := append([]string(nil), prof.Tools.Enabled...)
+	skillGateway, err := skilltool.New(skilltool.Deps{Service: skillSvc, Approval: baseApprovalSvc, CatalogRequest: catalogReq, EnabledTools: enabledToolInventory})
 	if err != nil {
-		return productRuntime{}, err
+		_ = runtimeLogging.Close()
+		return productRuntime{}, nil, err
 	}
 	listResources, err := listskillresources.New(listskillresources.Deps{Service: skillSvc, Approval: baseApprovalSvc, CatalogRequest: catalogReq, Registry: capabilityRegistry})
 	if err != nil {
-		return productRuntime{}, err
+		_ = runtimeLogging.Close()
+		return productRuntime{}, nil, err
 	}
 	readResource, err := readskillresource.New(readskillresource.Deps{Service: skillSvc, Approval: baseApprovalSvc, CatalogRequest: catalogReq, Registry: capabilityRegistry})
 	if err != nil {
-		return productRuntime{}, err
+		_ = runtimeLogging.Close()
+		return productRuntime{}, nil, err
 	}
 	searchResources, err := searchskillresources.New(searchskillresources.Deps{Service: skillSvc, Approval: baseApprovalSvc, CatalogRequest: catalogReq})
 	if err != nil {
-		return productRuntime{}, err
+		_ = runtimeLogging.Close()
+		return productRuntime{}, nil, err
 	}
-	tools = append(tools, loadSkill, listResources, readResource, searchResources)
-	injector := promptbuilder.ContextInjectorFunc(func(ctx context.Context, req promptbuilder.BuildRequest) (promptbuilder.Fragment, error) {
-		contents, err := skillSvc.RenderAvailableSkills(ctx, catalogReq)
-		if err != nil {
-			return promptbuilder.Fragment{}, err
-		}
-		return promptbuilder.Fragment{Name: "skills_instructions", Contents: contents}, nil
+	sharedScriptsFS, err := skillembedded.OfficeCommonScriptsFS()
+	if err != nil {
+		_ = runtimeLogging.Close()
+		return productRuntime{}, nil, fmt.Errorf("加载共享 office scripts失败: %w", err)
+	}
+	skillScriptSvc, err := scriptservice.New(scriptservice.Deps{
+		Skills:                skillSvc,
+		Runner:                execStack.Runner,
+		Approval:              baseApprovalSvc,
+		SessionClient:         execStack.SessionClient,
+		WorkspaceRef:          execStack.WorkspaceRef,
+		Logger:                log,
+		SharedScriptsFS:       sharedScriptsFS,
+		EnablePreflight:       cfg.Skills.EnablePreflight,
+		AutoRetryAfterInstall: cfg.Skills.AutoRetryAfterInstall,
 	})
-	return productRuntime{tools: tools, promptInjectors: []promptbuilder.ContextInjector{injector}, auditSink: auditSink, usageSink: usageSink}, nil
+	if err != nil {
+		_ = runtimeLogging.Close()
+		return productRuntime{}, nil, err
+	}
+	runSkillScript, err := runskillscript.New(runskillscript.Deps{
+		Runner:         skillScriptSvc,
+		CatalogRequest: catalogReq,
+		Sandbox:        sandboxCfg.ExecutionProfile(),
+	})
+	if err != nil {
+		_ = runtimeLogging.Close()
+		return productRuntime{}, nil, err
+	}
+	installDeps, err := installskilldeps.New(installskilldeps.Deps{
+		Skills:         skillSvc,
+		Runner:         execStack.Runner,
+		Approval:       baseApprovalSvc,
+		CatalogRequest: catalogReq,
+		Sandbox:        sandboxCfg.ExecutionProfile(),
+		WorkspaceRoot:  workspaceRootOrDot(),
+	})
+	if err != nil {
+		_ = runtimeLogging.Close()
+		return productRuntime{}, nil, err
+	}
+	tools = append(tools, skillGateway, listResources, readResource, searchResources, runSkillScript, installDeps)
+	skillMatcher := &skillcollision.Matcher{Service: skillSvc, CatalogRequest: catalogReq}
+	skillMentions := &react.MentionSelector{Service: skillSvc, CatalogRequest: catalogReq}
+	// system 仅短硬规则；完整 catalog 挂在 Skill 工具 DescriptionFunc。
+	injector := promptbuilder.ContextInjectorFunc(func(ctx context.Context, req promptbuilder.BuildRequest) (promptbuilder.Fragment, error) {
+		return promptbuilder.Fragment{
+			Name: "skills_instructions",
+			Contents: "Skills 是任务流程包，不是可执行工具。加载技能必须调用 Skill(skill=...)；禁止把 office-ppt 等技能名当作独立工具调用。用户输入中的 $skill 或 skill:// 引用会在回合开始自动注入。可用技能列表见 Skill 工具描述中的 <available_skills>。若 run_skill_script 返回 failure_kind=dependency_missing：调用 install_skill_dependencies（须审批，仅装 runtime 白名单包）后，用相同参数再跑脚本；sandbox_violation 勿当成缺包。",
+		}, nil
+	})
+	return productRuntime{
+		tools:                tools,
+		promptInjectors:      []promptbuilder.ContextInjector{injector},
+		logger:               log,
+		logging:              runtimeLogging,
+		auditSink:            auditSink,
+		usageSink:            usageSink,
+		skillNameMatcher:     skillMatcher,
+		skillMentionSelector: skillMentions,
+	}, log, nil
 }
 
 func buildCapabilityTools(ctx context.Context, registry capcontract.Registry) ([]toolcontract.Tool, error) {
@@ -268,31 +376,29 @@ func buildCapabilityTools(ctx context.Context, registry capcontract.Registry) ([
 	}
 	return adapter.Tools(), nil
 }
-func toolNames(tools []toolcontract.Tool) []string {
-	names := make([]string, 0, len(tools))
-	for _, candidate := range tools {
-		if candidate == nil || candidate.GetInfo() == nil {
-			continue
-		}
-		names = append(names, candidate.GetInfo().Name)
-	}
-	return names
-}
-func buildBaseApprovalService(quiet bool, policyCfg platformconfig.PolicyConfig) (approvalcontract.Service, error) {
+
+func buildBaseApprovalService(quiet bool, policyCfg platformconfig.PolicyConfig, log logger.Logger, auditSink auditcontract.Sink) (approvalcontract.Service, error) {
 	policyEngine, err := policyapproval.NewEngine(policyconfig.BuildEvaluator(policyCfg))
 	if err != nil {
 		return nil, fmt.Errorf("初始化PolicyEngine失败: %w", err)
 	}
-	baseApprovalSvc, err := approvalservice.New(policyEngine, newApprovalRequester(quiet), approvalmemory.NewStore())
+	baseApprovalSvc, err := approvalservice.New(policyEngine, newApprovalRequester(quiet), approvalmemory.NewStore(), log, approvalservice.WithAuditSink(auditSink))
 	if err != nil {
 		return nil, fmt.Errorf("初始化ApprovalService失败: %w", err)
 	}
 	return baseApprovalSvc, nil
 }
-func buildProductTools(sandboxCfg clisandbox.Config, baseApprovalSvc approvalcontract.Service) ([]toolcontract.Tool, error) {
+// productExecStack 是 CLI 执行栈，供 run_command 与 run_skill_script 复用。
+type productExecStack struct {
+	Runner        execcontract.ExecutionRunner
+	SessionClient sandboxcontract.SessionClient
+	WorkspaceRef  sandboxcontract.WorkspaceRef
+}
+
+func buildProductTools(sandboxCfg clisandbox.Config, baseApprovalSvc approvalcontract.Service, log logger.Logger) ([]toolcontract.Tool, productExecStack, error) {
 	resolver, err := localresolver.New("")
 	if err != nil {
-		return nil, fmt.Errorf("初始化本地PathResolver失败: %w", err)
+		return nil, productExecStack{}, fmt.Errorf("初始化本地PathResolver失败: %w", err)
 	}
 	approvalSvc := fspermission.NewApprovalService(baseApprovalSvc, fspermission.NewRuntimeFilePermissions())
 	locker := scheduler.NewMemoryResourceLocker()
@@ -302,18 +408,18 @@ func buildProductTools(sandboxCfg clisandbox.Config, baseApprovalSvc approvalcon
 	for _, constructor := range constructors {
 		t, err := constructor(fileDeps)
 		if err != nil {
-			return nil, err
+			return nil, productExecStack{}, err
 		}
 		tools = append(tools, t)
 	}
 	directRunner := localexec.NewRunner()
-	sandboxRunner, err := buildSandboxRunner(directRunner, sandboxCfg)
+	sandboxRunner, sessionClient, workspaceRef, err := buildSandboxStack(directRunner, sandboxCfg)
 	if err != nil {
-		return nil, err
+		return nil, productExecStack{}, err
 	}
-	executionRunner, err := execservice.NewRunner(directRunner, sandboxRunner)
+	executionRunner, err := execservice.NewRunner(directRunner, sandboxRunner, execservice.WithLogger(log))
 	if err != nil {
-		return nil, err
+		return nil, productExecStack{}, err
 	}
 	localPTYRunner := localexec.NewLocalPTYRunner()
 	sessionManager := execservice.NewSessionManager(localPTYRunner).WithApproval(baseApprovalSvc)
@@ -330,7 +436,7 @@ func buildProductTools(sandboxCfg clisandbox.Config, baseApprovalSvc approvalcon
 		},
 	})
 	if err != nil {
-		return nil, err
+		return nil, productExecStack{}, err
 	}
 	tools = append(tools, runCommand)
 
@@ -338,14 +444,18 @@ func buildProductTools(sandboxCfg clisandbox.Config, baseApprovalSvc approvalcon
 		SessionManager: sessionManager,
 	})
 	if err != nil {
-		return nil, err
+		return nil, productExecStack{}, err
 	}
 	tools = append(tools, writeStdin)
 
-	return tools, nil
+	return tools, productExecStack{
+		Runner:        executionRunner,
+		SessionClient: sessionClient,
+		WorkspaceRef:  workspaceRef,
+	}, nil
 }
 
-func buildSandboxRunner(directRunner *localexec.Runner, sandboxCfg clisandbox.Config) (execcontract.SandboxRunner, error) {
+func buildSandboxStack(directRunner *localexec.Runner, sandboxCfg clisandbox.Config) (execcontract.SandboxRunner, sandboxcontract.SessionClient, sandboxcontract.WorkspaceRef, error) {
 	switch sandboxCfg.Mode {
 	case clisandbox.ModeDockerSandbox, clisandbox.ModeRemoteSandbox:
 		client, err := sandboxhttp.New(sandboxhttp.Config{
@@ -355,16 +465,25 @@ func buildSandboxRunner(directRunner *localexec.Runner, sandboxCfg clisandbox.Co
 			LocalArtifactRoot: filepath.Join(".", ".genesis", "artifacts"),
 		})
 		if err != nil {
-			return nil, fmt.Errorf("初始化genesis-sandbox HTTP client失败: %w", err)
+			return nil, nil, sandboxcontract.WorkspaceRef{}, fmt.Errorf("初始化genesis-sandbox HTTP client失败: %w", err)
 		}
-		return execsandbox.NewRunner(client, sandboxcontract.WorkspaceRef{
+		workspaceRef := sandboxcontract.WorkspaceRef{
 			ID:       sandboxCfg.WorkspaceID,
 			Provider: clisandbox.ProviderGenesisSandbox,
-		})
+		}
+		runner, err := execsandbox.NewRunner(client, workspaceRef)
+		if err != nil {
+			return nil, nil, sandboxcontract.WorkspaceRef{}, err
+		}
+		return runner, client, workspaceRef, nil
 	case clisandbox.ModePlatform:
-		return localexec.NewSandboxRunner(directRunner, localexec.SandboxRunnerOptions{})
+		runner, err := localexec.NewSandboxRunner(directRunner, localexec.SandboxRunnerOptions{})
+		if err != nil {
+			return nil, nil, sandboxcontract.WorkspaceRef{}, err
+		}
+		return runner, nil, sandboxcontract.WorkspaceRef{}, nil
 	default:
-		return nil, nil
+		return nil, nil, sandboxcontract.WorkspaceRef{}, nil
 	}
 }
 
@@ -448,6 +567,13 @@ func defaultSkillRoots(configDir string) []localskill.Root {
 	return dedupeRoots(roots)
 }
 
+func workspaceRootOrDot() string {
+	if wd, err := os.Getwd(); err == nil && strings.TrimSpace(wd) != "" {
+		return wd
+	}
+	return "."
+}
+
 func appendUniqueStrings(base []string, extra ...string) []string {
 	seen := make(map[string]struct{}, len(base)+len(extra))
 	out := make([]string, 0, len(base)+len(extra))
@@ -481,12 +607,12 @@ func dedupeRoots(roots []localskill.Root) []localskill.Root {
 
 func newApprovalRequester(quiet bool) approvalcontract.Requester {
 	if quiet {
-		return approvaldeny.NewRequester()
+		return cliapproval.GlobalTUIRequester
 	}
 	return cliapproval.NewTerminalRequester(os.Stdin, os.Stderr)
 }
 
-func buildWebOptions(cfg *platformconfig.Config) (shared.WebBuildOptions, error) {
+func buildWebOptions(cfg *platformconfig.Config, log logger.Logger) (shared.WebBuildOptions, error) {
 	cache := webcache.NewCache()
 	policy := webservice.NewPolicy(nil, nil)
 
@@ -540,7 +666,7 @@ func buildWebOptions(cfg *platformconfig.Config) (shared.WebBuildOptions, error)
 		defaultSearcher = "brave"
 	}
 
-	searchService := webservice.NewSearchService(providers, defaultSearcher, policy, cache)
+	searchService := webservice.NewSearchService(providers, defaultSearcher, policy, cache, log)
 	httpFetcher := httpfetcher.NewFetcher()
 	htmlExtractor := webextractor.NewExtractor()
 	fetchService := webservice.NewFetchService(httpFetcher, htmlExtractor, policy, cache)

@@ -11,9 +11,10 @@ import (
 // domainToSchema 将 domain.Message 转换为 eino schema.Message
 func domainToSchema(m *domain.Message) *schema.Message {
 	msg := &schema.Message{
-		Role:       schema.RoleType(m.Role),
-		Content:    m.Content,
-		ToolCallID: m.ToolCallID,
+		Role:             schema.RoleType(m.Role),
+		Content:          m.Content,
+		ToolCallID:       m.ToolCallID,
+		ReasoningContent: m.ReasoningContent,
 	}
 	for _, tc := range m.ToolCalls {
 		msg.ToolCalls = append(msg.ToolCalls, schema.ToolCall{
@@ -31,9 +32,10 @@ func domainToSchema(m *domain.Message) *schema.Message {
 // schemaToDomain 将 eino schema.Message 转换为 domain.Message
 func schemaToDomain(m *schema.Message) *domain.Message {
 	msg := &domain.Message{
-		Role:       domain.RoleType(m.Role),
-		Content:    m.Content,
-		ToolCallID: m.ToolCallID,
+		Role:             domain.RoleType(m.Role),
+		Content:          m.Content,
+		ToolCallID:       m.ToolCallID,
+		ReasoningContent: m.ReasoningContent,
 	}
 	for _, tc := range m.ToolCalls {
 		msg.ToolCalls = append(msg.ToolCalls, domain.ToolCall{

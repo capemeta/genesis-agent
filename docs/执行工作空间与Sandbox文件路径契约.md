@@ -398,9 +398,12 @@ Runner
 -> Analyzer Registry
    -> shell_text analyzer
    -> python_source analyzer
-   -> future: javascript/typescript analyzer
-   -> future: powershell analyzer
-   -> future: office skill manifest analyzer
+   -> javascript_source analyzer
+   -> go_source analyzer
+   -> java_source analyzer
+   -> powershell_source analyzer
+   -> shell_script_source analyzer
+   -> skill_manifest analyzer
 -> structured violations
 ```
 
@@ -411,7 +414,7 @@ Runner
 | `Runner` | 注入逻辑目录、调用 `PathValidator`、根据 sandbox 策略选择 backend | 解析具体编程语言 AST |
 | `PathValidator` | 根据 `PathPolicy` 决定是否启用强校验，聚合分析器结果 | 直接执行命令或修改用户代码 |
 | `Analyzer Registry` | 注册和编排多种语言/脚本分析器，去重诊断 | 参与权限授权决策 |
-| 语言分析器 | 在能可靠拿到源码时做语言特定分析，例如 Python 字符串字面量、JS import/FS API、PowerShell path 参数 | 声称覆盖所有动态表达式或替代 sandbox |
+| 语言分析器 | 在能可靠拿到源码时做语言特定分析，例如源码字面量、脚本参数、Skill manifest 中的路径声明 | 声称覆盖所有动态表达式或替代 sandbox |
 
 核心不变量：
 
@@ -427,10 +430,16 @@ Runner
 | --- | --- | --- | --- |
 | `shell_text` | 命令字符串 | 明显宿主机绝对路径、UNC 路径、非 `/workspace` 的 Unix 绝对路径、`/tmp` 等 | 不理解语言语义 |
 | `python_source` | `python -c` 源码、可读取的 `.py` 脚本 | Python 字符串字面量中的宿主机路径、UNC 路径、非 `/workspace` 的 Unix 绝对路径、`/tmp` 等 | 不追踪任意动态拼接、外部配置、运行时输入 |
+| `javascript_source` | `node -e`、`tsx/ts-node/bun/deno`、可读取的 `.js/.ts/.tsx/.jsx/.mjs/.cjs/.mts/.cts` | JS/TS 字符串和模板字面量中的违规路径 | 不执行类型推导，不追踪变量拼接 |
+| `go_source` | `go run` 后可读取的 `.go` 文件，或 `go run .` / `go run ./dir` 的目录顶层 `.go` 文件 | Go 普通字符串和 raw string 中的违规路径 | 不递归扫描整个 module，不解析 build tag 或生成代码 |
+| `java_source` | `java/javac` 后可读取的 `.java` 文件 | Java 字符串和 text block 中的违规路径 | 不解析 classpath、配置文件或运行时参数 |
+| `powershell_source` | `pwsh/powershell -Command/-File`、可读取的 `.ps1/.psm1` | PowerShell 脚本源码中的未加引号或加引号违规路径 | 只做行级注释剥离，不执行 PowerShell AST 语义求值 |
+| `shell_script_source` | `sh/bash/zsh -c`、可读取的 `.sh/.bash/.zsh` | Shell 脚本源码中的未加引号或加引号违规路径 | 只做行级注释剥离，不展开变量、glob 或命令替换 |
+| `skill_manifest` | 可读取的 `SKILL.md/skill.md/*.skill.yaml/*.skill.yml` | Skill manifest、Markdown、脚本说明中的违规路径 | 不替代 Skill parser 的结构化校验 |
 
 后续扩展规则：
 
-1. 高价值语言优先：Python、JavaScript/TypeScript、PowerShell、Shell、Office Skill manifest。
+1. 高价值语言优先：Python、JavaScript/TypeScript、Go、Java、PowerShell、Shell、Office Skill manifest。
 2. 每个分析器必须声明输入来源和限制，避免“全语言完整 AST 无漏洞”这种不可验证承诺。
 3. 语言分析器应输出统一的 `Violation`，至少包含 `fragment`、`location`、`reason`、`fix`。
 4. 对用户脚本和第三方脚本，远程 strict 模式下宁可显式失败，也不自动重写路径或隐式搬运成果物。

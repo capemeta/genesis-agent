@@ -12,6 +12,8 @@ import (
 
 	"genesis-agent/internal/app"
 	"genesis-agent/internal/domain"
+	"genesis-agent/internal/runtime/progress"
+	approval "genesis-agent/products/cli/internal/approval"
 	"genesis-agent/products/cli/internal/tui/styles"
 )
 
@@ -39,14 +41,21 @@ type Model struct {
 	session  *domain.Session    // 当前对话会话
 
 	// ── 对话状态 ──────────────────────────────────────────────
-	messages []uiMessage // 当前会话所有消息（用于 View 渲染）
-	loading  bool        // 是否正在等待 Agent 推理响应
-	err      error       // 最近一次错误（nil 表示无错误）
+	messages      []uiMessage      // 当前会话所有消息（用于 View 渲染）
+	loading       bool             // 是否正在等待 Agent 推理响应
+	err           error            // 最近一次错误（nil 表示无错误）
+	progressCh    chan progressMsg // 当前 run 的进度事件通道
+	currentStatus string           // 状态栏当前展示文本
+	progressLog   []string         // 最近的过程摘要，独立于最终回答
 
 	// ── 布局状态 ──────────────────────────────────────────────
 	width  int  // 当前终端宽度（通过 WindowSizeMsg 更新）
 	height int  // 当前终端高度（通过 WindowSizeMsg 更新）
 	ready  bool // viewport 是否已完成首次初始化
+
+	// ── 审批流状态 ────────────────────────────────────────────
+	activeApproval *approval.ApprovalRequiredMsg // 当前等待人工确认的审批请求
+	approvalFocus  bool                          // 当前是否为审批输入拦截状态
 }
 
 // NewModel 创建 TUI 对话界面 Model（Bubble Tea 入口）
@@ -107,17 +116,102 @@ func (m Model) viewportHeight() int {
 // refreshViewportContent 重新渲染消息列表并更新 viewport 内容
 // 在每次 messages 变化后调用
 func (m *Model) refreshViewportContent() {
-	m.viewport.SetContent(renderMessages(m.messages, m.width))
+	msgs := m.messages
+	if m.loading && (len(m.progressLog) > 0 || m.activeApproval != nil) {
+		tempMsgs := make([]uiMessage, len(m.messages)+1)
+		copy(tempMsgs, m.messages)
+		if m.activeApproval != nil {
+			tempMsgs[len(m.messages)] = uiMessage{
+				role:    "system",
+				content: m.renderApprovalCard(),
+			}
+		} else {
+			tempMsgs[len(m.messages)] = uiMessage{
+				role:    "system",
+				content: m.progressSummaryMessage(),
+			}
+		}
+		msgs = tempMsgs
+	}
+	m.viewport.SetContent(renderMessages(msgs, m.width))
+}
+
+func (m *Model) renderApprovalCard() string {
+	if m.activeApproval == nil {
+		return ""
+	}
+	req := m.activeApproval.Request
+
+	borderStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(styles.ColorYellow).
+		Padding(1, 2).
+		Width(m.width - 4)
+
+	titleStyle := lipgloss.NewStyle().
+		Foreground(styles.ColorYellow).
+		Bold(true)
+
+	boldStyle := lipgloss.NewStyle().Bold(true)
+
+	display := req.Resource.Display
+	if display == "" {
+		display = req.Resource.URI
+	}
+
+	content := fmt.Sprintf(
+		"%s\n\n"+
+			"  %s: %s\n"+
+			"  %s: %s\n"+
+			"  %s: %s\n"+
+			"  %s: %s\n\n"+
+			"%s",
+		titleStyle.Render("🛡️ 需要授权的操作 (Human Approval Required)"),
+		boldStyle.Render("工具"), req.ToolName,
+		boldStyle.Render("动作"), req.Action,
+		boldStyle.Render("资源"), display,
+		boldStyle.Render("原因"), req.Reason,
+		lipgloss.NewStyle().Foreground(styles.ColorGreen).Bold(true).
+			Render("按键授权: [Y]允许本次 / [S]允许当前会话 / [N]拒绝 / [A]终止任务"),
+	)
+
+	return borderStyle.Render(content)
+}
+
+func waitProgress(ch <-chan progressMsg) tea.Cmd {
+	return func() tea.Msg {
+		if ch == nil {
+			return nil
+		}
+		msg, ok := <-ch
+		if !ok {
+			return nil
+		}
+		return msg
+	}
 }
 
 // runAgentCmd 构造一个 Bubble Tea Cmd，在后台 goroutine 中执行 Agent 推理
 // 推理结果通过 runCompleteMsg 或 runErrorMsg 发回 Update 循环
-func (m Model) runAgentCmd(input string) tea.Cmd {
+func (m Model) runAgentCmd(input string, progressCh chan<- progressMsg) tea.Cmd {
 	return func() tea.Msg {
+		if progressCh != nil {
+			defer close(progressCh)
+		}
+		emit := func(event progress.Event) {
+			if progressCh == nil {
+				return
+			}
+			select {
+			case progressCh <- progressMsg{event: event}:
+			default:
+			}
+		}
 		result, err := m.svc.RunOnce(m.ctx, app.RunRequest{
-			SessionID: m.session.ID,
-			TenantID:  m.session.TenantID,
-			Input:     input,
+			SessionID:  m.session.ID,
+			TenantID:   m.session.TenantID,
+			Input:      input,
+			OnProgress: emit,
 		})
 
 		if err != nil {

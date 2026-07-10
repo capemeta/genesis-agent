@@ -5,10 +5,14 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 
 	execcontract "genesis-agent/internal/capabilities/execution/contract"
 	execmodel "genesis-agent/internal/capabilities/execution/model"
 	"genesis-agent/internal/capabilities/execution/pathcontract"
+	"genesis-agent/internal/platform/logger"
+	"genesis-agent/internal/platform/logger/correl"
 )
 
 const sandboxFallbackWarning = "sandbox runner unavailable; fell back to local execution"
@@ -18,6 +22,7 @@ type Runner struct {
 	direct        execcontract.CommandRunner
 	sandbox       execcontract.SandboxRunner
 	pathValidator commandPathValidator
+	logger        logger.Logger
 }
 
 type commandPathValidator interface {
@@ -36,6 +41,15 @@ func WithPathValidator(validator commandPathValidator) RunnerOption {
 	}
 }
 
+// WithLogger 注入日志记录器。
+func WithLogger(l logger.Logger) RunnerOption {
+	return func(r *Runner) {
+		if l != nil {
+			r.logger = l
+		}
+	}
+}
+
 // NewRunner 创建组合执行 runner。direct runner 必须存在；sandbox runner 可后续由产品注入。
 func NewRunner(direct execcontract.CommandRunner, sandbox execcontract.SandboxRunner, options ...RunnerOption) (*Runner, error) {
 	if direct == nil {
@@ -45,6 +59,7 @@ func NewRunner(direct execcontract.CommandRunner, sandbox execcontract.SandboxRu
 		direct:        direct,
 		sandbox:       sandbox,
 		pathValidator: pathcontract.NewValidator(nil),
+		logger:        logger.NewNop(),
 	}
 	for _, option := range options {
 		if option != nil {
@@ -68,32 +83,68 @@ func (r *Runner) Run(ctx context.Context, cmd execmodel.Command, opts execcontra
 	if mode == "" {
 		mode = execmodel.SandboxDisabled
 	}
+
+	l := correl.AttachLogger(ctx, r.logger).With("command", cmd.Command, "cwd", cmd.Cwd, "mode", string(mode))
+
 	switch mode {
 	case execmodel.SandboxDisabled:
+		l.Info("准备在[本地宿主机]执行命令")
 		result, err := r.direct.Run(ctx, cmd, opts)
 		ensureEnvironment(result, execmodel.EnvironmentLocal, "")
+		if err != nil {
+			l.Error("本地宿主机命令执行失败", "error", err)
+		} else {
+			l.Info("本地宿主机命令执行完成", "exit_code", result.ExitCode)
+		}
 		return result, err
 	case execmodel.SandboxOptional:
 		if r.sandbox == nil {
+			l.Info("准备在[本地宿主机]执行命令 (未配置沙箱，降级到本地)")
 			result, err := r.direct.Run(ctx, cmd, opts)
 			ensureEnvironment(result, execmodel.EnvironmentLocal, "")
 			addWarning(result, sandboxFallbackWarning)
+			if err != nil {
+				l.Error("本地宿主机命令执行失败", "error", err)
+			} else {
+				l.Info("本地宿主机命令执行完成", "exit_code", result.ExitCode)
+			}
 			return result, err
 		}
+		l.Info("准备在[沙箱环境]执行命令 (可选沙箱)", "provider", opts.Sandbox.Provider, "sandbox_type", resolveSandboxType(opts.Sandbox.Provider), "runtime_profile", string(opts.Sandbox.RuntimeProfile))
 		result, err := r.sandbox.RunInSandbox(ctx, cmd, opts.Sandbox, opts)
 		if err != nil && execcontract.CodeOf(err) == execcontract.ErrCodeSandboxUnavailable {
+			l.Warn("沙箱服务不可用，自动降级至本地宿主机执行", "error", err)
 			result, directErr := r.direct.Run(ctx, cmd, opts)
 			ensureEnvironment(result, execmodel.EnvironmentLocal, "")
 			addWarning(result, sandboxFallbackWarning+": "+err.Error())
+			if directErr != nil {
+				l.Error("降级本地执行命令失败", "error", directErr)
+			} else {
+				l.Info("降级本地执行命令完成", "exit_code", result.ExitCode)
+			}
 			return result, directErr
+		}
+		if err != nil {
+			l.Error("沙箱命令执行失败", "error", err)
+		} else {
+			l.Info("沙箱命令执行完成", "exit_code", result.ExitCode)
 		}
 		return result, err
 	case execmodel.SandboxRequired:
 		if r.sandbox == nil {
+			l.Error("沙箱必填但未配置SandboxRunner，执行中止")
 			return nil, execcontract.NewError(execcontract.ErrCodeSandboxUnavailable, fmt.Errorf("SandboxRunner未配置"))
 		}
-		return r.sandbox.RunInSandbox(ctx, cmd, opts.Sandbox, opts)
+		l.Info("准备在[沙箱环境]执行命令 (强制沙箱)", "provider", opts.Sandbox.Provider, "sandbox_type", resolveSandboxType(opts.Sandbox.Provider), "runtime_profile", string(opts.Sandbox.RuntimeProfile))
+		result, err := r.sandbox.RunInSandbox(ctx, cmd, opts.Sandbox, opts)
+		if err != nil {
+			l.Error("沙箱命令执行失败", "error", err)
+		} else {
+			l.Info("沙箱命令执行完成", "exit_code", result.ExitCode)
+		}
+		return result, err
 	default:
+		l.Error("未知沙箱模式，执行中止")
 		return nil, execcontract.NewError(execcontract.ErrCodeInvalidInput, fmt.Errorf("未知sandbox模式: %s", mode))
 	}
 }
@@ -116,7 +167,16 @@ func applyExecutionWorkspaceEnv(cmd execmodel.Command, workspace execmodel.Execu
 	setIfNonEmpty(env, "INPUT_DIR", workspace.InputDir)
 	setIfNonEmpty(env, "OUTPUT_DIR", workspace.OutputDir)
 	setIfNonEmpty(env, "TMPDIR", workspace.TmpDir)
+	setIfNonEmpty(env, "SKILL_DIR", workspace.SkillDir)
 	setIfNonEmpty(env, "GENESIS_WORKSPACE", workspace.WorkDir)
+	if workspace.SkillDir != "" {
+		scripts := filepath.Join(workspace.SkillDir, "scripts")
+		if existing := env["PYTHONPATH"]; existing == "" {
+			env["PYTHONPATH"] = scripts
+		} else if !strings.Contains(existing, scripts) {
+			env["PYTHONPATH"] = scripts + string(os.PathListSeparator) + existing
+		}
+	}
 	cmd.Env = env
 	return cmd
 }
@@ -131,12 +191,8 @@ func ensureEnvironment(result *execmodel.Result, env execmodel.ExecutionEnvironm
 	if result == nil {
 		return
 	}
-	if result.Environment == "" {
-		result.Environment = env
-	}
-	if result.SandboxProvider == "" {
-		result.SandboxProvider = provider
-	}
+	result.Environment = env
+	result.SandboxProvider = provider
 }
 
 func addWarning(result *execmodel.Result, warning string) {
@@ -144,4 +200,12 @@ func addWarning(result *execmodel.Result, warning string) {
 		return
 	}
 	result.Warnings = append(result.Warnings, warning)
+}
+
+func resolveSandboxType(provider string) string {
+	provider = strings.TrimSpace(strings.ToLower(provider))
+	if provider == "local" || provider == "local_host" || provider == "host" || provider == "" {
+		return "本地平台沙箱 (bwrap/landlock/seatbelt)"
+	}
+	return "沙箱容器API (genesis-sandbox)"
 }

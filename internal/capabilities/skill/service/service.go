@@ -18,16 +18,18 @@ import (
 	"genesis-agent/internal/capabilities/skill/model"
 	usagecontract "genesis-agent/internal/capabilities/usage/contract"
 	usagemodel "genesis-agent/internal/capabilities/usage/model"
+	"genesis-agent/internal/platform/logger/correl"
 )
 
 // Options 控制 Skill Service 行为。
 type Options struct {
-	MaxPromptBytes int
-	MaxListBytes   int
-	SourceTimeout  time.Duration
-	AuditSink      auditcontract.Sink
-	UsageSink      usagecontract.Sink
-	Visibility     capcontract.Registry
+	MaxPromptBytes  int
+	MaxListBytes    int
+	MaxListTokens   int // 近似 token 上限；<=0 时用 model.MaxAvailableSkillsTokens
+	SourceTimeout   time.Duration
+	AuditSink       auditcontract.Sink
+	UsageSink       usagecontract.Sink
+	Visibility      capcontract.Registry
 }
 
 // Service 是产品无关的 Skill 编排服务。
@@ -46,6 +48,9 @@ func New(sources []contract.Source, opts Options) *Service {
 	}
 	if opts.MaxListBytes <= 0 {
 		opts.MaxListBytes = model.MaxAvailableSkillsSize
+	}
+	if opts.MaxListTokens <= 0 {
+		opts.MaxListTokens = model.MaxAvailableSkillsTokens
 	}
 	if opts.SourceTimeout <= 0 {
 		opts.SourceTimeout = 5 * time.Second
@@ -363,29 +368,46 @@ func (s *Service) RenderAvailableSkills(ctx context.Context, req contract.Catalo
 		return "", err
 	}
 	var sb strings.Builder
-	sb.WriteString("## Skills\n")
-	sb.WriteString("可按需调用 `load_skill` 加载下列技能的完整说明；不要臆造未列出的技能。\n")
+	sb.WriteString("<available_skills>\n")
 	count := 0
 	omitted := 0
+	approxTokens := estimateTokens(sb.String())
 	for _, entry := range catalog.Entries {
 		if !entry.PromptVisible {
 			continue
 		}
-		line := fmt.Sprintf("- %s: %s (%s: %s)\n", entry.QualifiedName, oneLine(entry.Description), entry.Authority.Kind, entry.MainResource)
-		if sb.Len()+len(line) > s.opts.MaxListBytes {
+		locator := string(entry.MainResource)
+		if entry.Authority.Kind != "" {
+			locator = string(entry.Authority.Kind) + ":" + entry.Name
+		}
+		block := fmt.Sprintf("<skill>\n<name>\n%s\n</name>\n<description>\n%s\n</description>\n<location>\n%s\n</location>\n</skill>\n",
+			entry.QualifiedName, oneLine(entry.Description), locator)
+		blockTokens := estimateTokens(block)
+		if sb.Len()+len(block) > s.opts.MaxListBytes || approxTokens+blockTokens > s.opts.MaxListTokens {
 			omitted++
 			continue
 		}
-		sb.WriteString(line)
+		sb.WriteString(block)
+		approxTokens += blockTokens
 		count++
 	}
 	if count == 0 {
 		return "", nil
 	}
 	if omitted > 0 {
-		sb.WriteString(fmt.Sprintf("- %d additional skills omitted from this bounded skills list.\n", omitted))
+		sb.WriteString(fmt.Sprintf("<!-- Showing %d of %d skills due to catalog budget -->\n", count, count+omitted))
 	}
+	sb.WriteString("</available_skills>")
 	return sb.String(), nil
+}
+
+// estimateTokens 用 rune/4 近似估算 token，取更严预算时与字节上限并用。
+func estimateTokens(text string) int {
+	n := utf8.RuneCountInString(text)
+	if n <= 0 {
+		return 0
+	}
+	return (n + 3) / 4
 }
 
 func (s *Service) ClearCache() {
@@ -579,11 +601,33 @@ func (s *Service) record(ctx context.Context, action string, success bool, start
 	if metadata == nil {
 		metadata = map[string]string{}
 	}
+	runID, sessionID, metadata := correl.Enrich(ctx, "", "", metadata)
 	if s.opts.AuditSink != nil {
-		_ = s.opts.AuditSink.Record(ctx, auditmodel.Event{Category: "skill", Action: "skill." + action, Severity: severity(success), Allowed: success, StartedAt: started, CompletedAt: completed, DurationMS: completed.Sub(started).Milliseconds(), Metadata: cloneMap(metadata)})
+		_ = s.opts.AuditSink.Record(ctx, auditmodel.Event{
+			Category:    "skill",
+			Action:      "skill." + action,
+			RunID:       runID,
+			SessionID:   sessionID,
+			Severity:    severity(success),
+			Allowed:     success,
+			StartedAt:   started,
+			CompletedAt: completed,
+			DurationMS:  completed.Sub(started).Milliseconds(),
+			Metadata:    cloneMap(metadata),
+		})
 	}
 	if s.opts.UsageSink != nil {
-		_ = s.opts.UsageSink.RecordToolUsage(ctx, usagemodel.ToolUsage{ToolName: "skill." + action, Success: success, ReadOnly: true, StartedAt: started, CompletedAt: completed, DurationMS: completed.Sub(started).Milliseconds(), Metadata: cloneMap(metadata)})
+		_ = s.opts.UsageSink.RecordToolUsage(ctx, usagemodel.ToolUsage{
+			ToolName:    "skill." + action,
+			Success:     success,
+			ReadOnly:    true,
+			StartedAt:   started,
+			CompletedAt: completed,
+			DurationMS:  completed.Sub(started).Milliseconds(),
+			RunID:       runID,
+			SessionID:   sessionID,
+			Metadata:    cloneMap(metadata),
+		})
 	}
 }
 

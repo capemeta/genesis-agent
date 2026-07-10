@@ -14,6 +14,7 @@ import (
 	execmodel "genesis-agent/internal/capabilities/execution/model"
 	toolcontract "genesis-agent/internal/capabilities/tool/contract"
 	platformconfig "genesis-agent/internal/platform/config"
+	"genesis-agent/internal/platform/logger"
 	clisandbox "genesis-agent/products/cli/internal/sandbox"
 )
 
@@ -163,11 +164,11 @@ func mustRunCommandTool(t *testing.T, cfg clisandbox.Config) toolcontract.Tool {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(workspace) })
 	t.Chdir(workspace)
-	approvalSvc, err := buildBaseApprovalService(true, platformconfig.PolicyConfig{})
+	approvalSvc, err := buildBaseApprovalService(true, platformconfig.PolicyConfig{}, logger.NewNop(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	tools, err := buildProductTools(cfg, approvalSvc)
+	tools, _, err := buildProductTools(cfg, approvalSvc, logger.NewNop())
 	if err != nil {
 		t.Fatal(err)
 	}

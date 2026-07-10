@@ -6,6 +6,7 @@ import (
 	"os"
 
 	"genesis-agent/products/cli/internal/tui/chat"
+	cliapproval "genesis-agent/products/cli/internal/approval"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/spf13/cobra"
 )
@@ -58,6 +59,9 @@ func newChatCmd(configDirRef *string, sandboxModeRef *string, factory ServiceFac
 				tea.WithAltScreen(),
 				tea.WithMouseCellMotion(),
 			)
+
+			// 绑定全局 TUI 审批器对应的 program 实例
+			cliapproval.GlobalTUIRequester.SetProgram(p)
 
 			if _, err := p.Run(); err != nil {
 				fmt.Fprintf(os.Stderr, "TUI 运行错误: %v\n", err)

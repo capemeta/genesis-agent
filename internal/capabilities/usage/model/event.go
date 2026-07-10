@@ -10,5 +10,7 @@ type ToolUsage struct {
 	DurationMS  int64             `json:"duration_ms"`
 	StartedAt   time.Time         `json:"started_at"`
 	CompletedAt time.Time         `json:"completed_at"`
+	RunID       string            `json:"run_id,omitempty"`
+	SessionID   string            `json:"session_id,omitempty"`
 	Metadata    map[string]string `json:"metadata,omitempty"`
 }

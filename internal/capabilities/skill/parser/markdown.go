@@ -165,21 +165,113 @@ func cleanDependencies(node yaml.Node) model.Dependencies {
 	if node.Kind == yaml.MappingNode {
 		for i := 0; i+1 < len(node.Content); i += 2 {
 			key := strings.TrimSpace(strings.ToLower(node.Content[i].Value))
-			if key != "tools" {
-				continue
-			}
 			value := node.Content[i+1]
-			if value.Kind == yaml.SequenceNode {
-				for _, item := range value.Content {
-					dep := dependencyFromNode(item)
-					if dep.Value != "" {
-						deps.Tools = append(deps.Tools, dep)
+			switch key {
+			case "tools":
+				if value.Kind == yaml.SequenceNode {
+					for _, item := range value.Content {
+						dep := dependencyFromNode(item)
+						if dep.Value != "" {
+							deps.Tools = append(deps.Tools, dep)
+						}
 					}
 				}
+			case "runtime":
+				deps.Runtime = cleanRuntimeDeps(value)
+			case "install_hints", "install-hints":
+				deps.InstallHints = cleanStringSeq(value)
 			}
 		}
 	}
 	return deps
+}
+
+func cleanRuntimeDeps(node *yaml.Node) model.RuntimeDeps {
+	out := model.RuntimeDeps{}
+	if node == nil || node.Kind != yaml.MappingNode {
+		return out
+	}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		key := strings.TrimSpace(strings.ToLower(node.Content[i].Value))
+		value := node.Content[i+1]
+		pkgs := cleanRuntimePackages(value)
+		switch key {
+		case "python", "pip":
+			out.Python = append(out.Python, pkgs...)
+		case "node", "npm":
+			out.Node = append(out.Node, pkgs...)
+		case "system", "bin", "command":
+			out.System = append(out.System, pkgs...)
+		}
+	}
+	return out
+}
+
+func cleanRuntimePackages(node *yaml.Node) []model.RuntimePackage {
+	if node == nil {
+		return nil
+	}
+	if node.Kind == yaml.SequenceNode {
+		out := make([]model.RuntimePackage, 0, len(node.Content))
+		for _, item := range node.Content {
+			if pkg := runtimePackageFromNode(item); pkg.Name != "" {
+				out = append(out, pkg)
+			}
+		}
+		return out
+	}
+	if pkg := runtimePackageFromNode(node); pkg.Name != "" {
+		return []model.RuntimePackage{pkg}
+	}
+	return nil
+}
+
+func runtimePackageFromNode(node *yaml.Node) model.RuntimePackage {
+	if node == nil {
+		return model.RuntimePackage{}
+	}
+	if node.Kind == yaml.ScalarNode {
+		name := strings.TrimSpace(node.Value)
+		return model.RuntimePackage{Name: name}
+	}
+	if node.Kind != yaml.MappingNode {
+		return model.RuntimePackage{}
+	}
+	pkg := model.RuntimePackage{}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		key := strings.TrimSpace(strings.ToLower(node.Content[i].Value))
+		value := strings.TrimSpace(node.Content[i+1].Value)
+		switch key {
+		case "name", "package", "pkg":
+			pkg.Name = value
+		case "import":
+			pkg.Import = value
+		case "require", "module":
+			pkg.Require = value
+		case "command", "bin", "cmd":
+			pkg.Command = value
+		case "description":
+			pkg.Description = value
+		}
+	}
+	return pkg
+}
+
+func cleanStringSeq(node *yaml.Node) []string {
+	if node == nil || node.Kind != yaml.SequenceNode {
+		return nil
+	}
+	out := make([]string, 0, len(node.Content))
+	for _, item := range node.Content {
+		if item == nil {
+			continue
+		}
+		v := strings.TrimSpace(item.Value)
+		if v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 func dependencyFromNode(node *yaml.Node) model.ToolDependency {

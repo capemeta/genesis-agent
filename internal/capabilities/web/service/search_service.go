@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"genesis-agent/internal/capabilities/web/contract"
+	"genesis-agent/internal/platform/logger"
 )
 
 type SearchService struct {
@@ -15,18 +16,23 @@ type SearchService struct {
 	defaultProvider  string
 	policy           contract.WebPolicy
 	cache            contract.Cache
+	log              logger.Logger
 }
 
-func NewSearchService(providers []contract.SearchProvider, defaultProvider string, pol contract.WebPolicy, c contract.Cache) *SearchService {
+func NewSearchService(providers []contract.SearchProvider, defaultProvider string, pol contract.WebPolicy, c contract.Cache, log logger.Logger) *SearchService {
 	pm := make(map[string]contract.SearchProvider)
 	for _, p := range providers {
 		pm[p.Metadata().ID] = p
+	}
+	if log == nil {
+		log = logger.NewNop()
 	}
 	return &SearchService{
 		providers:       pm,
 		defaultProvider: defaultProvider,
 		policy:          pol,
 		cache:           c,
+		log:             log,
 	}
 }
 
@@ -87,8 +93,10 @@ func (s *SearchService) Search(ctx context.Context, req contract.SearchRequest) 
 
 	if !success {
 		if lastErr != nil {
+			s.log.Error("网络搜索执行失败", "query", req.Query, "error", lastErr)
 			return contract.SearchResult{}, fmt.Errorf("all search providers failed. Last error: %w", lastErr)
 		}
+		s.log.Error("网络搜索未配置任何可用提供商")
 		return contract.SearchResult{}, fmt.Errorf("no search providers configured")
 	}
 
@@ -110,6 +118,8 @@ func (s *SearchService) Search(ctx context.Context, req contract.SearchRequest) 
 	}
 
 	res.Duration = time.Since(start)
+
+	s.log.Info("网络搜索执行成功", "query", req.Query, "provider", res.Provider, "hits", len(res.Results), "duration_ms", res.Duration.Milliseconds())
 
 	// 6. Save to cache
 	if s.cache != nil {

@@ -57,9 +57,11 @@ type WebConfig struct {
 
 // SkillsConfig 描述本地 Skill 目录和启停配置。
 type SkillsConfig struct {
-	Enabled  []string            `mapstructure:"enabled"`
-	Disabled []string            `mapstructure:"disabled"`
-	Sources  []SkillSourceConfig `mapstructure:"sources"`
+	Enabled               []string            `mapstructure:"enabled"`
+	Disabled              []string            `mapstructure:"disabled"`
+	Sources               []SkillSourceConfig `mapstructure:"sources"`
+	EnablePreflight       bool                `mapstructure:"enable_preflight"`         // 默认 false
+	AutoRetryAfterInstall bool                `mapstructure:"auto_retry_after_install"` // 默认 false
 }
 
 // SkillSourceConfig 描述一个可扫描的 Skill 来源。
@@ -298,9 +300,46 @@ type AgentConfig struct {
 	SystemPrompt  string `mapstructure:"system_prompt"`
 }
 
-// LogConfig 日志配置。
+// LogConfig 日志配置（agent/audit/usage 三类通道）。
 type LogConfig struct {
-	Level string `mapstructure:"level"`
+	Level    string                     `mapstructure:"level"`
+	Path     string                     `mapstructure:"path"` // 兼容旧配置：指向 agent.log 时推导 dir
+	Dir      string                     `mapstructure:"dir"`
+	Rotate   LogRotateConfig            `mapstructure:"rotate"`
+	Channels map[string]LogChannelConfig `mapstructure:"channels"`
+}
+
+// LogRotateConfig 全局滚动默认值；各 channel 可用 retain_days 覆盖保留期。
+type LogRotateConfig struct {
+	Daily      *bool `mapstructure:"daily"`
+	MaxSizeMB  int   `mapstructure:"max_size_mb"`
+	RetainDays int   `mapstructure:"retain_days"`
+	Compress   bool  `mapstructure:"compress"`
+}
+
+// DailyEnabled 未配置时默认按日滚动。
+func (r LogRotateConfig) DailyEnabled() bool {
+	if r.Daily == nil {
+		return true
+	}
+	return *r.Daily
+}
+
+// LogChannelConfig 单通道配置。
+type LogChannelConfig struct {
+	Enabled    *bool  `mapstructure:"enabled"`
+	File       string `mapstructure:"file"`
+	Format     string `mapstructure:"format"` // agent: text|json；audit/usage: jsonl
+	RetainDays int    `mapstructure:"retain_days"`
+	Level      string `mapstructure:"level"`
+}
+
+// ChannelEnabled 未配置时默认启用。
+func (c LogChannelConfig) ChannelEnabled() bool {
+	if c.Enabled == nil {
+		return true
+	}
+	return *c.Enabled
 }
 
 // ServerConfig HTTP 服务配置。
@@ -702,10 +741,14 @@ func validate(cfg *Config) error {
 	applySecretsDefaults(&cfg.Secrets)
 	applySandboxDefaults(&cfg.Sandbox)
 	applyPolicyDefaults(&cfg.Policy)
+	applyLogDefaults(&cfg.Log)
 	if err := validatePolicyConfig(cfg.Policy); err != nil {
 		return err
 	}
 	if err := validateSandboxConfig(cfg.Sandbox); err != nil {
+		return err
+	}
+	if err := validateLogConfig(cfg.Log); err != nil {
 		return err
 	}
 	if len(cfg.LLM.Providers) == 0 {
@@ -844,6 +887,106 @@ func applyPolicyDefaults(cfg *PolicyConfig) {
 	if strings.TrimSpace(cfg.Sandbox.DefaultMode) == "" {
 		cfg.Sandbox.DefaultMode = "disabled"
 	}
+}
+
+func applyLogDefaults(cfg *LogConfig) {
+	if strings.TrimSpace(cfg.Level) == "" {
+		cfg.Level = "info"
+	}
+	// 旧 path 兼容：指向 .../agent.log 时推导 dir 与 agent 文件名。
+	if strings.TrimSpace(cfg.Dir) == "" {
+		path := strings.TrimSpace(cfg.Path)
+		if path != "" {
+			cfg.Dir = filepath.ToSlash(filepath.Dir(path))
+			base := filepath.Base(path)
+			if strings.HasSuffix(strings.ToLower(base), ".log") {
+				if cfg.Channels == nil {
+					cfg.Channels = map[string]LogChannelConfig{}
+				}
+				ch := cfg.Channels["agent"]
+				if strings.TrimSpace(ch.File) == "" {
+					ch.File = base
+					cfg.Channels["agent"] = ch
+				}
+			}
+		}
+	}
+	if strings.TrimSpace(cfg.Dir) == "" {
+		cfg.Dir = ".genesis/logs"
+	}
+	if cfg.Rotate.MaxSizeMB <= 0 {
+		cfg.Rotate.MaxSizeMB = 100
+	}
+	if cfg.Rotate.RetainDays <= 0 {
+		cfg.Rotate.RetainDays = 14
+	}
+	if cfg.Channels == nil {
+		cfg.Channels = map[string]LogChannelConfig{}
+	}
+	cfg.Channels["agent"] = mergeLogChannel(cfg.Channels["agent"], LogChannelConfig{
+		File: "agent.log", Format: "text", RetainDays: 14, Level: cfg.Level,
+	})
+	cfg.Channels["audit"] = mergeLogChannel(cfg.Channels["audit"], LogChannelConfig{
+		File: "audit.log", Format: "jsonl", RetainDays: 90, Level: "info",
+	})
+	cfg.Channels["usage"] = mergeLogChannel(cfg.Channels["usage"], LogChannelConfig{
+		File: "usage.log", Format: "jsonl", RetainDays: 90, Level: "info",
+	})
+}
+
+func mergeLogChannel(cur, def LogChannelConfig) LogChannelConfig {
+	if cur.Enabled == nil {
+		cur.Enabled = def.Enabled
+		if cur.Enabled == nil {
+			enabled := true
+			cur.Enabled = &enabled
+		}
+	}
+	if strings.TrimSpace(cur.File) == "" {
+		cur.File = def.File
+	}
+	if strings.TrimSpace(cur.Format) == "" {
+		cur.Format = def.Format
+	}
+	if cur.RetainDays <= 0 {
+		cur.RetainDays = def.RetainDays
+	}
+	if strings.TrimSpace(cur.Level) == "" {
+		cur.Level = def.Level
+	}
+	return cur
+}
+
+func validateLogConfig(cfg LogConfig) error {
+	if strings.TrimSpace(cfg.Dir) == "" {
+		return fmt.Errorf("log.dir 不能为空")
+	}
+	if cfg.Rotate.MaxSizeMB <= 0 {
+		return fmt.Errorf("log.rotate.max_size_mb 必须大于 0")
+	}
+	for name, ch := range cfg.Channels {
+		if !ch.ChannelEnabled() {
+			continue
+		}
+		if strings.TrimSpace(ch.File) == "" {
+			return fmt.Errorf("log.channels.%s.file 不能为空", name)
+		}
+		format := strings.ToLower(strings.TrimSpace(ch.Format))
+		switch name {
+		case "agent":
+			if format != "text" && format != "json" {
+				return fmt.Errorf("log.channels.agent.format 必须是 text 或 json")
+			}
+		case "audit", "usage":
+			if format != "jsonl" {
+				return fmt.Errorf("log.channels.%s.format 必须是 jsonl", name)
+			}
+		}
+		if ch.RetainDays <= 0 {
+			return fmt.Errorf("log.channels.%s.retain_days 必须大于 0", name)
+		}
+	}
+	return nil
 }
 
 func defaultFileOps(cfg *PolicyFileOperations, read, list, walk, write, edit, delete string) {

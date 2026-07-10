@@ -87,3 +87,32 @@ func TestEvaluatorMetadataFallbackAllowsWorkspace(t *testing.T) {
 		t.Fatalf("result = %+v, want allow", result)
 	}
 }
+
+func TestEvaluatorSkillScriptSuggestsSessionScope(t *testing.T) {
+	evaluator := NewEvaluator(config.PolicyDefaultsConfig{Unknown: "ask", AllowedGrantScopes: []string{"once", "session"}})
+	result, err := evaluator.Evaluate(context.Background(), approvalmodel.Request{
+		ToolName: "run_skill_script",
+		Action:   approvalmodel.ActionCommandExec,
+		Resource: approvalmodel.Resource{URI: "office-ppt/scripts/inspect_pptx.py"},
+		Metadata: map[string]string{"skill_script": "true"},
+		SuggestedScopes: []approvalmodel.GrantScope{
+			approvalmodel.GrantScopeOnce,
+			approvalmodel.GrantScopeSession,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Type != approvalmodel.PolicyAsk {
+		t.Fatalf("result = %+v, want ask", result)
+	}
+	hasSession := false
+	for _, scope := range result.SuggestedScopes {
+		if scope == approvalmodel.GrantScopeSession {
+			hasSession = true
+		}
+	}
+	if !hasSession {
+		t.Fatalf("SuggestedScopes = %v, want include session", result.SuggestedScopes)
+	}
+}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"genesis-agent/internal/app"
+	"genesis-agent/internal/runtime/progress"
 )
 
 // runResult run 命令的 JSON 输出结构（--json 模式）
@@ -26,8 +28,9 @@ type runResult struct {
 // run 命令执行单次 Agent 推理并输出结果，适合脚本调用和非交互场景
 func newRunCmd(configDirRef *string, sandboxModeRef *string, factory ServiceFactory) *cobra.Command {
 	var (
-		jsonOutput bool
-		quiet      bool
+		jsonOutput   bool
+		quiet        bool
+		progressMode string
 	)
 
 	cmd := &cobra.Command{
@@ -50,6 +53,9 @@ func newRunCmd(configDirRef *string, sandboxModeRef *string, factory ServiceFact
 			if input == "" {
 				return fmt.Errorf("消息内容不能为空")
 			}
+			if err := validateProgressMode(progressMode); err != nil {
+				return err
+			}
 
 			// JSON/quiet 模式不能出现交互式审批提示，避免污染机器可读输出。
 			serviceQuiet := quiet || jsonOutput
@@ -60,17 +66,22 @@ func newRunCmd(configDirRef *string, sandboxModeRef *string, factory ServiceFact
 
 			session := svc.NewSession()
 
+			progressSink := runProgressSink(progressMode, quiet, jsonOutput)
+
 			// 非 quiet / 非 JSON 模式：打印执行进度提示
 			if !quiet && !jsonOutput {
 				fmt.Printf("\n📤 输入: %s\n", input)
-				fmt.Println("⚙️  Agent 推理中...")
+				if progressSink == nil {
+					fmt.Println("⚙️  Agent 推理中...")
+				}
 				fmt.Println()
 			}
 
 			result, err := svc.RunOnce(ctx, app.RunRequest{
-				SessionID: session.ID,
-				TenantID:  session.TenantID,
-				Input:     input,
+				SessionID:  session.ID,
+				TenantID:   session.TenantID,
+				Input:      input,
+				OnProgress: progressSink,
 			})
 
 			// ── 错误处理 ──────────────────────────────────────────
@@ -132,6 +143,54 @@ func newRunCmd(configDirRef *string, sandboxModeRef *string, factory ServiceFact
 
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "以 JSON 格式输出结果（适合脚本解析）")
 	cmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "仅输出最终回答文本（适合管道操作）")
+	cmd.Flags().StringVar(&progressMode, "progress", "auto", "进度输出模式：auto|off|text|jsonl（输出到stderr）")
 
 	return cmd
+}
+
+func runProgressSink(mode string, quiet, jsonOutput bool) progress.Sink {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == "" {
+		mode = "auto"
+	}
+	if mode == "auto" {
+		if quiet || jsonOutput {
+			return nil
+		}
+		mode = "text"
+	}
+	if mode == "off" || mode == "none" {
+		return nil
+	}
+	return func(event progress.Event) {
+		if event.Summary == "" && event.Name == "" {
+			return
+		}
+		switch mode {
+		case "jsonl":
+			data, err := json.Marshal(event)
+			if err == nil {
+				fmt.Fprintln(os.Stderr, string(data))
+			}
+		default:
+			summary := event.Summary
+			if summary == "" {
+				summary = string(event.Kind) + ": " + event.Name
+			}
+			fmt.Fprintf(os.Stderr, "· %s\n", summary)
+		}
+	}
+}
+
+func validateProgressMode(mode string) error {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == "" {
+		return nil
+	}
+	switch mode {
+	case "auto", "off", "none", "text", "jsonl":
+		return nil
+	default:
+		return fmt.Errorf("未知progress模式 %q，可选: auto|off|text|jsonl", mode)
+	}
 }

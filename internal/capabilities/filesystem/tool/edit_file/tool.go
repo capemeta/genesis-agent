@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"genesis-agent/internal/capabilities/filesystem/binarygate"
 	fscontract "genesis-agent/internal/capabilities/filesystem/contract"
 	"genesis-agent/internal/capabilities/filesystem/model"
 	"genesis-agent/internal/capabilities/filesystem/permission"
@@ -95,6 +96,9 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 		return "", fscontract.NewError(fscontract.ErrCodeInvalidInput, path.DisplayPath, fmt.Errorf("old_string匹配次数为%d，必须唯一匹配", count))
 	}
 	next := []byte(strings.Replace(content, in.OldString, in.NewString, 1))
+	if err := binarygate.RejectFakeOfficeBinary(path.DisplayPath, next); err != nil {
+		return "", err
+	}
 	if err := t.deps.Backend.Write(ctx, path, next, fscontract.WriteOptions{
 		Overwrite:    true,
 		Atomic:       true,

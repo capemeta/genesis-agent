@@ -1,9 +1,9 @@
-// package runtime - RunContext定义
-// RunContext 是Loop执行期间的内存上下文对象，不持久化
-// 对应 AGENTS.md §3.8 RunContext
 package runtime
 
 import (
+	"sync"
+	"sync/atomic"
+
 	"genesis-agent/internal/domain"
 )
 
@@ -21,15 +21,54 @@ type RunContext struct {
 
 	// --- 统计 ---
 	TokenUsed int64 // 本次Run累计Token消耗
+
+	// --- Stream / Block状态 ---
+	blockSeq int64 // 递增分配的BlockIndex，用于流式多端输出，线程安全
+
+	// --- Skill 注入去重（本 Run 内）---
+	injectedMu     sync.Mutex
+	injectedSkills map[string]struct{} // key = opaque resource 或 authority:package
 }
 
 // NewRunContext 初始化RunContext
 func NewRunContext(run *domain.Run, agent *domain.Agent) *RunContext {
 	return &RunContext{
-		Run:      run,
-		Agent:    agent,
-		Messages: make([]*domain.Message, 0, 16),
+		Run:            run,
+		Agent:          agent,
+		Messages:       make([]*domain.Message, 0, 16),
+		blockSeq:       -1, // 第一个分配的将是 0
+		injectedSkills: make(map[string]struct{}),
 	}
+}
+
+// NextBlockIndex 分配并返回下一个 BlockIndex（从0开始）
+func (rc *RunContext) NextBlockIndex() int {
+	return int(atomic.AddInt64(&rc.blockSeq, 1))
+}
+
+// HasInjectedSkill 判断本 Run 是否已注入过该 skill resource。
+func (rc *RunContext) HasInjectedSkill(key string) bool {
+	if rc == nil || key == "" {
+		return false
+	}
+	rc.injectedMu.Lock()
+	defer rc.injectedMu.Unlock()
+	_, ok := rc.injectedSkills[key]
+	return ok
+}
+
+// MarkInjectedSkill 记录已注入的 skill；若已存在返回 false。
+func (rc *RunContext) MarkInjectedSkill(key string) bool {
+	if rc == nil || key == "" {
+		return false
+	}
+	rc.injectedMu.Lock()
+	defer rc.injectedMu.Unlock()
+	if _, ok := rc.injectedSkills[key]; ok {
+		return false
+	}
+	rc.injectedSkills[key] = struct{}{}
+	return true
 }
 
 // AddStep 向Run中追加一个Step记录

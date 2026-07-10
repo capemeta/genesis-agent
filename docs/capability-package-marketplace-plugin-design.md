@@ -49,7 +49,7 @@ Capability 是运行时原子能力。典型类型包括：
 
 | 类型 | 说明 | 是否可被 Agent 直接使用 |
 | --- | --- | --- |
-| Skill | 任务流程、约束、资源和执行说明 | 是，通过 Skill Runtime / load_skill |
+| Skill | 任务流程、约束、资源和执行说明 | 是，通过 Skill Runtime / `Skill` 网关（）；skill 名永不进 function schema |
 | Tool | 稳定原子动作 | 是，通过 Tool Gateway |
 | MCP | 外部系统连接和远程能力 | 是，通过 MCP Runtime / Connector |
 | SubAgent | 可委派的智能体角色或执行单元 | 是，通过多 Agent 编排 |
@@ -289,7 +289,7 @@ Office 能力优先以内置 Skills 落地；稳定后可以形成 `genesis-offi
 运行时使用：
 
 ```text
-load_skill office-word
+Skill(skill="office-word")
 read_skill_resource office-word/references/validation-checklist.md
 run_command python scripts/create_docx.py
 ```
@@ -327,7 +327,7 @@ Tool Runtime Adapter
   -> disabled / unregistered tool capability 在 Gateway 中 hidden，不可见、不可执行
 
 Skill Runtime
-  -> 仍通过 load_skill / list_skill_resources / read_skill_resource 暴露
+  -> 仍通过 Skill / list_skill_resources / read_skill_resource 暴露
   -> 可见性受 Capability Registry 中 skill / skill-resource enabled 状态约束
 ```
 
@@ -343,7 +343,7 @@ Skill Runtime
 | 单 Capability 启停 | [x] 已完成 | `Registry.SetCapabilityEnabled`、`Service.SetCapabilityEnabled`、`capability enable/disable` | 支持按 capability id 单独启停，并同步更新 InstallRecord 中的 capability 状态；Registry 可通过 RuntimeAdapterRegistry 同步 runtime adapter。 |
 | Tool Runtime Adapter | [x] 已完成（Gateway 可见性层） | `internal/capabilities/tool/adapter/capability` | enabled tool capability 可投影为 Tool Gateway 工具；disabled / unregister 后在 Gateway 中 hidden。实际外部执行器仍未接入。 |
 | CLI / Tool Gateway 装配 | [x] 已完成 | `products/cli/bootstrap/container.go`、`products/cli/bootstrap/capability_tool_test.go` | CLI 启动时从 Capability Registry 加载 tool capability，并作为 AdditionalTools 进入共享 Tool Gateway。 |
-| Skill 可见性接入 Capability Registry | [x] 已完成 | `skill/service.Options.Visibility`、`filterVisibleSkills`、CLI bootstrap 注入 Registry | disabled Skill capability 会从 catalog、`load_skill`、prompt 注入中消失；enable 后恢复。 |
+| Skill 可见性接入 Capability Registry | [x] 已完成 | `skill/service.Options.Visibility`、`filterVisibleSkills`、CLI bootstrap 注入 Registry | disabled Skill capability 会从 catalog、`Skill`、prompt 注入中消失；enable 后恢复。协议边界见 `docs/superpowers/specs/2026-07-09-skill-tool-protocol-boundary-design.md`。 |
 | Skill Resource 工具接入启用态校验 | [/] 部分完成 | `list_skill_resources.Deps.Registry`、`read_skill_resource.Deps.Registry` | 工具使用 Capability Registry 过滤/校验 enabled 的 `skill-resource`；实际内容读取仍由 Skill Source 完成。 |
 | Product 装配协议 | [x] 已完成（协议层） | `CLIProtocol()`、`DesktopProtocol()`、`EnterpriseProtocol()` | CLI/desktop/enterprise 的持久化协议与 scope 结构已定义；Desktop SQLite 与 Enterprise DB 实现尚未落地。 |
 | Plugin 组合 Package | [/] 部分完成 | `plugin install/list/show/enable/disable/uninstall`、`plugin.json` 解析 | Plugin 可组合 Skill/Tool/MCP/SubAgent/Resource 并进入索引；Tool 已进入 Gateway 可见性层，MCP/SubAgent 仍未接具体 runtime。 |

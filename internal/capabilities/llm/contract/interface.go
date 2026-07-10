@@ -19,6 +19,10 @@ type ChatModel interface {
 	// tools:    本次 Run 可用的工具元信息（空切片=不启用工具调用）
 	Generate(ctx context.Context, messages []*domain.Message, tools []*tool.Info) (*domain.Message, error)
 
+	// StreamGenerate 流式生成回复，并通过回调回传增量文本（思考内容或正式文本）
+	// onDelta(delta, isThought): delta 是增量内容，isThought=true 时表示该内容是 CoT 思考过程（推理步骤）
+	StreamGenerate(ctx context.Context, messages []*domain.Message, tools []*tool.Info, onDelta func(delta string, isThought bool)) (*domain.Message, error)
+
 	// GetModelName 返回当前模型名称（用于日志/追踪）
 	GetModelName() string
 }

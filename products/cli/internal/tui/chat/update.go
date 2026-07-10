@@ -2,10 +2,15 @@ package chat
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
+
+	approvalmodel "genesis-agent/internal/capabilities/approval/model"
+	"genesis-agent/internal/runtime/progress"
+	approval "genesis-agent/products/cli/internal/approval"
 )
 
 // Update 处理所有外部事件，返回新的 Model 状态和待执行的 Cmd
@@ -16,12 +21,93 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 
+	case approval.ApprovalRequiredMsg:
+		m.activeApproval = &msg
+		m.approvalFocus = true
+		m.textinput.Blur()
+		m.refreshViewportContent()
+		m.viewport.GotoBottom()
+		return m, nil
+
 	// ── 终端窗口尺寸变化（初次加载和调整窗口大小时触发）──────
 	case tea.WindowSizeMsg:
 		return m.handleWindowSize(msg)
 
 	// ── 键盘输入 ───────────────────────────────────────────────
 	case tea.KeyMsg:
+		if m.approvalFocus && m.activeApproval != nil {
+			switch strings.ToLower(msg.String()) {
+			case "y", "once":
+				m.messages = append(m.messages, uiMessage{
+					role:    "system",
+					content: "🟢 已允许本次操作：" + string(m.activeApproval.Request.Action),
+				})
+				m.activeApproval.ResultCh <- approvalmodel.Decision{
+					Type:   approvalmodel.DecisionApproved,
+					Scope:  approvalmodel.GrantScopeOnce,
+					Reason: "用户在TUI同意本次操作",
+				}
+				m.activeApproval = nil
+				m.approvalFocus = false
+				m.textinput.Focus()
+				m.refreshViewportContent()
+				m.viewport.GotoBottom()
+				return m, nil
+
+			case "s", "session":
+				m.messages = append(m.messages, uiMessage{
+					role:    "system",
+					content: "🟢 已允许当前会话所有此类操作：" + string(m.activeApproval.Request.Action),
+				})
+				m.activeApproval.ResultCh <- approvalmodel.Decision{
+					Type:   approvalmodel.DecisionApprovedForScope,
+					Scope:  approvalmodel.GrantScopeSession,
+					Reason: "用户在TUI同意当前会话",
+				}
+				m.activeApproval = nil
+				m.approvalFocus = false
+				m.textinput.Focus()
+				m.refreshViewportContent()
+				m.viewport.GotoBottom()
+				return m, nil
+
+			case "n", "no", "deny":
+				m.messages = append(m.messages, uiMessage{
+					role:    "system",
+					content: "🔴 已拒绝操作：" + string(m.activeApproval.Request.Action),
+				})
+				m.activeApproval.ResultCh <- approvalmodel.Decision{
+					Type:   approvalmodel.DecisionDenied,
+					Scope:  approvalmodel.GrantScopeOnce,
+					Reason: "用户在TUI拒绝操作",
+				}
+				m.activeApproval = nil
+				m.approvalFocus = false
+				m.textinput.Focus()
+				m.refreshViewportContent()
+				m.viewport.GotoBottom()
+				return m, nil
+
+			case "a", "abort":
+				m.messages = append(m.messages, uiMessage{
+					role:    "system",
+					content: "⚠️ 已终止整个任务",
+				})
+				m.activeApproval.ResultCh <- approvalmodel.Decision{
+					Type:   approvalmodel.DecisionAbort,
+					Scope:  approvalmodel.GrantScopeOnce,
+					Reason: "用户在TUI终止任务",
+				}
+				m.activeApproval = nil
+				m.approvalFocus = false
+				m.textinput.Focus()
+				m.refreshViewportContent()
+				m.viewport.GotoBottom()
+				return m, nil
+			}
+			return m, nil
+		}
+
 		switch msg.Type {
 
 		case tea.KeyCtrlC:
@@ -55,14 +141,35 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case runCompleteMsg:
 		m.loading = false
 		m.err = nil
+		m.currentStatus = ""
+		m.progressCh = nil
+		m.activeApproval = nil
+		m.approvalFocus = false
+		m.textinput.Focus()
 		run := msg.result.Run
-		m.messages = append(m.messages, uiMessage{
-			role:    "assistant",
-			content: run.FinalAnswer,
-			steps:   len(run.Steps),
-			tokens:  run.TotalTokens,
-			elapsed: msg.result.Elapsed,
-		})
+		if summary := m.progressSummaryMessage(); summary != "" {
+			m.messages = append(m.messages, uiMessage{role: "system", content: summary})
+		}
+		found := false
+		for i := len(m.messages) - 1; i >= 0; i-- {
+			if m.messages[i].role == "assistant" {
+				m.messages[i].content = run.FinalAnswer
+				m.messages[i].steps = len(run.Steps)
+				m.messages[i].tokens = run.TotalTokens
+				m.messages[i].elapsed = msg.result.Elapsed
+				found = true
+				break
+			}
+		}
+		if !found {
+			m.messages = append(m.messages, uiMessage{
+				role:    "assistant",
+				content: run.FinalAnswer,
+				steps:   len(run.Steps),
+				tokens:  run.TotalTokens,
+				elapsed: msg.result.Elapsed,
+			})
+		}
 		m.refreshViewportContent()
 		m.viewport.GotoBottom()
 		// 恢复光标闪烁（推理期间被 spinner tick 替代）
@@ -72,7 +179,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case runErrorMsg:
 		m.loading = false
 		m.err = msg.err
+		m.currentStatus = ""
+		m.progressCh = nil
+		m.activeApproval = nil
+		m.approvalFocus = false
+		m.textinput.Focus()
 		errContent := "❌ 错误: " + msg.err.Error()
+		if summary := m.progressSummaryMessage(); summary != "" {
+			m.messages = append(m.messages, uiMessage{role: "system", content: summary})
+		}
 		m.messages = append(m.messages, uiMessage{
 			role:    "system",
 			content: errContent,
@@ -80,6 +195,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refreshViewportContent()
 		m.viewport.GotoBottom()
 		return m, textinput.Blink
+
+	case progressMsg:
+		if !m.loading {
+			return m, nil
+		}
+		m.applyProgress(msg.event)
+		m.refreshViewportContent()
+		m.viewport.GotoBottom()
+		cmds = append(cmds, waitProgress(m.progressCh))
 	}
 
 	// ── 转发事件给子组件 ────────────────────────────────────────
@@ -145,15 +269,190 @@ func (m Model) sendMessage(input string) (tea.Model, tea.Cmd) {
 	// 进入加载状态
 	m.loading = true
 	m.err = nil
+	m.currentStatus = "准备运行 Agent"
+	m.progressLog = nil
+	m.progressCh = make(chan progressMsg, 32)
 	// 更新消息区并滚动到底部
 	m.refreshViewportContent()
 	m.viewport.GotoBottom()
 
 	// 同时启动：Spinner 动画 + Agent 后台推理
 	return m, tea.Batch(
-		m.spinner.Tick,       // 启动加载动画
-		m.runAgentCmd(input), // 后台执行 LLM 推理
+		m.spinner.Tick,                     // 启动加载动画
+		waitProgress(m.progressCh),         // 接收结构化运行进度
+		m.runAgentCmd(input, m.progressCh), // 后台执行 LLM 推理
 	)
+}
+
+func (m *Model) applyProgress(event progress.Event) {
+	if event.BlockType == "final_answer" {
+		if event.Phase == progress.PhaseStart {
+			found := false
+			// 寻找当前 Turn（即最后一个 User 消息之后）是否已有 assistant 消息
+			userMsgIdx := -1
+			for i := len(m.messages) - 1; i >= 0; i-- {
+				if m.messages[i].role == "user" {
+					userMsgIdx = i
+					break
+				}
+			}
+			for i := len(m.messages) - 1; i > userMsgIdx; i-- {
+				if m.messages[i].role == "assistant" {
+					m.messages[i].content = "" // 重置内容以供新的一轮重新流式输出
+					found = true
+					break
+				}
+			}
+			if !found {
+				m.messages = append(m.messages, uiMessage{
+					role:    "assistant",
+					content: "",
+				})
+			}
+		} else if event.Phase == progress.PhaseProgress {
+			for i := len(m.messages) - 1; i >= 0; i-- {
+				if m.messages[i].role == "assistant" {
+					m.messages[i].content += event.Detail
+					break
+				}
+			}
+		}
+		return
+	}
+
+	summary := progressSummary(event)
+	if summary == "" {
+		return
+	}
+	m.currentStatus = summary
+	if shouldLogProgress(event) {
+		m.progressLog = append(m.progressLog, summary)
+	}
+}
+
+func (m Model) progressSummaryMessage() string {
+	if len(m.progressLog) == 0 {
+		return ""
+	}
+	lines := make([]string, 0, len(m.progressLog)+1)
+	lines = append(lines, "运行过程:")
+	for _, item := range m.progressLog {
+		lines = append(lines, "- "+item)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func progressSummary(event progress.Event) string {
+	summary := event.Summary
+	if summary == "" {
+		if event.Name != "" {
+			switch event.Kind {
+			case progress.KindTool:
+				summary = "调用工具: " + event.Name
+			case progress.KindSandbox:
+				summary = "sandbox: " + event.Name
+			case progress.KindLLM:
+				summary = "调用 LLM: " + event.Name
+			}
+		}
+	}
+
+	// 针对具体工具参数进行解析并人性化输出
+	if event.Kind == progress.KindTool && event.Name != "" {
+		detail := event.Detail
+		if detail != "" && strings.HasPrefix(detail, "{") {
+			if event.Name == "web_search" {
+				if event.Phase == progress.PhaseStart && strings.Contains(detail, `"query"`) {
+					query := extractJSONField(detail, "query")
+					if query != "" {
+						return fmt.Sprintf("调用工具: web_search (查询: %s)", truncateString(query, 40))
+					}
+				} else if event.Phase == progress.PhaseComplete && strings.Contains(detail, `"provider"`) {
+					provider := extractJSONField(detail, "provider")
+					if provider != "" {
+						return fmt.Sprintf("工具执行完成: web_search (搜索引擎: %s)", provider)
+					}
+				}
+			}
+			if event.Name == "Skill" && (strings.Contains(detail, `"skill"`) || strings.Contains(detail, `"qualified_name"`) || strings.Contains(detail, `"name"`)) {
+				name := extractJSONField(detail, "skill")
+				if name == "" {
+					name = extractJSONField(detail, "qualified_name")
+				}
+				if name == "" {
+					name = extractJSONField(detail, "name")
+				}
+				if name != "" {
+					if event.Phase == progress.PhaseStart {
+						return fmt.Sprintf("加载技能: %s", name)
+					}
+					return fmt.Sprintf("技能加载完成: %s", name)
+				}
+			}
+			if strings.Contains(detail, `"command"`) {
+				cmd := extractJSONField(detail, "command")
+				if cmd != "" {
+					if event.Phase == progress.PhaseStart {
+						return fmt.Sprintf("调用工具: %s (命令: %s)", event.Name, truncateString(cmd, 40))
+					}
+					return fmt.Sprintf("工具执行完成: %s (命令: %s)", event.Name, truncateString(cmd, 40))
+				}
+			}
+			if strings.Contains(detail, `"path"`) {
+				path := extractJSONField(detail, "path")
+				if path != "" {
+					if event.Phase == progress.PhaseStart {
+						return fmt.Sprintf("调用工具: %s (路径: %s)", event.Name, path)
+					}
+					return fmt.Sprintf("工具执行完成: %s (路径: %s)", event.Name, path)
+				}
+			}
+		}
+	}
+
+	return summary
+}
+
+func extractJSONField(jsonStr, field string) string {
+	idx := strings.Index(jsonStr, `"`+field+`"`)
+	if idx == -1 {
+		return ""
+	}
+	sub := jsonStr[idx+len(field)+2:]
+	colonIdx := strings.Index(sub, ":")
+	if colonIdx == -1 {
+		return ""
+	}
+	sub = sub[colonIdx+1:]
+	start := strings.Index(sub, `"`)
+	if start == -1 {
+		return ""
+	}
+	sub = sub[start+1:]
+	end := strings.Index(sub, `"`)
+	if end == -1 {
+		return ""
+	}
+	return sub[:end]
+}
+
+func truncateString(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "..."
+}
+
+func shouldLogProgress(event progress.Event) bool {
+	if event.Display != nil && !*event.Display {
+		return false
+	}
+	switch event.Kind {
+	case progress.KindLLM, progress.KindTool, progress.KindSkill, progress.KindSandbox, progress.KindFile:
+		return event.Phase == progress.PhaseStart || event.Phase == progress.PhaseComplete || event.Phase == progress.PhaseError
+	default:
+		return false
+	}
 }
 
 // handleSlashCmd 处理 / 开头的斜杠命令

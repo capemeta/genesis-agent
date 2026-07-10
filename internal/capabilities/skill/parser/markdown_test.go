@@ -42,3 +42,44 @@ func TestParseDependencies(t *testing.T) {
 		t.Fatalf("unexpected dependency: %+v", meta.Dependencies.Tools[1])
 	}
 }
+
+func TestParseDependenciesRuntime(t *testing.T) {
+	data := []byte(`---
+name: office-ppt
+description: PPT skill
+dependencies:
+  tools:
+    - type: tool
+      value: run_skill_script
+  runtime:
+    node:
+      - name: pptxgenjs
+        require: pptxgenjs
+    python:
+      - name: pillow
+        import: PIL
+  install_hints:
+    - npm install pptxgenjs
+---
+Body`)
+	meta, _, err := New().ParseFull(data, contract.ParseSource{Authority: model.Authority{Kind: model.SourceKindHost, ID: "test"}, Scope: model.ScopeProject, DirectoryName: "office-ppt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(meta.Dependencies.Runtime.Node) != 1 || meta.Dependencies.Runtime.Node[0].Name != "pptxgenjs" || meta.Dependencies.Runtime.Node[0].Require != "pptxgenjs" {
+		t.Fatalf("node runtime = %+v", meta.Dependencies.Runtime.Node)
+	}
+	if len(meta.Dependencies.Runtime.Python) != 1 || meta.Dependencies.Runtime.Python[0].Name != "pillow" {
+		t.Fatalf("python runtime = %+v", meta.Dependencies.Runtime.Python)
+	}
+	if len(meta.Dependencies.InstallHints) != 1 {
+		t.Fatalf("install_hints = %+v", meta.Dependencies.InstallHints)
+	}
+	wl := meta.Dependencies.RuntimeWhitelist()
+	if _, ok := wl["npm:pptxgenjs"]; !ok {
+		t.Fatalf("whitelist missing npm:pptxgenjs: %+v", wl)
+	}
+	if _, ok := wl["pip:pillow"]; !ok {
+		t.Fatalf("whitelist missing pip:pillow: %+v", wl)
+	}
+}

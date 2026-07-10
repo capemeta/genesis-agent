@@ -1,0 +1,7 @@
+interface:
+  display_name: "审查修复再审查"
+  short_description: "循环审查、修订并复核工程产物"
+  default_prompt: "Use $review-fix-rereview to review, revise, and re-review this engineering work product until no actionable issues remain."
+policy:
+  allow_implicit_invocation: true
+

@@ -2,6 +2,7 @@ package embedded
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"testing/fstest"
 
@@ -88,6 +89,9 @@ func TestSystemFSIncludesOfficeSkills(t *testing.T) {
 		"pdf-review":   false,
 	}
 	for _, entry := range listed.Entries {
+		if entry.Name == OfficeCommonPackage || strings.HasPrefix(entry.Name, "_") {
+			t.Fatalf("shared package should not appear in catalog: %s", entry.Name)
+		}
 		if _, ok := want[entry.Name]; ok {
 			want[entry.Name] = true
 			if len(entry.AllowedTools) == 0 {
@@ -119,5 +123,22 @@ func TestSystemFSIncludesOfficeSkills(t *testing.T) {
 	}
 	if !hasScript || !hasReference {
 		t.Fatalf("office-word resources=%+v", resources.Resources)
+	}
+
+	pptResources, err := source.ListResources(context.Background(), contract.SourceListResourcesRequest{PackageID: "office-ppt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var hasThumb, hasUnpack bool
+	for _, resource := range pptResources.Resources {
+		if resource.Resource == "office-ppt/scripts/thumbnail.py" {
+			hasThumb = true
+		}
+		if resource.Resource == "office-ppt/scripts/office/unpack.py" {
+			hasUnpack = true
+		}
+	}
+	if !hasThumb || !hasUnpack {
+		t.Fatalf("office-ppt missing migrated scripts: thumb=%v unpack=%v count=%d", hasThumb, hasUnpack, len(pptResources.Resources))
 	}
 }

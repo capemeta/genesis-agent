@@ -201,6 +201,138 @@ open(output_path, "w").write("ok")
 	}
 }
 
+func TestValidateCommandRejectsPathInsideJavaScriptSource(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "process.js")
+	if err := os.WriteFile(script, []byte(`const fs = require("fs");
+fs.writeFileSync("/tmp/result.txt", "bad");
+`), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	err := ValidateCommand(execmodel.Command{Command: `node process.js`, Cwd: dir}, strictOptions())
+	if code := execcontract.CodeOf(err); code != execcontract.ErrCodeInvalidInput {
+		t.Fatalf("CodeOf(err)=%s err=%v", code, err)
+	}
+	if !strings.Contains(err.Error(), script) || !strings.Contains(err.Error(), "/tmp/result.txt") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestValidateCommandRejectsPathInsideTypeScriptSource(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "process.ts")
+	if err := os.WriteFile(script, []byte("const path = `/var/logs/out.txt`;"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	err := ValidateCommand(execmodel.Command{Command: `tsx process.ts`, Cwd: dir}, strictOptions())
+	if code := execcontract.CodeOf(err); code != execcontract.ErrCodeInvalidInput {
+		t.Fatalf("CodeOf(err)=%s err=%v", code, err)
+	}
+	if !strings.Contains(err.Error(), "/var/logs/out.txt") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestValidateCommandRejectsPathInsideGoRunSource(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "main.go")
+	if err := os.WriteFile(script, []byte("package main\nfunc main(){ println(`/etc/passwd`) }\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	err := ValidateCommand(execmodel.Command{Command: `go run main.go`, Cwd: dir}, strictOptions())
+	if code := execcontract.CodeOf(err); code != execcontract.ErrCodeInvalidInput {
+		t.Fatalf("CodeOf(err)=%s err=%v", code, err)
+	}
+	if !strings.Contains(err.Error(), "/etc/passwd") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestValidateCommandRejectsPathInsideGoRunPackageSource(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "main.go")
+	if err := os.WriteFile(script, []byte("package main\nfunc main(){ println(\"/var/logs/out.txt\") }\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	err := ValidateCommand(execmodel.Command{Command: `go run .`, Cwd: dir}, strictOptions())
+	if code := execcontract.CodeOf(err); code != execcontract.ErrCodeInvalidInput {
+		t.Fatalf("CodeOf(err)=%s err=%v", code, err)
+	}
+	if !strings.Contains(err.Error(), "/var/logs/out.txt") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestValidateCommandRejectsPathInsideJavaSource(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "Main.java")
+	if err := os.WriteFile(script, []byte(`class Main { String p = "D:\data\input.xlsx"; }`), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	err := ValidateCommand(execmodel.Command{Command: `javac Main.java`, Cwd: dir}, strictOptions())
+	if code := execcontract.CodeOf(err); code != execcontract.ErrCodeInvalidInput {
+		t.Fatalf("CodeOf(err)=%s err=%v", code, err)
+	}
+	if !strings.Contains(err.Error(), `D:\data\input.xlsx`) {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestValidateCommandRejectsPathInsidePowerShellSource(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "run.ps1")
+	if err := os.WriteFile(script, []byte(`Get-Content C:\data\input.csv`), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	err := ValidateCommand(execmodel.Command{Command: `pwsh -File run.ps1`, Cwd: dir}, strictOptions())
+	if code := execcontract.CodeOf(err); code != execcontract.ErrCodeInvalidInput {
+		t.Fatalf("CodeOf(err)=%s err=%v", code, err)
+	}
+	if !strings.Contains(err.Error(), `C:\data\input.csv`) {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestValidateCommandRejectsPathInsideShellScriptSource(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "run.sh")
+	if err := os.WriteFile(script, []byte(`#!/usr/bin/env bash
+cat /home/alice/input.txt
+`), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	err := ValidateCommand(execmodel.Command{Command: `bash run.sh`, Cwd: dir}, strictOptions())
+	if code := execcontract.CodeOf(err); code != execcontract.ErrCodeInvalidInput {
+		t.Fatalf("CodeOf(err)=%s err=%v", code, err)
+	}
+	if !strings.Contains(err.Error(), "/home/alice/input.txt") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestValidateCommandRejectsPathInsideSkillManifest(t *testing.T) {
+	dir := t.TempDir()
+	skill := filepath.Join(dir, "SKILL.md")
+	if err := os.WriteFile(skill, []byte("---\nname: demo\ndescription: Demo\n---\nRun `python /var/scripts/run.py`.\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	err := ValidateCommand(execmodel.Command{Command: `genesis-cli skill validate SKILL.md`, Cwd: dir}, strictOptions())
+	if code := execcontract.CodeOf(err); code != execcontract.ErrCodeInvalidInput {
+		t.Fatalf("CodeOf(err)=%s err=%v", code, err)
+	}
+	if !strings.Contains(err.Error(), "/var/scripts/run.py") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
 func TestCustomRegistryAnalyzerCanExtendPreflight(t *testing.T) {
 	registry := NewRegistry(staticAnalyzer{violations: []Violation{{
 		Fragment: "custom://bad",
@@ -236,4 +368,10 @@ func (staticAnalyzer) Name() string { return "static" }
 
 func (a staticAnalyzer) Analyze(AnalysisInput) ([]Violation, error) {
 	return a.violations, nil
+}
+
+func strictOptions() execcontract.RunOptions {
+	return execcontract.RunOptions{
+		Workspace: execmodel.ExecutionWorkspace{PathPolicy: execmodel.PathPolicyStrictWorkspace},
+	}
 }

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"genesis-agent/internal/app"
+	"genesis-agent/internal/runtime/progress"
 )
 
 // runCompleteMsg Agent 推理成功完成时，后台 goroutine 发回 Update 的消息
@@ -16,6 +17,11 @@ type runCompleteMsg struct {
 // runErrorMsg Agent 推理出错时发回 Update 的消息
 type runErrorMsg struct {
 	err error // 错误详情
+}
+
+// progressMsg Agent 运行进度事件。
+type progressMsg struct {
+	event progress.Event
 }
 
 // uiMessage TUI 渲染用的对话消息，是 domain.Message 的视图层映射

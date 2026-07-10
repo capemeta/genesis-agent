@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	fscontract "genesis-agent/internal/capabilities/filesystem/contract"
+	"genesis-agent/internal/capabilities/filesystem/binarygate"
 	"genesis-agent/internal/capabilities/filesystem/model"
 	"genesis-agent/internal/capabilities/filesystem/permission"
 	"genesis-agent/internal/capabilities/filesystem/tool/toolkit"
@@ -96,6 +97,9 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 		return "", fscontract.NewError(fscontract.ErrCodeNotFound, path.DisplayPath, fmt.Errorf("expected_hash要求目标文件已存在"))
 	}
 	content := []byte(in.Content)
+	if err := binarygate.RejectFakeOfficeBinary(path.DisplayPath, content); err != nil {
+		return "", err
+	}
 	if err := t.deps.Backend.Write(ctx, path, content, fscontract.WriteOptions{
 		CreateParents: in.CreateParents,
 		Overwrite:     overwrite,

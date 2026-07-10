@@ -19,6 +19,7 @@ import (
 	"genesis-agent/internal/domain"
 	"genesis-agent/internal/platform/config"
 	"genesis-agent/internal/runtime"
+	"genesis-agent/internal/runtime/progress"
 )
 
 // AgentService 应用服务接口
@@ -54,11 +55,12 @@ type AgentService interface {
 
 // RunRequest RunOnce 的请求参数
 type RunRequest struct {
-	SessionID string        // 会话 ID（跨 Run 保持对话历史）
-	TenantID  string        // 租户 ID（隔离租户数据）
-	Input     string        // 用户输入内容
-	Agent     *domain.Agent // 可选：指定 Agent 配置；nil 时使用 DefaultAgent
-	Sandbox   *execmodel.SandboxProfile
+	SessionID  string        // 会话 ID（跨 Run 保持对话历史）
+	TenantID   string        // 租户 ID（隔离租户数据）
+	Input      string        // 用户输入内容
+	Agent      *domain.Agent // 可选：指定 Agent 配置；nil 时使用 DefaultAgent
+	Sandbox    *execmodel.SandboxProfile
+	OnProgress progress.Sink // 可选：接收结构化运行进度事件
 }
 
 // RunResult RunOnce 的执行结果

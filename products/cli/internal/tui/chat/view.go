@@ -19,13 +19,13 @@ func (m Model) View() string {
 		return "\n  正在初始化界面...\n"
 	}
 
-	return strings.Join([]string{
-		m.headerView(),    // 2 行（标题 + 分隔线）
-		m.viewport.View(), // N 行（动态高度）
-		m.statusView(),    // 1 行（状态栏）
-		m.helpView(),      // 1 行（帮助栏）
-		m.inputView(),     // 3 行（边框 + 输入 + 边框）
-	}, "\n")
+	return lipgloss.JoinVertical(lipgloss.Left,
+		m.headerView(),
+		m.viewport.View(),
+		m.statusView(),
+		m.helpView(),
+		m.inputView(),
+	)
 }
 
 // headerView 渲染顶部标题栏（2 行：信息行 + 分隔线）
@@ -60,8 +60,12 @@ func (m Model) statusView() string {
 	var content string
 	switch {
 	case m.loading:
+		status := m.currentStatus
+		if status == "" {
+			status = "准备运行 Agent"
+		}
 		content = styles.StatusLoading.Render(
-			fmt.Sprintf("  %s Agent 思考中，请稍候...", m.spinner.View()),
+			fmt.Sprintf("  %s %s", m.spinner.View(), truncateDisplay(status, m.width-8)),
 		)
 	case m.err != nil:
 		// 错误摘要（完整错误已以 system 消息显示在对话区）
@@ -73,6 +77,20 @@ func (m Model) statusView() string {
 	}
 	// Width 固定为终端宽度，防止不足一行时布局错位
 	return lipgloss.NewStyle().Width(m.width).Render(content)
+}
+
+func truncateDisplay(value string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) <= max {
+		return value
+	}
+	if max <= 3 {
+		return string(runes[:max])
+	}
+	return string(runes[:max-3]) + "..."
 }
 
 // helpView 渲染帮助栏（1 行，显示常用快捷键）

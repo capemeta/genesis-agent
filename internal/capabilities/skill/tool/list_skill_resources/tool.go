@@ -13,6 +13,7 @@ import (
 	capcontract "genesis-agent/internal/capabilities/capability/contract"
 	skillcontract "genesis-agent/internal/capabilities/skill/contract"
 	"genesis-agent/internal/capabilities/skill/model"
+	"genesis-agent/internal/capabilities/skill/script/scriptutil"
 	tool "genesis-agent/internal/capabilities/tool/contract"
 )
 
@@ -69,7 +70,9 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	data, err := json.Marshal(output{SkillQualifiedName: result.Skill.QualifiedName, Package: string(result.Skill.PackageID), Resources: t.filterIndexedResources(ctx, pkg, name, result.Resources)})
+	resources := t.filterIndexedResources(ctx, pkg, name, result.Resources)
+	resources = filterExecutableScriptEntries(resources)
+	data, err := json.Marshal(output{SkillQualifiedName: result.Skill.QualifiedName, Package: string(result.Skill.PackageID), Resources: resources})
 	if err != nil {
 		return "", err
 	}
@@ -99,6 +102,18 @@ func (t *Tool) filterIndexedResources(ctx context.Context, pkg model.PackageID, 
 		if _, ok := indexed[normalizeResourcePath(string(resource.Resource))]; ok {
 			out = append(out, resource)
 		}
+	}
+	return out
+}
+
+// filterExecutableScriptEntries 对模型隐藏不可作为 run_skill_script 入口的辅助模块。
+func filterExecutableScriptEntries(resources []model.ResourceInfo) []model.ResourceInfo {
+	out := make([]model.ResourceInfo, 0, len(resources))
+	for _, resource := range resources {
+		if resource.Kind == model.ResourceKindScript && !scriptutil.IsExecutableScriptEntry(string(resource.Resource)) {
+			continue
+		}
+		out = append(out, resource)
 	}
 	return out
 }

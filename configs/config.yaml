@@ -237,14 +237,43 @@ skills:
   sources: []
 agent:
   # ReAct Loop 最大迭代次数（防止无限循环）
-  max_iterations: 10
+  max_iterations: 50
 
   # Agent 系统提示词（可在 config.local.yaml 中覆盖为业务专属提示词）
   system_prompt: "你是一个有帮助、有能力的AI助手。善用提供的工具来准确回答用户的问题。回答时请简洁清晰，直接给出答案。"
 
 log:
-  # 日志级别: debug | info | warn | error
+  # 日志级别: debug | info | warn | error（作用于 agent 通道）
   level: info
+
+  # 三类日志根目录（相对路径相对配置目录父目录）；默认 .genesis/logs
+  dir: .genesis/logs
+
+  # 兼容旧配置：若仅设置 path 指向 .../agent.log，将推导 dir 与 agent 文件名
+  # path: ""
+
+  rotate:
+    daily: true
+    max_size_mb: 100
+    retain_days: 14
+    compress: false
+
+  channels:
+    agent:
+      enabled: true
+      file: agent.log
+      format: text            # text | json
+      retain_days: 14
+    audit:
+      enabled: true
+      file: audit.log
+      format: jsonl
+      retain_days: 90
+    usage:
+      enabled: true
+      file: usage.log
+      format: jsonl
+      retain_days: 90
 
 server:
   # HTTP 服务监听地址

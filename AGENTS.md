@@ -18,6 +18,7 @@
 - Tool / MCP / Skill / Sandbox / Memory / LLM / Trace / Auth / Usage 等能力应可独立演化。
 - 系统装配集中在 `bootstrap`；平台级通用基础设施放 `platform`；能力实现优先按能力域聚合在 `capabilities`。
 - Tool / MCP / Skill / Sandbox 使用统一能力适用范围配置，按接入端、租户、项目、Agent、用户、角色、运行环境过滤。
+- Skill 是任务知识/流程包，不是可执行原语；LLM function schema 只能出现 Tool 名。加载技能必须经固定网关工具 `Skill(skill=...)`，禁止把 skill 名（如 `office-ppt`）当作 Tool 调用。协议细节以 `docs/superpowers/specs/2026-07-09-skill-tool-protocol-boundary-design.md` 为准。
 - 记忆系统从 Phase 1 起支持 ShortTermMemory / LongTermMemory / UserProfileStore 接口；当前可用文件存储实现，后续替换为 DB、Redis、向量库或外部画像服务。
 - RBAC、多级限流、全链路异步、缓存/并发优化属于 Phase 2.5；Phase 1B 优先做 Tool Gateway、权限策略、人工干预、状态持久化、SSE、Session/Message 持久化、记忆/画像管理 API、Usage、Hook、Skills 基础。
 

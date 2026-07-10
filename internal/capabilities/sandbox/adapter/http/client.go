@@ -21,6 +21,7 @@ import (
 	fscontract "genesis-agent/internal/capabilities/filesystem/contract"
 	fsmodel "genesis-agent/internal/capabilities/filesystem/model"
 	sandboxcontract "genesis-agent/internal/capabilities/sandbox/contract"
+	"genesis-agent/internal/runtime/progress"
 )
 
 const (
@@ -120,21 +121,28 @@ func (c *Client) RunCommand(ctx context.Context, req sandboxcontract.CommandRequ
 	if c == nil {
 		return nil, execcontract.NewError(execcontract.ErrCodeSandboxUnavailable, fmt.Errorf("sandbox http client未初始化"))
 	}
+	progress.Emit(ctx, progress.Event{Kind: progress.KindSandbox, Phase: progress.PhaseStart, Component: "genesis-sandbox", Name: string(req.Sandbox.RuntimeProfile), Summary: "申请 sandbox 租约"})
 	lease, err := c.leaseSandbox(ctx, req)
 	if err != nil {
+		progress.Emit(ctx, progress.Event{Kind: progress.KindSandbox, Phase: progress.PhaseError, Level: progress.LevelError, Component: "genesis-sandbox", Summary: "sandbox 租约申请失败", Detail: err.Error()})
 		return nil, err
 	}
+	progress.Emit(ctx, progress.Event{Kind: progress.KindSandbox, Phase: progress.PhaseComplete, Component: "genesis-sandbox", Name: lease.SandboxID, Summary: "sandbox 租约已就绪"})
 	renewCtx, cancelRenew := context.WithCancel(context.Background())
 	go c.renewLoop(renewCtx, lease.SandboxID)
 	defer func() {
 		cancelRenew()
+		progress.Emit(ctx, progress.Event{Kind: progress.KindSandbox, Phase: progress.PhaseStart, Component: "genesis-sandbox", Name: lease.SandboxID, Summary: "释放 sandbox 租约"})
 		if closeErr := c.closeSandbox(lease.SandboxID); closeErr != nil {
 			if result != nil {
 				result.Warnings = append(result.Warnings, fmt.Sprintf("sandbox释放异常: %v", closeErr))
 			} else if err == nil {
 				err = closeErr
 			}
+			progress.Emit(ctx, progress.Event{Kind: progress.KindSandbox, Phase: progress.PhaseError, Level: progress.LevelWarn, Component: "genesis-sandbox", Name: lease.SandboxID, Summary: "sandbox 租约释放异常", Detail: closeErr.Error()})
+			return
 		}
+		progress.Emit(ctx, progress.Event{Kind: progress.KindSandbox, Phase: progress.PhaseComplete, Component: "genesis-sandbox", Name: lease.SandboxID, Summary: "sandbox 租约已释放"})
 	}()
 
 	payload := execJobRequestFromCommand(req)
@@ -144,13 +152,18 @@ func (c *Client) RunCommand(ctx context.Context, req sandboxcontract.CommandRequ
 		return nil, execcontract.NewError(execcontract.ErrCodeInvalidInput, fmt.Errorf("编码sandbox job请求失败: %w", err))
 	}
 	var job jobResult
+	progress.Emit(ctx, progress.Event{Kind: progress.KindSandbox, Phase: progress.PhaseStart, Component: "genesis-sandbox", Name: lease.SandboxID, Summary: "提交 sandbox job"})
 	if err := c.doJSON(ctx, http.MethodPost, "/v1/jobs", &body, &job); err != nil {
+		progress.Emit(ctx, progress.Event{Kind: progress.KindSandbox, Phase: progress.PhaseError, Level: progress.LevelError, Component: "genesis-sandbox", Name: lease.SandboxID, Summary: "sandbox job 提交失败", Detail: err.Error()})
 		return nil, err
 	}
+	progress.Emit(ctx, progress.Event{Kind: progress.KindSandbox, Phase: progress.PhaseProgress, Component: "genesis-sandbox", Name: job.JobID, Summary: "等待 sandbox job 完成"})
 	finalJob, err := c.finalJob(ctx, job, requestTimeout(req))
 	if err != nil {
+		progress.Emit(ctx, progress.Event{Kind: progress.KindSandbox, Phase: progress.PhaseError, Level: progress.LevelError, Component: "genesis-sandbox", Name: job.JobID, Summary: "sandbox job 执行失败", Detail: err.Error()})
 		return nil, err
 	}
+	progress.Emit(ctx, progress.Event{Kind: progress.KindSandbox, Phase: progress.PhaseComplete, Component: "genesis-sandbox", Name: finalJob.JobID, Summary: "sandbox job 已完成"})
 	return c.resultFromJob(ctx, req, *finalJob), nil
 }
 
@@ -543,17 +556,21 @@ func (c *Client) materializeArtifacts(ctx context.Context, artifacts []execmodel
 		if artifacts[i].ID == "" {
 			continue
 		}
+		progress.Emit(ctx, progress.Event{Kind: progress.KindSandbox, Phase: progress.PhaseStart, Component: "genesis-sandbox", Name: artifacts[i].Name, Summary: "下载 sandbox artifact"})
 		data, err := c.DownloadArtifact(ctx, artifacts[i].ID)
 		if err != nil {
 			warnings = append(warnings, fmt.Sprintf("artifact %s 下载失败: %v", artifacts[i].ID, err))
+			progress.Emit(ctx, progress.Event{Kind: progress.KindSandbox, Phase: progress.PhaseError, Level: progress.LevelWarn, Component: "genesis-sandbox", Name: artifacts[i].Name, Summary: "artifact 下载失败", Detail: err.Error()})
 			continue
 		}
 		localPath, err := c.writeArtifact(artifacts[i], data)
 		if err != nil {
 			warnings = append(warnings, fmt.Sprintf("artifact %s 写入本地失败: %v", artifacts[i].ID, err))
+			progress.Emit(ctx, progress.Event{Kind: progress.KindFile, Phase: progress.PhaseError, Level: progress.LevelWarn, Component: "artifact", Name: artifacts[i].Name, Summary: "artifact 写入本地失败", Detail: err.Error()})
 			continue
 		}
 		artifacts[i].LocalPath = localPath
+		progress.Emit(ctx, progress.Event{Kind: progress.KindFile, Phase: progress.PhaseComplete, Component: "artifact", Name: artifacts[i].Name, Summary: "artifact 已写入本地", Detail: localPath})
 	}
 	return warnings
 }
@@ -814,6 +831,9 @@ func sandboxEnv(userEnv map[string]string, workspace execmodel.ExecutionWorkspac
 	env["INPUT_DIR"] = workspace.InputDir
 	env["OUTPUT_DIR"] = workspace.OutputDir
 	env["TMPDIR"] = workspace.TmpDir
+	if strings.TrimSpace(workspace.SkillDir) != "" {
+		env["SKILL_DIR"] = workspace.SkillDir
+	}
 	env["GENESIS_WORKSPACE"] = workspace.WorkDir
 	return env
 }

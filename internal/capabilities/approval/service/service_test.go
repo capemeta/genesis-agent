@@ -6,10 +6,12 @@ import (
 
 	"genesis-agent/internal/capabilities/approval/adapter/memory"
 	"genesis-agent/internal/capabilities/approval/model"
+	auditmodel "genesis-agent/internal/capabilities/audit/model"
+	"genesis-agent/internal/platform/contextutil"
 )
 
 func TestAuthorizeAllowDoesNotCallRequester(t *testing.T) {
-	svc, err := New(fakePolicy{result: model.PolicyResult{Type: model.PolicyAllow}}, &fakeRequester{}, memory.NewStore())
+	svc, err := New(fakePolicy{result: model.PolicyResult{Type: model.PolicyAllow}}, &fakeRequester{}, memory.NewStore(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -22,9 +24,29 @@ func TestAuthorizeAllowDoesNotCallRequester(t *testing.T) {
 	}
 }
 
+func TestAuthorizeWritesAuditWithRunID(t *testing.T) {
+	audit := &captureAudit{}
+	svc, err := New(fakePolicy{result: model.PolicyResult{Type: model.PolicyAllow, Reason: "ok"}}, &fakeRequester{}, memory.NewStore(), nil, WithAuditSink(audit))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := contextutil.WithRunID(context.Background(), "run-approve-1")
+	ctx = contextutil.WithSessionID(ctx, "sess-1")
+	if _, err := svc.Authorize(ctx, testRequest()); err != nil {
+		t.Fatal(err)
+	}
+	if len(audit.events) != 1 {
+		t.Fatalf("audit events = %d, want 1", len(audit.events))
+	}
+	ev := audit.events[0]
+	if ev.Category != "approval.decision" || ev.RunID != "run-approve-1" || ev.SessionID != "sess-1" || !ev.Allowed {
+		t.Fatalf("event = %+v", ev)
+	}
+}
+
 func TestAuthorizeDenyDoesNotCallRequester(t *testing.T) {
 	requester := &fakeRequester{}
-	svc, err := New(fakePolicy{result: model.PolicyResult{Type: model.PolicyDeny, Reason: "no"}}, requester, memory.NewStore())
+	svc, err := New(fakePolicy{result: model.PolicyResult{Type: model.PolicyDeny, Reason: "no"}}, requester, memory.NewStore(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,7 +62,7 @@ func TestAuthorizeDenyDoesNotCallRequester(t *testing.T) {
 func TestAuthorizeAskStoresSessionDecisionButStillEvaluatesPolicy(t *testing.T) {
 	requester := &fakeRequester{decision: model.Decision{Type: model.DecisionApprovedForScope, Scope: model.GrantScopeSession}}
 	policy := &countingPolicy{result: model.PolicyResult{Type: model.PolicyAsk}}
-	svc, err := New(policy, requester, memory.NewStore())
+	svc, err := New(policy, requester, memory.NewStore(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +83,7 @@ func TestAuthorizeAskStoresSessionDecisionButStillEvaluatesPolicy(t *testing.T) 
 func TestAuthorizeDenyOverridesCachedSessionGrant(t *testing.T) {
 	requester := &fakeRequester{decision: model.Decision{Type: model.DecisionApprovedForScope, Scope: model.GrantScopeSession}}
 	policy := &mutablePolicy{result: model.PolicyResult{Type: model.PolicyAsk}}
-	svc, err := New(policy, requester, memory.NewStore())
+	svc, err := New(policy, requester, memory.NewStore(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +105,7 @@ func TestAuthorizeDenyOverridesCachedSessionGrant(t *testing.T) {
 }
 
 func TestAuthorizeAbortDecisionReturned(t *testing.T) {
-	svc, err := New(fakePolicy{result: model.PolicyResult{Type: model.PolicyAsk}}, &fakeRequester{decision: model.Decision{Type: model.DecisionAbort}}, memory.NewStore())
+	svc, err := New(fakePolicy{result: model.PolicyResult{Type: model.PolicyAsk}}, &fakeRequester{decision: model.Decision{Type: model.DecisionAbort}}, memory.NewStore(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +121,7 @@ func TestAuthorizeAbortDecisionReturned(t *testing.T) {
 func TestAuthorizeDoesNotCacheProjectScopeInFirstRound(t *testing.T) {
 	requester := &fakeRequester{decision: model.Decision{Type: model.DecisionApprovedForScope, Scope: model.GrantScopeProject}}
 	policy := &countingPolicy{result: model.PolicyResult{Type: model.PolicyAsk}}
-	svc, err := New(policy, requester, memory.NewStore())
+	svc, err := New(policy, requester, memory.NewStore(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,4 +176,13 @@ func testRequest() model.Request {
 		Action:   model.ActionFileWrite,
 		Resource: model.Resource{Type: "file", URI: "workspace://a.txt"},
 	}
+}
+
+type captureAudit struct {
+	events []auditmodel.Event
+}
+
+func (c *captureAudit) Record(_ context.Context, event auditmodel.Event) error {
+	c.events = append(c.events, event)
+	return nil
 }

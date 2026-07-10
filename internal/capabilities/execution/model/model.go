@@ -126,6 +126,7 @@ type ExecutionWorkspace struct {
 	InputDir   string            `json:"input_dir,omitempty"`
 	OutputDir  string            `json:"output_dir,omitempty"`
 	TmpDir     string            `json:"tmp_dir,omitempty"`
+	SkillDir   string            `json:"skill_dir,omitempty"` // 本次可执行的 skill 包根（含 scripts/）
 	Metadata   map[string]string `json:"metadata,omitempty"`
 }
 

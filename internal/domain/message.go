@@ -37,6 +37,8 @@ type Message struct {
 	ToolCalls []ToolCall
 	// ToolCallID 本消息对应的工具调用ID（仅 tool 角色时有值）
 	ToolCallID string
+	// ReasoningContent 推理/思考内容（仅 assistant 角色在支持CoT时有值）
+	ReasoningContent string
 }
 
 // NewSystemMessage 创建 system 角色消息

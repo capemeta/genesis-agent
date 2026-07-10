@@ -2,7 +2,10 @@
 // Tool是Agent与外部能力交互的标准方式，通过ToolRegistry统一管理
 package tool
 
-import "context"
+import (
+	"context"
+	"strings"
+)
 
 // ParameterSchema 工具参数的JSON Schema定义
 // 遵循 JSON Schema Draft-07 规范，与 OpenAI function calling 格式兼容
@@ -44,10 +47,41 @@ func (t ToolTraits) Normalize() ToolTraits {
 // Info 工具元信息，描述工具的能力和参数要求。
 // LLM通过这些信息决定何时以及如何调用工具。
 type Info struct {
-	Name        string           // 工具名称（唯一标识符，snake_case）
-	Description string           // 工具功能描述（供LLM理解）
-	Parameters  *ParameterSchema // 工具参数 Schema（type=object）
-	Traits      ToolTraits       // 工具治理元数据
+	Name            string                              // 工具名称（唯一标识符；原语 snake_case，元工具可如 Skill）
+	Description     string                              // 静态描述；若 DescriptionFunc 成功则被覆盖
+	DescriptionFunc func(context.Context) (string, error) // 可选动态描述（如 Skill catalog）
+	Parameters      *ParameterSchema                    // 工具参数 Schema（type=object）
+	Traits          ToolTraits                          // 工具治理元数据
+}
+
+// ResolveDescription 解析工具描述：优先 DescriptionFunc，失败或空则回退静态 Description。
+func ResolveDescription(ctx context.Context, info *Info) string {
+	if info == nil {
+		return ""
+	}
+	if info.DescriptionFunc != nil {
+		desc, err := info.DescriptionFunc(ctx)
+		if err != nil {
+			// 动态描述失败时回退静态文案，避免整轮 schema 构建失败。
+			return info.Description
+		}
+		if trimmed := strings.TrimSpace(desc); trimmed != "" {
+			return trimmed
+		}
+	}
+	return info.Description
+}
+
+// SnapshotForLLM 返回供 LLM 绑定的 Info 副本（已解析动态描述，去掉 Func）。
+func SnapshotForLLM(ctx context.Context, info *Info) *Info {
+	if info == nil {
+		return nil
+	}
+	clone := *info
+	clone.Description = ResolveDescription(ctx, info)
+	clone.DescriptionFunc = nil
+	clone.Traits = TraitsOf(info)
+	return &clone
 }
 
 // WithTraits 为工具信息设置治理元数据。
@@ -83,9 +117,11 @@ func DefaultTraits(name string) ToolTraits {
 		return ToolTraits{Exposure: ToolExposureDirect, ReadOnly: false, ConcurrencySafe: false, NeedsPermission: true}
 	case "read_skill_resource":
 		return ToolTraits{Exposure: ToolExposureDirect, ReadOnly: true, ConcurrencySafe: true, NeedsPermission: true}
-	case "load_skill":
+	case "Skill":
 		return ToolTraits{Exposure: ToolExposureDirect, ReadOnly: false, ConcurrencySafe: false, NeedsPermission: true, RequiresUserInteraction: true}
-	case "run_command", "http_request":
+	case "list_skill_resources":
+		return ToolTraits{Exposure: ToolExposureDirect, ReadOnly: true, ConcurrencySafe: true, NeedsPermission: true}
+	case "run_command", "run_skill_script", "http_request":
 		return ToolTraits{Exposure: ToolExposureDirect, ReadOnly: false, ConcurrencySafe: false, NeedsPermission: true}
 	default:
 		return ToolTraits{Exposure: ToolExposureDirect, ReadOnly: false, ConcurrencySafe: false}

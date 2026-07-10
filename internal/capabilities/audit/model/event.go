@@ -18,6 +18,8 @@ type Event struct {
 	Action      string            `json:"action"`
 	SubjectID   string            `json:"subject_id,omitempty"`
 	Resource    string            `json:"resource,omitempty"`
+	RunID       string            `json:"run_id,omitempty"`
+	SessionID   string            `json:"session_id,omitempty"`
 	Severity    Severity          `json:"severity"`
 	Allowed     bool              `json:"allowed"`
 	Reason      string            `json:"reason,omitempty"`

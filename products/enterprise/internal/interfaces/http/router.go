@@ -26,6 +26,7 @@ func newRouter(svc app.AgentService) http.Handler {
 	mux.HandleFunc("POST /v1/runs", h.Run)
 	mux.HandleFunc("POST /v1/runs/stream", h.RunStream)
 	mux.HandleFunc("GET /v1/tools", h.ListTools)
+	mux.HandleFunc("GET /v1/resources/{id}", h.GetResource)
 
 	// ── 密钥与业务连接 API ─────────────────────────────────────
 	// 密钥接口只返回元数据，不回显 secret 明文。

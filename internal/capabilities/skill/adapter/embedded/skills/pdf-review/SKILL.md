@@ -7,14 +7,15 @@ allowed-tools:
   - read_file
   - write_file
   - edit_file
-  - run_command
+  - run_skill_script
+  - list_skill_resources
   - read_skill_resource
   - search_skill_resources
 dependencies:
   tools:
     - type: tool
-      value: run_command
-      description: 在受控执行环境中运行 PDF 检查、转换、表单和 OCR 脚本
+      value: run_skill_script
+      description: 在受控执行环境中 materialize 并运行 PDF 检查、转换、表单和 OCR 脚本
     - type: command
       value: python
       description: 执行 PDF 脚本
@@ -56,23 +57,29 @@ products:
 - OCR 不是 PDF 专属。如果 PDF 是由 Word/PPT/Excel 的截图或扫描图转换而来，也按内容升级到 `office-ocr`。
 - 运行期默认无网络；不要在对话中临时安装依赖。
 
+## 硬约束（必须遵守）
+
+1. **执行脚本必须用 `run_skill_script`**，不要用 `run_command` 拼 `python scripts/...`，也不要用 `python -c`。
+2. **禁止用 `write_file` 写入 `.pdf` 冒充交付物**。
+3. `script` 参数必须是 resource id（如 `pdf-review/scripts/inspect_pdf.py`）。
+
 ## 推荐流程
 
 1. 明确输入 PDF、输出目标、是否需要保留版式、是否需要 OCR。
-2. 先用 `scripts/inspect_pdf.py` 或等价工具判断页数、文本层和是否疑似扫描件。
-3. 有文本层时优先用文本抽取工具；表格优先使用 `pdfplumber` 或服务端等价能力。
+2. 先用 `run_skill_script` 调用 `pdf-review/scripts/inspect_pdf.py` 判断页数、文本层和是否疑似扫描件。
+3. 有文本层时优先用文本抽取脚本；表格优先使用 `pdfplumber` 或服务端等价能力。
 4. 无文本层或用户明确要求读图片文字时，切换到 `office-ocr`。
-5. 修改或生成 PDF 后必须做验证：可打开性、页数、关键文本、页面预览或表单字段。
+5. 修改或生成 PDF 后必须做验证：可打开性、页数、关键文本、页面预览或表单字段；检查返回的 `ok` 与 `artifacts`。
 
 ## 常用资源
 
 - 读取本 Skill 的 `references/validation-checklist.md` 获取验收清单。
 - 输入文件默认从环境变量 `INPUT_DIR` 解析；只传文件名即可，例如 `report.pdf`。
 - 输出文件默认写入环境变量 `OUTPUT_DIR`；不要写入 `/tmp` 或项目根目录作为最终成果。
-- 运行 `python scripts/inspect_pdf.py <input.pdf>` 获取统一 JSON 诊断。
-- 运行 `python scripts/extract_pdf_text.py <input.pdf>` 抽取文本；无文本时切换 OCR。
-- 运行 `python scripts/list_pdf_form_fields.py <input.pdf>` 检查可填写表单字段。
-- 运行 `python scripts/render_pdf_pages.py <input.pdf> [output_dir] [dpi]` 渲染页面预览图；不传 `output_dir` 时写入 `OUTPUT_DIR`。
+- `run_skill_script(..., script="pdf-review/scripts/inspect_pdf.py", args=["report.pdf"], inputs=[...])` 获取统一 JSON 诊断。
+- `run_skill_script(..., script="pdf-review/scripts/extract_pdf_text.py", ...)` 抽取文本；无文本时切换 OCR。
+- `run_skill_script(..., script="pdf-review/scripts/list_pdf_form_fields.py", ...)` 检查可填写表单字段。
+- `run_skill_script(..., script="pdf-review/scripts/render_pdf_pages.py", args=["report.pdf"], ...)` 渲染页面预览图。
 
 ## 输出要求
 

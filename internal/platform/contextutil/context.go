@@ -1,17 +1,22 @@
 // Package contextutil 提供 context 属性提取辅助函数，用于隔离多租户和会话上下文。
 package contextutil
 
-import "context"
+import (
+	"context"
+	"strings"
+)
 
 type tenantKey struct{}
 type userKey struct{}
 type sessionKey struct{}
+type runKey struct{}
 type sandboxProfileKey struct{}
 
 var (
 	tenantIDKey        = tenantKey{}
 	userIDKey          = userKey{}
 	sessionIDKey       = sessionKey{}
+	runIDKey           = runKey{}
 	sandboxOverrideKey = sandboxProfileKey{}
 )
 
@@ -46,6 +51,35 @@ func WithSessionID(ctx context.Context, sessionID string) context.Context {
 func GetSessionID(ctx context.Context) (string, bool) {
 	val, ok := ctx.Value(sessionIDKey).(string)
 	return val, ok
+}
+
+// WithRunID 将一次 Agent Run ID 注入 context（跨 agent/audit/usage 关联主键）。
+func WithRunID(ctx context.Context, runID string) context.Context {
+	return context.WithValue(ctx, runIDKey, strings.TrimSpace(runID))
+}
+
+// GetRunID 从 context 提取 Run ID。
+func GetRunID(ctx context.Context) (string, bool) {
+	val, ok := ctx.Value(runIDKey).(string)
+	val = strings.TrimSpace(val)
+	if !ok || val == "" {
+		return "", false
+	}
+	return val, true
+}
+
+// CorrelationIDs 返回日志关联键；缺失时返回空字符串。
+func CorrelationIDs(ctx context.Context) (runID, sessionID string) {
+	if ctx == nil {
+		return "", ""
+	}
+	if id, ok := GetRunID(ctx); ok {
+		runID = id
+	}
+	if id, ok := GetSessionID(ctx); ok {
+		sessionID = strings.TrimSpace(id)
+	}
+	return runID, sessionID
 }
 
 // WithSandboxProfileOverride 将会话级 sandbox 执行意图注入 context。

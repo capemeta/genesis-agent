@@ -68,7 +68,7 @@ func TestServiceFiltersDisabledSkillCapabilities(t *testing.T) {
 		t.Fatalf("expected disabled skill hidden: %+v", catalog.Entries)
 	}
 	if _, err := svc.Load(context.Background(), contract.LoadRequest{ResolveRequest: contract.ResolveRequest{CatalogRequest: req, Name: "review", ModelCall: true}}); err == nil {
-		t.Fatal("expected load_skill to fail for disabled capability")
+		t.Fatal("expected Skill load to fail for disabled capability")
 	}
 	rendered, err := svc.RenderAvailableSkills(context.Background(), req)
 	if err != nil {

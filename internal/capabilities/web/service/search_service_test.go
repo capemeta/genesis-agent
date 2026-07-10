@@ -50,7 +50,7 @@ func TestSearchService_Search(t *testing.T) {
 		},
 	}
 
-	svc := NewSearchService([]contract.SearchProvider{p1}, "brave", pol, nil)
+	svc := NewSearchService([]contract.SearchProvider{p1}, "brave", pol, nil, nil)
 	req := contract.SearchRequest{
 		Query: "hello",
 		Limit: 5,
@@ -103,7 +103,7 @@ func TestSearchService_Search_Fallback(t *testing.T) {
 		},
 	}
 
-	svc := NewSearchService([]contract.SearchProvider{p1, p2}, "brave", pol, nil)
+	svc := NewSearchService([]contract.SearchProvider{p1, p2}, "brave", pol, nil, nil)
 	req := contract.SearchRequest{
 		Query: "hello",
 		Limit: 5,
@@ -142,7 +142,7 @@ func TestSearchService_Search_Filters(t *testing.T) {
 		},
 	}
 
-	svc := NewSearchService([]contract.SearchProvider{p1}, "brave", pol, nil)
+	svc := NewSearchService([]contract.SearchProvider{p1}, "brave", pol, nil, nil)
 	req := contract.SearchRequest{
 		Query:          "hello",
 		Limit:          5,

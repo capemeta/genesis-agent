@@ -8,6 +8,8 @@ import (
 )
 
 func TestLoadLLMProvidersModelsRouter(t *testing.T) {
+	t.Setenv("USERPROFILE", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
 	t.Setenv("QWEN_API_KEY", "qwen-key")
 
 	dir := t.TempDir()
@@ -483,6 +485,59 @@ func TestLoadEnsuresDesktopUserConfig(t *testing.T) {
 		t.Fatalf("desktop skills dir was not created: info=%v err=%v", info, err)
 	}
 }
+func TestLoadLogDefaultsAndPathCompat(t *testing.T) {
+	t.Setenv("USERPROFILE", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+
+	dir := t.TempDir()
+	content := `
+llm:
+  providers:
+    qwen:
+      base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+      auth:
+        type: api_key
+        api_key: test-key
+  models:
+    default:
+      provider: qwen
+      model: qwen-plus
+      strategy: balanced
+  router:
+    chat: default
+agent:
+  max_iterations: 10
+  system_prompt: test
+log:
+  level: debug
+  path: custom/logs/agent.log
+server:
+  host: 127.0.0.1
+  port: 8080
+`
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Log.Dir != "custom/logs" {
+		t.Fatalf("dir = %q", cfg.Log.Dir)
+	}
+	agent := cfg.Log.Channels["agent"]
+	if agent.File != "agent.log" || agent.Format != "text" || agent.RetainDays != 14 {
+		t.Fatalf("agent channel = %+v", agent)
+	}
+	audit := cfg.Log.Channels["audit"]
+	if audit.File != "audit.log" || audit.RetainDays != 90 || audit.Format != "jsonl" {
+		t.Fatalf("audit channel = %+v", audit)
+	}
+	if !cfg.Log.Rotate.DailyEnabled() || cfg.Log.Rotate.MaxSizeMB != 100 {
+		t.Fatalf("rotate = %+v", cfg.Log.Rotate)
+	}
+}
+
 func minimalConfig(extraPolicy string, extraSecrets string) string {
 	return `
 llm:

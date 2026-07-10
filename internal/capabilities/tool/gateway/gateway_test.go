@@ -96,3 +96,64 @@ func TestGatewayFilterInfosAppliesPolicy(t *testing.T) {
 		t.Fatalf("FilterInfos() = %#v, want only calculator", infos)
 	}
 }
+
+func TestGatewayExposesSkillTool(t *testing.T) {
+	reg := &fakeRegistry{tools: map[string]tool.Tool{}}
+	reg.Register(fakeTool{name: "Skill"})
+	g := New(reg, profilemodel.ToolSet{Enabled: []string{"Skill"}})
+	if got := g.Get("Skill"); got == nil || got.GetInfo().Name != "Skill" {
+		t.Fatalf("Get(Skill) = %#v", got)
+	}
+	if got := g.Get("load_skill"); got != nil {
+		t.Fatalf("Get(load_skill) should be nil after alias removal, got %#v", got)
+	}
+	infos := g.ListInfos()
+	if len(infos) != 1 || infos[0].Name != "Skill" {
+		t.Fatalf("ListInfos = %#v", infos)
+	}
+}
+
+func TestGatewayIsRegisteredIgnoresProfile(t *testing.T) {
+	reg := newFakeRegistry()
+	g := New(reg, profilemodel.ToolSet{Enabled: []string{"calculator"}})
+	if !g.IsRegistered("http_request") {
+		t.Fatal("http_request should be registered even when profile-disabled")
+	}
+	if g.Get("http_request") != nil {
+		t.Fatal("Get should still respect profile")
+	}
+}
+
+func TestGatewaySnapshotUsesDescriptionFunc(t *testing.T) {
+	reg := &fakeRegistry{tools: map[string]tool.Tool{}}
+	reg.Register(dynamicTool{name: "Skill", staticDesc: "static", dynamicDesc: "dynamic-catalog"})
+	g := New(reg, profilemodel.ToolSet{Enabled: []string{"Skill"}})
+	infos := g.ListInfosContext(context.Background())
+	if len(infos) != 1 || infos[0].Description != "dynamic-catalog" {
+		t.Fatalf("ListInfosContext = %#v", infos)
+	}
+	if infos[0].DescriptionFunc != nil {
+		t.Fatal("SnapshotForLLM should clear DescriptionFunc")
+	}
+}
+
+type dynamicTool struct {
+	name        string
+	staticDesc  string
+	dynamicDesc string
+}
+
+func (t dynamicTool) GetInfo() *tool.Info {
+	return &tool.Info{
+		Name:        t.name,
+		Description: t.staticDesc,
+		DescriptionFunc: func(context.Context) (string, error) {
+			return t.dynamicDesc, nil
+		},
+		Traits: tool.ToolTraits{Exposure: tool.ToolExposureDirect},
+	}
+}
+
+func (t dynamicTool) Execute(context.Context, string) (string, error) {
+	return "ok", nil
+}
