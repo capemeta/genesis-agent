@@ -163,6 +163,49 @@ func TestRemoteSkillScriptUsesAbsoluteSandboxEntryAndScriptsCwd(t *testing.T) {
 		t.Fatalf("workspace=%+v", client.session.lastRun.Options.Workspace)
 	}
 }
+
+func TestRemoteSkillScriptExposesImageNodeModules(t *testing.T) {
+	skillSvc := newEmbeddedSkillService(t)
+	approval := newAllowApproval(t)
+	client := &recordingSessionClient{}
+	shared, err := embedded.OfficeCommonScriptsFS()
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc, err := scriptservice.New(scriptservice.Deps{
+		Skills:          skillSvc,
+		Runner:          &fakeRunner{},
+		Approval:        approval,
+		SessionClient:   client,
+		Logger:          logger.NewNop(),
+		SharedScriptsFS: shared,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := svc.Run(context.Background(), scriptcontract.RunRequest{
+		Catalog:       catalogCLI(),
+		Skill:         "office-ppt",
+		Script:        "office-ppt/scripts/run_pptxgen_script.js",
+		Args:          []string{"deck_gen.js"},
+		Sandbox:       execmodel.SandboxProfile{Mode: execmodel.SandboxRequired, Provider: "genesis-sandbox"},
+		WorkspaceRoot: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result == nil || !result.OK {
+		t.Fatalf("result=%+v", result)
+	}
+	env := client.session.lastRun.Command.Env
+	if !strings.Contains(env["NODE_PATH"], "/opt/genesis-sandbox/image/node_modules") {
+		t.Fatalf("NODE_PATH=%q", env["NODE_PATH"])
+	}
+	if env["PYTHONPATH"] != "/workspace/tmp/skills/office-ppt/scripts" {
+		t.Fatalf("PYTHONPATH=%q", env["PYTHONPATH"])
+	}
+}
+
 func TestOptionalRemoteDegradesWhenSessionClientMissing(t *testing.T) {
 	skillSvc := newEmbeddedSkillService(t)
 	approval := newAllowApproval(t)

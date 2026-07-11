@@ -447,7 +447,7 @@ func (s *Service) runRemote(ctx context.Context, meta model.Metadata, mat *mater
 			Command: cmdLine,
 			Cwd:     "/workspace",
 			Shell:   "auto",
-			Env:     map[string]string{"PYTHONPATH": remoteScripts},
+			Env:     remoteSkillEnv(remoteScripts),
 		},
 		Sandbox: sandbox,
 		Options: execcontract.RunOptions{
@@ -797,6 +797,21 @@ func nodeModuleSearchPath(workspaceRoot string) string {
 		}
 	}
 	return strings.Join(parts, string(os.PathListSeparator))
+}
+
+func remoteSkillEnv(remoteScripts string) map[string]string {
+	return map[string]string{
+		"PYTHONPATH": remoteScripts,
+		"NODE_PATH":  remoteNodeModuleSearchPath(),
+	}
+}
+
+func remoteNodeModuleSearchPath() string {
+	return strings.Join([]string{
+		"/opt/genesis-sandbox/image/node_modules",
+		"/workspace/node_modules",
+		"/workspace/tmp/node_modules",
+	}, ":")
 }
 
 func shellJoin(parts []string) string {

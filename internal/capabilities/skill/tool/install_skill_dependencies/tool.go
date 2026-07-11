@@ -102,7 +102,7 @@ func (t *Tool) GetInfo() *tool.Info {
 			Properties: map[string]*tool.ParameterSchema{
 				"skill": {Type: "string", Description: "Skill 名称，例如 office-ppt"},
 				"packages": {
-					Type: "array",
+					Type:        "array",
 					Description: "要安装的包列表",
 					Items: &tool.ParameterSchema{
 						Type: "object",
@@ -166,6 +166,16 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 		out.OK = false
 		out.Error = fmt.Sprintf("scope=%s 尚未支持；当前仅支持 workspace（session/user 见 Gate C）", scope)
 		out.Metadata["failure_kind"] = "install_scope_unsupported"
+		out.DurationMS = time.Since(started).Milliseconds()
+		return marshalFail(out, out.Error)
+	}
+	if remoteSandboxWorkspaceInstallUnsupported(t.deps.Sandbox) {
+		out.OK = false
+		out.Error = "scope=workspace 在 genesis-sandbox 远程模式下不会被后续 run_skill_script 的 office/skill session 可靠看见；当前请使用 profile/镜像预装，或等待 session scope 安装闭环"
+		out.Metadata["failure_kind"] = "install_scope_not_visible"
+		out.Metadata["provider"] = t.deps.Sandbox.Provider
+		out.Metadata["sandbox_mode"] = string(t.deps.Sandbox.Mode)
+		out.Suggested = "不要重复安装；请重跑脚本以使用镜像预装依赖，或重建对应 runtime profile"
 		out.DurationMS = time.Since(started).Milliseconds()
 		return marshalFail(out, out.Error)
 	}
@@ -424,6 +434,13 @@ func joinPkgNames(pkgs []packageInput) string {
 		parts = append(parts, p.Manager+":"+p.Name)
 	}
 	return strings.Join(parts, ",")
+}
+
+func remoteSandboxWorkspaceInstallUnsupported(sandbox execmodel.SandboxProfile) bool {
+	if !strings.EqualFold(strings.TrimSpace(sandbox.Provider), "genesis-sandbox") {
+		return false
+	}
+	return sandbox.Mode == execmodel.SandboxOptional || sandbox.Mode == execmodel.SandboxRequired
 }
 
 func cloneSandbox(in execmodel.SandboxProfile) execmodel.SandboxProfile {

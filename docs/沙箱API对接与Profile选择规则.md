@@ -159,7 +159,7 @@ requirements:
     - pypdf
 ```
 
-运行期依赖必须预构建或由 profile 提供。Office 运行期不应在对话中临时 `pip install` / `npm install`；确实需要解析依赖时进入注册期/安装期，使用 `skill-build-polyglot` 并产出 lock、缓存或镜像层。
+运行期依赖必须预构建或由 profile 提供。Office 运行期不应在对话中临时 `pip install` / `npm install`；确实需要解析依赖时进入注册期/安装期，使用 `skill-build-polyglot` 并产出 lock、缓存或镜像层。远程 Skill 脚本解压到 `/workspace/tmp/skills/<pkg>/scripts` 后执行，Node 默认不会向 `/opt/genesis-sandbox/image/node_modules` 查找；因此 adapter 必须为远程 Office/Skill 脚本注入 `NODE_PATH=/opt/genesis-sandbox/image/node_modules:...`，否则会把镜像已预装的 `pptxgenjs` 等包误判为 `dependency_missing`。
 
 ### 5.2 Office 操作到 Profile 的映射
 

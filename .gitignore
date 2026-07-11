@@ -15,6 +15,7 @@ products/desktop/web/.github
 /data/
 .genesis/runs/
 .genesis/logs/
+.genesis/
 
 # ── Go ────────────────────────────────────────────────────
 *.exe

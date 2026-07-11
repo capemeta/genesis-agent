@@ -167,7 +167,7 @@ run_skill_script(skill, script ResourceID, args[], inputs[])
 | `OUTPUT_DIR` | `.genesis/runs/<id>/output` | `/workspace/output` |
 | `TMPDIR` | `.genesis/runs/<id>/tmp` | `/workspace/tmp` |
 | `SKILL_DIR` | `WORK_DIR/skills/<pkg>` | `/workspace/tmp/skills/<pkg>` |
-| `PYTHONPATH` / `NODE_PATH` | 指向 `SKILL_DIR/scripts`（及约定 node_modules 搜索路径） | 同逻辑，路径换远程映射 |
+| `PYTHONPATH` / `NODE_PATH` | `PYTHONPATH` 指向 `SKILL_DIR/scripts`；`NODE_PATH` 指向工作区/祖先 `node_modules` | `PYTHONPATH=/workspace/tmp/skills/<pkg>/scripts`；`NODE_PATH` 必须包含 `/opt/genesis-sandbox/image/node_modules`，并可包含 `/workspace/node_modules` 等 session 落点 |
 
 远程 StageInput 命名：
 
@@ -226,7 +226,7 @@ dependencies:
 
 | Skill 类型 | 默认 |
 | --- | --- |
-| 内置 Office（`office-basic` / `office-ocr`） | 镜像/本机 profile **必须**预装声明的 runtime；对话期安装为兜底 |
+| 内置 Office（`office-basic` / `office-ocr`） | 镜像/本机 profile **必须**预装声明的 runtime；远程运行期优先使用镜像预装，不依赖对话期安装 |
 | 用户/项目 Skill | 注册/安装期可用 `skill-build-polyglot` 构建 venv/node_modules 缓存 |
 | 第三方 Marketplace | **禁止**默认对话期装包；须注册期构建或管理员授权策略 |
 
@@ -352,7 +352,7 @@ Execute 返回 (resultJSON, err)
 | --- | --- | --- | --- |
 | 无沙箱本地 | `workspace` | 项目 `node_modules` / `.venv`，或 `WORK_DIR` 下约定目录 | `NODE_PATH`/`VIRTUAL_ENV`/`PATH` 注入与 `run_skill_script` 一致 |
 | 本地平台沙箱 | `workspace` 或 `session` | 同上，且须在沙箱可写 roots 内 | 同左；网络须 build profile 放开 allowlist |
-| 远程 genesis-sandbox | `session`（默认）或镜像预装 | job 内 `/workspace` 下 venv/node_modules；**默认不持久** | 同 Session 内后续 `run_skill_script` 复用；跨 job 依赖 **image/profile 预装** |
+| 远程 genesis-sandbox | 当前 Gate B：镜像/profile 预装；目标 Gate C：`session` | 当前 `run_skill_script` 每次打开独立 session 并结束后关闭，`workspace` 安装不会可靠传给后续 Office/Skill 运行 session | 当前必须通过 `/opt/genesis-sandbox/image/node_modules` 等预装路径暴露；session scope 完成后才允许“安装后同 session 重跑” |
 | Enterprise 生产 | `image` | 对话期安装返回明确错误：`failure_kind=install_forbidden_use_image` | 运维重建 `office-basic` 等 profile |
 
 **禁止**：在宿主机装包却期望远程容器内生效（跨 backend 串味）。
@@ -393,14 +393,25 @@ Enterprise 生产建议保持默认 `false`，由治理策略显式打开。
 
 ### 6.8 时序（标准路径）
 
+本地/本地平台 `workspace` scope：
+
 ```text
 Agent: run_skill_script(create_pptx.js)
   → ok=false, failure_kind=dependency_missing, missing=[pptxgenjs]
 Agent: install_skill_dependencies(skill=office-ppt, packages=[pptxgenjs])
-  → 审批（session）→ skill-build-polyglot → npm install
+  → 审批（session）→ npm install 到本地 workspace 可见路径
   → ok=true, scope=workspace, path=.../node_modules
 Agent: run_skill_script(create_pptx.js)  # 相同参数
   → ok=true, artifacts=[demo.pptx]
+```
+
+远程 `genesis-sandbox` 当前 Gate B：
+
+```text
+Agent: run_skill_script(create_pptx.js)
+  → 优先通过 office-basic 镜像预装依赖 + NODE_PATH 运行
+若仍返回 dependency_missing：
+  → 不要重复 workspace 安装；应修复/重建 runtime profile，或等 Gate C 的 session scope 安装闭环落地
 ```
 
 ### 6.9 Preflight（可选加速，不替代报错契约）

@@ -140,6 +140,30 @@ func TestInstallSuccessRunsWhitelistedCommand(t *testing.T) {
 	}
 }
 
+func TestInstallWorkspaceScopeRejectedForRemoteGenesisSandbox(t *testing.T) {
+	runner := &fakeRunner{}
+	tool, err := New(Deps{
+		Skills:        fakeSkills{meta: testMeta(skillmodel.RuntimeDeps{Node: []skillmodel.RuntimePackage{{Name: "pptxgenjs"}}})},
+		Runner:        runner,
+		Approval:      allowAllApproval{},
+		WorkspaceRoot: t.TempDir(),
+		Sandbox:       execmodel.SandboxProfile{Mode: execmodel.SandboxRequired, Provider: "genesis-sandbox"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := tool.Execute(context.Background(), `{"skill":"office-ppt","packages":[{"manager":"npm","name":"pptxgenjs"}],"scope":"workspace"}`)
+	if err == nil {
+		t.Fatal("expected remote workspace install visibility error")
+	}
+	if !strings.Contains(body, "install_scope_not_visible") {
+		t.Fatalf("body=%s", body)
+	}
+	if runner.lastCmd.Command != "" {
+		t.Fatalf("runner should not be called, got %q", runner.lastCmd.Command)
+	}
+}
+
 func TestInstallImageScopeForbidden(t *testing.T) {
 	tool, err := New(Deps{
 		Skills:   fakeSkills{meta: testMeta(skillmodel.RuntimeDeps{Node: []skillmodel.RuntimePackage{{Name: "pptxgenjs"}}})},
