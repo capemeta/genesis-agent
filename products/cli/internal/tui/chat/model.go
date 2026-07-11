@@ -202,9 +202,10 @@ func (m Model) runAgentCmd(input string, progressCh chan<- progressMsg) tea.Cmd 
 			if progressCh == nil {
 				return
 			}
+			// 必须可靠投递：丢弃 PhaseStart 会导致 final_answer 无法清空，对话区出现段落叠加/重复。
 			select {
 			case progressCh <- progressMsg{event: event}:
-			default:
+			case <-m.ctx.Done():
 			}
 		}
 		result, err := m.svc.RunOnce(m.ctx, app.RunRequest{

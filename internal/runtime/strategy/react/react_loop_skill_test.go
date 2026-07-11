@@ -6,9 +6,11 @@ import (
 	"strings"
 	"testing"
 
+	skillcontract "genesis-agent/internal/capabilities/skill/contract"
 	tool "genesis-agent/internal/capabilities/tool/contract"
 	"genesis-agent/internal/domain"
 	"genesis-agent/internal/platform/logger"
+	"genesis-agent/internal/runtime"
 )
 
 func TestNarrowToolNamesEmptyAllowedKeepsCurrent(t *testing.T) {
@@ -105,6 +107,26 @@ func (emptyRegistry) ListInfos() []*tool.Info           { return nil }
 func (emptyRegistry) FilterInfos([]string) []*tool.Info { return nil }
 func (emptyRegistry) Names() []string                   { return nil }
 
+func TestInjectMentionedSkillsUsesExplicitLoader(t *testing.T) {
+	loader := &fakeExplicitLoader{result: `{"type":"skill_injection","name":"manual","qualified_name":"manual","resource":"manual/SKILL.md","content":"Manual body","truncated":false}`}
+	e := &ReactLoopEngine{
+		registry:             emptyRegistry{},
+		skillMentionSelector: fakeMentionSelector{mentions: []SkillMention{{Skill: "manual", Resource: "manual/SKILL.md"}}},
+		skillExplicitLoader:  loader,
+	}
+	rc := runtime.NewRunContext(&domain.Run{ID: "run-skill"}, &domain.Agent{})
+	active := []string{"Skill", "read_file"}
+	var infos []*tool.Info
+
+	e.injectMentionedSkills(context.Background(), rc, "$manual", &active, &infos, logger.NewNop())
+
+	if loader.calls != 1 {
+		t.Fatalf("explicit loader calls = %d", loader.calls)
+	}
+	if len(rc.Messages) != 1 || !strings.Contains(rc.Messages[0].Content, "Manual body") {
+		t.Fatalf("messages = %+v", rc.Messages)
+	}
+}
 func TestRenderSkillToolAckReportsNarrowFailure(t *testing.T) {
 	ack := renderSkillToolAck(skillInjectionOutput{QualifiedName: "demo", AllowedTools: []string{"missing"}}, false)
 	if !strings.Contains(ack, `"narrow_failed":true`) {
@@ -117,4 +139,22 @@ func TestNormalizeExclusiveSkipMessageMentionsSkill(t *testing.T) {
 	if !strings.Contains(msg, "Skill") {
 		t.Fatalf("message outdated: %s", msg)
 	}
+}
+
+type fakeMentionSelector struct {
+	mentions []SkillMention
+}
+
+func (f fakeMentionSelector) SelectMentions(context.Context, string) ([]SkillMention, error) {
+	return f.mentions, nil
+}
+
+type fakeExplicitLoader struct {
+	result string
+	calls  int
+}
+
+func (f *fakeExplicitLoader) LoadExplicitSkill(context.Context, skillcontract.ExplicitLoadRequest) (string, error) {
+	f.calls++
+	return f.result, nil
 }

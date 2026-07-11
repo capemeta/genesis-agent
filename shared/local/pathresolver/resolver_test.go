@@ -8,6 +8,7 @@ import (
 
 	fscontract "genesis-agent/internal/capabilities/filesystem/contract"
 	"genesis-agent/internal/capabilities/filesystem/model"
+	"genesis-agent/internal/platform/contextutil"
 )
 
 func TestResolverMarksEscapeAsExternal(t *testing.T) {
@@ -150,5 +151,41 @@ func TestResolverCanPreserveFinalSymlink(t *testing.T) {
 	}
 	if filepath.Clean(got.BackendPath) != filepath.Clean(link) {
 		t.Fatalf("BackendPath=%q, want link path %q", got.BackendPath, link)
+	}
+}
+
+func TestResolverExpandsWorkDirLogicalPath(t *testing.T) {
+	root := tempWorkspace(t)
+	resolver, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := contextutil.WithRunID(context.Background(), "run-test-1")
+	got, err := resolver.Resolve(ctx, model.PathRef{Raw: "$WORK_DIR/deck_gen.js"}, fscontract.ResolveOptions{MustExist: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRel := ".genesis/runs/run-test-1/work/deck_gen.js"
+	if got.WorkspaceRel != wantRel {
+		t.Fatalf("WorkspaceRel=%q, want %q", got.WorkspaceRel, wantRel)
+	}
+	wantAbs := filepath.Join(root, ".genesis", "runs", "run-test-1", "work", "deck_gen.js")
+	if filepath.Clean(got.BackendPath) != filepath.Clean(wantAbs) {
+		t.Fatalf("BackendPath=%q, want %q", got.BackendPath, wantAbs)
+	}
+	if _, err := os.Stat(filepath.Dir(got.BackendPath)); err != nil {
+		t.Fatalf("work dir should exist after resolve: %v", err)
+	}
+}
+
+func TestResolverLogicalPathRequiresRunID(t *testing.T) {
+	root := tempWorkspace(t)
+	resolver, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = resolver.Resolve(context.Background(), model.PathRef{Raw: "$WORK_DIR/deck_gen.js"}, fscontract.ResolveOptions{})
+	if err == nil {
+		t.Fatal("expected error without run_id")
 	}
 }

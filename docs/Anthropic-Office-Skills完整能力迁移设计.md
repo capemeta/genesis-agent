@@ -276,8 +276,8 @@ Materialize 规则：执行 `office-ppt` 脚本时，Materializer 将 `_office_c
 3. [x] 重写 `office-ppt/SKILL.md` Quick Reference + 硬约束 + 设计/QA
 4. [x] 保留并接线现有 inspect/render；`path_contract` 三端统一签名
 5. [x] 单测：materialize 含 office 树；嵌套 `office/unpack.py` 相对路径；gate；catalog 跳过 `_office_common`
-6. [x] CLI smoke：`inspect` 真实执行；`thumbnail`/`create_pptx` 缺依赖时 skip
-7. [x] `create_pptx.js` 最小从零生成封装（Node + pptxgenjs）
+6. [x] CLI smoke：`inspect` 真实执行；`thumbnail`/`create_pptx`/`run_pptxgen_script` 缺依赖时 skip
+7. [x] `run_pptxgen_script.js`（Anthropic 对齐主路径：顶层 pptxgen JS）+ `create_pptx.js` 降级为 smoke
 8. [x] Enterprise：`shared/skillstack` + bootstrap 注入 embed Skills / `run_skill_script` / SharedScriptsFS（远程沙箱仍待后续）
 
 ### Phase 2 — Word 完整能力
@@ -380,8 +380,8 @@ Phase 0 许可
 | 项                              | 状态                                                              |
 | ------------------------------ | --------------------------------------------------------------- |
 | Enterprise 未注入 SharedScriptsFS | 已通过 `shared/skillstack.BuildEmbedded` + Enterprise bootstrap 接线 |
-| CLI smoke                      | `inspect` 必跑；`thumbnail`/`create_pptx` 缺依赖 skip                 |
-| pptxgenjs 从零生成                 | 已提供 `create_pptx.js`；复杂版式仍走 references                          |
+| CLI smoke                      | `inspect` 必跑；`thumbnail`/`create_pptx`/`run_pptxgen_script` 缺依赖 skip |
+| pptxgenjs 从零生成                 | 默认 `run_pptxgen_script.js`（写顶层 JS）；`create_pptx.js` 仅 smoke；教程见 `pptxgenjs.md` |
 | Proprietary 标注                 | `_office_common/NOTICE.md` + 设计文档 Phase 0                       |
 
 

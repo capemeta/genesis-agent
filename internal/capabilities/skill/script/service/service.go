@@ -1,6 +1,7 @@
 package service
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -160,7 +162,7 @@ func (s *Service) Run(ctx context.Context, req scriptcontract.RunRequest) (*scri
 	}
 	ws.SkillDir = matResult.SkillDir
 
-	staged, err := stageInputs(req.WorkspaceRoot, ws.InputDir, req.Inputs)
+	staged, err := stageInputs(req.WorkspaceRoot, ws, req.Inputs)
 	if err != nil {
 		return nil, err
 	}
@@ -335,11 +337,6 @@ func (s *Service) Run(ctx context.Context, req scriptcontract.RunRequest) (*scri
 			out.OK = true
 			out.Error = ""
 		}
-		// 空输出且无 stderr：多为辅助模块被当入口执行（import 后直接退出）。
-		if out.OK && strings.TrimSpace(result.Stdout) == "" && strings.TrimSpace(result.Stderr) == "" {
-			out.OK = false
-			out.Error = "脚本无 stdout/stderr 输出；可能误执行了辅助模块，或脚本未按契约打印结果。请改用 list_skill_resources 确认的可执行脚本"
-		}
 		artifacts, warnings := collectArtifacts(ws.OutputDir)
 		// 远程产物也可能在 Result.Artifacts
 		for _, a := range result.Artifacts {
@@ -356,6 +353,12 @@ func (s *Service) Run(ctx context.Context, req scriptcontract.RunRequest) (*scri
 		}
 		out.Artifacts = artifacts
 		out.Warnings = append(out.Warnings, warnings...)
+
+		// 空输出且无 stderr，且没有产生任何交付物：多为辅助模块被当入口执行（import 后直接退出）。
+		if out.OK && strings.TrimSpace(result.Stdout) == "" && strings.TrimSpace(result.Stderr) == "" && len(out.Artifacts) == 0 {
+			out.OK = false
+			out.Error = "脚本无 stdout/stderr 输出且未产生交付物；可能误执行了辅助模块，或脚本未按契约打印结果与生成文件。请改用 list_skill_resources 确认的可执行脚本"
+		}
 		if out.OK && looksJSON(result.Stdout) {
 			var payload map[string]any
 			if json.Unmarshal([]byte(strings.TrimSpace(result.Stdout)), &payload) == nil {
@@ -399,30 +402,16 @@ func (s *Service) runRemote(ctx context.Context, meta model.Metadata, mat *mater
 	defer func() { _ = session.Close(context.Background()) }()
 
 	inputArtifacts := make([]execmodel.InputArtifactRef, 0)
-	// stage scripts under skills/<pkg>/scripts/
-	err = filepath.Walk(mat.ScriptsDir, func(p string, info os.FileInfo, err error) error {
-		if err != nil || info == nil || info.IsDir() {
-			return err
-		}
-		rel, err := filepath.Rel(mat.ScriptsDir, p)
-		if err != nil {
-			return err
-		}
-		name := path.Join("skills", string(meta.PackageID), "scripts", filepath.ToSlash(rel))
-		data, err := os.ReadFile(p)
-		if err != nil {
-			return err
-		}
-		stagedArt, err := session.StageInput(ctx, sandboxcontract.StageInputRequest{Name: name, Content: bytes.NewReader(data)})
-		if err != nil {
-			return err
-		}
-		inputArtifacts = append(inputArtifacts, stagedArt.Artifact)
-		return nil
-	})
+	scriptsZip, err := zipSkillScripts(mat.ScriptsDir)
 	if err != nil {
 		return nil, err
 	}
+	scriptsZipName := "skill-scripts-" + string(meta.PackageID) + ".zip"
+	stagedScripts, err := session.StageInput(ctx, sandboxcontract.StageInputRequest{Name: scriptsZipName, Content: bytes.NewReader(scriptsZip)})
+	if err != nil {
+		return nil, err
+	}
+	inputArtifacts = append(inputArtifacts, stagedScripts.Artifact)
 	for _, name := range staged {
 		data, err := os.ReadFile(filepath.Join(localWS.InputDir, name))
 		if err != nil {
@@ -435,7 +424,7 @@ func (s *Service) runRemote(ctx context.Context, meta model.Metadata, mat *mater
 		inputArtifacts = append(inputArtifacts, stagedArt.Artifact)
 	}
 
-	remoteSkillDir := "/workspace/input/skills/" + string(meta.PackageID)
+	remoteSkillDir := "/workspace/tmp/skills/" + string(meta.PackageID)
 	remoteScripts := remoteSkillDir + "/scripts"
 	ws := execmodel.ExecutionWorkspace{
 		Mode:       execmodel.WorkspaceModeSandboxSess,
@@ -446,12 +435,17 @@ func (s *Service) runRemote(ctx context.Context, meta model.Metadata, mat *mater
 		TmpDir:     "/workspace/tmp",
 		SkillDir:   remoteSkillDir,
 	}
-	cmdLine := shellJoin(append([]string{runtimeBin, scriptRel}, args...))
+	remoteScriptPath := path.Join(remoteScripts, scriptRel)
+	unpackCode := fmt.Sprintf("import os, zipfile; d=%q; os.makedirs(d, exist_ok=True); zipfile.ZipFile(%q).extractall(d)", remoteScripts, "/workspace/input/"+scriptsZipName)
+	unpackCmd := shellJoin([]string{"python", "-c", unpackCode})
+	cdCmd := shellJoin([]string{"cd", remoteScripts})
+	execCmd := shellJoin(append([]string{runtimeBin, remoteScriptPath}, args...))
+	cmdLine := unpackCmd + " && " + cdCmd + " && " + execCmd
 	return session.Run(ctx, sandboxcontract.CommandRequest{
 		Workspace: s.workspaceRef,
 		Command: execmodel.Command{
 			Command: cmdLine,
-			Cwd:     remoteScripts,
+			Cwd:     "/workspace",
 			Shell:   "auto",
 			Env:     map[string]string{"PYTHONPATH": remoteScripts},
 		},
@@ -465,6 +459,41 @@ func (s *Service) runRemote(ctx context.Context, meta model.Metadata, mat *mater
 	})
 }
 
+func zipSkillScripts(scriptsDir string) ([]byte, error) {
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	err := filepath.Walk(scriptsDir, func(p string, info os.FileInfo, err error) error {
+		if err != nil || info == nil || info.IsDir() {
+			return err
+		}
+		rel, err := filepath.Rel(scriptsDir, p)
+		if err != nil {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+		if rel == ".." || strings.HasPrefix(rel, "../") || path.IsAbs(rel) {
+			return fmt.Errorf("脚本zip路径越界: %s", p)
+		}
+		w, err := zw.Create(rel)
+		if err != nil {
+			return err
+		}
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return err
+		}
+		_, err = w.Write(data)
+		return err
+	})
+	if err != nil {
+		_ = zw.Close()
+		return nil, err
+	}
+	if err := zw.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
 func useRemoteSession(sandbox execmodel.SandboxProfile) bool {
 	// SandboxProfile.Mode 是 disabled/optional/required；远程判定看 Provider。
 	if !strings.EqualFold(strings.TrimSpace(sandbox.Provider), "genesis-sandbox") {
@@ -539,7 +568,9 @@ func (s *Service) runLocal(ctx context.Context, cmdLine, scriptsDir, scriptRel, 
 	})
 }
 
-func stageInputs(workspaceRoot, inputDir string, inputs []string) ([]string, error) {
+// stageInputs 将 inputs 复制到本 Run 的 INPUT_DIR。
+// 相对路径按顺序解析：逻辑前缀（$OUTPUT_DIR 等）→ 工作区根 → 本 Run OUTPUT/INPUT/WORK/TMP。
+func stageInputs(workspaceRoot string, ws execmodel.ExecutionWorkspace, inputs []string) ([]string, error) {
 	if len(inputs) == 0 {
 		return nil, nil
 	}
@@ -551,28 +582,125 @@ func stageInputs(workspaceRoot, inputDir string, inputs []string) ([]string, err
 		}
 		root = wd
 	}
+	rootReal, err := boundaryPath(root)
+	if err != nil {
+		return nil, fmt.Errorf("解析工作区失败: %w", err)
+	}
+
 	staged := make([]string, 0, len(inputs))
 	for _, raw := range inputs {
 		raw = strings.TrimSpace(raw)
 		if raw == "" {
 			continue
 		}
-		src := raw
-		if !filepath.IsAbs(src) {
-			src = filepath.Join(root, raw)
+		srcReal, tried, err := resolveStageSource(raw, rootReal, ws)
+		if err != nil {
+			return nil, fmt.Errorf("解析输入失败 %s: %w（已尝试: %s）", raw, err, strings.Join(tried, ", "))
 		}
-		data, err := os.ReadFile(src)
+		if !isWithinPath(srcReal, rootReal) {
+			return nil, fmt.Errorf("输入路径必须位于工作区内: %s", raw)
+		}
+		data, err := os.ReadFile(srcReal)
 		if err != nil {
 			return nil, fmt.Errorf("读取输入失败 %s: %w", raw, err)
 		}
-		name := filepath.Base(src)
-		dest := filepath.Join(inputDir, name)
+		name := filepath.Base(srcReal)
+		dest := filepath.Join(ws.InputDir, name)
 		if err := os.WriteFile(dest, data, 0o644); err != nil {
 			return nil, err
 		}
 		staged = append(staged, name)
 	}
 	return staged, nil
+}
+
+func resolveStageSource(raw, workspaceRoot string, ws execmodel.ExecutionWorkspace) (string, []string, error) {
+	tried := make([]string, 0, 8)
+	tryFile := func(candidate string) (string, bool) {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			return "", false
+		}
+		real, err := boundaryPath(candidate)
+		if err != nil {
+			tried = append(tried, candidate)
+			return "", false
+		}
+		tried = append(tried, real)
+		info, err := os.Stat(real)
+		if err != nil || info.IsDir() {
+			return "", false
+		}
+		return real, true
+	}
+
+	if rel, ok := scriptworkspace.StripLogicalDirPrefix(raw); ok {
+		base := scriptworkspace.DirBase(rel.Prefix, ws)
+		if base == "" {
+			return "", tried, fmt.Errorf("逻辑目录 %s 未注入", rel.Prefix)
+		}
+		if found, ok := tryFile(filepath.Join(base, filepath.FromSlash(rel.Rest))); ok {
+			return found, tried, nil
+		}
+		return "", tried, fmt.Errorf("文件不存在")
+	}
+
+	if filepath.IsAbs(raw) {
+		if found, ok := tryFile(raw); ok {
+			return found, tried, nil
+		}
+		return "", tried, fmt.Errorf("文件不存在")
+	}
+
+	candidates := []string{
+		filepath.Join(workspaceRoot, raw),
+		filepath.Join(ws.OutputDir, raw),
+		filepath.Join(ws.InputDir, raw),
+		filepath.Join(ws.WorkDir, raw),
+		filepath.Join(ws.TmpDir, raw),
+	}
+	for _, c := range candidates {
+		if found, ok := tryFile(c); ok {
+			return found, tried, nil
+		}
+	}
+	return "", tried, fmt.Errorf("文件不存在")
+}
+
+func boundaryPath(pathValue string) (string, error) {
+	abs, err := filepath.Abs(pathValue)
+	if err != nil {
+		return "", err
+	}
+	abs = filepath.Clean(abs)
+	if real, err := filepath.EvalSymlinks(abs); err == nil {
+		return filepath.Clean(real), nil
+	}
+	info, err := os.Lstat(abs)
+	if err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("无法解析符号链接: %s", pathValue)
+	}
+	return abs, nil
+}
+
+func isWithinPath(pathValue, root string) bool {
+	pathValue = filepath.Clean(pathValue)
+	root = filepath.Clean(root)
+	if samePath(pathValue, root) {
+		return true
+	}
+	rel, err := filepath.Rel(root, pathValue)
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
+}
+
+func samePath(left, right string) bool {
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(left, right)
+	}
+	return left == right
 }
 
 func collectArtifacts(outputDir string) ([]scriptcontract.Artifact, []string) {
@@ -629,18 +757,44 @@ func (s *Service) runtimeBin(scriptRel, pythonOverride string) string {
 }
 
 func nodeModuleSearchPath(workspaceRoot string) string {
-	parts := make([]string, 0, 3)
+	parts := make([]string, 0, 8)
+	seen := map[string]struct{}{}
+	addNodeModuleAncestors := func(root string) {
+		root = strings.TrimSpace(root)
+		if root == "" {
+			return
+		}
+		if abs, err := filepath.Abs(root); err == nil {
+			root = abs
+		}
+		for {
+			nodeModules := filepath.Clean(filepath.Join(root, "node_modules"))
+			if _, ok := seen[nodeModules]; !ok {
+				seen[nodeModules] = struct{}{}
+				parts = append(parts, nodeModules)
+			}
+			parent := filepath.Dir(root)
+			if parent == root {
+				break
+			}
+			root = parent
+		}
+	}
 	root := strings.TrimSpace(workspaceRoot)
 	if root == "" {
 		if wd, err := os.Getwd(); err == nil {
 			root = wd
 		}
 	}
-	if root != "" {
-		parts = append(parts, filepath.Join(root, "node_modules"))
+	addNodeModuleAncestors(root)
+	if cwd, err := os.Getwd(); err == nil {
+		addNodeModuleAncestors(cwd)
 	}
 	if home, err := os.UserHomeDir(); err == nil && home != "" {
-		parts = append(parts, filepath.Join(home, ".node_modules"))
+		legacy := filepath.Join(home, ".node_modules")
+		if _, ok := seen[legacy]; !ok {
+			parts = append(parts, legacy)
+		}
 	}
 	return strings.Join(parts, string(os.PathListSeparator))
 }

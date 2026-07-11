@@ -44,11 +44,11 @@ func New(deps toolkit.Deps) (tool.Tool, error) {
 func (t *Tool) GetInfo() *tool.Info {
 	return &tool.Info{
 		Name:        "write_file",
-		Description: "写入当前 workspace 内或经审批的外部文件。默认允许覆盖并使用原子写；可传 create_parents、overwrite=false、expected_hash。",
+		Description: "写入当前 workspace 内或经审批的外部文件。Run 中间脚本/临时文件请写 $WORK_DIR/...，最终交付写 $OUTPUT_DIR/...；禁止把 Run 产物写到仓库根。默认允许覆盖并使用原子写；可传 create_parents、overwrite=false、expected_hash。",
 		Parameters: &tool.ParameterSchema{
 			Type: "object",
 			Properties: map[string]*tool.ParameterSchema{
-				"path":           {Type: "string", Description: "workspace 内或经审批的外部文件路径"},
+				"path":           {Type: "string", Description: "workspace 内或经审批的外部文件路径；Run 中间产物请用 $WORK_DIR/...（勿写仓库根）"},
 				"content":        {Type: "string", Description: "要写入的完整文件内容"},
 				"create_parents": {Type: "boolean", Description: "是否创建父目录"},
 				"overwrite":      {Type: "boolean", Description: "是否允许覆盖已有文件，默认true"},

@@ -2,6 +2,14 @@
 
 > Genesis：从零生成时用 Node/pptxgenjs；最终文件必须写到 `OUTPUT_DIR`（可用环境变量）。禁止用 `write_file` 写假 `.pptx`。生成后用 `inspect_pptx.py` / `thumbnail.py` / `render_pptx_preview.py` 做 QA。
 
+## Genesis 执行方式（替代直接 node / bash）
+
+1. `write_file` 保存本教程风格的顶层 `.js` 到 **`$WORK_DIR/deck_gen.js`**（禁止写仓库根；中文写在源码字符串里）。创建前先读 `references/design.md`。
+2. `run_skill_script(skill="office-ppt", script="office-ppt/scripts/run_pptxgen_script.js", args=["deck_gen.js"], inputs=["$WORK_DIR/deck_gen.js"])`。
+3. 最终 `.pptx` 必须写入 `process.env.OUTPUT_DIR`。
+4. **必须**跑 Visual QA（`render_pptx_preview.py` / `thumbnail.py`）。缺 `soffice`/`pdftoppm` 时按 `dependency_missing` 说明，勿假装已 QA。
+5. 禁止 `write_file` 假 `.pptx`；禁止用 `create_pptx.js` 冒充多页交付。
+
 ## Setup & Basic Structure
 
 ```javascript
@@ -17,7 +25,9 @@ let slide = pres.addSlide();
 slide.addText("Hello World!", { x: 0.5, y: 0.5, fontSize: 36, color: "363636" });
 
 const out = path.join(process.env.OUTPUT_DIR || ".", "Presentation.pptx");
-pres.writeFile({ fileName: out });
+pres.writeFile({ fileName: out }).then(() => {
+  console.log(JSON.stringify({ ok: true, output: "Presentation.pptx" }));
+});
 ```
 
 ## Layout Dimensions
@@ -278,12 +288,13 @@ slide.addTable([
   border: { pt: 1, color: "999999" }, fill: { color: "F1F1F1" }
 });
 
-// Advanced with merged cells
+// Advanced with merged cells — colW must fit: x + sum(colW) ≤ slide width − margin
 let tableData = [
   [{ text: "Header", options: { fill: { color: "6699CC" }, color: "FFFFFF", bold: true } }, "Cell"],
   [{ text: "Merged", options: { colspan: 2 } }]
 ];
-slide.addTable(tableData, { x: 1, y: 3.5, w: 8, colW: [4, 4] });
+// LAYOUT_16x9 is 10" wide → e.g. x:0.5 + colW [4, 4.5] = 9.5 OK; [3, 2.5, 4.5]=10 with x:0.5 overflows
+slide.addTable(tableData, { x: 0.5, y: 3.5, w: 9, colW: [4.5, 4.5] });
 ```
 
 ---
@@ -387,7 +398,7 @@ titleSlide.addText("My Title", { placeholder: "title" });
 
 4. **Use `breakLine: true`** between array items or text runs together
 
-5. **Avoid `lineSpacing` with bullets** - causes excessive gaps; use `paraSpaceAfter` instead
+5. **Avoid `lineSpacing` for body copy** — in PptxGenJS `lineSpacing` is **points**, not a multiplier. `lineSpacing: 1.5` ≈ 1.5pt and **crushes/overlaps lines**. Prefer text arrays with `breakLine: true` and `paraSpaceAfter` (or omit lineSpacing). Never use tiny lineSpacing values expecting “1.5× spacing”.
 
 6. **Each presentation needs fresh instance** - don't reuse `pptxgen()` objects
 
@@ -412,6 +423,8 @@ titleSlide.addText("My Title", { placeholder: "title" });
    slide.addShape(pres.shapes.RECTANGLE, { x: 1, y: 1, w: 3, h: 1.5, fill: { color: "FFFFFF" } });
    slide.addShape(pres.shapes.RECTANGLE, { x: 1, y: 1, w: 0.08, h: 1.5, fill: { color: "0891B2" } });
    ```
+
+9. **Table `colW` must fit the slide** — `colW` widths are used as-is; `w` does not clamp them. For `LAYOUT_16x9` (10" wide) keep `x + sum(colW) ≤ 10 - rightMargin` (typical: `x: 0.5`, `sum(colW) ≤ 9`). Too-tall `rowH` needs room for wrapped Chinese text or cells look crushed.
 
 ---
 

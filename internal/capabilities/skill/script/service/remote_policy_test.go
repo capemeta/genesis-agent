@@ -18,7 +18,8 @@ import (
 )
 
 type recordingSession struct {
-	staged []string
+	staged  []string
+	lastRun sandboxcontract.CommandRequest
 }
 
 func (s *recordingSession) StageInput(ctx context.Context, req sandboxcontract.StageInputRequest) (*sandboxcontract.StageInputResult, error) {
@@ -32,6 +33,7 @@ func (s *recordingSession) StageInput(ctx context.Context, req sandboxcontract.S
 }
 
 func (s *recordingSession) Run(ctx context.Context, req sandboxcontract.CommandRequest) (*execmodel.Result, error) {
+	s.lastRun = req
 	return &execmodel.Result{ExitCode: 0, Stdout: `{"ok":true}`}, nil
 }
 
@@ -58,7 +60,7 @@ func catalogCLI() skillcontract.CatalogRequest {
 	return skillcontract.CatalogRequest{Product: profilemodel.ChannelCLI, Environment: profilemodel.EnvironmentLocal}
 }
 
-func TestRemoteStageInputKeepsNestedScriptPath(t *testing.T) {
+func TestRemoteStageInputUsesSkillScriptsZip(t *testing.T) {
 	skillSvc := newEmbeddedSkillService(t)
 	approval := newAllowApproval(t)
 	client := &recordingSessionClient{}
@@ -98,19 +100,69 @@ func TestRemoteStageInputKeepsNestedScriptPath(t *testing.T) {
 	}
 	found := false
 	for _, name := range client.session.staged {
-		if name == "skills/office-ppt/scripts/office/unpack.py" {
+		if name == "skill-scripts-office-ppt.zip" {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Fatalf("nested StageInput missing; staged=%v", client.session.staged)
+		t.Fatalf("skill scripts zip missing; staged=%v", client.session.staged)
 	}
 	if result.Metadata["backend"] != "remote_session" {
 		t.Fatalf("backend=%v", result.Metadata)
 	}
 }
 
+func TestRemoteSkillScriptUsesAbsoluteSandboxEntryAndScriptsCwd(t *testing.T) {
+	skillSvc := newEmbeddedSkillService(t)
+	approval := newAllowApproval(t)
+	client := &recordingSessionClient{}
+	shared, err := embedded.OfficeCommonScriptsFS()
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc, err := scriptservice.New(scriptservice.Deps{
+		Skills:          skillSvc,
+		Runner:          &fakeRunner{},
+		Approval:        approval,
+		SessionClient:   client,
+		Logger:          logger.NewNop(),
+		SharedScriptsFS: shared,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := svc.Run(context.Background(), scriptcontract.RunRequest{
+		Catalog:       catalogCLI(),
+		Skill:         "office-ppt",
+		Script:        "office-ppt/scripts/run_pptxgen_script.js",
+		Args:          []string{"deck_gen.js"},
+		Sandbox:       execmodel.SandboxProfile{Mode: execmodel.SandboxRequired, Provider: "genesis-sandbox"},
+		WorkspaceRoot: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result == nil || !result.OK {
+		t.Fatalf("result=%+v", result)
+	}
+	cmd := client.session.lastRun.Command
+	if !strings.Contains(cmd.Command, "/workspace/input/skill-scripts-office-ppt.zip") {
+		t.Fatalf("command should unzip staged scripts first, got %q", cmd.Command)
+	}
+	if !strings.Contains(cmd.Command, "/workspace/tmp/skills/office-ppt/scripts/run_pptxgen_script.js") {
+		t.Fatalf("command should use absolute sandbox script path, got %q", cmd.Command)
+	}
+	if cmd.Cwd != "/workspace" {
+		t.Fatalf("cwd=%q", cmd.Cwd)
+	}
+	if !strings.Contains(cmd.Command, "cd /workspace/tmp/skills/office-ppt/scripts") {
+		t.Fatalf("command should cd into scripts dir after unzip, got %q", cmd.Command)
+	}
+	if client.session.lastRun.Options.Workspace.SkillDir != "/workspace/tmp/skills/office-ppt" {
+		t.Fatalf("workspace=%+v", client.session.lastRun.Options.Workspace)
+	}
+}
 func TestOptionalRemoteDegradesWhenSessionClientMissing(t *testing.T) {
 	skillSvc := newEmbeddedSkillService(t)
 	approval := newAllowApproval(t)

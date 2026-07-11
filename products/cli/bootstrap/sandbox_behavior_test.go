@@ -6,10 +6,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
 
+	approvalmodel "genesis-agent/internal/capabilities/approval/model"
 	execcontract "genesis-agent/internal/capabilities/execution/contract"
 	execmodel "genesis-agent/internal/capabilities/execution/model"
 	toolcontract "genesis-agent/internal/capabilities/tool/contract"
@@ -144,6 +146,86 @@ func TestRunCommandRequiredSandboxFailsClosedOnUnsupportedWindowsPolicy(t *testi
 	}
 }
 
+func TestFileDiscoveryUsesWorkspaceRootAndSkipsNoiseDirs(t *testing.T) {
+	workspace := newTestWorkspace(t, "glob-workspace-*")
+	if err := os.WriteFile(filepath.Join(workspace, "ultra5-comparison-summary.md"), []byte("summary"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(workspace, ".gocache", "01"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, ".gocache", "01", "large.bin"), make([]byte, 5*1024*1024), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(workspace, "node_modules", "pkg"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "node_modules", "pkg", "large.bin"), make([]byte, 5*1024*1024), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tools, _, err := buildProductTools(clisandbox.DefaultConfig(), allowBootstrapApproval{}, logger.NewNop(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var globTool toolcontract.Tool
+	var walkTool toolcontract.Tool
+	for _, candidate := range tools {
+		switch candidate.GetInfo().Name {
+		case "glob":
+			globTool = candidate
+		case "walk_dir":
+			walkTool = candidate
+		}
+	}
+	if globTool == nil {
+		t.Fatal("glob tool not found")
+	}
+	if walkTool == nil {
+		t.Fatal("walk_dir tool not found")
+	}
+	out, err := globTool.Execute(context.Background(), `{"pattern":"ultra5-comparison-summary.md"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result struct {
+		Matches   []string `json:"matches"`
+		Truncated bool     `json:"truncated"`
+	}
+	if err := json.Unmarshal([]byte(out), &result); err != nil {
+		t.Fatalf("unmarshal glob result: %v\n%s", err, out)
+	}
+	if len(result.Matches) != 1 || result.Matches[0] != "ultra5-comparison-summary.md" {
+		t.Fatalf("matches=%+v output=%s", result.Matches, out)
+	}
+	if result.Truncated {
+		t.Fatalf("exact glob should not be truncated by noise: %s", out)
+	}
+
+	walkOut, err := walkTool.Execute(context.Background(), `{"path":".","max_depth":1}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var walkResult struct {
+		Entries []struct {
+			Path string `json:"path"`
+		} `json:"entries"`
+	}
+	if err := json.Unmarshal([]byte(walkOut), &walkResult); err != nil {
+		t.Fatalf("unmarshal walk result: %v\n%s", err, walkOut)
+	}
+	for _, entry := range walkResult.Entries {
+		if strings.HasPrefix(entry.Path, ".gocache") || strings.HasPrefix(entry.Path, "node_modules") {
+			t.Fatalf("walk_dir leaked noise entry %+v output=%s", entry, walkOut)
+		}
+	}
+}
+
+type allowBootstrapApproval struct{}
+
+func (allowBootstrapApproval) Authorize(context.Context, approvalmodel.Request) (approvalmodel.Decision, error) {
+	return approvalmodel.Decision{Type: approvalmodel.DecisionApproved, Reason: "test allow"}, nil
+}
+
 const runCommandParams = `{"command":"echo hello","timeout_ms":30000}`
 
 type runCommandResult struct {
@@ -158,17 +240,12 @@ type runCommandResult struct {
 
 func mustRunCommandTool(t *testing.T, cfg clisandbox.Config) toolcontract.Tool {
 	t.Helper()
-	workspace, err := os.MkdirTemp(".", ".sandbox-behavior-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(workspace) })
-	t.Chdir(workspace)
+	workspace := newTestWorkspace(t, "sandbox-behavior-*")
 	approvalSvc, err := buildBaseApprovalService(true, platformconfig.PolicyConfig{}, logger.NewNop(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	tools, _, err := buildProductTools(cfg, approvalSvc, logger.NewNop())
+	tools, _, err := buildProductTools(cfg, approvalSvc, logger.NewNop(), workspace)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -181,6 +258,23 @@ func mustRunCommandTool(t *testing.T, cfg clisandbox.Config) toolcontract.Tool {
 	return nil
 }
 
+func newTestWorkspace(t *testing.T, pattern string) string {
+	t.Helper()
+	parent := filepath.Join(".gotmp", "test-workspaces")
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := os.MkdirTemp(parent, pattern)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace, err = filepath.Abs(workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(workspace) })
+	return workspace
+}
 func executeRunCommand(t *testing.T, tool toolcontract.Tool) runCommandResult {
 	t.Helper()
 	out, err := tool.Execute(context.Background(), runCommandParams)

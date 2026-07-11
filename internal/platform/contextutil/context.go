@@ -11,14 +11,39 @@ type userKey struct{}
 type sessionKey struct{}
 type runKey struct{}
 type sandboxProfileKey struct{}
+type approvalGrantedHookKey struct{}
 
 var (
-	tenantIDKey        = tenantKey{}
-	userIDKey          = userKey{}
-	sessionIDKey       = sessionKey{}
-	runIDKey           = runKey{}
-	sandboxOverrideKey = sandboxProfileKey{}
+	tenantIDKey           = tenantKey{}
+	userIDKey             = userKey{}
+	sessionIDKey          = sessionKey{}
+	runIDKey              = runKey{}
+	sandboxOverrideKey    = sandboxProfileKey{}
+	approvalGrantedHookID = approvalGrantedHookKey{}
 )
+
+// ApprovalGrantedHook 在用户批准后回调（供 Repeat Guard 等 Run 级状态清零）。
+type ApprovalGrantedHook func(ctx context.Context)
+
+// WithApprovalGrantedHook 注入审批通过钩子。
+func WithApprovalGrantedHook(ctx context.Context, hook ApprovalGrantedHook) context.Context {
+	if ctx == nil || hook == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, approvalGrantedHookID, hook)
+}
+
+// NotifyApprovalGranted 在审批通过时触发钩子（无钩子则静默）。
+func NotifyApprovalGranted(ctx context.Context) {
+	if ctx == nil {
+		return
+	}
+	hook, ok := ctx.Value(approvalGrantedHookID).(ApprovalGrantedHook)
+	if !ok || hook == nil {
+		return
+	}
+	hook(ctx)
+}
 
 // WithTenantID 将租户 ID 注入 context
 func WithTenantID(ctx context.Context, tenantID string) context.Context {

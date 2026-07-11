@@ -296,8 +296,12 @@ type PolicySandboxConfig struct {
 
 // AgentConfig Agent 运行时策略。
 type AgentConfig struct {
-	MaxIterations int    `mapstructure:"max_iterations"`
-	SystemPrompt  string `mapstructure:"system_prompt"`
+	MaxIterations            int    `mapstructure:"max_iterations"`
+	MaxConsecutiveFail       int    `mapstructure:"max_consecutive_fail"`
+	RepeatGuardEnabled       *bool  `mapstructure:"repeat_guard_enabled"`
+	MaxIdenticalToolFailures *int   `mapstructure:"max_identical_tool_failures"`
+	MaxStagnantIterations    *int   `mapstructure:"max_stagnant_iterations"`
+	SystemPrompt             string `mapstructure:"system_prompt"`
 }
 
 // LogConfig 日志配置（agent/audit/usage 三类通道）。

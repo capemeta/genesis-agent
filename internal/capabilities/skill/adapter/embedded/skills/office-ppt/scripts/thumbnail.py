@@ -16,6 +16,7 @@ Examples:
 """
 
 import argparse
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -23,8 +24,7 @@ import zipfile
 from pathlib import Path
 
 import defusedxml.minidom
-from office.soffice import get_soffice_env
-from path_contract import resolve_input_path, resolve_output_dir
+from path_contract import emit_json, resolve_input_path, resolve_output_dir
 from PIL import Image, ImageDraw, ImageFont
 
 THUMBNAIL_WIDTH = 300
@@ -96,6 +96,21 @@ def main():
                 print(f"  {grid_file}")
 
     except Exception as e:
+        msg = str(e)
+        # convert_to_images 用 "dependency_missing:<name>: ..." 标记系统依赖缺口
+        if msg.startswith("dependency_missing:"):
+            parts = msg.split(":", 2)
+            dep = parts[1].strip() if len(parts) > 1 else "unknown"
+            emit_json(
+                {
+                    "ok": False,
+                    "errors": [msg],
+                    "hint": "dependency_missing",
+                    "dependency": dep,
+                    "manager": "system",
+                },
+                exit_code=1,
+            )
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
@@ -166,9 +181,27 @@ def create_hidden_placeholder(size: tuple[int, int]) -> Image.Image:
 def convert_to_images(pptx_path: Path, temp_dir: Path) -> list[Path]:
     pdf_path = temp_dir / f"{pptx_path.stem}.pdf"
 
+    try:
+        from office.soffice import get_soffice_env, resolve_soffice_bin
+
+        soffice = resolve_soffice_bin()
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            f"dependency_missing:libreoffice: {exc}"
+        ) from exc
+    except Exception as exc:
+        raise RuntimeError(f"office.soffice unavailable: {exc}") from exc
+
+    if shutil.which("pdftoppm") is None and shutil.which("pdftoppm.exe") is None:
+        raise RuntimeError(
+            "dependency_missing:poppler: pdftoppm not found on PATH; install Poppler"
+        )
+
+    pdftoppm = shutil.which("pdftoppm") or shutil.which("pdftoppm.exe")
+
     result = subprocess.run(
         [
-            "soffice",
+            soffice,
             "--headless",
             "--convert-to",
             "pdf",
@@ -181,11 +214,12 @@ def convert_to_images(pptx_path: Path, temp_dir: Path) -> list[Path]:
         env=get_soffice_env(),
     )
     if result.returncode != 0 or not pdf_path.exists():
-        raise RuntimeError("PDF conversion failed")
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(f"PDF conversion failed: {detail or 'unknown error'}")
 
     result = subprocess.run(
         [
-            "pdftoppm",
+            pdftoppm,
             "-jpeg",
             "-r",
             str(CONVERSION_DPI),
@@ -196,7 +230,8 @@ def convert_to_images(pptx_path: Path, temp_dir: Path) -> list[Path]:
         text=True,
     )
     if result.returncode != 0:
-        raise RuntimeError("Image conversion failed")
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(f"Image conversion failed: {detail or 'unknown error'}")
 
     return sorted(temp_dir.glob("slide-*.jpg"))
 

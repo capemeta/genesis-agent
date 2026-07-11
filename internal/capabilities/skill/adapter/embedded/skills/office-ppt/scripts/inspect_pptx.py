@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """Inspect a PPTX package with only Python stdlib."""
 
-import json
 import os
 import re
 import sys
 import zipfile
 import xml.etree.ElementTree as ET
 
-from path_contract import resolve_input_path
+from path_contract import emit_json, resolve_input_path
 
 NS = {"a": "http://schemas.openxmlformats.org/drawingml/2006/main"}
 SLIDE_RE = re.compile(r"ppt/slides/slide(\d+)\.xml$")
@@ -59,4 +58,5 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    print(json.dumps(main(sys.argv), ensure_ascii=False, indent=2))
+    result = main(sys.argv)
+    emit_json(result, exit_code=0 if result.get("ok") else 1)

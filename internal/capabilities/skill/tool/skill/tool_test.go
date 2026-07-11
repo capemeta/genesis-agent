@@ -67,6 +67,34 @@ func TestSkillToolExposesGatewayNameAndDescriptionFunc(t *testing.T) {
 	}
 }
 
+func TestSkillExplicitLoadAllowsDisableModelInvocation(t *testing.T) {
+	meta := skillmodel.Metadata{
+		Name: "manual", QualifiedName: "manual", Description: "Manual", Enabled: true, PromptVisible: true,
+		Authority: skillmodel.Authority{Kind: skillmodel.SourceKindEmbedded, ID: "test"}, PackageID: "manual", MainResource: "manual/SKILL.md",
+		Policy: skillmodel.Policy{DisableModelInvocation: true},
+	}.Normalize()
+	source := skillmemory.NewSource(meta.Authority, []skillmemory.Skill{{Metadata: meta, Body: "Manual body"}})
+	svc := skillservice.New([]skillcontract.Source{source}, skillservice.Options{})
+	approval, err := approvalservice.New(approvalstatic.NewPolicyEngine(), approvaldeny.NewRequester(), approvalmemory.NewStore(), logger.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := New(Deps{Service: svc, Approval: approval, EnabledTools: []string{"read_file"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway := created.(*Tool)
+	if _, err := gateway.Execute(context.Background(), `{"skill":"manual"}`); err == nil {
+		t.Fatal("model path should reject manual-only skill")
+	}
+	out, err := gateway.LoadExplicitSkill(context.Background(), skillcontract.ExplicitLoadRequest{Skill: "manual"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, `"type":"skill_injection"`) || !strings.Contains(out, "Manual body") {
+		t.Fatalf("output = %s", out)
+	}
+}
 func TestSkillRejectsMissingToolDependency(t *testing.T) {
 	tool := newTestTool(t, skillmodel.Dependencies{Tools: []skillmodel.ToolDependency{{Type: "tool", Value: "grep"}}}, []string{"read_file"})
 	_, err := tool.Execute(context.Background(), `{"skill":"review"}`)

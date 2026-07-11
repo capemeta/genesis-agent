@@ -153,7 +153,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		found := false
 		for i := len(m.messages) - 1; i >= 0; i-- {
 			if m.messages[i].role == "assistant" {
-				m.messages[i].content = run.FinalAnswer
+				// 保留已流式展示的中间思考；仅在缺失时回填 FinalAnswer。
+				if run.FinalAnswer != "" && !strings.Contains(m.messages[i].content, run.FinalAnswer) {
+					if strings.TrimSpace(m.messages[i].content) == "" {
+						m.messages[i].content = run.FinalAnswer
+					} else {
+						m.messages[i].content = strings.TrimRight(m.messages[i].content, "\n") + "\n\n—— 最终回答 ——\n\n" + run.FinalAnswer
+					}
+				}
 				m.messages[i].steps = len(run.Steps)
 				m.messages[i].tokens = run.TotalTokens
 				m.messages[i].elapsed = msg.result.Elapsed
@@ -271,7 +278,7 @@ func (m Model) sendMessage(input string) (tea.Model, tea.Cmd) {
 	m.err = nil
 	m.currentStatus = "准备运行 Agent"
 	m.progressLog = nil
-	m.progressCh = make(chan progressMsg, 32)
+		m.progressCh = make(chan progressMsg, 256)
 	// 更新消息区并滚动到底部
 	m.refreshViewportContent()
 	m.viewport.GotoBottom()
@@ -285,38 +292,8 @@ func (m Model) sendMessage(input string) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) applyProgress(event progress.Event) {
-	if event.BlockType == "final_answer" {
-		if event.Phase == progress.PhaseStart {
-			found := false
-			// 寻找当前 Turn（即最后一个 User 消息之后）是否已有 assistant 消息
-			userMsgIdx := -1
-			for i := len(m.messages) - 1; i >= 0; i-- {
-				if m.messages[i].role == "user" {
-					userMsgIdx = i
-					break
-				}
-			}
-			for i := len(m.messages) - 1; i > userMsgIdx; i-- {
-				if m.messages[i].role == "assistant" {
-					m.messages[i].content = "" // 重置内容以供新的一轮重新流式输出
-					found = true
-					break
-				}
-			}
-			if !found {
-				m.messages = append(m.messages, uiMessage{
-					role:    "assistant",
-					content: "",
-				})
-			}
-		} else if event.Phase == progress.PhaseProgress {
-			for i := len(m.messages) - 1; i >= 0; i-- {
-				if m.messages[i].role == "assistant" {
-					m.messages[i].content += event.Detail
-					break
-				}
-			}
-		}
+	if isLiveAssistantBlock(event.BlockType) {
+		m.applyLiveAssistantBlock(event)
 		return
 	}
 
@@ -324,10 +301,104 @@ func (m *Model) applyProgress(event progress.Event) {
 	if summary == "" {
 		return
 	}
+	// Display=false：协议/块闭合事件，不更新状态栏、不写入运行过程摘要。
+	if event.Display != nil && !*event.Display {
+		return
+	}
 	m.currentStatus = summary
 	if shouldLogProgress(event) {
+		// 连续相同摘要去重（例如同工具 start 被重复投递时）
+		if n := len(m.progressLog); n > 0 && m.progressLog[n-1] == summary {
+			return
+		}
 		m.progressLog = append(m.progressLog, summary)
 	}
+}
+
+func isLiveAssistantBlock(blockType string) bool {
+	switch blockType {
+	case "final_answer", "assistant_draft", "thinking":
+		return true
+	default:
+		return false
+	}
+}
+
+// applyLiveAssistantBlock 将中间思考 / 最终回答流式写入当前 Turn 的 Agent 气泡。
+// assistant_draft/thinking：多轮思考追加；final_answer：在思考之后接最终回答。
+func (m *Model) applyLiveAssistantBlock(event progress.Event) {
+	// 不可见块不进对话区（协议闭合等）。
+	if event.Display != nil && !*event.Display {
+		return
+	}
+
+	switch event.Phase {
+	case progress.PhaseStart:
+		idx := m.ensureAssistantMessage()
+		if event.BlockType == "final_answer" {
+			// 保留中间思考，再接最终回答；无思考时从空开始。
+			if strings.TrimSpace(m.messages[idx].content) != "" {
+				m.messages[idx].content = strings.TrimRight(m.messages[idx].content, "\n") + "\n\n—— 最终回答 ——\n\n"
+			} else {
+				m.messages[idx].content = ""
+			}
+			return
+		}
+		// 新一轮中间思考：与上一轮之间留空行，避免粘连。
+		if strings.TrimSpace(m.messages[idx].content) != "" {
+			m.messages[idx].content = strings.TrimRight(m.messages[idx].content, "\n") + "\n\n"
+		}
+	case progress.PhaseProgress:
+		if event.Detail == "" {
+			return
+		}
+		idx := m.ensureAssistantMessage()
+		m.messages[idx].content = appendStreamDelta(m.messages[idx].content, event.Detail)
+	}
+}
+
+func (m *Model) ensureAssistantMessage() int {
+	userMsgIdx := -1
+	for i := len(m.messages) - 1; i >= 0; i-- {
+		if m.messages[i].role == "user" {
+			userMsgIdx = i
+			break
+		}
+	}
+	for i := len(m.messages) - 1; i > userMsgIdx; i-- {
+		if m.messages[i].role == "assistant" {
+			return i
+		}
+	}
+	m.messages = append(m.messages, uiMessage{role: "assistant", content: ""})
+	return len(m.messages) - 1
+}
+
+// appendStreamDelta 合并流式增量；兼容部分模型返回「累计全文」而非纯 delta 的情况。
+func appendStreamDelta(current, delta string) string {
+	if delta == "" {
+		return current
+	}
+	if current == "" {
+		return delta
+	}
+	if strings.HasPrefix(delta, current) {
+		return delta
+	}
+	if strings.HasSuffix(current, delta) {
+		return current
+	}
+	// 重叠后缀：current 末尾与 delta 开头有公共部分
+	maxOverlap := len(delta)
+	if maxOverlap > len(current) {
+		maxOverlap = len(current)
+	}
+	for n := maxOverlap; n > 0; n-- {
+		if strings.HasSuffix(current, delta[:n]) {
+			return current + delta[n:]
+		}
+	}
+	return current + delta
 }
 
 func (m Model) progressSummaryMessage() string {
@@ -445,6 +516,10 @@ func truncateString(s string, max int) string {
 
 func shouldLogProgress(event progress.Event) bool {
 	if event.Display != nil && !*event.Display {
+		return false
+	}
+	// tool_input 的 complete 与 start 文案重复（非流式无增量），不写入运行过程。
+	if event.Kind == progress.KindTool && event.BlockType == "tool_input" && event.Phase == progress.PhaseComplete {
 		return false
 	}
 	switch event.Kind {

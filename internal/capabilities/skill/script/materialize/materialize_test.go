@@ -38,6 +38,7 @@ func TestMaterializeEmbeddedOfficePPT(t *testing.T) {
 	}
 	for _, name := range []string{
 		"inspect_pptx.py",
+		"extract_pptx_text.py",
 		"path_contract.py",
 		"thumbnail.py",
 		"add_slide.py",

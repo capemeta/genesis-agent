@@ -25,6 +25,7 @@ import (
 	"genesis-agent/internal/runtime"
 	"genesis-agent/internal/runtime/progress"
 	"genesis-agent/internal/runtime/prompt"
+	"genesis-agent/internal/runtime/repeatguard"
 )
 
 // SkillNameMatcher 识别「把 Skill 名当成 Tool 名」的误调用（由产品注入，Gateway 不依赖 skill）。
@@ -34,15 +35,16 @@ type SkillNameMatcher interface {
 
 // ReactLoopEngine ReAct Loop策略的RunEngine实现
 type ReactLoopEngine struct {
-	llm                        llm.ChatModel
-	registry                   tool.Registry
-	memory                     memory.ShortTermStore
-	prompt                     prompt.Builder
-	logger                     logger.Logger
-	tracer                     trace.Tracer
-	skillNameMatcher           SkillNameMatcher
-	skillMentionSelector       SkillMentionSelector
-	autoRewriteSkillCollision  *bool // nil 表示默认开启
+	llm                       llm.ChatModel
+	registry                  tool.Registry
+	memory                    memory.ShortTermStore
+	prompt                    prompt.Builder
+	logger                    logger.Logger
+	tracer                    trace.Tracer
+	skillNameMatcher          SkillNameMatcher
+	skillMentionSelector      SkillMentionSelector
+	skillExplicitLoader       SkillExplicitLoader
+	autoRewriteSkillCollision *bool // nil 表示默认开启
 }
 
 // EngineOption 可选依赖。
@@ -117,6 +119,13 @@ func (e *ReactLoopEngine) Start(ctx context.Context, req domain.StartRunRequest)
 	runSpan := e.tracer.StartSpan(ctx, "run", run.ID)
 
 	rc := runtime.NewRunContext(run, req.Agent)
+	ctx = contextutil.WithApprovalGrantedHook(ctx, func(context.Context) {
+		if rc.RepeatGuard == nil {
+			return
+		}
+		rc.RepeatGuard.ClearApprovalDenied()
+		rc.RepeatGuard.MarkUserIntervention()
+	})
 	err := e.loop(ctx, rc, req, log)
 
 	e.tracer.EndSpan(ctx, runSpan, err)
@@ -131,8 +140,12 @@ func (e *ReactLoopEngine) Start(ctx context.Context, req domain.StartRunRequest)
 		return run, err
 	}
 
-	log.Info("Run完成", "steps", len(run.Steps), "tokens", run.TotalTokens, "answer_len", len(run.FinalAnswer))
-	progress.Emit(ctx, progress.Event{Kind: progress.KindRun, Phase: progress.PhaseComplete, RunID: run.ID, Summary: "Agent 运行完成"})
+	log.Info("Run完成", "steps", len(run.Steps), "tokens", run.TotalTokens, "answer_len", len(run.FinalAnswer), "incomplete", run.Incomplete)
+	summary := "Agent 运行完成"
+	if run.Incomplete {
+		summary = "Agent 运行完成（结果可能不完整）"
+	}
+	progress.Emit(ctx, progress.Event{Kind: progress.KindRun, Phase: progress.PhaseComplete, RunID: run.ID, Summary: summary})
 	return run, nil
 }
 
@@ -179,6 +192,9 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 	// ── 步骤3: 主循环 ─────────────────────────────────────────
 	for rc.Iteration = 0; rc.Iteration < maxIter; rc.Iteration++ {
 		iterLog := log.With("iteration", rc.Iteration)
+		if rc.RepeatGuard != nil {
+			rc.RepeatGuard.BeginIteration()
+		}
 
 		stepID := fmt.Sprintf("%s-step-%d", rc.Run.ID, rc.Iteration)
 		stepSpan := e.tracer.StartSpan(ctx, "step", stepID)
@@ -194,7 +210,7 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 
 		// ── LLM推理（通过我们的接口，不感知 eino）───────────────
 		iterLog.Info("调用LLM推理...")
-		
+
 		thinkingBlockIdx := rc.NextBlockIndex()
 		stepIdx := rc.Iteration
 		displayFalse := false
@@ -216,6 +232,7 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 
 		onDelta := func(delta string, isThought bool) {
 			if isThought {
+				// CoT / reasoning：对用户可见的中间思考
 				progress.Emit(ctx, progress.Event{
 					Kind:       progress.KindLLM,
 					Phase:      progress.PhaseProgress,
@@ -224,42 +241,44 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 					BlockIndex: &thinkingBlockIdx,
 					BlockType:  "thinking",
 					StepIndex:  &stepIdx,
-					Display:    &displayFalse,
-					DeltaType:  "text_delta",
-					Detail:     delta,
-				})
-			} else {
-				if contentBlockIdx == nil {
-					idx := rc.NextBlockIndex()
-					contentBlockIdx = &idx
-
-					progress.Emit(ctx, progress.Event{
-						Kind:        progress.KindLLM,
-						Phase:       progress.PhaseStart,
-						RunID:       rc.Run.ID,
-						StepID:      stepID,
-						Summary:     "生成最终回答",
-						BlockIndex:  contentBlockIdx,
-						BlockType:   "final_answer",
-						StepIndex:   &stepIdx,
-						Display:     &displayTrue,
-						ContentType: "text/markdown",
-					})
-				}
-
-				progress.Emit(ctx, progress.Event{
-					Kind:       progress.KindLLM,
-					Phase:      progress.PhaseProgress,
-					RunID:      rc.Run.ID,
-					StepID:     stepID,
-					BlockIndex: contentBlockIdx,
-					BlockType:  "final_answer",
-					StepIndex:  &stepIdx,
 					Display:    &displayTrue,
 					DeltaType:  "text_delta",
 					Detail:     delta,
+					Summary:    "思考中",
+				})
+				return
+			}
+			// 工具前正文也是中间思考：用 assistant_draft 展示，避免与最终回答块混淆。
+			// 最终回答在确认无 tool_calls 后另发 final_answer。
+			if contentBlockIdx == nil {
+				idx := rc.NextBlockIndex()
+				contentBlockIdx = &idx
+				progress.Emit(ctx, progress.Event{
+					Kind:        progress.KindLLM,
+					Phase:       progress.PhaseStart,
+					RunID:       rc.Run.ID,
+					StepID:      stepID,
+					Summary:     "思考中",
+					BlockIndex:  contentBlockIdx,
+					BlockType:   "assistant_draft",
+					StepIndex:   &stepIdx,
+					Display:     &displayTrue,
+					ContentType: "text/markdown",
 				})
 			}
+			progress.Emit(ctx, progress.Event{
+				Kind:       progress.KindLLM,
+				Phase:      progress.PhaseProgress,
+				RunID:      rc.Run.ID,
+				StepID:     stepID,
+				BlockIndex: contentBlockIdx,
+				BlockType:  "assistant_draft",
+				StepIndex:  &stepIdx,
+				Display:    &displayTrue,
+				DeltaType:  "text_delta",
+				Detail:     delta,
+				Summary:    "思考中",
+			})
 		}
 
 		llmResp, err := e.llm.StreamGenerate(ctx, rc.Messages, toolInfos, onDelta)
@@ -282,7 +301,7 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 			return fmt.Errorf("第%d轮LLM调用失败: %w", rc.Iteration, err)
 		}
 		iterLog.Debug("LLM响应", "tool_calls", len(llmResp.ToolCalls), "content_len", len(llmResp.Content))
-		
+
 		progress.Emit(ctx, progress.Event{
 			Kind:       progress.KindLLM,
 			Phase:      progress.PhaseComplete,
@@ -304,7 +323,7 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 				RunID:      rc.Run.ID,
 				StepID:     stepID,
 				BlockIndex: contentBlockIdx,
-				BlockType:  "final_answer",
+				BlockType:  "assistant_draft",
 				StepIndex:  &stepIdx,
 				Display:    &displayTrue,
 				StopReason: "complete",
@@ -333,49 +352,60 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 			payload, _ := json.Marshal(llmResp.ToolCalls)
 			step.ActionPayload = payload
 
+			if stop, stopErr := e.applyRepeatGuardProgress(ctx, rc, iterLog, false); stop {
+				now := time.Now()
+				step.Status = domain.StepStatusCompleted
+				step.FinishedAt = &now
+				rc.AddStep(step)
+				e.tracer.EndSpan(ctx, stepSpan, stopErr)
+				return stopErr
+			}
+
 		} else if llmResp.Content != "" {
 			// ── 路径B: 最终回答 ──────────────────────────────
 			step.ActionType = domain.ActionTypeFinalAnswer
 			iterLog.Info("获得最终回答", "content_preview", truncate(llmResp.Content, 100))
-			
-			if contentBlockIdx == nil {
-				answerBlockIdx := rc.NextBlockIndex()
-				displayTrue := true
-				progress.Emit(ctx, progress.Event{
-					Kind:        progress.KindRun,
-					Phase:       progress.PhaseStart,
-					RunID:       rc.Run.ID,
-					StepID:      stepID,
-					Summary:     "生成最终回答",
-					BlockIndex:  &answerBlockIdx,
-					BlockType:   "final_answer",
-					StepIndex:   &stepIdx,
-					Display:     &displayTrue,
-					ContentType: "text/markdown",
-				})
-				progress.Emit(ctx, progress.Event{
-					Kind:        progress.KindRun,
-					Phase:       progress.PhaseProgress,
-					RunID:       rc.Run.ID,
-					StepID:      stepID,
-					BlockIndex:  &answerBlockIdx,
-					BlockType:   "final_answer",
-					StepIndex:   &stepIdx,
-					DeltaType:   "text_delta",
-					Detail:      llmResp.Content,
-				})
-				progress.Emit(ctx, progress.Event{
-					Kind:        progress.KindRun,
-					Phase:       progress.PhaseComplete,
-					RunID:       rc.Run.ID,
-					StepID:      stepID,
-					BlockIndex:  &answerBlockIdx,
-					BlockType:   "final_answer",
-					StepIndex:   &stepIdx,
-					Display:     &displayTrue,
-					StopReason:  "complete",
-				})
+			if rc.RepeatGuard != nil {
+				_ = rc.RepeatGuard.EndIteration(rc.Iteration, true)
 			}
+
+			// 流式阶段未向对话区展示正文；此处一次性写入 final_answer。
+			answerBlockIdx := rc.NextBlockIndex()
+			displayTrue := true
+			progress.Emit(ctx, progress.Event{
+				Kind:        progress.KindRun,
+				Phase:       progress.PhaseStart,
+				RunID:       rc.Run.ID,
+				StepID:      stepID,
+				Summary:     "生成最终回答",
+				BlockIndex:  &answerBlockIdx,
+				BlockType:   "final_answer",
+				StepIndex:   &stepIdx,
+				Display:     &displayTrue,
+				ContentType: "text/markdown",
+			})
+			progress.Emit(ctx, progress.Event{
+				Kind:       progress.KindRun,
+				Phase:      progress.PhaseProgress,
+				RunID:      rc.Run.ID,
+				StepID:     stepID,
+				BlockIndex: &answerBlockIdx,
+				BlockType:  "final_answer",
+				StepIndex:  &stepIdx,
+				DeltaType:  "text_delta",
+				Detail:     llmResp.Content,
+			})
+			progress.Emit(ctx, progress.Event{
+				Kind:       progress.KindRun,
+				Phase:      progress.PhaseComplete,
+				RunID:      rc.Run.ID,
+				StepID:     stepID,
+				BlockIndex: &answerBlockIdx,
+				BlockType:  "final_answer",
+				StepIndex:  &stepIdx,
+				Display:    &displayTrue,
+				StopReason: "complete",
+			})
 
 			rc.Run.FinalAnswer = llmResp.Content
 			rc.Run.Status = domain.RunStatusCompleted
@@ -526,77 +556,138 @@ func (e *ReactLoopEngine) runToolCall(ctx context.Context, rc *runtime.RunContex
 	// 1. Tool Input Block
 	inputBlockIdx := rc.NextBlockIndex()
 	progress.Emit(ctx, progress.Event{
-		Kind:        progress.KindTool,
-		Phase:       progress.PhaseStart,
-		RunID:       runID,
-		CallID:      tc.ID,
-		Name:        toolName,
-		Summary:     "调用工具: " + toolName,
-		Detail:      truncate(tc.Function.Arguments, 240),
-		Component:   "tool",
-		BlockIndex:  &inputBlockIdx,
-		BlockType:   "tool_input",
-		StepIndex:   &stepIdx,
-		Display:     &displayTrue,
+		Kind:       progress.KindTool,
+		Phase:      progress.PhaseStart,
+		RunID:      runID,
+		CallID:     tc.ID,
+		Name:       toolName,
+		Summary:    "调用工具: " + toolName,
+		Detail:     truncate(tc.Function.Arguments, 240),
+		Component:  "tool",
+		BlockIndex: &inputBlockIdx,
+		BlockType:  "tool_input",
+		StepIndex:  &stepIdx,
+		Display:    &displayTrue,
 	})
 
-	// Since we are in non-streaming, input completes immediately
+	// 非流式下 input 立即完成；该 complete 仅闭合 tool_input block，不面向用户展示
+	//（否则会与上方带参数的「调用工具」摘要重复）。
+	displayFalse := false
 	progress.Emit(ctx, progress.Event{
-		Kind:        progress.KindTool,
-		Phase:       progress.PhaseComplete,
-		RunID:       runID,
-		CallID:      tc.ID,
-		Name:        toolName,
-		Summary:     "调用工具: " + toolName,
-		Component:   "tool",
-		BlockIndex:  &inputBlockIdx,
-		BlockType:   "tool_input",
-		StepIndex:   &stepIdx,
-		Display:     &displayTrue,
-		StopReason:  "complete",
+		Kind:       progress.KindTool,
+		Phase:      progress.PhaseComplete,
+		RunID:      runID,
+		CallID:     tc.ID,
+		Name:       toolName,
+		Summary:    "调用工具: " + toolName,
+		Component:  "tool",
+		BlockIndex: &inputBlockIdx,
+		BlockType:  "tool_input",
+		StepIndex:  &stepIdx,
+		Display:    &displayFalse,
+		StopReason: "complete",
 	})
 
 	// 2. Tool Result Block
 	resultBlockIdx := rc.NextBlockIndex()
 	progress.Emit(ctx, progress.Event{
-		Kind:        progress.KindTool,
-		Phase:       progress.PhaseStart,
-		RunID:       runID,
-		CallID:      tc.ID,
-		Name:        toolName,
-		Summary:     "执行工具: " + toolName,
-		Component:   "tool",
-		BlockIndex:  &resultBlockIdx,
-		BlockType:   "tool_result",
-		StepIndex:   &stepIdx,
-		Display:     &displayTrue,
+		Kind:       progress.KindTool,
+		Phase:      progress.PhaseStart,
+		RunID:      runID,
+		CallID:     tc.ID,
+		Name:       toolName,
+		Summary:    "执行工具: " + toolName,
+		Component:  "tool",
+		BlockIndex: &resultBlockIdx,
+		BlockType:  "tool_result",
+		StepIndex:  &stepIdx,
+		Display:    &displayTrue,
 	})
 
 	toolSpanID := fmt.Sprintf("%s-tool-%s", runID, tc.ID)
 	toolSpan := e.tracer.StartSpan(ctx, "tool:"+toolName, toolSpanID)
+
+	// Repeat Guard L1：同调用身份连续失败达阈值后硬拦截（不 Execute、不入账）。
+	if rc.RepeatGuard != nil {
+		check := rc.RepeatGuard.Check(toolName, tc.Function.Arguments, nil)
+		if check.Blocked {
+			toolLog.Warn("Repeat Guard 拦截重复失败",
+				"failure_kind", check.FailureKind,
+				"call_key_prefix", check.Identity.KeyPrefix,
+			)
+			e.tracer.EndSpan(ctx, toolSpan, nil)
+			progress.Emit(ctx, progress.Event{
+				Kind:       progress.KindTool,
+				Phase:      progress.PhaseError,
+				Level:      progress.LevelWarn,
+				RunID:      runID,
+				CallID:     tc.ID,
+				Name:       toolName,
+				Summary:    "已拦截重复失败: " + toolName,
+				Detail:     truncate(check.Content, 240),
+				Component:  "tool",
+				BlockIndex: &resultBlockIdx,
+				BlockType:  "tool_result",
+				StepIndex:  &stepIdx,
+				Display:    &displayTrue,
+				StopReason: check.FailureKind,
+				Metadata: map[string]string{
+					"failure_kind":    check.FailureKind,
+					"call_key_prefix": check.Identity.KeyPrefix,
+				},
+			})
+			return check.Content, nil
+		}
+	}
+
 	result, toolErr := e.registry.Execute(ctx, toolName, tc.Function.Arguments)
-	if toolErr != nil {
-		toolLog.Warn("工具执行失败", "error", toolErr)
+	var outcome repeatguard.Outcome
+	if rc.RepeatGuard != nil {
+		outcome = rc.RepeatGuard.Record(toolName, tc.Function.Arguments, result, toolErr, nil)
+	} else {
+		outcome = repeatguard.ParseOutcome(toolName, result, toolErr)
+	}
+	if toolErr != nil || !outcome.Success {
+		kind, stdout, stderr := extractToolFailureLogFields(result, toolErr)
+		if kind == "" || kind == "tool_error" {
+			if outcome.FailureKind != "" {
+				kind = outcome.FailureKind
+			}
+		}
+		errMsg := ""
+		if toolErr != nil {
+			errMsg = toolErr.Error()
+		} else if outcome.ErrorExcerpt != "" {
+			errMsg = outcome.ErrorExcerpt
+		} else {
+			errMsg = "ok=false"
+		}
+		toolLog.Warn("工具执行失败",
+			"error", errMsg,
+			"failure_kind", kind,
+			"stdout", truncate(stdout, 500),
+			"stderr", truncate(stderr, 500),
+		)
 		e.tracer.EndSpan(ctx, toolSpan, toolErr)
-		detail := toolErr.Error()
+		detail := errMsg
 		if trimmed := strings.TrimSpace(result); trimmed != "" {
 			detail = trimmed
 		}
 		progress.Emit(ctx, progress.Event{
-			Kind:        progress.KindTool,
-			Phase:       progress.PhaseError,
-			Level:       progress.LevelError,
-			RunID:       runID,
-			CallID:      tc.ID,
-			Name:        tc.Function.Name,
-			Summary:     "工具执行失败: " + tc.Function.Name,
-			Detail:      truncate(detail, 240),
-			Component:   "tool",
-			BlockIndex:  &resultBlockIdx,
-			BlockType:   "tool_result",
-			StepIndex:   &stepIdx,
-			Display:     &displayTrue,
-			StopReason:  "error",
+			Kind:       progress.KindTool,
+			Phase:      progress.PhaseError,
+			Level:      progress.LevelError,
+			RunID:      runID,
+			CallID:     tc.ID,
+			Name:       tc.Function.Name,
+			Summary:    "工具执行失败: " + tc.Function.Name,
+			Detail:     truncate(detail, 240),
+			Component:  "tool",
+			BlockIndex: &resultBlockIdx,
+			BlockType:  "tool_result",
+			StepIndex:  &stepIdx,
+			Display:    &displayTrue,
+			StopReason: "error",
 		})
 		// 保留 result JSON（如 ok=false + failure_kind），对齐 Codex RespondToModel(content)。
 		return result, toolErr
@@ -604,21 +695,76 @@ func (e *ReactLoopEngine) runToolCall(ctx context.Context, rc *runtime.RunContex
 	toolLog.Info("工具执行成功", "result", result)
 	e.tracer.EndSpan(ctx, toolSpan, nil)
 	progress.Emit(ctx, progress.Event{
-		Kind:        progress.KindTool,
-		Phase:       progress.PhaseComplete,
-		RunID:       runID,
-		CallID:      tc.ID,
-		Name:        tc.Function.Name,
-		Summary:     "工具执行完成: " + tc.Function.Name,
-		Detail:      truncate(result, 240),
-		Component:   "tool",
-		BlockIndex:  &resultBlockIdx,
-		BlockType:   "tool_result",
-		StepIndex:   &stepIdx,
-		Display:     &displayTrue,
-		StopReason:  "complete",
+		Kind:       progress.KindTool,
+		Phase:      progress.PhaseComplete,
+		RunID:      runID,
+		CallID:     tc.ID,
+		Name:       tc.Function.Name,
+		Summary:    "工具执行完成: " + tc.Function.Name,
+		Detail:     truncate(result, 240),
+		Component:  "tool",
+		BlockIndex: &resultBlockIdx,
+		BlockType:  "tool_result",
+		StepIndex:  &stepIdx,
+		Display:    &displayTrue,
+		StopReason: "complete",
 	})
 	return result, nil
+}
+
+// applyRepeatGuardProgress 评估 L2 进展门禁；若 partial_complete 则结束 Run（err=nil）。
+func (e *ReactLoopEngine) applyRepeatGuardProgress(ctx context.Context, rc *runtime.RunContext, log logger.Logger, finalAnswer bool) (stop bool, err error) {
+	if rc == nil || rc.RepeatGuard == nil {
+		return false, nil
+	}
+	dec := rc.RepeatGuard.EndIteration(rc.Iteration, finalAnswer)
+	if dec.InjectNoProgress {
+		log.Warn("Repeat Guard 无进展",
+			"failure_kind", "no_progress",
+			"stagnant_iterations", dec.StagnantIterations,
+		)
+		progress.Emit(ctx, progress.Event{
+			Kind:    progress.KindRun,
+			Phase:   progress.PhaseProgress,
+			Level:   progress.LevelWarn,
+			RunID:   rc.Run.ID,
+			Summary: "运行无进展，请更换策略",
+			Detail:  truncate(dec.NoProgressJSON, 240),
+			Metadata: map[string]string{
+				"failure_kind":        "no_progress",
+				"stagnant_iterations": fmt.Sprintf("%d", dec.StagnantIterations),
+			},
+		})
+		rc.Messages = append(rc.Messages, domain.NewSystemMessage(
+			"<repeat_guard>\n"+dec.NoProgressJSON+"\n</repeat_guard>",
+		))
+		return false, nil
+	}
+	if dec.PartialComplete {
+		log.Warn("Repeat Guard partial_complete",
+			"stagnant_iterations", dec.StagnantIterations,
+		)
+		progress.Emit(ctx, progress.Event{
+			Kind:    progress.KindRun,
+			Phase:   progress.PhaseComplete,
+			Level:   progress.LevelWarn,
+			RunID:   rc.Run.ID,
+			Summary: "无进展，已 partial_complete",
+			Detail:  dec.PartialCompleteMsg,
+			Metadata: map[string]string{
+				"incomplete":          "true",
+				"failure_kind":        "no_progress",
+				"stagnant_iterations": fmt.Sprintf("%d", dec.StagnantIterations),
+			},
+		})
+		if strings.TrimSpace(rc.Run.FinalAnswer) == "" {
+			rc.Run.FinalAnswer = dec.PartialCompleteMsg
+		}
+		rc.Run.Incomplete = true
+		rc.Run.Status = domain.RunStatusCompleted
+		return true, nil
+	}
+	return false, nil
 }
 
 func indexOfLoadSkill(calls []domain.ToolCall) int {
@@ -670,6 +816,71 @@ func (e *ReactLoopEngine) filterToolInfos(ctx context.Context, names []string) [
 // newRunID 生成唯一RunID（MVP阶段用纳秒时间戳）
 func newRunID() string {
 	return fmt.Sprintf("run-%d", time.Now().UnixNano())
+}
+
+// extractToolFailureLogFields 从工具 JSON 结果提取 failure_kind / stdout / stderr，便于 agent.log 排障。
+// 若 JSON 无 failure_kind，则从 error 文案推导常见 kind。
+func extractToolFailureLogFields(result string, toolErr error) (kind, stdout, stderr string) {
+	trimmed := strings.TrimSpace(result)
+	if trimmed != "" {
+		var payload map[string]any
+		if json.Unmarshal([]byte(trimmed), &payload) == nil {
+			kind = stringField(payload, "failure_kind")
+			stdout = stringField(payload, "stdout")
+			stderr = stringField(payload, "stderr")
+			if stdout == "" {
+				if msg := stringField(payload, "message"); msg != "" {
+					stdout = msg
+				}
+			}
+		}
+		if stdout == "" && !strings.HasPrefix(trimmed, "{") {
+			stdout = trimmed
+		}
+	}
+	if kind == "" && toolErr != nil {
+		kind = inferFailureKindFromError(toolErr.Error())
+	}
+	if kind == "" {
+		kind = "tool_error"
+	}
+	return kind, stdout, stderr
+}
+
+func stringField(m map[string]any, key string) string {
+	if m == nil {
+		return ""
+	}
+	v, ok := m[key]
+	if !ok || v == nil {
+		return ""
+	}
+	switch t := v.(type) {
+	case string:
+		return t
+	default:
+		return fmt.Sprint(t)
+	}
+}
+
+func inferFailureKindFromError(msg string) string {
+	lower := strings.ToLower(msg)
+	switch {
+	case strings.Contains(lower, "execution_path_contract_violation"), strings.Contains(lower, "path_contract"):
+		return "path_contract_violation"
+	case strings.Contains(lower, "dependency_missing"):
+		return "dependency_missing"
+	case strings.Contains(lower, "approval"):
+		return "approval_denied"
+	case strings.Contains(lower, "timeout"), strings.Contains(lower, "deadline exceeded"):
+		return "timeout"
+	case strings.Contains(lower, "sandbox"):
+		return "sandbox_violation"
+	case strings.Contains(lower, "冒充"), strings.Contains(lower, "artifact"):
+		return "artifact_invalid"
+	default:
+		return ""
+	}
 }
 
 // truncate 截断字符串，用于日志展示

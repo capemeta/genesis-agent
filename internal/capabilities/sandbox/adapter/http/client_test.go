@@ -157,6 +157,48 @@ func TestRunCommandOutputOnlyWarnsWhenNoArtifacts(t *testing.T) {
 	}
 }
 
+func TestRunCommandUsesSandboxCwdAsWorkingDir(t *testing.T) {
+	var got execJobRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v1/sandboxes:lease" && r.Method == http.MethodPost:
+			_ = json.NewEncoder(w).Encode(sandboxLease{SandboxID: "sandbox-1", LeaseID: "lease-1", Status: "leased"})
+		case r.URL.Path == "/v1/jobs" && r.Method == http.MethodPost:
+			if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+				t.Fatal(err)
+			}
+			_ = json.NewEncoder(w).Encode(jobResult{JobID: "job-1", SandboxID: "sandbox-1", Status: "succeeded"})
+		case r.URL.Path == "/v1/jobs/job-1" && r.Method == http.MethodGet:
+			_ = json.NewEncoder(w).Encode(jobResult{JobID: "job-1", SandboxID: "sandbox-1", Status: "succeeded", ExitCode: 0})
+		case r.URL.Path == "/v1/sandboxes/sandbox-1/release" && r.Method == http.MethodPost:
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client, err := New(Config{BaseURL: server.URL, RenewInterval: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := client.RunCommand(context.Background(), sandboxcontract.CommandRequest{
+		Command: execmodel.Command{Command: "node run.js", Cwd: "/workspace/input/skills/office-ppt/scripts", Shell: execmodel.ShellSh},
+		Options: execcontract.RunOptions{Workspace: execmodel.ExecutionWorkspace{WorkDir: "/workspace"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Cwd != "/workspace/input/skills/office-ppt/scripts" {
+		t.Fatalf("result cwd=%q", result.Cwd)
+	}
+	if got.Spec.WorkingDir != "/workspace/input/skills/office-ppt/scripts" {
+		t.Fatalf("working_dir=%q", got.Spec.WorkingDir)
+	}
+	if got.Metadata["cwd"] != "/workspace/input/skills/office-ppt/scripts" {
+		t.Fatalf("metadata=%+v", got.Metadata)
+	}
+}
 func TestRunCommandUsesSandboxWorkspaceEnvAndInputArtifacts(t *testing.T) {
 	var got execJobRequest
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

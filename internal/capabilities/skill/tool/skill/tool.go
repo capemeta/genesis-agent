@@ -115,6 +115,16 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 	if err := json.Unmarshal([]byte(params), &in); err != nil {
 		return "", fmt.Errorf("解析Skill参数失败: %w", err)
 	}
+	return t.load(ctx, in, true, "model")
+}
+
+// LoadExplicitSkill 加载用户显式选择的 Skill。
+// 这是 runtime 内部端口，不进入 LLM schema；它复用网关的依赖预检、审批和注入输出。
+func (t *Tool) LoadExplicitSkill(ctx context.Context, req skillcontract.ExplicitLoadRequest) (string, error) {
+	return t.load(ctx, input{Skill: req.Skill, Resource: req.Resource, Args: req.Args}, false, "explicit")
+}
+
+func (t *Tool) load(ctx context.Context, in input, modelCall bool, invocation string) (string, error) {
 	skillName := strings.TrimSpace(in.Skill)
 	if skillName == "" && strings.TrimSpace(in.Resource) == "" {
 		return "", fmt.Errorf("skill或resource必须至少提供一个")
@@ -123,7 +133,8 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 		CatalogRequest: t.deps.CatalogRequest,
 		Name:           skillName,
 		Resource:       strings.TrimSpace(in.Resource),
-		ModelCall:      true,
+		ModelCall:      modelCall,
+		Invocation:     invocation,
 	}
 	meta, err := t.deps.Service.Resolve(ctx, resolveReq)
 	if err != nil {
@@ -134,11 +145,11 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 		// 当前不实现半吊子子 Run，避免与后续多 Agent / 子 Agent 设计冲突。
 		return "", fmt.Errorf("skill %q 声明 context=fork；规范化 subagent 运行时尚未启用，请改用 context=inline", meta.QualifiedName)
 	}
-	depReport, err := t.checkDependencies(ctx, meta)
+	depReport, err := t.checkDependencies(ctx, meta, invocation)
 	if err != nil {
 		return "", err
 	}
-	if err := t.authorize(ctx, meta, depReport); err != nil {
+	if err := t.authorize(ctx, meta, depReport, invocation); err != nil {
 		return "", err
 	}
 	injection, err := t.deps.Service.Load(ctx, skillcontract.LoadRequest{ResolveRequest: resolveReq, Args: in.Args})
@@ -172,7 +183,7 @@ type dependencyReport struct {
 	DependencyCount  int
 }
 
-func (t *Tool) checkDependencies(ctx context.Context, meta model.Metadata) (dependencyReport, error) {
+func (t *Tool) checkDependencies(ctx context.Context, meta model.Metadata, invocation string) (dependencyReport, error) {
 	report := dependencyReport{}
 	availableTools := stringSet(normalizeEnabledTools(t.deps.EnabledTools))
 	hasToolInventory := len(t.deps.EnabledTools) > 0
@@ -216,18 +227,10 @@ func (t *Tool) checkDependencies(ctx context.Context, meta model.Metadata) (depe
 			ToolName: toolNameSkill,
 			Action:   approvalmodel.ActionSkillLoad,
 			Resource: approvalmodel.Resource{
-				Type:    "skill.dependencies",
-				URI:     model.SkillDependenciesDecisionKey(meta.QualifiedName),
-				Display: model.SkillDependenciesDecisionKey(meta.QualifiedName),
-				Metadata: map[string]string{
-					"trusted":                   "false",
-					"dangerous":                 "true",
-					"authority":                 meta.Authority.String(),
-					"package":                   string(meta.PackageID),
-					"qualified_name":            meta.QualifiedName,
-					"dependency_count":          fmt.Sprintf("%d", report.DependencyCount),
-					"external_dependency_count": fmt.Sprintf("%d", report.ExternalCount),
-				},
+				Type:     "skill.dependencies",
+				URI:      model.SkillDependenciesDecisionKey(meta.QualifiedName),
+				Display:  model.SkillDependenciesDecisionKey(meta.QualifiedName),
+				Metadata: dependencyApprovalMetadata(meta, report, invocation),
 			},
 			Reason:          report.ApprovalReason,
 			Risk:            approvalmodel.RiskMedium,
@@ -250,7 +253,7 @@ func (t *Tool) checkDependencies(ctx context.Context, meta model.Metadata) (depe
 	return report, nil
 }
 
-func (t *Tool) authorize(ctx context.Context, meta model.Metadata, deps dependencyReport) error {
+func (t *Tool) authorize(ctx context.Context, meta model.Metadata, deps dependencyReport, invocation string) error {
 	metadata := map[string]string{
 		"trusted":                   "true",
 		"authority":                 meta.Authority.String(),
@@ -259,6 +262,7 @@ func (t *Tool) authorize(ctx context.Context, meta model.Metadata, deps dependen
 		"dependency_count":          fmt.Sprintf("%d", deps.DependencyCount),
 		"external_dependency_count": fmt.Sprintf("%d", deps.ExternalCount),
 	}
+	addInvocationMetadata(metadata, invocation)
 	decision, err := t.deps.Approval.Authorize(ctx, approvalmodel.Request{
 		ToolName: toolNameSkill,
 		Action:   approvalmodel.ActionSkillLoad,
@@ -284,6 +288,28 @@ func (t *Tool) authorize(ctx context.Context, meta model.Metadata, deps dependen
 		}
 		return fmt.Errorf("Skill未通过审批: %s", reason)
 	}
+}
+
+func dependencyApprovalMetadata(meta model.Metadata, report dependencyReport, invocation string) map[string]string {
+	metadata := map[string]string{
+		"trusted":                   "false",
+		"dangerous":                 "true",
+		"authority":                 meta.Authority.String(),
+		"package":                   string(meta.PackageID),
+		"qualified_name":            meta.QualifiedName,
+		"dependency_count":          fmt.Sprintf("%d", report.DependencyCount),
+		"external_dependency_count": fmt.Sprintf("%d", report.ExternalCount),
+	}
+	addInvocationMetadata(metadata, invocation)
+	return metadata
+}
+
+func addInvocationMetadata(metadata map[string]string, invocation string) {
+	invocation = strings.TrimSpace(invocation)
+	if invocation == "" {
+		return
+	}
+	metadata["invocation"] = invocation
 }
 
 func toJSON(value any) (string, error) {

@@ -3,7 +3,9 @@
 各 office-* Skill 保持同名模块；签名需与 _office_common/scripts/office 兼容。
 """
 
+import json
 import os
+import sys
 
 
 def logical_dir(name, fallback):
@@ -75,3 +77,27 @@ def resolve_work_path(raw):
     if os.path.exists(raw):
         return raw
     return os.path.join(work_dir(), raw)
+
+
+def configure_utf8_stdio():
+    """Windows 控制台默认 GBK，打印含 emoji 的 JSON 会 UnicodeEncodeError。"""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
+def emit_json(payload, exit_code=None):
+    """安全输出 JSON（UTF-8），避免 Windows GBK 控制台崩溃。"""
+    configure_utf8_stdio()
+    text = json.dumps(payload, ensure_ascii=False, indent=2)
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        # 极端回退：ASCII 转义，保证脚本仍能返回结构化结果。
+        print(json.dumps(payload, ensure_ascii=True, indent=2))
+    if exit_code is not None:
+        sys.exit(exit_code)

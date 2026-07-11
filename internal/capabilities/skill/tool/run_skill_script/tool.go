@@ -52,7 +52,7 @@ func (t *Tool) GetInfo() *tool.Info {
 禁止把 path_contract.py、__init__.py 等辅助模块当作 script 入口。
 运行时会 materialize 脚本、注入 INPUT_DIR/OUTPUT_DIR/SKILL_DIR，并按 workload 选择 sandbox profile。
 禁止用 write_file 伪造 .pptx/.docx/.xlsx/.pdf；交付物由脚本写入 OUTPUT_DIR 并经格式门禁校验。
-注意：office-ppt 已提供 inspect/preview/thumbnail/add_slide/clean/unpack/pack，以及 create_pptx.js（需 Node+pptxgenjs）。不要臆造不存在的脚本能力；以 list_skill_resources 为准。
+注意：office-ppt 从零生成默认走 run_pptxgen_script.js（Agent 写顶层 pptxgenjs 脚本后由 runner 执行）；create_pptx.js 仅 smoke。另有 inspect/preview/thumbnail/add_slide/clean/unpack/pack。不要臆造不存在的脚本能力；以 list_skill_resources 为准。
 `),
 		Parameters: &tool.ParameterSchema{
 			Type: "object",
@@ -60,7 +60,7 @@ func (t *Tool) GetInfo() *tool.Info {
 				"skill":      {Type: "string", Description: "Skill 名称，例如 office-ppt"},
 				"script":     {Type: "string", Description: "脚本 resource id，例如 office-ppt/scripts/inspect_pptx.py"},
 				"args":       {Type: "array", Description: "传给脚本的参数列表（文件名相对 INPUT_DIR）", Items: &tool.ParameterSchema{Type: "string"}},
-				"inputs":     {Type: "array", Description: "工作区相对路径；会 stage 到 INPUT_DIR", Items: &tool.ParameterSchema{Type: "string"}},
+				"inputs":     {Type: "array", Description: "输入路径：工作区相对路径、本 Run 产物文件名，或 $OUTPUT_DIR/$INPUT_DIR/...；会 stage 到 INPUT_DIR", Items: &tool.ParameterSchema{Type: "string"}},
 				"timeout_ms": {Type: "integer", Description: "超时毫秒，默认 120000"},
 			},
 			Required: []string{"skill", "script"},

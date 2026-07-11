@@ -10,8 +10,9 @@ When using an existing presentation as a template:
    ```text
    run_skill_script(script="office-ppt/scripts/thumbnail.py", args=["template.pptx"], inputs=[...])
    run_skill_script(script="office-ppt/scripts/inspect_pptx.py", args=["template.pptx"], inputs=[...])
+   run_skill_script(script="office-ppt/scripts/extract_pptx_text.py", args=["template.pptx", "--format", "markdown"], inputs=[...])
    ```
-   Review thumbnail output to see layouts, and inspect/markitdown output to see placeholder text.
+   Review thumbnail output to see layouts, inspect output for structure, and extract output to see placeholder text, notes, and comments.
 
 2. **Plan slide mapping**: For each content section, choose a template slide.
 
@@ -54,6 +55,7 @@ When using an existing presentation as a template:
 | `clean.py` | Remove orphaned files |
 | `pack.py` | Repack with validation |
 | `thumbnail.py` | Create visual grid of slides |
+| `extract_pptx_text.py` | Extract full slide text, speaker notes, and comments |
 
 ### unpack.py
 

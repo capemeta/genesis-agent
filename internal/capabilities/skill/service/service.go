@@ -23,13 +23,13 @@ import (
 
 // Options 控制 Skill Service 行为。
 type Options struct {
-	MaxPromptBytes  int
-	MaxListBytes    int
-	MaxListTokens   int // 近似 token 上限；<=0 时用 model.MaxAvailableSkillsTokens
-	SourceTimeout   time.Duration
-	AuditSink       auditcontract.Sink
-	UsageSink       usagecontract.Sink
-	Visibility      capcontract.Registry
+	MaxPromptBytes int
+	MaxListBytes   int
+	MaxListTokens  int // 近似 token 上限；<=0 时用 model.MaxAvailableSkillsTokens
+	SourceTimeout  time.Duration
+	AuditSink      auditcontract.Sink
+	UsageSink      usagecontract.Sink
+	Visibility     capcontract.Registry
 }
 
 // Service 是产品无关的 Skill 编排服务。
@@ -229,8 +229,10 @@ func (s *Service) Resolve(ctx context.Context, req contract.ResolveRequest) (mod
 	started := time.Now()
 	selected, err := s.resolve(ctx, req)
 	metadata := map[string]string{"skill.query": firstNonEmpty(req.Name, req.Resource)}
+	addInvocationMetadata(metadata, req.Invocation)
 	if err == nil {
 		metadata = skillMetadata(selected)
+		addInvocationMetadata(metadata, req.Invocation)
 	}
 	s.record(ctx, "resolve", err == nil, started, metadata)
 	return selected, err
@@ -240,7 +242,9 @@ func (s *Service) Load(ctx context.Context, req contract.LoadRequest) (model.Inj
 	started := time.Now()
 	meta, err := s.resolve(ctx, req.ResolveRequest)
 	if err != nil {
-		s.record(ctx, "load", false, started, map[string]string{"skill.query": firstNonEmpty(req.Name, req.Resource)})
+		metadata := map[string]string{"skill.query": firstNonEmpty(req.Name, req.Resource)}
+		addInvocationMetadata(metadata, req.Invocation)
+		s.record(ctx, "load", false, started, metadata)
 		return model.Injection{}, err
 	}
 	source := s.sourceFor(meta.Authority)
@@ -258,6 +262,7 @@ func (s *Service) Load(ctx context.Context, req contract.LoadRequest) (model.Inj
 	contents, truncated := truncateUTF8(contents, s.opts.MaxPromptBytes)
 	out := model.Injection{Skill: read.Metadata, Resource: read.Resource, Contents: contents, Args: req.Args, Truncated: truncated || read.Truncated}
 	metadata := skillMetadata(out.Skill)
+	addInvocationMetadata(metadata, req.Invocation)
 	metadata["truncated"] = fmt.Sprintf("%t", out.Truncated)
 	s.record(ctx, "load", true, started, metadata)
 	return out, nil
@@ -349,9 +354,6 @@ func (s *Service) SelectForTurn(ctx context.Context, req contract.SelectionReque
 	for _, name := range mentions.names {
 		matches := make([]model.Metadata, 0, 1)
 		for _, entry := range catalog.Entries {
-			if !entry.Policy.AllowsImplicitInvocation() {
-				continue
-			}
 			if entry.Name == name || entry.QualifiedName == name {
 				matches = append(matches, entry)
 			}
@@ -373,7 +375,7 @@ func (s *Service) RenderAvailableSkills(ctx context.Context, req contract.Catalo
 	omitted := 0
 	approxTokens := estimateTokens(sb.String())
 	for _, entry := range catalog.Entries {
-		if !entry.PromptVisible {
+		if !entry.PromptVisible || entry.Policy.DisableModelInvocation {
 			continue
 		}
 		locator := string(entry.MainResource)
@@ -629,6 +631,14 @@ func (s *Service) record(ctx context.Context, action string, success bool, start
 			Metadata:    cloneMap(metadata),
 		})
 	}
+}
+
+func addInvocationMetadata(metadata map[string]string, invocation string) {
+	invocation = strings.TrimSpace(invocation)
+	if invocation == "" {
+		return
+	}
+	metadata["invocation"] = invocation
 }
 
 func severity(success bool) auditmodel.Severity {

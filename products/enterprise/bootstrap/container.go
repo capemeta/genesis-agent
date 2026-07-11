@@ -26,12 +26,12 @@ import (
 	profilemodel "genesis-agent/internal/capabilities/profile/model"
 	sandboxhttp "genesis-agent/internal/capabilities/sandbox/adapter/http"
 	sandboxcontract "genesis-agent/internal/capabilities/sandbox/contract"
-	platformconfig "genesis-agent/internal/platform/config"
-	"genesis-agent/internal/platform/logger"
-	promptbuilder "genesis-agent/internal/runtime/prompt"
 	usagefile "genesis-agent/internal/capabilities/usage/adapter/file"
 	usagememory "genesis-agent/internal/capabilities/usage/adapter/memory"
 	usagecontract "genesis-agent/internal/capabilities/usage/contract"
+	platformconfig "genesis-agent/internal/platform/config"
+	"genesis-agent/internal/platform/logger"
+	promptbuilder "genesis-agent/internal/runtime/prompt"
 	"genesis-agent/products/enterprise/internal/profile"
 	localexec "genesis-agent/shared/local/execution"
 	"genesis-agent/shared/skillstack"
@@ -144,6 +144,7 @@ func (c *Container) Init(ctx context.Context) error {
 			UsageSink:            usageSink,
 			SkillNameMatcher:     skillStack.SkillNameMatcher,
 			SkillMentionSelector: skillStack.SkillMentionSelector,
+			SkillExplicitLoader:  skillStack.SkillExplicitLoader,
 		})
 		if c.initErr != nil {
 			_ = runtimeLogging.Close()
@@ -195,8 +196,8 @@ func (headlessAskApprover) RequestApproval(ctx context.Context, req approvalmode
 		return approvalmodel.Decision{Type: approvalmodel.DecisionApproved, Reason: firstNonEmpty(result.Reason, "policy allow")}, nil
 	default:
 		return approvalmodel.Decision{
-			Type:  approvalmodel.DecisionApprovedForScope,
-			Scope: approvalmodel.GrantScopeSession,
+			Type:   approvalmodel.DecisionApprovedForScope,
+			Scope:  approvalmodel.GrantScopeSession,
 			Reason: firstNonEmpty(result.Reason, "enterprise headless auto-approve ask"),
 		}, nil
 	}

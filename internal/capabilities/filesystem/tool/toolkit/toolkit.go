@@ -19,6 +19,55 @@ import (
 	"genesis-agent/internal/capabilities/tool/scheduler"
 )
 
+var defaultNoiseDirs = []string{
+	".git",
+	".genesis",
+	".gocache",
+	".gomodcache",
+	".gotmp",
+	"node_modules",
+	"vendor",
+	"dist",
+	"build",
+}
+
+// DefaultNoiseDirs 返回文件发现工具默认跳过的高噪声目录。
+func DefaultNoiseDirs() []string {
+	out := make([]string, len(defaultNoiseDirs))
+	copy(out, defaultNoiseDirs)
+	return out
+}
+
+// NoiseDirsExceptExplicitPattern 保留默认降噪，但尊重 pattern 中显式点名的目录。
+func NoiseDirsExceptExplicitPattern(pattern string) []string {
+	explicit := explicitPathSegments(pattern)
+	if len(explicit) == 0 {
+		return DefaultNoiseDirs()
+	}
+	out := make([]string, 0, len(defaultNoiseDirs))
+	for _, dir := range defaultNoiseDirs {
+		if _, ok := explicit[strings.ToLower(dir)]; ok {
+			continue
+		}
+		out = append(out, dir)
+	}
+	return out
+}
+
+func explicitPathSegments(pattern string) map[string]struct{} {
+	out := map[string]struct{}{}
+	for _, segment := range strings.FieldsFunc(pattern, func(r rune) bool {
+		return r == '/' || r == '\\'
+	}) {
+		segment = strings.TrimSpace(segment)
+		if segment == "" || strings.ContainsAny(segment, "*?[") {
+			continue
+		}
+		out[strings.ToLower(segment)] = struct{}{}
+	}
+	return out
+}
+
 // Deps 是文件工具共享依赖。
 type Deps struct {
 	Resolver  fscontract.PathResolver

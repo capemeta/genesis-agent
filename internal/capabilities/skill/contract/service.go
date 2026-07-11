@@ -35,14 +35,23 @@ type CatalogRequest struct {
 
 type ResolveRequest struct {
 	CatalogRequest
-	Name      string
-	Resource  string
-	ModelCall bool
+	Name       string
+	Resource   string
+	ModelCall  bool
+	Invocation string
 }
 
 type LoadRequest struct {
 	ResolveRequest
 	Args string
+}
+
+// ExplicitLoadRequest 描述用户显式选择 Skill 的内部加载请求。
+// 它不进入 LLM function schema，只在 runtime / 产品装配层传递调用方身份。
+type ExplicitLoadRequest struct {
+	Skill    string
+	Resource string
+	Args     string
 }
 
 type ResourceRequest struct {

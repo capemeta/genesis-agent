@@ -10,9 +10,11 @@ import (
 )
 
 var (
-	reModuleNotFound = regexp.MustCompile(`(?i)ModuleNotFoundError:\s*No module named ['"]([^'"]+)['"]`)
-	reCannotFindMod  = regexp.MustCompile(`(?i)Cannot find module ['"]([^'"]+)['"]`)
-	reNpmNotFound    = regexp.MustCompile(`(?i)Error:\s*Cannot find package ['"]([^'"]+)['"]`)
+	reModuleNotFound      = regexp.MustCompile(`(?i)ModuleNotFoundError:\s*No module named ['"]([^'"]+)['"]`)
+	reCannotFindMod       = regexp.MustCompile(`(?i)Cannot find module ['"]([^'"]+)['"]`)
+	reNpmNotFound         = regexp.MustCompile(`(?i)Error:\s*Cannot find package ['"]([^'"]+)['"]`)
+	rePythonOpenFile      = regexp.MustCompile(`(?i)(?:python(?:\.exe)?|[^\s]+python[^\s]*)?:?\s*can't open file ['"]([^'"]+)['"]`)
+	reSandboxInputMissing = regexp.MustCompile(`(?i)(?:FileNotFoundError|No such file or directory).*['"](/workspace/input/[^'"]+)['"]`)
 )
 
 // classifyFailure 解析脚本 hint / 常见 stderr，填充 failure_kind 与 suggested_*。
@@ -32,15 +34,23 @@ func classifyFailure(out *scriptcontract.RunResult) {
 			out.FailureKind = kind
 		}
 	}
-	hint, dep := parseScriptHint(out.Stdout)
+	if out.FailureKind == "" {
+		if kind := detectSandboxInputMissing(out.Stderr); kind != "" {
+			out.FailureKind = kind
+		}
+	}
+	hint, dep, mgr := parseScriptHint(out.Stdout)
 	if out.FailureKind == "" && hint != "" {
 		out.FailureKind = hint
 	}
 	if out.FailureKind == "" {
-		if kind, name, manager := detectStderrDependency(out.Stderr); kind != "" {
+		if kind, name, manager := detectStderrDependency(out.Stderr, out.Script); kind != "" {
 			out.FailureKind = kind
 			if dep == "" {
 				dep = name
+			}
+			if mgr == "" {
+				mgr = manager
 			}
 			if len(out.Missing) == 0 && name != "" {
 				out.Missing = []scriptcontract.MissingDep{{
@@ -57,7 +67,10 @@ func classifyFailure(out *scriptcontract.RunResult) {
 	}
 	if out.FailureKind == "dependency_missing" {
 		if len(out.Missing) == 0 && dep != "" {
-			manager := guessManager(out.Script)
+			manager := mgr
+			if manager == "" {
+				manager = guessManager(out.Script)
+			}
 			out.Missing = []scriptcontract.MissingDep{{
 				Manager: manager,
 				Name:    dep,
@@ -105,6 +118,14 @@ func classifyFailure(out *scriptcontract.RunResult) {
 		out.SuggestedAction = "increase_timeout_or_split"
 		out.Retryable = true
 	}
+	if out.FailureKind == "script_entry_missing" {
+		out.SuggestedAction = "check_skill_script_staging_or_sandbox_working_dir"
+		out.Retryable = false
+	}
+	if out.FailureKind == "sandbox_input_missing" {
+		out.SuggestedAction = "check_sandbox_input_artifact_transport"
+		out.Retryable = false
+	}
 }
 
 func detectApprovalOrTimeout(errMsg string) string {
@@ -137,21 +158,28 @@ func detectArtifactFailure(out *scriptcontract.RunResult) string {
 	return ""
 }
 
-func parseScriptHint(stdout string) (hint, dependency string) {
+func detectSandboxInputMissing(stderr string) string {
+	if reSandboxInputMissing.MatchString(stderr) {
+		return "sandbox_input_missing"
+	}
+	return ""
+}
+
+func parseScriptHint(stdout string) (hint, dependency, manager string) {
 	stdout = strings.TrimSpace(stdout)
 	if stdout == "" {
-		return "", ""
+		return "", "", ""
 	}
 	// 允许前后有非 JSON 噪声：取首个 '{' 起尝试解析。
 	if i := strings.Index(stdout, "{"); i >= 0 {
 		stdout = stdout[i:]
 	}
 	if !strings.HasPrefix(stdout, "{") {
-		return "", ""
+		return "", "", ""
 	}
 	var payload map[string]any
 	if json.Unmarshal([]byte(stdout), &payload) != nil {
-		return "", ""
+		return "", "", ""
 	}
 	if h, ok := payload["hint"].(string); ok {
 		hint = strings.TrimSpace(h)
@@ -159,10 +187,13 @@ func parseScriptHint(stdout string) (hint, dependency string) {
 	if d, ok := payload["dependency"].(string); ok {
 		dependency = strings.TrimSpace(d)
 	}
-	return hint, dependency
+	if m, ok := payload["manager"].(string); ok {
+		manager = strings.TrimSpace(m)
+	}
+	return hint, dependency, manager
 }
 
-func detectStderrDependency(stderr string) (kind, name, manager string) {
+func detectStderrDependency(stderr, script string) (kind, name, manager string) {
 	stderr = strings.TrimSpace(stderr)
 	if stderr == "" {
 		return "", "", ""
@@ -171,7 +202,11 @@ func detectStderrDependency(stderr string) (kind, name, manager string) {
 		return "dependency_missing", m[1], "pip"
 	}
 	if m := reCannotFindMod.FindStringSubmatch(stderr); len(m) == 2 {
-		name = strings.TrimSuffix(m[1], ".js")
+		missing := strings.TrimSpace(m[1])
+		if isMissingScriptEntry(missing, script) {
+			return "script_entry_missing", "", ""
+		}
+		name = strings.TrimSuffix(filepath.ToSlash(missing), ".js")
 		parts := strings.Split(name, "/")
 		if len(parts) > 0 && strings.HasPrefix(parts[0], "@") && len(parts) > 1 {
 			name = parts[0] + "/" + parts[1]
@@ -180,10 +215,28 @@ func detectStderrDependency(stderr string) (kind, name, manager string) {
 		}
 		return "dependency_missing", name, "npm"
 	}
+	if m := rePythonOpenFile.FindStringSubmatch(stderr); len(m) == 2 && isMissingScriptEntry(m[1], script) {
+		return "script_entry_missing", "", ""
+	}
 	if m := reNpmNotFound.FindStringSubmatch(stderr); len(m) == 2 {
 		return "dependency_missing", m[1], "npm"
 	}
 	return "", "", ""
+}
+
+func isMissingScriptEntry(missing, script string) bool {
+	missing = strings.TrimSpace(filepath.ToSlash(missing))
+	if missing == "" {
+		return false
+	}
+	if !strings.Contains(missing, "/") && !strings.HasPrefix(missing, ".") {
+		return false
+	}
+	scriptBase := filepath.Base(filepath.ToSlash(script))
+	if scriptBase == "." || scriptBase == "" {
+		return false
+	}
+	return filepath.Base(missing) == scriptBase
 }
 
 // guessManager 仅按脚本扩展名推断；禁止用包名模糊猜（避免 jsonschema 等误判 npm）。

@@ -13,6 +13,8 @@ products/desktop/web/.git
 products/desktop/web/.github
 # ── 本地运行数据（含加密密钥文件与连接配置）──────────────
 /data/
+.genesis/runs/
+.genesis/logs/
 
 # ── Go ────────────────────────────────────────────────────
 *.exe
@@ -26,6 +28,8 @@ products/desktop/web/.github
 .gomodcache
 vendor/
 
+
+
 # Go workspace file
 go.work
 go.work.sum
@@ -33,6 +37,9 @@ go.work.sum
 # ── 构建产物 ───────────────────────────────────────────────
 /bin/
 /dist/
+node_modules
+package.json
+package-lock.json
 
 # ── IDE ────────────────────────────────────────────────────
 .idea/

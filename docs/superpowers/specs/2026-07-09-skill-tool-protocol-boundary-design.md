@@ -3,7 +3,9 @@
 > 状态：Phase 2 已实现（fork/subagent 延后）  
 > 日期：2026-07-09  
 > 触发问题：模型把 `office-ppt`（Skill）当成 Tool 直接调用，被 Profile 拒绝。  
-> 参考：Kode-CLI `SkillTool`、Codex `core-skills` / `ext/skills`、现有 `docs/Skills设计.md` / `docs/Office能力与Skills设计.md`（仅作参照，本文件以最佳实践为准）。
+> 参考：Kode-CLI `SkillTool`、Codex `core-skills` / `ext/skills`、现有 `docs/Skills设计.md` / `docs/Office能力与Skills设计.md`（仅作参照，本文件以最佳实践为准）。  
+> 三方调用原理对照（提示词 / 模型返回 / 执行）：`docs/Skill调用原理对比-Kode-Codex-Genesis.md`。  
+> 触发模式（`/` / `$mention` / Agent 自判）与未完成项实现路径：`docs/superpowers/specs/2026-07-11-skill-trigger-modes-design.md`。
 
 ---
 

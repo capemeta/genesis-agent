@@ -19,9 +19,9 @@ import (
 	skillcontract "genesis-agent/internal/capabilities/skill/contract"
 	skillmodel "genesis-agent/internal/capabilities/skill/model"
 	skillparser "genesis-agent/internal/capabilities/skill/parser"
-	skillservice "genesis-agent/internal/capabilities/skill/service"
 	scriptcontract "genesis-agent/internal/capabilities/skill/script/contract"
 	scriptservice "genesis-agent/internal/capabilities/skill/script/service"
+	skillservice "genesis-agent/internal/capabilities/skill/service"
 	"genesis-agent/internal/platform/logger"
 )
 
@@ -112,6 +112,49 @@ func TestSkillScriptServiceMaterializeAndRunLocal(t *testing.T) {
 	}
 	if runner.lastOpts.Sandbox.Metadata["source"] != "skill" {
 		t.Fatalf("metadata=%v", runner.lastOpts.Sandbox.Metadata)
+	}
+}
+
+func TestSkillScriptServiceRejectsInputOutsideWorkspace(t *testing.T) {
+	skillSvc := newEmbeddedSkillService(t)
+	approval := newAllowApproval(t)
+	runner := &fakeRunner{}
+	shared, err := embedded.OfficeCommonScriptsFS()
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc, err := scriptservice.New(scriptservice.Deps{
+		Skills:          skillSvc,
+		Runner:          runner,
+		Approval:        approval,
+		Logger:          logger.NewNop(),
+		SharedScriptsFS: shared,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := t.TempDir()
+	root := filepath.Join(parent, "workspace")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(parent, "outside.pptx")
+	writeMinimalPPTX(t, outside)
+
+	_, err = svc.Run(context.Background(), scriptcontract.RunRequest{
+		Catalog:       skillcontract.CatalogRequest{Product: profilemodel.ChannelCLI},
+		Skill:         "office-ppt",
+		Script:        "office-ppt/scripts/inspect_pptx.py",
+		Args:          []string{"outside.pptx"},
+		Inputs:        []string{"../outside.pptx"},
+		WorkspaceRoot: root,
+		Sandbox:       execmodel.SandboxProfile{Mode: execmodel.SandboxDisabled},
+	})
+	if err == nil || !strings.Contains(err.Error(), "工作区内") {
+		t.Fatalf("err=%v, want workspace boundary error", err)
+	}
+	if runner.lastCmd.Command != "" {
+		t.Fatalf("runner should not execute, command=%q", runner.lastCmd.Command)
 	}
 }
 

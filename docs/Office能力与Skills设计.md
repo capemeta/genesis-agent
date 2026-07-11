@@ -243,7 +243,7 @@ Office Skill 脚本的 sandbox profile 选择以 `docs/沙箱API对接与Profile
 | 触发条件 | 按文件类型和交付物强触发，描述非常细 | 保留强触发思想，但改成中文、通用模型友好的简短规则 | 避免长提示淹没上下文，降低非 Claude 模型误读概率 |
 | PDF | 覆盖 pypdf、pdfplumber、reportlab、qpdf、pdftk、Poppler、OCR、表单脚本 | 已提供 inspect、文本抽取、表单字段列举、页面渲染脚本 | 保留高价值入口；复杂填表、加密、合并拆分后续扩展，避免一次性搬入过重脚本 |
 | DOCX | 深度使用 docx-js、pandoc、OpenXML 解包/打包、comments、tracked changes、schema validator | 已提供 inspect 和 LibreOffice 转 PDF 入口，文档要求保留模板和验证闭环 | tracked changes/comments 很复杂，直接照搬容易和 Genesis 权限、作者名、审计不一致；后续应独立实现 Genesis 版 |
-| PPTX | 强调视觉设计、模板编辑、缩略图、LibreOffice+Poppler 渲染 QA、pptxgenjs | 已提供 inspect/preview/thumbnail/`create_pptx.js`；`dependencies.runtime` 声明 pptxgenjs/Pillow；缺包走 `install_skill_dependencies`；`office-basic` 镜像包清单见沙箱文档 §10 | 通用模型更需要短流程和强验证；设计长指南后续可拆 reference，不塞满主 Skill |
+| PPTX | 强调视觉设计、模板编辑、缩略图、LibreOffice+Poppler 渲染 QA、pptxgenjs | 从零生成默认：`run_pptxgen_script.js`（Agent 写顶层 pptxgenjs 脚本）；`create_pptx.js` 仅 smoke；`dependencies.runtime` 声明 pptxgenjs/Pillow；缺包走 `install_skill_dependencies`；`office-basic` 镜像包清单见沙箱文档 §10 | 通用模型更需要短流程和强验证；设计长指南后续可拆 reference，不塞满主 Skill |
 | XLSX | 强调公式而非硬编码、LibreOffice 重算、公式错误 JSON、金融模型格式规范 | 已提供 inspect 和 recalc 脚本，保留公式重算和零错误原则 | 金融模型规范保留在验证清单方向；复杂 openpyxl 样例后续按场景拆 reference |
 | 共享 office 脚本 | pack/unpack/validate/soffice helpers 和大量 schema | 当前不直接复制 schema 和 helper | 原脚本带专有许可且体积大；Genesis 应沉淀自有、可测试、可审计版本 |
 | OCR | PDF 中强调扫描件 OCR | 扩展为内容/操作触发，Word/PPT/Excel 内嵌图片也可升级 `office-ocr` | 更符合真实 Office 文档，避免把 OCR 错误绑定到扩展名 |

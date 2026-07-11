@@ -66,6 +66,8 @@ func (b *DefaultBuilder) BuildSystem(ctx context.Context, req BuildRequest) (str
 	sb.WriteString("- 使用工具前先判断是否必要\n")
 	sb.WriteString("- 工具结果需要结合上下文给出完整回答\n")
 	sb.WriteString("- 直接回答用户的问题，不要重复工具的原始输出\n")
+	sb.WriteString("- 收到 failure_kind=repeated_failure：禁止再次提交相同调用，必须改参、先完成 suggested_action，或向用户说明阻塞\n")
+	sb.WriteString("- 收到 failure_kind=no_progress：必须总结阻塞或询问用户，禁止继续微调无效调用\n")
 
 	return sb.String(), nil
 }

@@ -42,7 +42,7 @@
 | --- | --- | --- |
 | 无沙箱跑 Skill 脚本 | CLI/Enterprise 可用 | 保持 |
 | 本地平台沙箱跑 Skill | CLI 已接线；Enterprise 可配 | 三产品可测通过 |
-| 远程 API 跑 Skill | CLI 有路径；嵌套 StageInput 客户端契约已测；Enterprise 可按配置注入 SessionClient | 三模式齐 + 服务端联调 |
+| 远程 API 跑 Skill | CLI 有路径；Skill 脚本 zip staging + job 内解压已测；Enterprise 可按配置注入 SessionClient | 三模式齐 + sandbox E2E 联调 |
 | 失败 JSON 到模型 | ReAct 保留 Output JSON（Gate A） | I4 |
 | 缺依赖结构化字段 | `failure_kind` / `missing` / `suggested_install`（Gate A） | §6.2–6.3 |
 | 对话期安装通道 | `install_skill_dependencies`（Gate B，workspace） | §6.5；session/user 后续 |
@@ -104,7 +104,7 @@ flowchart TD
   D --> E{执行 backend}
   E -->|disabled| F[本地直跑 ExecutionRunner]
   E -->|local-platform| G[本地平台沙箱]
-  E -->|genesis-sandbox| H[远程 Session StageInput + Run]
+  E -->|genesis-sandbox| H[远程 Session StageInput zip + unzip + Run]
   F --> I{结果}
   G --> I
   H --> I
@@ -140,7 +140,7 @@ run_skill_script(skill, script ResourceID, args[], inputs[])
 
 | 产品 | 无沙箱 | 本地平台沙箱 | 远程 API |
 | --- | --- | --- | --- |
-| CLI | 已具备 | 代码已接，补 Skill E2E | 代码已接，补嵌套 StageInput 联调 |
+| CLI | 已具备 | 代码已接，补 Skill E2E | 代码已接，脚本包 zip staging 已测，补 sandbox E2E |
 | Enterprise | 已接（headless 审批过渡） | 待注入 SandboxRunner | 待注入 SessionClient + WorkspaceRef + 租户 credential |
 
 ### 4.2 Backend 选择规则
@@ -166,12 +166,12 @@ run_skill_script(skill, script ResourceID, args[], inputs[])
 | `INPUT_DIR` | `.genesis/runs/<id>/input` | `/workspace/input` |
 | `OUTPUT_DIR` | `.genesis/runs/<id>/output` | `/workspace/output` |
 | `TMPDIR` | `.genesis/runs/<id>/tmp` | `/workspace/tmp` |
-| `SKILL_DIR` | `WORK_DIR/skills/<pkg>` | `/workspace/input/skills/<pkg>` |
+| `SKILL_DIR` | `WORK_DIR/skills/<pkg>` | `/workspace/tmp/skills/<pkg>` |
 | `PYTHONPATH` / `NODE_PATH` | 指向 `SKILL_DIR/scripts`（及约定 node_modules 搜索路径） | 同逻辑，路径换远程映射 |
 
 远程 StageInput 命名：
 
-- 脚本：`skills/<pkg>/scripts/<rel>`
+- Skill 脚本：`skill-scripts-<pkg>.zip` → `/workspace/input/skill-scripts-<pkg>.zip`，job 内解压到 `/workspace/tmp/skills/<pkg>/scripts`
 - 用户输入：`<basename>` → `/workspace/input/<basename>`
 
 ### 4.4 三模式验收
@@ -453,7 +453,7 @@ Agent: run_skill_script(create_pptx.js)  # 相同参数
 
 1. 修复 ReAct / `run_skill_script`：**失败时保留 JSON ToolResult**  
 2. `RunResult` 增加 `failure_kind` / `missing` / `suggested_action`；解析脚本 `hint`  
-3. CLI：Skill 远程 optional 降级与 `run_command` 对齐；补嵌套 StageInput 测试  
+3. CLI：Skill 远程 optional 降级与 `run_command` 对齐；补脚本包 zip staging + 解压执行测试  
 4. Enterprise：可配置注入平台沙箱 / SessionClient（不再写死仅 disabled）  
 5. 更新 office-ppt SKILL：缺依赖指引指向结构化字段（即使尚未有专用 install 工具，也先保证模型看得见）
 
@@ -479,7 +479,7 @@ Agent: run_skill_script(create_pptx.js)  # 相同参数
 ### 10.1 三模式
 
 - [x] 同一 `office-ppt/scripts/inspect_pptx.py` 在三种 backend 返回语义一致的 JSON（本地/单测；远程服务端联调仍属 sandbox 仓）
-- [x] 远程嵌套 `office/unpack.py` StageInput **客户端命名契约**已测；服务端联调待 sandbox
+- [x] 远程 `office/unpack.py` 经脚本包 zip staging + job 内解压执行的客户端契约已测；真实 sandbox E2E 仍属联调项
 - [x] required 失败不静默降级；optional 降级有 warning + metadata（与 run_command 对齐；独立 audit sink 事件仍可加强）
 
 ### 10.2 依赖闭环
@@ -527,7 +527,7 @@ Agent: run_skill_script(create_pptx.js)  # 相同参数
 | 安装工具 | `internal/capabilities/skill/tool/install_skill_dependencies/`（新建） |
 | Build profile | `execution/model` 已有枚举 → Runner/Sandbox 真正消费 |
 | Enterprise 三模式 | `products/enterprise/bootstrap` + `shared/skillstack` |
-| 契约测试 | `script/service` smoke + 远程 mock StageInput |
+| 契约测试 | `script/service` smoke + 远程 mock StageInput zip |
 
 ---
 

@@ -28,6 +28,7 @@ type Run struct {
 	SessionID   string
 	Status      RunStatus
 	FinalAnswer string  // Loop结束时的最终回答
+	Incomplete  bool    // partial_complete：以当前最佳结果结束，结果可能不完整
 	TotalTokens int64   // 本次Run的Token总消耗
 	Steps       []*Step // 按执行顺序排列的步骤列表
 	StartedAt   time.Time

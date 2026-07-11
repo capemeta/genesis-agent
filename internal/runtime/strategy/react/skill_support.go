@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	skillcontract "genesis-agent/internal/capabilities/skill/contract"
 	tool "genesis-agent/internal/capabilities/tool/contract"
 	"genesis-agent/internal/domain"
 	"genesis-agent/internal/platform/logger"
@@ -23,10 +24,22 @@ type SkillMentionSelector interface {
 	SelectMentions(ctx context.Context, text string) ([]SkillMention, error)
 }
 
+// SkillExplicitLoader 加载用户显式选择的 Skill。
+type SkillExplicitLoader interface {
+	LoadExplicitSkill(ctx context.Context, req skillcontract.ExplicitLoadRequest) (string, error)
+}
+
 // WithSkillMentionSelector 注入 mention 自动选择。
 func WithSkillMentionSelector(selector SkillMentionSelector) EngineOption {
 	return func(e *ReactLoopEngine) {
 		e.skillMentionSelector = selector
+	}
+}
+
+// WithSkillExplicitLoader 注入用户显式 Skill 加载器。
+func WithSkillExplicitLoader(loader SkillExplicitLoader) EngineOption {
+	return func(e *ReactLoopEngine) {
+		e.skillExplicitLoader = loader
 	}
 }
 
@@ -100,16 +113,15 @@ func (e *ReactLoopEngine) injectMentionedSkills(ctx context.Context, rc *runtime
 		log.Warn("解析 skill mention 失败，跳过自动注入", "error", err)
 		return
 	}
+	if e.skillExplicitLoader == nil {
+		log.Warn("未配置显式 Skill 加载器，跳过 mention 自动注入")
+		return
+	}
 	for _, mention := range mentions {
-		args := map[string]string{}
-		if mention.Skill != "" {
-			args["skill"] = mention.Skill
-		}
-		if mention.Resource != "" {
-			args["resource"] = mention.Resource
-		}
-		payload, _ := json.Marshal(args)
-		result, execErr := e.registry.Execute(ctx, "Skill", string(payload))
+		result, execErr := e.skillExplicitLoader.LoadExplicitSkill(ctx, skillcontract.ExplicitLoadRequest{
+			Skill:    mention.Skill,
+			Resource: mention.Resource,
+		})
 		if execErr != nil {
 			log.Warn("mention 自动加载 Skill 失败", "skill", mention.Skill, "error", execErr)
 			rc.Messages = append(rc.Messages, domain.NewSystemMessage(fmt.Sprintf(

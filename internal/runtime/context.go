@@ -5,6 +5,7 @@ import (
 	"sync/atomic"
 
 	"genesis-agent/internal/domain"
+	"genesis-agent/internal/runtime/repeatguard"
 )
 
 // RunContext Loop执行期间的内存状态
@@ -28,17 +29,26 @@ type RunContext struct {
 	// --- Skill 注入去重（本 Run 内）---
 	injectedMu     sync.Mutex
 	injectedSkills map[string]struct{} // key = opaque resource 或 authority:package
+
+	// --- Repeat Guard（本 Run 内；Resume 时须随可恢复状态一并恢复）---
+	RepeatGuard *repeatguard.Guard
 }
 
 // NewRunContext 初始化RunContext
 func NewRunContext(run *domain.Run, agent *domain.Agent) *RunContext {
-	return &RunContext{
+	rc := &RunContext{
 		Run:            run,
 		Agent:          agent,
 		Messages:       make([]*domain.Message, 0, 16),
 		blockSeq:       -1, // 第一个分配的将是 0
 		injectedSkills: make(map[string]struct{}),
 	}
+	policy := domain.RuntimePolicy{}
+	if agent != nil {
+		policy = agent.RuntimePolicy
+	}
+	rc.RepeatGuard = repeatguard.New(repeatguard.ConfigFromPolicy(policy))
+	return rc
 }
 
 // NextBlockIndex 分配并返回下一个 BlockIndex（从0开始）

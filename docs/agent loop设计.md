@@ -580,6 +580,11 @@ type RuntimePolicy struct {
 
 Loop 中的错误分四类，处理方式不同：
 
+> **行为环重复失败 / 无进展防护（最终版）**：  
+> `docs/superpowers/specs/2026-07-10-agent-repeated-failure-circuit-design.md`（Repeat Guard：L1 同调用身份硬闸 + L2 进展门禁；与下方 RetryPolicy 分层）。
+>
+> RuntimePolicy 增补字段（与 `MaxConsecutiveFail` 并列）：`RepeatGuardEnabled`、`MaxIdenticalToolFailures`、`MaxStagnantIterations`。
+
 ```text
 错误类型              触发条件                         处理策略
 ────────────────────────────────────────────────────────────────────────

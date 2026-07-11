@@ -4,6 +4,8 @@ package glob
 import (
 	"context"
 	"fmt"
+	"path/filepath"
+	"strings"
 
 	fscontract "genesis-agent/internal/capabilities/filesystem/contract"
 	"genesis-agent/internal/capabilities/filesystem/model"
@@ -94,6 +96,9 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 	}
 	defer release()
 
+	if isExactGlobPattern(in.Pattern) {
+		return t.executeExact(ctx, in, rootRaw)
+	}
 	matcher, err := search.NewGlobMatcher(in.Pattern)
 	if err != nil {
 		return "", fscontract.NewError(fscontract.ErrCodeInvalidInput, in.Pattern, err)
@@ -102,7 +107,7 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 	if maxResults <= 0 {
 		maxResults = defaultGlobMaxResults
 	}
-	walk, err := t.deps.Backend.Walk(ctx, root, fscontract.WalkOptions{MaxDepth: in.MaxDepth, MaxEntries: maxResults * 20})
+	walk, err := t.deps.Backend.Walk(ctx, root, fscontract.WalkOptions{MaxDepth: in.MaxDepth, MaxEntries: maxResults * 20, ExcludeDirs: toolkit.NoiseDirsExceptExplicitPattern(in.Pattern)})
 	if err != nil {
 		return "", err
 	}
@@ -123,6 +128,43 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 		}
 	}
 	return toolkit.ToJSON(output{Root: root.DisplayPath, Pattern: in.Pattern, Matches: matches, Truncated: walk.Truncated, LimitCause: walk.LimitCause})
+}
+
+func (t *Tool) executeExact(ctx context.Context, in input, rootRaw string) (string, error) {
+	raw := strings.TrimSpace(in.Pattern)
+	if raw == "" {
+		return toolkit.ToJSON(output{Root: "", Pattern: in.Pattern, Matches: nil})
+	}
+	if !filepath.IsAbs(raw) && strings.TrimSpace(rootRaw) != "" && strings.TrimSpace(rootRaw) != "." {
+		raw = filepath.Join(rootRaw, raw)
+	}
+	resolved, err := toolkit.ResolveRequire(ctx, t.deps, "glob", raw, permission.OperationWalk, fscontract.ResolveOptions{
+		Operation:      string(permission.OperationWalk),
+		MustExist:      true,
+		AllowDirectory: true,
+	})
+	if err != nil {
+		if fscontract.CodeOf(err) == fscontract.ErrCodeNotFound {
+			return toolkit.ToJSON(output{Root: "", Pattern: in.Pattern, Matches: []string{}})
+		}
+		return "", err
+	}
+	stat, err := t.deps.Backend.Stat(ctx, resolved)
+	if err != nil {
+		if fscontract.CodeOf(err) == fscontract.ErrCodeNotFound {
+			return toolkit.ToJSON(output{Root: "", Pattern: in.Pattern, Matches: []string{}})
+		}
+		return "", err
+	}
+	if !in.IncludeDirs && stat.Type == model.EntryTypeDir {
+		return toolkit.ToJSON(output{Root: "", Pattern: in.Pattern, Matches: []string{}})
+	}
+	return toolkit.ToJSON(output{Root: "", Pattern: in.Pattern, Matches: []string{resolved.DisplayPath}})
+}
+
+func isExactGlobPattern(pattern string) bool {
+	pattern = strings.TrimSpace(pattern)
+	return pattern != "" && !strings.ContainsAny(pattern, "*?[")
 }
 
 func trimRoot(path string, root string) string {

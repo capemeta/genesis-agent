@@ -134,6 +134,29 @@ func (f fakeSource) Search(context.Context, contract.SearchRequest) (contract.Se
 	return contract.SearchResult{Matches: matches}, nil
 }
 
+func TestRenderAvailableSkillsOmitsDisableModelInvocationButExplicitLoadWorks(t *testing.T) {
+	meta := model.Metadata{Name: "manual", QualifiedName: "manual", Description: "Manual only", Enabled: true, PromptVisible: true, Authority: model.Authority{Kind: model.SourceKindHost, ID: "fake"}, PackageID: "manual", MainResource: "manual/SKILL.md", Policy: model.Policy{DisableModelInvocation: true}}.Normalize()
+	svc := New([]contract.Source{fakeSource{meta: meta, body: "Manual body"}}, Options{})
+	req := contract.CatalogRequest{Product: profilemodel.ChannelCLI, Environment: profilemodel.EnvironmentLocal}
+
+	rendered, err := svc.RenderAvailableSkills(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(rendered, "manual") {
+		t.Fatalf("manual-only skill should not be rendered to model catalog: %q", rendered)
+	}
+	if _, err := svc.Resolve(context.Background(), contract.ResolveRequest{CatalogRequest: req, Name: "manual", ModelCall: true}); err == nil {
+		t.Fatal("model call should reject disable-model-invocation skill")
+	}
+	injection, err := svc.Load(context.Background(), contract.LoadRequest{ResolveRequest: contract.ResolveRequest{CatalogRequest: req, Name: "manual", ModelCall: false, Invocation: "explicit"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(injection.Contents, "Manual body") {
+		t.Fatalf("injection = %+v", injection)
+	}
+}
 func TestServiceReadAndSearchResources(t *testing.T) {
 	meta := model.Metadata{Name: "review", QualifiedName: "review", Description: "Review things", Enabled: true, PromptVisible: true, Authority: model.Authority{Kind: model.SourceKindHost, ID: "fake"}, PackageID: "review", MainResource: "review/SKILL.md"}.Normalize()
 	source := fakeSource{meta: meta, body: "Body", resources: map[model.ResourceID]string{"review/references/guide.md": "alpha beta"}}
@@ -165,6 +188,18 @@ func TestServiceListResources(t *testing.T) {
 	}
 	if len(listed.Resources) != 1 || listed.Resources[0].Resource != "review/references/guide.md" {
 		t.Fatalf("listed = %+v", listed)
+	}
+}
+func TestServiceSelectForTurnExplicitMentionIgnoresImplicitPolicy(t *testing.T) {
+	allowImplicit := false
+	meta := model.Metadata{Name: "manual", QualifiedName: "manual", Description: "Manual", Enabled: true, PromptVisible: true, Authority: model.Authority{Kind: model.SourceKindHost, ID: "fake"}, PackageID: "manual", MainResource: "manual/SKILL.md", Policy: model.Policy{AllowImplicitInvocation: &allowImplicit, DisableModelInvocation: true}}.Normalize()
+	svc := New([]contract.Source{fakeSource{meta: meta, body: "Body"}}, Options{})
+	selected, err := svc.SelectForTurn(context.Background(), contract.SelectionRequest{CatalogRequest: contract.CatalogRequest{Product: profilemodel.ChannelCLI, Environment: profilemodel.EnvironmentLocal}, Text: "use $manual"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(selected) != 1 || selected[0].Name != "manual" {
+		t.Fatalf("selected = %+v", selected)
 	}
 }
 func TestServiceSelectForTurnSkillURIAndAmbiguousName(t *testing.T) {

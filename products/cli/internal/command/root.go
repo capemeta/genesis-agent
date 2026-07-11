@@ -5,6 +5,8 @@ package command
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -18,9 +20,10 @@ const defaultConfigDir = "configs"
 
 // ServiceOptions 描述 CLI 命令初始化 AgentService 时需要传给产品 bootstrap 的参数。
 type ServiceOptions struct {
-	ConfigDirRef *string
-	Quiet        bool
-	Sandbox      clisandbox.Config
+	ConfigDirRef  *string
+	Quiet         bool
+	Sandbox       clisandbox.Config
+	WorkspaceRoot string
 }
 
 // ServiceFactory 由产品分发层注入 AgentService 构建方式。
@@ -43,7 +46,7 @@ func initService(ctx context.Context, factory ServiceFactory, configDirRef *stri
 			return nil, err
 		}
 	}
-	svc, err := factory(ctx, ServiceOptions{ConfigDirRef: configDirRef, Quiet: quiet, Sandbox: sandboxCfg})
+	svc, err := factory(ctx, ServiceOptions{ConfigDirRef: configDirRef, Quiet: quiet, Sandbox: sandboxCfg, WorkspaceRoot: currentWorkspaceRoot()})
 	if err != nil {
 		return nil, err
 	}
@@ -51,6 +54,18 @@ func initService(ctx context.Context, factory ServiceFactory, configDirRef *stri
 		return nil, fmt.Errorf("CLI service factory 返回了空 AgentService")
 	}
 	return svc, nil
+}
+
+func currentWorkspaceRoot() string {
+	wd, err := os.Getwd()
+	if err != nil || strings.TrimSpace(wd) == "" {
+		return "."
+	}
+	abs, err := filepath.Abs(wd)
+	if err != nil {
+		return filepath.Clean(wd)
+	}
+	return filepath.Clean(abs)
 }
 
 // newRootCmd 构建 Cobra 根命令树，注册全局 flag 和所有子命令

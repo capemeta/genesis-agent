@@ -11,6 +11,8 @@ import (
 
 	fscontract "genesis-agent/internal/capabilities/filesystem/contract"
 	"genesis-agent/internal/capabilities/filesystem/model"
+	scriptworkspace "genesis-agent/internal/capabilities/skill/script/workspace"
+	"genesis-agent/internal/platform/contextutil"
 )
 
 const defaultWorkspaceID = "local"
@@ -62,7 +64,11 @@ func (r *Resolver) Resolve(ctx context.Context, ref model.PathRef, opts fscontra
 	}
 
 	candidate := raw
-	if !filepath.IsAbs(candidate) {
+	if expanded, ok, err := r.expandLogicalDir(ctx, raw); err != nil {
+		return model.ResolvedPath{}, fscontract.NewError(fscontract.ErrCodeInvalidPath, raw, err)
+	} else if ok {
+		candidate = expanded
+	} else if !filepath.IsAbs(candidate) {
 		candidate = filepath.Join(r.workspaceRoot, candidate)
 	}
 	abs, err := filepath.Abs(candidate)
@@ -102,6 +108,23 @@ func (r *Resolver) Resolve(ctx context.Context, ref model.PathRef, opts fscontra
 		Scope:        scope,
 		RawPath:      raw,
 	}, nil
+}
+
+// expandLogicalDir 将 $WORK_DIR/$OUTPUT_DIR 等展开到本 Run 的 .genesis/runs/<id>/…。
+// 中间产物应写逻辑目录，禁止落到仓库根。
+func (r *Resolver) expandLogicalDir(ctx context.Context, raw string) (string, bool, error) {
+	if _, ok := scriptworkspace.StripLogicalDirPrefix(raw); !ok {
+		return "", false, nil
+	}
+	runID, ok := contextutil.GetRunID(ctx)
+	if !ok {
+		return "", false, fmt.Errorf("%s 需要活跃 Run 上下文（context run_id）", raw)
+	}
+	ws, err := scriptworkspace.PrepareLocalTask(r.workspaceRoot, runID)
+	if err != nil {
+		return "", false, err
+	}
+	return scriptworkspace.ExpandLogicalPath(raw, ws)
 }
 
 func (r *Resolver) scopeOf(real string) model.PathScope {

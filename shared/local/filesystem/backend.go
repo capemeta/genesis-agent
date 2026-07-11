@@ -25,11 +25,11 @@ const (
 	defaultWalkDepth    = 8
 	defaultWalkDirs     = 1000
 	defaultWalkEntries  = 10000
-	defaultWalkBytes    = int64(4 * 1024 * 1024)
+	defaultWalkBytes    = int64(100 * 1024 * 1024 * 1024)
 	maxWalkDepth        = 64
 	maxWalkDirs         = 10000
 	maxWalkEntries      = 50000
-	maxWalkBytes        = int64(4 * 1024 * 1024)
+	maxWalkBytes        = int64(100 * 1024 * 1024 * 1024)
 )
 
 // Backend 是本地宿主机文件系统实现。
@@ -144,6 +144,7 @@ func (b *Backend) Walk(ctx context.Context, path model.ResolvedPath, opts fscont
 	if err := validateWalkLimits(path, limits); err != nil {
 		return nil, err
 	}
+	excludeDirs := normalizeExcludeDirs(opts.ExcludeDirs)
 	out := &model.WalkOutcome{Root: path.DisplayPath}
 	rootDepth := pathDepth(path.BackendPath)
 	errStop := fmt.Errorf("walk stopped")
@@ -160,6 +161,9 @@ func (b *Backend) Walk(ctx context.Context, path model.ResolvedPath, opts fscont
 		}
 		if current == path.BackendPath {
 			return nil
+		}
+		if entry.IsDir() && shouldSkipDir(entry.Name(), excludeDirs) {
+			return filepath.SkipDir
 		}
 		depth := pathDepth(current) - rootDepth
 		if depth > limits.MaxDepth {
@@ -210,6 +214,25 @@ func (b *Backend) Walk(ctx context.Context, path model.ResolvedPath, opts fscont
 	return out, nil
 }
 
+func normalizeExcludeDirs(values []string) map[string]struct{} {
+	out := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(strings.ToLower(value))
+		if value == "" || strings.ContainsAny(value, `/\`) {
+			continue
+		}
+		out[value] = struct{}{}
+	}
+	return out
+}
+
+func shouldSkipDir(name string, exclude map[string]struct{}) bool {
+	if len(exclude) == 0 {
+		return false
+	}
+	_, ok := exclude[strings.ToLower(strings.TrimSpace(name))]
+	return ok
+}
 func (b *Backend) Stat(ctx context.Context, path model.ResolvedPath) (*model.FileStat, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err

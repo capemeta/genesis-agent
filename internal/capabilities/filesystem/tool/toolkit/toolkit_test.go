@@ -33,3 +33,36 @@ func TestDecodeParamsAcceptsExpectedFields(t *testing.T) {
 		t.Fatalf("Path = %q, want a.txt", in.Path)
 	}
 }
+
+func TestNoiseDirsExceptExplicitPatternKeepsDefaultNoiseForBroadPattern(t *testing.T) {
+	exclude := NoiseDirsExceptExplicitPattern("**/*.md")
+	if !containsString(exclude, "node_modules") || !containsString(exclude, ".genesis") {
+		t.Fatalf("exclude=%v, want default noise dirs", exclude)
+	}
+}
+
+func TestNoiseDirsExceptExplicitPatternRespectsExplicitNoiseDir(t *testing.T) {
+	exclude := NoiseDirsExceptExplicitPattern("node_modules/**/package.json")
+	if containsString(exclude, "node_modules") {
+		t.Fatalf("exclude=%v, should not exclude explicit node_modules", exclude)
+	}
+	if !containsString(exclude, ".genesis") {
+		t.Fatalf("exclude=%v, unrelated noise dirs should remain excluded", exclude)
+	}
+}
+
+func TestNoiseDirsExceptExplicitPatternRespectsExplicitNoiseDirAfterWildcard(t *testing.T) {
+	exclude := NoiseDirsExceptExplicitPattern("**/dist/*.js")
+	if containsString(exclude, "dist") {
+		t.Fatalf("exclude=%v, should not exclude explicit dist", exclude)
+	}
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}

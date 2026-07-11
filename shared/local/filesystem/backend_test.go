@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	fscontract "genesis-agent/internal/capabilities/filesystem/contract"
@@ -83,6 +84,27 @@ func TestBackendExpectedHashMismatch(t *testing.T) {
 	}
 }
 
+func TestBackendWalkExcludeDirs(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "node_modules", "pkg"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "node_modules", "pkg", "hidden.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "wanted.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := New().Walk(context.Background(), resolved(root, ""), fscontract.WalkOptions{ExcludeDirs: []string{"node_modules"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range out.Entries {
+		if strings.Contains(entry.Path, "node_modules") {
+			t.Fatalf("excluded directory leaked into walk: %+v", entry)
+		}
+	}
+}
 func TestBackendWalkRejectsFollowSymlinks(t *testing.T) {
 	root := t.TempDir()
 	_, err := New().Walk(context.Background(), resolved(root, ""), fscontract.WalkOptions{FollowSymlinks: true})

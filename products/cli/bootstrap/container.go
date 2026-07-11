@@ -14,8 +14,8 @@ import (
 	approvalmemory "genesis-agent/internal/capabilities/approval/adapter/memory"
 	approvalcontract "genesis-agent/internal/capabilities/approval/contract"
 	approvalservice "genesis-agent/internal/capabilities/approval/service"
-	auditmemory "genesis-agent/internal/capabilities/audit/adapter/memory"
 	auditfile "genesis-agent/internal/capabilities/audit/adapter/file"
+	auditmemory "genesis-agent/internal/capabilities/audit/adapter/memory"
 	auditcontract "genesis-agent/internal/capabilities/audit/contract"
 	capcontract "genesis-agent/internal/capabilities/capability/contract"
 	execsandbox "genesis-agent/internal/capabilities/execution/adapter/sandbox"
@@ -44,24 +44,25 @@ import (
 	skillcontract "genesis-agent/internal/capabilities/skill/contract"
 	skillmodel "genesis-agent/internal/capabilities/skill/model"
 	skillparser "genesis-agent/internal/capabilities/skill/parser"
-	skillservice "genesis-agent/internal/capabilities/skill/service"
 	scriptservice "genesis-agent/internal/capabilities/skill/script/service"
-	listskillresources "genesis-agent/internal/capabilities/skill/tool/list_skill_resources"
+	scriptworkspace "genesis-agent/internal/capabilities/skill/script/workspace"
+	skillservice "genesis-agent/internal/capabilities/skill/service"
 	installskilldeps "genesis-agent/internal/capabilities/skill/tool/install_skill_dependencies"
-	runskillscript "genesis-agent/internal/capabilities/skill/tool/run_skill_script"
-	skilltool "genesis-agent/internal/capabilities/skill/tool/skill"
+	listskillresources "genesis-agent/internal/capabilities/skill/tool/list_skill_resources"
 	readskillresource "genesis-agent/internal/capabilities/skill/tool/read_skill_resource"
+	runskillscript "genesis-agent/internal/capabilities/skill/tool/run_skill_script"
 	searchskillresources "genesis-agent/internal/capabilities/skill/tool/search_skill_resources"
+	skilltool "genesis-agent/internal/capabilities/skill/tool/skill"
 	toolcapability "genesis-agent/internal/capabilities/tool/adapter/capability"
 	toolcontract "genesis-agent/internal/capabilities/tool/contract"
 	"genesis-agent/internal/capabilities/tool/scheduler"
-	usagememory "genesis-agent/internal/capabilities/usage/adapter/memory"
 	usagefile "genesis-agent/internal/capabilities/usage/adapter/file"
+	usagememory "genesis-agent/internal/capabilities/usage/adapter/memory"
 	usagecontract "genesis-agent/internal/capabilities/usage/contract"
 	platformconfig "genesis-agent/internal/platform/config"
 	"genesis-agent/internal/platform/logger"
-	"genesis-agent/internal/runtime/strategy/react"
 	promptbuilder "genesis-agent/internal/runtime/prompt"
+	"genesis-agent/internal/runtime/strategy/react"
 	cliapproval "genesis-agent/products/cli/internal/approval"
 	"genesis-agent/products/cli/internal/command"
 	"genesis-agent/products/cli/internal/profile"
@@ -89,9 +90,10 @@ import (
 
 // Container 是 CLI 产品的装配容器。
 type Container struct {
-	configDirRef *string
-	quiet        bool
-	sandbox      clisandbox.Config
+	configDirRef  *string
+	quiet         bool
+	sandbox       clisandbox.Config
+	workspaceRoot string
 
 	once    sync.Once
 	initErr error
@@ -108,6 +110,7 @@ type productRuntime struct {
 	usageSink            usagecontract.Sink
 	skillNameMatcher     react.SkillNameMatcher
 	skillMentionSelector react.SkillMentionSelector
+	skillExplicitLoader  react.SkillExplicitLoader
 }
 
 // Execute 执行 CLI 产品命令树。
@@ -122,7 +125,7 @@ func Execute(ctx context.Context) error {
 
 // NewContainer 创建 CLI 产品容器。
 func NewContainer(configDirRef *string, quiet bool) *Container {
-	return &Container{configDirRef: configDirRef, quiet: quiet}
+	return &Container{configDirRef: configDirRef, quiet: quiet, workspaceRoot: workspaceRootOrDot("")}
 }
 
 // Init 初始化 CLI 产品运行时依赖。
@@ -149,7 +152,7 @@ func (c *Container) Init(ctx context.Context) error {
 		sandboxCfg = clisandbox.MergeSessionOverride(sandboxCfg, c.sandbox)
 		c.sandbox = sandboxCfg
 		prof := profile.DefaultProfile()
-		runtime, log, err := buildProductRuntime(ctx, configDir, cfg, c.quiet, sandboxCfg, prof)
+		runtime, log, err := buildProductRuntime(ctx, configDir, cfg, c.quiet, sandboxCfg, prof, workspaceRootOrDot(c.workspaceRoot))
 		if err != nil {
 			c.initErr = err
 			return
@@ -171,22 +174,23 @@ func (c *Container) Init(ctx context.Context) error {
 			return
 		}
 		c.bundle, c.initErr = shared.BuildAgentService(ctx, shared.BuildOptions{
-			Product:          "cli",
-			ConfigDir:        configDir,
-			Quiet:            c.quiet,
-			RouteName:        "chat",
-			DefaultAgentID:   "default-agent",
-			DefaultAgentName: "Genesis Agent",
-			Profile:          prof,
-			AdditionalTools:  runtime.tools,
-			PromptInjectors:  runtime.promptInjectors,
-			Logger:           runtime.logger,
-			AuditSink:        runtime.auditSink,
-			UsageSink:        runtime.usageSink,
-			Web:              webOpts,
-			PlanRepository:            planRepo,
-			SkillNameMatcher:          runtime.skillNameMatcher,
-			SkillMentionSelector:      runtime.skillMentionSelector,
+			Product:              "cli",
+			ConfigDir:            configDir,
+			Quiet:                c.quiet,
+			RouteName:            "chat",
+			DefaultAgentID:       "default-agent",
+			DefaultAgentName:     "Genesis Agent",
+			Profile:              prof,
+			AdditionalTools:      runtime.tools,
+			PromptInjectors:      runtime.promptInjectors,
+			Logger:               runtime.logger,
+			AuditSink:            runtime.auditSink,
+			UsageSink:            runtime.usageSink,
+			Web:                  webOpts,
+			PlanRepository:       planRepo,
+			SkillNameMatcher:     runtime.skillNameMatcher,
+			SkillMentionSelector: runtime.skillMentionSelector,
+			SkillExplicitLoader:  runtime.skillExplicitLoader,
 		})
 		if c.initErr != nil {
 			_ = c.logging.Close()
@@ -218,14 +222,14 @@ func NewService(ctx context.Context, configDirRef *string, quiet bool) (app.Agen
 }
 
 func NewServiceWithOptions(ctx context.Context, opts command.ServiceOptions) (app.AgentService, error) {
-	c := &Container{configDirRef: opts.ConfigDirRef, quiet: opts.Quiet, sandbox: opts.Sandbox}
+	c := &Container{configDirRef: opts.ConfigDirRef, quiet: opts.Quiet, sandbox: opts.Sandbox, workspaceRoot: workspaceRootOrDot(opts.WorkspaceRoot)}
 	if err := c.Init(ctx); err != nil {
 		return nil, err
 	}
 	return c.Service(), nil
 }
 
-func buildProductRuntime(ctx context.Context, configDir string, cfg *platformconfig.Config, quiet bool, sandboxCfg clisandbox.Config, prof profilemodel.Profile) (productRuntime, logger.Logger, error) {
+func buildProductRuntime(ctx context.Context, configDir string, cfg *platformconfig.Config, quiet bool, sandboxCfg clisandbox.Config, prof profilemodel.Profile, workspaceRoot string) (productRuntime, logger.Logger, error) {
 	if cfg == nil {
 		loaded, err := platformconfig.LoadWithOptions(configDir, platformconfig.LoadOptions{Product: "cli", EnsureUserConfig: true})
 		if err != nil {
@@ -260,7 +264,8 @@ func buildProductRuntime(ctx context.Context, configDir string, cfg *platformcon
 		return productRuntime{}, nil, err
 	}
 
-	productTools, execStack, err := buildProductTools(sandboxCfg, baseApprovalSvc, log)
+	workspaceRoot = workspaceRootOrDot(workspaceRoot)
+	productTools, execStack, err := buildProductTools(sandboxCfg, baseApprovalSvc, log, workspaceRoot)
 	if err != nil {
 		_ = runtimeLogging.Close()
 		return productRuntime{}, nil, err
@@ -277,7 +282,7 @@ func buildProductRuntime(ctx context.Context, configDir string, cfg *platformcon
 		return productRuntime{}, nil, err
 	}
 	tools = append(tools, capabilityTools...)
-	skillSvc, roots, err := buildSkillService(configDir, cfg.Skills, prof, auditSink, usageSink, capabilityRegistry)
+	skillSvc, roots, err := buildSkillService(configDir, cfg.Skills, prof, auditSink, usageSink, capabilityRegistry, workspaceRoot)
 	if err != nil {
 		_ = runtimeLogging.Close()
 		return productRuntime{}, nil, err
@@ -290,6 +295,11 @@ func buildProductRuntime(ctx context.Context, configDir string, cfg *platformcon
 	if err != nil {
 		_ = runtimeLogging.Close()
 		return productRuntime{}, nil, err
+	}
+	explicitLoader, ok := skillGateway.(react.SkillExplicitLoader)
+	if !ok {
+		_ = runtimeLogging.Close()
+		return productRuntime{}, nil, fmt.Errorf("Skill 网关未实现显式加载接口")
 	}
 	listResources, err := listskillresources.New(listskillresources.Deps{Service: skillSvc, Approval: baseApprovalSvc, CatalogRequest: catalogReq, Registry: capabilityRegistry})
 	if err != nil {
@@ -330,6 +340,7 @@ func buildProductRuntime(ctx context.Context, configDir string, cfg *platformcon
 		Runner:         skillScriptSvc,
 		CatalogRequest: catalogReq,
 		Sandbox:        sandboxCfg.ExecutionProfile(),
+		WorkspaceRoot:  workspaceRoot,
 	})
 	if err != nil {
 		_ = runtimeLogging.Close()
@@ -341,7 +352,7 @@ func buildProductRuntime(ctx context.Context, configDir string, cfg *platformcon
 		Approval:       baseApprovalSvc,
 		CatalogRequest: catalogReq,
 		Sandbox:        sandboxCfg.ExecutionProfile(),
-		WorkspaceRoot:  workspaceRootOrDot(),
+		WorkspaceRoot:  workspaceRoot,
 	})
 	if err != nil {
 		_ = runtimeLogging.Close()
@@ -352,9 +363,24 @@ func buildProductRuntime(ctx context.Context, configDir string, cfg *platformcon
 	skillMentions := &react.MentionSelector{Service: skillSvc, CatalogRequest: catalogReq}
 	// system 仅短硬规则；完整 catalog 挂在 Skill 工具 DescriptionFunc。
 	injector := promptbuilder.ContextInjectorFunc(func(ctx context.Context, req promptbuilder.BuildRequest) (promptbuilder.Fragment, error) {
+		var b strings.Builder
+		b.WriteString("Skills 是任务流程包，不是可执行工具。加载技能必须调用 Skill(skill=...)；禁止把 office-ppt 等技能名当作独立工具调用。用户输入中的 $skill 或 skill:// 引用会在回合开始自动注入。可用技能列表见 Skill 工具描述中的 <available_skills>。若 run_skill_script 返回 failure_kind=dependency_missing：调用 install_skill_dependencies（须审批，仅装 runtime 白名单包）后，用相同参数再跑脚本（安装成功会清零重复失败计数）；sandbox_violation 勿当成缺包。收到 failure_kind=repeated_failure：禁止再次提交相同调用，必须改参或改策略。收到 failure_kind=no_progress：必须总结阻塞或询问用户，禁止继续空转。")
+		b.WriteString("\n\nRun 文件落点：中间脚本/临时文件用 write_file(\"$WORK_DIR/...\")；最终交付进 $OUTPUT_DIR；禁止写到仓库根目录。")
+		if req.Run != nil && strings.TrimSpace(req.Run.ID) != "" {
+			if ws, err := scriptworkspace.PrepareLocalTask(workspaceRoot, req.Run.ID); err == nil {
+				rel := func(abs string) string {
+					r, err := filepath.Rel(workspaceRoot, abs)
+					if err != nil {
+						return abs
+					}
+					return filepath.ToSlash(r)
+				}
+				b.WriteString(fmt.Sprintf("\n本 Run：WORK_DIR=%s OUTPUT_DIR=%s INPUT_DIR=%s", rel(ws.WorkDir), rel(ws.OutputDir), rel(ws.InputDir)))
+			}
+		}
 		return promptbuilder.Fragment{
-			Name: "skills_instructions",
-			Contents: "Skills 是任务流程包，不是可执行工具。加载技能必须调用 Skill(skill=...)；禁止把 office-ppt 等技能名当作独立工具调用。用户输入中的 $skill 或 skill:// 引用会在回合开始自动注入。可用技能列表见 Skill 工具描述中的 <available_skills>。若 run_skill_script 返回 failure_kind=dependency_missing：调用 install_skill_dependencies（须审批，仅装 runtime 白名单包）后，用相同参数再跑脚本；sandbox_violation 勿当成缺包。",
+			Name:     "skills_instructions",
+			Contents: b.String(),
 		}, nil
 	})
 	return productRuntime{
@@ -366,6 +392,7 @@ func buildProductRuntime(ctx context.Context, configDir string, cfg *platformcon
 		usageSink:            usageSink,
 		skillNameMatcher:     skillMatcher,
 		skillMentionSelector: skillMentions,
+		skillExplicitLoader:  explicitLoader,
 	}, log, nil
 }
 
@@ -388,6 +415,7 @@ func buildBaseApprovalService(quiet bool, policyCfg platformconfig.PolicyConfig,
 	}
 	return baseApprovalSvc, nil
 }
+
 // productExecStack 是 CLI 执行栈，供 run_command 与 run_skill_script 复用。
 type productExecStack struct {
 	Runner        execcontract.ExecutionRunner
@@ -395,8 +423,8 @@ type productExecStack struct {
 	WorkspaceRef  sandboxcontract.WorkspaceRef
 }
 
-func buildProductTools(sandboxCfg clisandbox.Config, baseApprovalSvc approvalcontract.Service, log logger.Logger) ([]toolcontract.Tool, productExecStack, error) {
-	resolver, err := localresolver.New("")
+func buildProductTools(sandboxCfg clisandbox.Config, baseApprovalSvc approvalcontract.Service, log logger.Logger, workspaceRoot string) ([]toolcontract.Tool, productExecStack, error) {
+	resolver, err := localresolver.New(workspaceRootOrDot(workspaceRoot))
 	if err != nil {
 		return nil, productExecStack{}, fmt.Errorf("初始化本地PathResolver失败: %w", err)
 	}
@@ -487,8 +515,8 @@ func buildSandboxStack(directRunner *localexec.Runner, sandboxCfg clisandbox.Con
 	}
 }
 
-func buildSkillService(configDir string, cfg platformconfig.SkillsConfig, prof profilemodel.Profile, auditSink auditcontract.Sink, usageSink usagecontract.Sink, visibility capcontract.Registry) (skillcontract.Service, []localskill.Root, error) {
-	roots := defaultSkillRoots(configDir)
+func buildSkillService(configDir string, cfg platformconfig.SkillsConfig, prof profilemodel.Profile, auditSink auditcontract.Sink, usageSink usagecontract.Sink, visibility capcontract.Registry, workspaceRoot string) (skillcontract.Service, []localskill.Root, error) {
+	roots := defaultSkillRoots(configDir, workspaceRootOrDot(workspaceRoot))
 	installedRoots, err := cliskill.InstalledSkillRoots(context.Background())
 	if err != nil {
 		return nil, nil, err
@@ -552,10 +580,10 @@ func startSkillWatcher(ctx context.Context, roots []localskill.Root, svc skillco
 	}()
 }
 
-func defaultSkillRoots(configDir string) []localskill.Root {
+func defaultSkillRoots(configDir string, workspaceRoot string) []localskill.Root {
 	roots := make([]localskill.Root, 0, 3)
-	if wd, err := os.Getwd(); err == nil && wd != "" {
-		roots = append(roots, localskill.Root{Path: filepath.Join(wd, ".genesis", "skills"), Scope: skillmodel.ScopeProject})
+	if workspaceRoot = strings.TrimSpace(workspaceRoot); workspaceRoot != "" {
+		roots = append(roots, localskill.Root{Path: filepath.Join(workspaceRoot, ".genesis", "skills"), Scope: skillmodel.ScopeProject})
 	}
 	if configDir != "" {
 		roots = append(roots, localskill.Root{Path: filepath.Join(configDir, "skills"), Scope: skillmodel.ScopeUser})
@@ -567,11 +595,20 @@ func defaultSkillRoots(configDir string) []localskill.Root {
 	return dedupeRoots(roots)
 }
 
-func workspaceRootOrDot() string {
-	if wd, err := os.Getwd(); err == nil && strings.TrimSpace(wd) != "" {
-		return wd
+func workspaceRootOrDot(root string) string {
+	root = strings.TrimSpace(root)
+	if root == "" {
+		if wd, err := os.Getwd(); err == nil && strings.TrimSpace(wd) != "" {
+			root = wd
+		}
 	}
-	return "."
+	if root == "" {
+		return "."
+	}
+	if abs, err := filepath.Abs(root); err == nil {
+		return filepath.Clean(abs)
+	}
+	return filepath.Clean(root)
 }
 
 func appendUniqueStrings(base []string, extra ...string) []string {

@@ -35,6 +35,7 @@ type WalkOptions struct {
 	MaxEntries     int
 	MaxBytes       int64
 	FollowSymlinks bool
+	ExcludeDirs    []string
 }
 
 // MkdirOptions 控制目录创建。

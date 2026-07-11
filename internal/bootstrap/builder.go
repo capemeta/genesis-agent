@@ -74,13 +74,14 @@ type BuildOptions struct {
 	AdditionalTools  []toolcontract.Tool
 	PromptInjectors  []promptbuilder.ContextInjector
 	// Logger 由产品层注入；非 nil 时 builder 不再自建文件日志（禁止双 Writer）。
-	Logger           loggercontract.Logger
-	AuditSink        auditcontract.Sink
-	UsageSink        usagecontract.Sink
-	Web              WebBuildOptions
-	PlanRepository   plancontract.Repository
-	SkillNameMatcher react.SkillNameMatcher
-	SkillMentionSelector react.SkillMentionSelector
+	Logger                    loggercontract.Logger
+	AuditSink                 auditcontract.Sink
+	UsageSink                 usagecontract.Sink
+	Web                       WebBuildOptions
+	PlanRepository            plancontract.Repository
+	SkillNameMatcher          react.SkillNameMatcher
+	SkillMentionSelector      react.SkillMentionSelector
+	SkillExplicitLoader       react.SkillExplicitLoader
 	AutoRewriteSkillCollision *bool
 }
 
@@ -273,6 +274,7 @@ func BuildAgentService(ctx context.Context, opts BuildOptions) (*RuntimeBundle, 
 		tracer,
 		react.WithSkillNameMatcher(opts.SkillNameMatcher),
 		react.WithSkillMentionSelector(opts.SkillMentionSelector),
+		react.WithSkillExplicitLoader(opts.SkillExplicitLoader),
 		func() react.EngineOption {
 			if opts.AutoRewriteSkillCollision == nil {
 				return nil
@@ -289,7 +291,11 @@ func BuildAgentService(ctx context.Context, opts BuildOptions) (*RuntimeBundle, 
 		DefaultModel: resolvedLLM.Model,
 		SystemPrompt: cfg.Agent.SystemPrompt,
 		RuntimePolicy: domain.RuntimePolicy{
-			MaxIterations: cfg.Agent.MaxIterations,
+			MaxIterations:            cfg.Agent.MaxIterations,
+			MaxConsecutiveFail:       cfg.Agent.MaxConsecutiveFail,
+			RepeatGuardEnabled:       cfg.Agent.RepeatGuardEnabled,
+			MaxIdenticalToolFailures: cfg.Agent.MaxIdenticalToolFailures,
+			MaxStagnantIterations:    cfg.Agent.MaxStagnantIterations,
 		},
 	}
 

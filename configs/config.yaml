@@ -239,6 +239,12 @@ agent:
   # ReAct Loop 最大迭代次数（防止无限循环）
   max_iterations: 50
 
+  # Repeat Guard（同调用身份硬闸 + 无进展门禁）；省略时启用默认值
+  # repeat_guard_enabled: true
+  # max_identical_tool_failures: 2   # 同 call_key 失败 2 次后，第 3 次拦截；0=关闭 L1
+  # max_stagnant_iterations: 5       # 连续无进展达阈值触发 no_progress；0=关闭 L2
+  # max_consecutive_fail: 0          # 任意工具连续失败上限；0=关闭
+
   # Agent 系统提示词（可在 config.local.yaml 中覆盖为业务专属提示词）
   system_prompt: "你是一个有帮助、有能力的AI助手。善用提供的工具来准确回答用户的问题。回答时请简洁清晰，直接给出答案。"
 

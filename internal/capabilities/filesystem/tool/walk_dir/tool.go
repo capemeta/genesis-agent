@@ -5,6 +5,7 @@ import (
 	"context"
 
 	fscontract "genesis-agent/internal/capabilities/filesystem/contract"
+	"genesis-agent/internal/capabilities/filesystem/model"
 	"genesis-agent/internal/capabilities/filesystem/permission"
 	"genesis-agent/internal/capabilities/filesystem/tool/toolkit"
 	tool "genesis-agent/internal/capabilities/tool/contract"
@@ -23,6 +24,7 @@ type input struct {
 	MaxEntries     int    `json:"max_entries,omitempty"`
 	MaxBytes       int64  `json:"max_bytes,omitempty"`
 	FollowSymlinks bool   `json:"follow_symlinks,omitempty"`
+	IncludeNoise   bool   `json:"include_noise,omitempty"`
 }
 
 // New 创建 walk_dir 工具。
@@ -46,6 +48,7 @@ func (t *Tool) GetInfo() *tool.Info {
 				"max_entries":     {Type: "integer", Description: "最大条目数"},
 				"max_bytes":       {Type: "integer", Description: "累计文件大小上限"},
 				"follow_symlinks": {Type: "boolean", Description: "是否跟随符号链接目录，第一轮本地backend默认不跟随"},
+				"include_noise":   {Type: "boolean", Description: "是否包含 .git/.genesis/.gocache/node_modules 等高噪声目录，默认 false"},
 			},
 			Required: []string{"path"},
 		},
@@ -76,12 +79,17 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 	}
 	defer release()
 
+	excludeDirs := toolkit.DefaultNoiseDirs()
+	if in.IncludeNoise || path.Scope != model.PathScopeWorkspace {
+		excludeDirs = nil
+	}
 	out, err := t.deps.Backend.Walk(ctx, path, fscontract.WalkOptions{
 		MaxDepth:       in.MaxDepth,
 		MaxDirs:        in.MaxDirs,
 		MaxEntries:     in.MaxEntries,
 		MaxBytes:       in.MaxBytes,
 		FollowSymlinks: in.FollowSymlinks,
+		ExcludeDirs:    excludeDirs,
 	})
 	if err != nil {
 		return "", err

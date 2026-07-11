@@ -10,6 +10,28 @@ import (
 	"genesis-agent/internal/platform/contextutil"
 )
 
+func TestAuthorizeAskApprovedNotifiesHook(t *testing.T) {
+	requester := &fakeRequester{decision: model.Decision{Type: model.DecisionApproved, Scope: model.GrantScopeOnce}}
+	svc, err := New(fakePolicy{result: model.PolicyResult{Type: model.PolicyAsk, Reason: "need"}}, requester, memory.NewStore(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	notified := false
+	ctx := contextutil.WithApprovalGrantedHook(context.Background(), func(context.Context) {
+		notified = true
+	})
+	decision, err := svc.Authorize(ctx, testRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Type != model.DecisionApproved {
+		t.Fatalf("decision=%q", decision.Type)
+	}
+	if !notified {
+		t.Fatal("expected ApprovalGrantedHook to fire")
+	}
+}
+
 func TestAuthorizeAllowDoesNotCallRequester(t *testing.T) {
 	svc, err := New(fakePolicy{result: model.PolicyResult{Type: model.PolicyAllow}}, &fakeRequester{}, memory.NewStore(), nil)
 	if err != nil {
@@ -23,6 +45,7 @@ func TestAuthorizeAllowDoesNotCallRequester(t *testing.T) {
 		t.Fatalf("decision = %q, want approved", decision.Type)
 	}
 }
+
 
 func TestAuthorizeWritesAuditWithRunID(t *testing.T) {
 	audit := &captureAudit{}

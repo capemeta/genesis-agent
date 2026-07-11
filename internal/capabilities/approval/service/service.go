@@ -10,6 +10,7 @@ import (
 	auditmodel "genesis-agent/internal/capabilities/audit/model"
 	"genesis-agent/internal/capabilities/approval/contract"
 	"genesis-agent/internal/capabilities/approval/model"
+	"genesis-agent/internal/platform/contextutil"
 	"genesis-agent/internal/platform/logger"
 	"genesis-agent/internal/platform/logger/correl"
 )
@@ -102,6 +103,9 @@ func (s *Service) Authorize(ctx context.Context, req model.Request) (model.Decis
 			return model.Decision{}, err
 		}
 		s.recordAudit(ctx, req, decision, decision.Type == model.DecisionApproved || decision.Type == model.DecisionApprovedForScope, decision.Reason)
+		if decision.Type == model.DecisionApproved || decision.Type == model.DecisionApprovedForScope {
+			contextutil.NotifyApprovalGranted(ctx)
+		}
 		return decision, nil
 	default:
 		l.Error("未知安全策略评估结果，默认拒绝", "policy_type", string(result.Type))

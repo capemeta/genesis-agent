@@ -350,9 +350,10 @@ func (s *Session) ensureStageJob(ctx context.Context) (string, error) {
 
 func (c *Client) resultFromJob(ctx context.Context, req sandboxcontract.CommandRequest, job jobResult) *execmodel.Result {
 	workspace := sandboxWorkspace(req)
+	workingDir := sandboxWorkingDir(req.Command.Cwd, workspace)
 	result := &execmodel.Result{
 		Command:         req.Command.Command,
-		Cwd:             workspace.WorkDir,
+		Cwd:             workingDir,
 		Shell:           req.Command.Shell,
 		Environment:     execmodel.EnvironmentSandbox,
 		SandboxProvider: req.Sandbox.Provider,
@@ -774,6 +775,7 @@ func execJobRequestFromCommand(req sandboxcontract.CommandRequest) execJobReques
 		language = ""
 	}
 	workspace := sandboxWorkspace(req)
+	workingDir := sandboxWorkingDir(req.Command.Cwd, workspace)
 	inputArtifactIDs := make([]string, 0, len(req.Options.InputArtifacts))
 	for _, artifact := range req.Options.InputArtifacts {
 		if strings.TrimSpace(artifact.ID) != "" {
@@ -792,7 +794,7 @@ func execJobRequestFromCommand(req sandboxcontract.CommandRequest) execJobReques
 		QueueWaitTimeoutSeconds: defaultQueueWaitSeconds,
 		Metadata:                metadata,
 		Spec: sandboxSpec{
-			WorkingDir: workspace.WorkDir,
+			WorkingDir: workingDir,
 			Env:        sandboxEnv(req.Command.Env, workspace),
 		},
 		InputArtifactIDs: inputArtifactIDs,
@@ -822,6 +824,14 @@ func sandboxWorkspace(req sandboxcontract.CommandRequest) execmodel.ExecutionWor
 	return workspace
 }
 
+func sandboxWorkingDir(commandCwd string, workspace execmodel.ExecutionWorkspace) string {
+	cwd := strings.TrimSpace(filepath.ToSlash(commandCwd))
+	workDir := strings.TrimRight(firstNonEmpty(filepath.ToSlash(workspace.WorkDir), "/workspace"), "/")
+	if cwd == workDir || strings.HasPrefix(cwd, workDir+"/") {
+		return cwd
+	}
+	return workDir
+}
 func sandboxEnv(userEnv map[string]string, workspace execmodel.ExecutionWorkspace) map[string]string {
 	env := make(map[string]string, len(userEnv)+5)
 	for k, v := range userEnv {

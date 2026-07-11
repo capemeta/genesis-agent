@@ -201,6 +201,51 @@ open(output_path, "w").write("ok")
 	}
 }
 
+func TestValidateCommandAllowsCreatePptxJSOfficeSkill(t *testing.T) {
+	src := filepath.Join("..", "..", "skill", "adapter", "embedded", "skills", "office-ppt", "scripts", "create_pptx.js")
+	data, err := os.ReadFile(src)
+	if err != nil {
+		alt := filepath.FromSlash("d:/workspace/go/genesis-agent/internal/capabilities/skill/adapter/embedded/skills/office-ppt/scripts/create_pptx.js")
+		data, err = os.ReadFile(alt)
+		if err != nil {
+			t.Skip("create_pptx.js not found")
+		}
+	}
+	dir := t.TempDir()
+	script := filepath.Join(dir, "create_pptx.js")
+	if err := os.WriteFile(script, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err = ValidateCommand(execmodel.Command{Command: `node create_pptx.js Ultra5.pptx Title`, Cwd: dir}, strictOptions())
+	if err != nil {
+		t.Fatalf("create_pptx.js must pass pathcontract, got %v", err)
+	}
+}
+
+func TestValidateCommandIgnoresNaturalLanguageSlash(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "msg.js")
+	if err := os.WriteFile(script, []byte(`console.log("office-basic / Node env");`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := ValidateCommand(execmodel.Command{Command: `node msg.js`, Cwd: dir}, strictOptions())
+	if err != nil {
+		t.Fatalf("natural-language slash must not fail: %v", err)
+	}
+}
+
+func TestValidateCommandAllowsOOXMLPackagePathsInPython(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "edit.py")
+	if err := os.WriteFile(script, []byte("target = '/ppt/slides/{dest}'\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := ValidateCommand(execmodel.Command{Command: `python edit.py`, Cwd: dir}, strictOptions())
+	if err != nil {
+		t.Fatalf("OOXML package path must be allowed: %v", err)
+	}
+}
+
 func TestValidateCommandRejectsPathInsideJavaScriptSource(t *testing.T) {
 	dir := t.TempDir()
 	script := filepath.Join(dir, "process.js")

@@ -5,7 +5,7 @@ import (
 	"strings"
 )
 
-var pathLikePattern = regexp.MustCompile(`(?i)(\$?\{?(?:INPUT_DIR|OUTPUT_DIR|TMPDIR|WORK_DIR|SKILL_DIR|GENESIS_WORKSPACE)\}?[/\\][^\s"'` + "`" + `;|&)]*|%?(?:INPUT_DIR|OUTPUT_DIR|TMPDIR|WORK_DIR|SKILL_DIR|GENESIS_WORKSPACE)%?[/\\][^\s"'` + "`" + `;|&)]*|[a-z]:[/\\][^\s"'` + "`" + `;|&)]*|\\\\[^\s"'` + "`" + `;|&)]*|/[^\s"'` + "`" + `;|&)]*)`)
+var pathLikePattern = regexp.MustCompile(`(?i)(\$?\{?(?:INPUT_DIR|OUTPUT_DIR|TMPDIR|WORK_DIR|SKILL_DIR|GENESIS_WORKSPACE)\}?[/\\][^\s"'` + "`" + `;|&)]*|%?(?:INPUT_DIR|OUTPUT_DIR|TMPDIR|WORK_DIR|SKILL_DIR|GENESIS_WORKSPACE)%?[/\\][^\s"'` + "`" + `;|&)]*|[a-z]:[/\\][^\s"'` + "`" + `;|&)]*|\\\\[^\s"'` + "`" + `;|&)]*|/[A-Za-z0-9._~${%][^\s"'` + "`" + `;|&)]*)`)
 var windowsAbsPattern = regexp.MustCompile(`^[a-z]:/`)
 
 func violationsFromText(analyzer, location, text string) []Violation {
@@ -17,7 +17,7 @@ func violationsFromText(analyzer, location, text string) []Violation {
 	violations := make([]Violation, 0, len(matches))
 	for _, raw := range matches {
 		fragment := trimPathFragment(raw)
-		if fragment == "" || seen[fragment] || allowedStrictFragment(fragment) {
+		if fragment == "" || seen[fragment] || !isMeaningfulPathFragment(fragment) || allowedStrictFragment(fragment) {
 			continue
 		}
 		seen[fragment] = true
@@ -84,9 +84,58 @@ func allowedStrictFragment(fragment string) bool {
 	case lower == "/workspace",
 		strings.HasPrefix(lower, "/workspace/"):
 		return true
+	// OOXML 包内相对路径（/ppt/ /word/ /xl/），不是宿主机文件系统路径。
+	case isOfficePackagePath(lower):
+		return true
 	default:
 		return false
 	}
+}
+
+// isMeaningfulPathFragment 过滤「office-basic / Node」这类自然语言斜杠，以及单独的 "/"。
+func isMeaningfulPathFragment(fragment string) bool {
+	normalized := strings.ReplaceAll(strings.TrimSpace(fragment), `\`, `/`)
+	if normalized == "" || normalized == "/" {
+		return false
+	}
+	// UNC：//server/share
+	if strings.HasPrefix(normalized, "//") {
+		return len(normalized) > 2
+	}
+	// Windows 盘符：c:/...
+	if windowsAbsPattern.MatchString(strings.ToLower(normalized)) {
+		return true
+	}
+	// Unix 绝对路径至少是 /x；裸 "/" 不算。
+	if strings.HasPrefix(normalized, "/") {
+		if len(normalized) < 2 {
+			return false
+		}
+		first := normalized[1]
+		if !((first >= 'a' && first <= 'z') || (first >= 'A' && first <= 'Z') ||
+			(first >= '0' && first <= '9') || first == '.' || first == '_' || first == '~' ||
+			first == '$' || first == '%' || first == '{') {
+			return false
+		}
+	}
+	return true
+}
+
+func isOfficePackagePath(lower string) bool {
+	// 仅匹配 OOXML 包根（带尾斜杠或精确根名），避免误放行 /pptfoo 等。
+	roots := []string{"/ppt/", "/word/", "/xl/", "/docprops/", "/_rels/", "/customxml/"}
+	exact := []string{"/ppt", "/word", "/xl", "/docprops", "/_rels", "/customxml"}
+	for _, root := range roots {
+		if strings.HasPrefix(lower, root) {
+			return true
+		}
+	}
+	for _, name := range exact {
+		if lower == name {
+			return true
+		}
+	}
+	return false
 }
 
 func violationFor(fragment, location string) Violation {

@@ -14,6 +14,8 @@ func TestIsExecutableScriptEntry(t *testing.T) {
 		{"office-ppt/scripts/inspect_pptx.py", true},
 		{"office-ppt/scripts/render_pptx_preview.py", true},
 		{"office-ppt/scripts/thumbnail.py", true},
+		{"office-ppt/scripts/run_pptxgen_script.js", true},
+		{"office-ppt/scripts/create_pptx.js", true},
 		{"office-ppt/scripts/office/unpack.py", true},
 		{"office-ppt/scripts/office/pack.py", true},
 		{"office-ppt/scripts/path_contract.py", false},
