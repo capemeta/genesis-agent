@@ -106,7 +106,7 @@ func (t *Tool) filterIndexedResources(ctx context.Context, pkg model.PackageID, 
 	return out
 }
 
-// filterExecutableScriptEntries 对模型隐藏不可作为 run_skill_script 入口的辅助模块。
+// filterExecutableScriptEntries 对模型隐藏不可作为 run_skill_command 入口的辅助模块。
 func filterExecutableScriptEntries(resources []model.ResourceInfo) []model.ResourceInfo {
 	out := make([]model.ResourceInfo, 0, len(resources))
 	for _, resource := range resources {
@@ -160,3 +160,4 @@ func firstNonEmpty(values ...string) string {
 	}
 	return ""
 }
+

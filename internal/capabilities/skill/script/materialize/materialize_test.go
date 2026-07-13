@@ -11,8 +11,8 @@ import (
 	skillcontract "genesis-agent/internal/capabilities/skill/contract"
 	skillmodel "genesis-agent/internal/capabilities/skill/model"
 	skillparser "genesis-agent/internal/capabilities/skill/parser"
-	skillservice "genesis-agent/internal/capabilities/skill/service"
 	"genesis-agent/internal/capabilities/skill/script/materialize"
+	skillservice "genesis-agent/internal/capabilities/skill/service"
 )
 
 func TestMaterializeEmbeddedOfficePPT(t *testing.T) {
@@ -24,11 +24,7 @@ func TestMaterializeEmbeddedOfficePPT(t *testing.T) {
 	}
 	dir := t.TempDir()
 	skillDir := filepath.Join(dir, "skills", string(meta.PackageID))
-	shared, err := embedded.OfficeCommonScriptsFS()
-	if err != nil {
-		t.Fatal(err)
-	}
-	mat := &materialize.Materializer{Service: svc, SharedScriptsFS: shared}
+	mat := &materialize.Materializer{Service: svc}
 	result, err := mat.MaterializePackageScripts(context.Background(), catalog, meta, skillDir)
 	if err != nil {
 		t.Fatal(err)
@@ -37,22 +33,30 @@ func TestMaterializeEmbeddedOfficePPT(t *testing.T) {
 		t.Fatalf("result=%+v", result)
 	}
 	for _, name := range []string{
-		"inspect_pptx.py",
-		"extract_pptx_text.py",
-		"path_contract.py",
 		"thumbnail.py",
 		"add_slide.py",
 		"clean.py",
 		"office/unpack.py",
 		"office/pack.py",
-		"office/__init__.py",
+		"office/soffice.py",
+		"office/validate.py",
+		"office/helpers/merge_runs.py",
+		"office/validators/pptx.py",
 	} {
 		if _, err := os.Stat(filepath.Join(result.ScriptsDir, filepath.FromSlash(name))); err != nil {
 			t.Fatalf("missing %s: %v (files=%d)", name, err, len(result.Files))
 		}
 	}
-	if len(result.Files) < 50 {
-		t.Fatalf("expected shared office tree merged, got %d files", len(result.Files))
+	for _, name := range []string{"editing.md", "pptxgenjs.md", "LICENSE.txt"} {
+		if _, err := os.Stat(filepath.Join(result.SkillDir, name)); err != nil {
+			t.Fatalf("missing package resource %s: %v (package_files=%d)", name, err, len(result.PackageFiles))
+		}
+	}
+	if len(result.Files) < 20 {
+		t.Fatalf("expected anthropic office tree materialized, got %d files", len(result.Files))
+	}
+	if len(result.PackageFiles) <= len(result.Files) {
+		t.Fatalf("expected full package resources in addition to scripts, files=%d package_files=%d", len(result.Files), len(result.PackageFiles))
 	}
 }
 

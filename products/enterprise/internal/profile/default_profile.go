@@ -8,7 +8,7 @@ func DefaultProfile() profilemodel.Profile {
 	return profilemodel.Profile{
 		ID:          "genesis-enterprise-default",
 		Name:        "Genesis Enterprise Default",
-		Description: "Enterprise 默认能力集；内置 Skills + run_skill_script 已接线，远程沙箱/RBAC 后续接入。",
+		Description: "Enterprise 默认能力集；内置 Skills + run_skill_command 已接线，远程沙箱/RBAC 后续接入。",
 		Scope: profilemodel.CapabilityScope{
 			Channels:     []profilemodel.ChannelType{profilemodel.ChannelEnterprise},
 			Environments: []profilemodel.RuntimeEnvironment{profilemodel.EnvironmentServer},
@@ -18,7 +18,7 @@ func DefaultProfile() profilemodel.Profile {
 				"current_time",
 				"calculator",
 				"http_request",
-				"run_skill_script",
+				"run_skill_command",
 				"install_skill_dependencies",
 				"Skill",
 				"list_skill_resources",
@@ -29,3 +29,4 @@ func DefaultProfile() profilemodel.Profile {
 		Skills: profilemodel.SkillSet{AllowImplicit: true},
 	}
 }
+

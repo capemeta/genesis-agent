@@ -28,7 +28,7 @@ products/desktop/web/.github
 .gocache
 .gomodcache
 vendor/
-
+temp-dir/
 
 
 # Go workspace file

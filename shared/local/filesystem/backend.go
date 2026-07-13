@@ -285,7 +285,13 @@ func (b *Backend) Remove(ctx context.Context, path model.ResolvedPath, opts fsco
 		return mapOSError(path.DisplayPath, err)
 	}
 	if info.IsDir() {
-		return fscontract.NewError(fscontract.ErrCodeInvalidInput, path.DisplayPath, fmt.Errorf("不能删除目录"))
+		if !opts.Recursive {
+			return fscontract.NewError(fscontract.ErrCodeInvalidInput, path.DisplayPath, fmt.Errorf("删除目录必须显式recursive"))
+		}
+		if err := os.RemoveAll(path.BackendPath); err != nil {
+			return mapOSError(path.DisplayPath, err)
+		}
+		return nil
 	}
 	if err := os.Remove(path.BackendPath); err != nil {
 		return mapOSError(path.DisplayPath, err)

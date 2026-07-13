@@ -1,308 +1,126 @@
-package service_test
+package service
 
 import (
-	"archive/zip"
 	"context"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"testing/fstest"
 
-	approvalmemory "genesis-agent/internal/capabilities/approval/adapter/memory"
-	approvalcontract "genesis-agent/internal/capabilities/approval/contract"
 	approvalmodel "genesis-agent/internal/capabilities/approval/model"
-	approvalservice "genesis-agent/internal/capabilities/approval/service"
-	execcontract "genesis-agent/internal/capabilities/execution/contract"
 	execmodel "genesis-agent/internal/capabilities/execution/model"
-	profilemodel "genesis-agent/internal/capabilities/profile/model"
+	execservice "genesis-agent/internal/capabilities/execution/service"
 	"genesis-agent/internal/capabilities/skill/adapter/embedded"
 	skillcontract "genesis-agent/internal/capabilities/skill/contract"
 	skillmodel "genesis-agent/internal/capabilities/skill/model"
 	skillparser "genesis-agent/internal/capabilities/skill/parser"
 	scriptcontract "genesis-agent/internal/capabilities/skill/script/contract"
-	scriptservice "genesis-agent/internal/capabilities/skill/script/service"
 	skillservice "genesis-agent/internal/capabilities/skill/service"
-	"genesis-agent/internal/platform/logger"
+	localexec "genesis-agent/shared/local/execution"
 )
 
-type allowPolicy struct{}
+type allowAllApproval struct{}
 
-func (allowPolicy) Evaluate(ctx context.Context, req approvalmodel.Request) (approvalmodel.PolicyResult, error) {
-	return approvalmodel.PolicyResult{Type: approvalmodel.PolicyAllow, Reason: "test allow"}, nil
+func (allowAllApproval) Authorize(context.Context, approvalmodel.Request) (approvalmodel.Decision, error) {
+	return approvalmodel.Decision{Type: approvalmodel.DecisionApproved}, nil
 }
 
-type denyRequester struct{}
-
-func (denyRequester) RequestApproval(ctx context.Context, req approvalmodel.Request, result approvalmodel.PolicyResult) (approvalmodel.Decision, error) {
-	return approvalmodel.Decision{Type: approvalmodel.DecisionDenied, Reason: "should not ask"}, nil
-}
-
-type fakeRunner struct {
-	lastCmd  execmodel.Command
-	lastOpts execcontract.RunOptions
-}
-
-func (f *fakeRunner) Run(ctx context.Context, cmd execmodel.Command, opts execcontract.RunOptions) (*execmodel.Result, error) {
-	f.lastCmd = cmd
-	f.lastOpts = opts
-	return &execmodel.Result{ExitCode: 0, Stdout: `{"ok":true}`}, nil
-}
-
-type writingFakeRunner struct{}
-
-func (writingFakeRunner) Run(ctx context.Context, cmd execmodel.Command, opts execcontract.RunOptions) (*execmodel.Result, error) {
-	path := filepath.Join(opts.Workspace.OutputDir, "fake.pptx")
-	if err := os.WriteFile(path, []byte("not a pptx"), 0o644); err != nil {
-		return nil, err
-	}
-	return &execmodel.Result{ExitCode: 0, Stdout: `{"ok":true}`}, nil
-}
-
-func TestSkillScriptServiceMaterializeAndRunLocal(t *testing.T) {
-	skillSvc := newEmbeddedSkillService(t)
-	approval := newAllowApproval(t)
-	runner := &fakeRunner{}
-	shared, err := embedded.OfficeCommonScriptsFS()
-	if err != nil {
-		t.Fatal(err)
-	}
-	svc, err := scriptservice.New(scriptservice.Deps{
-		Skills:          skillSvc,
-		Runner:          runner,
-		Approval:        approval,
-		Logger:          logger.NewNop(),
-		SharedScriptsFS: shared,
+func TestSkillCommandServiceRunsLocalSkillCommand(t *testing.T) {
+	svc := newTestService(t, fstest.MapFS{
+		"demo/SKILL.md":               {Data: []byte("---\nname: demo\ndescription: demo skill\nallowed-tools:\n  - run_skill_command\n---\nDemo")},
+		"demo/scripts/make_output.py": {Data: []byte("from pathlib import Path\nPath(\"made.txt\").write_text(\"made\", encoding=\"utf-8\")\n")},
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	root := t.TempDir()
-	input := filepath.Join(root, "sample.pptx")
-	writeMinimalPPTX(t, input)
-
-	catalog := skillcontract.CatalogRequest{Product: profilemodel.ChannelCLI}
-	result, err := svc.Run(context.Background(), scriptcontract.RunRequest{
-		Catalog:       catalog,
-		Skill:         "office-ppt",
-		Script:        "office-ppt/scripts/inspect_pptx.py",
-		Args:          []string{"sample.pptx"},
-		Inputs:        []string{input},
-		WorkspaceRoot: root,
-		// CLI 默认会带 code-polyglot-basic；SkillScript 必须按 workload 覆盖为 office-basic。
-		Sandbox: execmodel.SandboxProfile{
-			Mode:           execmodel.SandboxDisabled,
-			RuntimeProfile: execmodel.RuntimeProfileCodePolyglotBasic,
-			TaskType:       execmodel.SandboxTaskShell,
-		},
-	})
+	result, err := svc.Run(context.Background(), skillRunRequest("demo", `python scripts/make_output.py`, root))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !result.OK {
 		t.Fatalf("result=%+v", result)
 	}
-	if !strings.Contains(runner.lastCmd.Command, "inspect_pptx.py") {
-		t.Fatalf("command=%q", runner.lastCmd.Command)
+	if result.WorkDir == "" || result.SkillDir == "" {
+		t.Fatalf("missing workdir: %+v", result)
 	}
-	if runner.lastOpts.Workspace.SkillDir == "" || runner.lastOpts.Workspace.InputDir == "" {
-		t.Fatalf("workspace=%+v", runner.lastOpts.Workspace)
-	}
-	if runner.lastOpts.Sandbox.RuntimeProfile != execmodel.RuntimeProfileOfficeBasic {
-		t.Fatalf("profile=%s", runner.lastOpts.Sandbox.RuntimeProfile)
-	}
-	if runner.lastOpts.Sandbox.Metadata["source"] != "skill" {
-		t.Fatalf("metadata=%v", runner.lastOpts.Sandbox.Metadata)
+	if got := filepath.Join(result.WorkDir, "made.txt"); !containsProduced(result.Produced, "made.txt") {
+		t.Fatalf("expected produced made.txt, produced=%v path=%s", result.Produced, got)
 	}
 }
 
-func TestSkillScriptServiceRejectsInputOutsideWorkspace(t *testing.T) {
-	skillSvc := newEmbeddedSkillService(t)
-	approval := newAllowApproval(t)
-	runner := &fakeRunner{}
-	shared, err := embedded.OfficeCommonScriptsFS()
-	if err != nil {
-		t.Fatal(err)
-	}
-	svc, err := scriptservice.New(scriptservice.Deps{
-		Skills:          skillSvc,
-		Runner:          runner,
-		Approval:        approval,
-		Logger:          logger.NewNop(),
-		SharedScriptsFS: shared,
+func TestSkillCommandServiceRejectsHelperModuleEntry(t *testing.T) {
+	svc := newTestService(t, fstest.MapFS{
+		"demo/SKILL.md":                 {Data: []byte("---\nname: demo\ndescription: demo skill\nallowed-tools:\n  - run_skill_command\n---\nDemo")},
+		"demo/scripts/path_contract.py": {Data: []byte("print('bad')")},
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	parent := t.TempDir()
-	root := filepath.Join(parent, "workspace")
-	if err := os.MkdirAll(root, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	outside := filepath.Join(parent, "outside.pptx")
-	writeMinimalPPTX(t, outside)
-
-	_, err = svc.Run(context.Background(), scriptcontract.RunRequest{
-		Catalog:       skillcontract.CatalogRequest{Product: profilemodel.ChannelCLI},
-		Skill:         "office-ppt",
-		Script:        "office-ppt/scripts/inspect_pptx.py",
-		Args:          []string{"outside.pptx"},
-		Inputs:        []string{"../outside.pptx"},
-		WorkspaceRoot: root,
-		Sandbox:       execmodel.SandboxProfile{Mode: execmodel.SandboxDisabled},
-	})
-	if err == nil || !strings.Contains(err.Error(), "工作区内") {
-		t.Fatalf("err=%v, want workspace boundary error", err)
-	}
-	if runner.lastCmd.Command != "" {
-		t.Fatalf("runner should not execute, command=%q", runner.lastCmd.Command)
-	}
-}
-
-func TestSkillScriptServiceRunsNestedOfficeScript(t *testing.T) {
-	skillSvc := newEmbeddedSkillService(t)
-	approval := newAllowApproval(t)
-	runner := &fakeRunner{}
-	shared, err := embedded.OfficeCommonScriptsFS()
-	if err != nil {
-		t.Fatal(err)
-	}
-	svc, err := scriptservice.New(scriptservice.Deps{
-		Skills:          skillSvc,
-		Runner:          runner,
-		Approval:        approval,
-		Logger:          logger.NewNop(),
-		SharedScriptsFS: shared,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	root := t.TempDir()
-	input := filepath.Join(root, "sample.pptx")
-	writeMinimalPPTX(t, input)
 	result, err := svc.Run(context.Background(), scriptcontract.RunRequest{
-		Catalog:       skillcontract.CatalogRequest{Product: profilemodel.ChannelCLI},
-		Skill:         "office-ppt",
-		Script:        "office-ppt/scripts/office/unpack.py",
-		Args:          []string{"sample.pptx", "unpacked"},
-		Inputs:        []string{input},
-		WorkspaceRoot: root,
-		Sandbox:       execmodel.SandboxProfile{Mode: execmodel.SandboxDisabled},
+		Catalog:       skillcontract.CatalogRequest{},
+		Skill:         "demo",
+		Command:       "python scripts/path_contract.py",
+		WorkspaceRoot: t.TempDir(),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !result.OK {
-		t.Fatalf("result=%+v", result)
-	}
-	if !strings.Contains(runner.lastCmd.Command, "office/unpack.py") && !strings.Contains(runner.lastCmd.Command, `office\unpack.py`) {
-		t.Fatalf("expected nested relative script path, command=%q", runner.lastCmd.Command)
-	}
-	if n := result.Metadata["materialized"]; n == "" || n == "0" {
-		t.Fatalf("expected shared files materialized, metadata=%v", result.Metadata)
-	}
-}
-
-func TestSkillScriptServiceRejectsHelperModuleEntry(t *testing.T) {
-	skillSvc := newEmbeddedSkillService(t)
-	approval := newAllowApproval(t)
-	svc, err := scriptservice.New(scriptservice.Deps{
-		Skills:   skillSvc,
-		Runner:   &fakeRunner{},
-		Approval: approval,
-		Logger:   logger.NewNop(),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	result, err := svc.Run(context.Background(), scriptcontract.RunRequest{
-		Catalog: skillcontract.CatalogRequest{Product: profilemodel.ChannelCLI},
-		Skill:   "office-ppt",
-		Script:  "office-ppt/scripts/path_contract.py",
-		Args:    []string{"create", "x.pptx"},
-		Sandbox: execmodel.SandboxProfile{Mode: execmodel.SandboxDisabled},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.OK {
-		t.Fatalf("expected reject helper entry, got %+v", result)
-	}
-	if !strings.Contains(result.Error, "辅助模块") {
-		t.Fatalf("error=%q", result.Error)
-	}
-}
-
-func TestSkillScriptServiceFailsArtifactGate(t *testing.T) {
-	skillSvc := newEmbeddedSkillService(t)
-	approval := newAllowApproval(t)
-	root := t.TempDir()
-	svc, err := scriptservice.New(scriptservice.Deps{
-		Skills:   skillSvc,
-		Runner:   writingFakeRunner{},
-		Approval: approval,
-		Logger:   logger.NewNop(),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	result, err := svc.Run(context.Background(), scriptcontract.RunRequest{
-		Catalog:       skillcontract.CatalogRequest{Product: profilemodel.ChannelCLI},
-		Skill:         "office-ppt",
-		Script:        "office-ppt/scripts/inspect_pptx.py",
-		Args:          []string{"x.pptx"},
-		WorkspaceRoot: root,
-		Sandbox:       execmodel.SandboxProfile{Mode: execmodel.SandboxDisabled},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.OK {
-		t.Fatalf("expected gate failure, got %+v", result)
-	}
-	if !strings.Contains(result.Error, "artifact gate") {
+	if result.OK || !strings.Contains(result.Error, "辅助模块") {
 		t.Fatalf("result=%+v", result)
 	}
 }
 
-func newAllowApproval(t *testing.T) approvalcontract.Service {
+func TestSkillCommandServiceRejectsDependencyInstallCommand(t *testing.T) {
+	svc := newTestService(t, fstest.MapFS{
+		"demo/SKILL.md": {Data: []byte("---\nname: demo\ndescription: demo skill\nallowed-tools:\n  - run_skill_command\ndependencies:\n  runtime:\n    node:\n      - name: pptxgenjs\n        require: pptxgenjs\n---\nDemo")},
+	})
+	result, err := svc.Run(context.Background(), skillRunRequest("demo", "npm install pptxgenjs", t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.OK || result.FailureKind != "dependency_install_forbidden" {
+		t.Fatalf("result=%+v", result)
+	}
+	if result.Retryable {
+		t.Fatalf("install command should not be retried: %+v", result)
+	}
+	if len(result.Missing) != 1 || result.Missing[0].Name != "pptxgenjs" {
+		t.Fatalf("missing=%+v", result.Missing)
+	}
+}
+
+func TestSkillEnvIncludesRemoteNodeRuntimeSearchPath(t *testing.T) {
+	env := skillEnv("/workspace", "/workspace/tmp")
+	nodePath := env["NODE_PATH"]
+	for _, want := range []string{"/workspace/node_modules", "/opt/genesis-sandbox/image/node_modules"} {
+		if !strings.Contains(nodePath, want) {
+			t.Fatalf("NODE_PATH missing %q: %s", want, nodePath)
+		}
+	}
+}
+
+func skillRunRequest(skill, command, root string) scriptcontract.RunRequest {
+	return scriptcontract.RunRequest{Catalog: skillcontract.CatalogRequest{}, Skill: skill, Command: command, RunID: "test-run", WorkspaceRoot: root, Sandbox: execmodel.SandboxProfile{Mode: execmodel.SandboxDisabled}}
+}
+
+func newTestService(t *testing.T, fsys fstest.MapFS) *Service {
 	t.Helper()
-	svc, err := approvalservice.New(allowPolicy{}, denyRequester{}, approvalmemory.NewStore(), logger.NewNop())
+	source, err := embedded.NewSource(skillmodel.Authority{Kind: skillmodel.SourceKindEmbedded, ID: "test"}, skillmodel.ScopeSystem, fsys, skillparser.New())
+	if err != nil {
+		t.Fatal(err)
+	}
+	skills := skillservice.New([]skillcontract.Source{source}, skillservice.Options{})
+	runner, err := execservice.NewRunner(localexec.NewRunner(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc, err := New(Deps{Skills: skills, Runner: runner, Approval: allowAllApproval{}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return svc
 }
 
-func newEmbeddedSkillService(t *testing.T) skillcontract.Service {
-	t.Helper()
-	systemFS, err := embedded.SystemFS()
-	if err != nil {
-		t.Fatal(err)
+func containsProduced(values []string, suffix string) bool {
+	for _, value := range values {
+		if strings.HasSuffix(value, suffix) {
+			return true
+		}
 	}
-	source, err := embedded.NewSource(skillmodel.Authority{Kind: skillmodel.SourceKindEmbedded, ID: "test"}, skillmodel.ScopeSystem, systemFS, skillparser.New())
-	if err != nil {
-		t.Fatal(err)
-	}
-	return skillservice.New([]skillcontract.Source{source}, skillservice.Options{})
-}
-
-func writeMinimalPPTX(t *testing.T, path string) {
-	t.Helper()
-	f, err := os.Create(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	zw := zip.NewWriter(f)
-	w, err := zw.Create("[Content_Types].xml")
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, _ = w.Write([]byte(`<?xml version="1.0"?><Types></Types>`))
-	w, err = zw.Create("ppt/slides/slide1.xml")
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, _ = w.Write([]byte(`<sld/>`))
-	_ = zw.Close()
-	_ = f.Close()
+	return false
 }

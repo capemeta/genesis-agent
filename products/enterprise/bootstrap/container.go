@@ -218,6 +218,7 @@ func buildEnterpriseExecStack(cfg platformconfig.SandboxConfig, log logger.Logge
 	directRunner := localexec.NewRunner()
 	profile := execmodel.SandboxProfile{Mode: execmodel.SandboxDisabled}
 	var sessionClient sandboxcontract.SessionClient
+	var fileClient sandboxcontract.FileSystemClient
 	var workspaceRef sandboxcontract.WorkspaceRef
 	var sandboxRunner execcontract.SandboxRunner
 
@@ -254,6 +255,7 @@ func buildEnterpriseExecStack(cfg platformconfig.SandboxConfig, log logger.Logge
 			}
 			sandboxRunner = runner
 			sessionClient = client
+			fileClient = client
 		case "local_platform_sandbox":
 			profile.Provider = "local-platform"
 			if profile.Mode == execmodel.SandboxDisabled {
@@ -277,6 +279,7 @@ func buildEnterpriseExecStack(cfg platformconfig.SandboxConfig, log logger.Logge
 	return skillstack.ExecStack{
 		Runner:        executionRunner,
 		SessionClient: sessionClient,
+		FileClient:    fileClient,
 		WorkspaceRef:  workspaceRef,
 		Sandbox:       profile,
 	}, nil

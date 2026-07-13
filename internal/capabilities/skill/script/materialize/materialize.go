@@ -3,9 +3,7 @@ package materialize
 import (
 	"context"
 	"fmt"
-	"io/fs"
 	"os"
-	"path"
 	"path/filepath"
 	"strings"
 
@@ -15,21 +13,18 @@ import (
 
 // Result 是脚本树落盘结果。
 type Result struct {
-	SkillDir   string
-	ScriptsDir string
-	Files      []string
+	SkillDir     string
+	ScriptsDir   string
+	Files        []string // scripts/ 下的相对文件，保留给入口脚本调用方使用。
+	PackageFiles []string // skillDir 下的完整包相对文件。
 }
 
 // Materializer 将 Skill scripts/ 落到可执行目录。
 type Materializer struct {
 	Service skillcontract.Service
-	// SharedScriptsFS 可选。根为共享包的 scripts/（含 office/），合并进目标 Skill。
-	SharedScriptsFS fs.FS
-	// SharedForPrefixes 触发共享合并的 skill name 前缀，默认 office-。
-	SharedForPrefixes []string
 }
 
-// MaterializePackageScripts 把包内全部 scripts 资源写到 skillDir/scripts。
+// MaterializePackageScripts 把 Skill 包资源写到 skillDir；其中 scripts/ 文件同时记录到 Files。
 func (m *Materializer) MaterializePackageScripts(ctx context.Context, catalog skillcontract.CatalogRequest, meta model.Metadata, skillDir string) (*Result, error) {
 	if m == nil || m.Service == nil {
 		return nil, fmt.Errorf("skill service未配置")
@@ -49,47 +44,36 @@ func (m *Materializer) MaterializePackageScripts(ctx context.Context, catalog sk
 	if err := os.MkdirAll(scriptsDir, 0o755); err != nil {
 		return nil, err
 	}
-	out := &Result{SkillDir: skillDir, ScriptsDir: scriptsDir, Files: make([]string, 0)}
-	seen := map[string]struct{}{}
+	out := &Result{SkillDir: skillDir, ScriptsDir: scriptsDir, Files: make([]string, 0), PackageFiles: make([]string, 0)}
 
-	// 磁盘 Skill：若 base_directory 存在，优先复制 scripts 目录（更快且保留非 UTF-8）。
 	if base := strings.TrimSpace(meta.SourceRef["base_directory"]); base != "" {
-		srcScripts := filepath.Join(base, "scripts")
-		if info, err := os.Stat(srcScripts); err == nil && info.IsDir() {
-			if err := copyDir(srcScripts, scriptsDir); err != nil {
+		if info, err := os.Stat(base); err == nil && info.IsDir() {
+			if err := copyDir(base, skillDir); err != nil {
 				return nil, err
 			}
-			_ = filepath.Walk(scriptsDir, func(path string, info os.FileInfo, err error) error {
+			_ = filepath.Walk(skillDir, func(path string, info os.FileInfo, err error) error {
 				if err != nil || info == nil || info.IsDir() {
 					return err
 				}
-				rel, _ := filepath.Rel(scriptsDir, path)
-				relSlash := filepath.ToSlash(rel)
-				seen[relSlash] = struct{}{}
-				out.Files = append(out.Files, relSlash)
+				rel, _ := filepath.Rel(skillDir, path)
+				rel = filepath.ToSlash(rel)
+				out.PackageFiles = append(out.PackageFiles, rel)
+				if strings.HasPrefix(rel, "scripts/") {
+					out.Files = append(out.Files, strings.TrimPrefix(rel, "scripts/"))
+				}
 				return nil
 			})
-			if err := m.mergeSharedScripts(meta.Name, scriptsDir, seen, out); err != nil {
-				return nil, err
-			}
 			if len(out.Files) == 0 {
 				return nil, fmt.Errorf("skill %s 没有可 materialize 的 scripts", meta.Name)
 			}
 			return out, nil
 		}
 	}
-	useSharedOffice := m.SharedScriptsFS != nil && needsSharedOffice(meta.Name, m.SharedForPrefixes)
+
 	for _, info := range listed.Resources {
-		if info.Kind != model.ResourceKindScript {
-			continue
-		}
-		rel := strings.TrimPrefix(string(info.Resource), string(pkg)+"/scripts/")
-		rel = strings.TrimPrefix(rel, "scripts/")
-		if rel == "" || strings.Contains(rel, "..") {
-			continue
-		}
-		// 共享 office/ 由 SharedScriptsFS 二进制安全合并，避免经 UTF-8 ReadResource。
-		if useSharedOffice && (rel == "office" || strings.HasPrefix(rel, "office/")) {
+		pkgPrefix := string(pkg) + "/"
+		pkgRel := strings.TrimPrefix(string(info.Resource), pkgPrefix)
+		if pkgRel == "" || pkgRel == string(info.Resource) || unsafeMaterializedPath(pkgRel) {
 			continue
 		}
 		content, err := m.Service.ReadResource(ctx, skillcontract.ResourceRequest{
@@ -101,18 +85,17 @@ func (m *Materializer) MaterializePackageScripts(ctx context.Context, catalog sk
 		if err != nil {
 			return nil, fmt.Errorf("读取脚本资源失败 %s: %w", info.Resource, err)
 		}
-		dest := filepath.Join(scriptsDir, filepath.FromSlash(rel))
+		dest := filepath.Join(skillDir, filepath.FromSlash(pkgRel))
 		if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 			return nil, err
 		}
 		if err := os.WriteFile(dest, []byte(content.Content), 0o644); err != nil {
 			return nil, err
 		}
-		seen[rel] = struct{}{}
-		out.Files = append(out.Files, rel)
-	}
-	if err := m.mergeSharedScripts(meta.Name, scriptsDir, seen, out); err != nil {
-		return nil, err
+		out.PackageFiles = append(out.PackageFiles, pkgRel)
+		if info.Kind == model.ResourceKindScript && strings.HasPrefix(pkgRel, "scripts/") {
+			out.Files = append(out.Files, strings.TrimPrefix(pkgRel, "scripts/"))
+		}
 	}
 	if len(out.Files) == 0 {
 		return nil, fmt.Errorf("skill %s 没有可 materialize 的 scripts", meta.Name)
@@ -120,55 +103,13 @@ func (m *Materializer) MaterializePackageScripts(ctx context.Context, catalog sk
 	return out, nil
 }
 
-func (m *Materializer) mergeSharedScripts(skillName, scriptsDir string, seen map[string]struct{}, out *Result) error {
-	if m.SharedScriptsFS == nil || !needsSharedOffice(skillName, m.SharedForPrefixes) {
-		return nil
+func unsafeMaterializedPath(rel string) bool {
+	rel = filepath.ToSlash(strings.TrimSpace(rel))
+	if rel == "" || strings.HasPrefix(rel, "/") || strings.Contains(rel, ":") {
+		return true
 	}
-	return fs.WalkDir(m.SharedScriptsFS, ".", func(p string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if d.IsDir() {
-			return nil
-		}
-		rel := path.Clean(p)
-		if rel == "." || strings.Contains(rel, "..") {
-			return nil
-		}
-		if strings.Contains(rel, "__pycache__") || strings.HasSuffix(rel, ".pyc") {
-			return nil
-		}
-		if _, ok := seen[rel]; ok {
-			// Skill 包内同名文件优先，不覆盖。
-			return nil
-		}
-		data, err := fs.ReadFile(m.SharedScriptsFS, p)
-		if err != nil {
-			return fmt.Errorf("读取共享脚本失败 %s: %w", p, err)
-		}
-		dest := filepath.Join(scriptsDir, filepath.FromSlash(rel))
-		if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
-			return err
-		}
-		if err := os.WriteFile(dest, data, 0o644); err != nil {
-			return err
-		}
-		seen[rel] = struct{}{}
-		out.Files = append(out.Files, rel)
-		return nil
-	})
-}
-
-func needsSharedOffice(skillName string, prefixes []string) bool {
-	name := strings.TrimSpace(skillName)
-	if name == "" {
-		return false
-	}
-	if len(prefixes) == 0 {
-		prefixes = []string{"office-"}
-	}
-	for _, p := range prefixes {
-		if p != "" && strings.HasPrefix(name, p) {
+	for _, part := range strings.Split(rel, "/") {
+		if part == "" || part == "." || part == ".." {
 			return true
 		}
 	}

@@ -22,13 +22,13 @@ func TestNarrowToolNamesEmptyAllowedKeepsCurrent(t *testing.T) {
 }
 
 func TestNarrowToolNamesIntersectsAndKeepsMetaTools(t *testing.T) {
-	current := []string{"read_file", "write_file", "run_command", "Skill", "list_skill_resources", "run_skill_script", "install_skill_dependencies", "web_search"}
+	current := []string{"read_file", "write_file", "run_command", "Skill", "list_skill_resources", "run_skill_command", "install_skill_dependencies", "web_search"}
 	allowed := []string{"read_file", "run_command"}
 	got, ok := narrowToolNames(current, allowed)
 	if !ok {
 		t.Fatal("expected ok")
 	}
-	want := map[string]bool{"read_file": true, "run_command": true, "Skill": true, "list_skill_resources": true, "run_skill_script": true, "install_skill_dependencies": true}
+	want := map[string]bool{"read_file": true, "run_command": true, "Skill": true, "list_skill_resources": true, "run_skill_command": true, "install_skill_dependencies": true}
 	if len(got) != len(want) {
 		t.Fatalf("got=%v", got)
 	}
@@ -125,6 +125,14 @@ func TestInjectMentionedSkillsUsesExplicitLoader(t *testing.T) {
 	}
 	if len(rc.Messages) != 1 || !strings.Contains(rc.Messages[0].Content, "Manual body") {
 		t.Fatalf("messages = %+v", rc.Messages)
+	}
+}
+func TestRenderSkillInjectionAddsRuntimeBridge(t *testing.T) {
+	body := renderSkillInjection(skillInjectionOutput{QualifiedName: "third-party", Content: "Run python scripts/do_work.py"})
+	for _, want := range []string{"<skill_runtime_bridge>", "run_skill_command", "完整 Skill 包", "third-party", "不要用 run_skill_command 执行 npm install"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("missing %q in %s", want, body)
+		}
 	}
 }
 func TestRenderSkillToolAckReportsNarrowFailure(t *testing.T) {

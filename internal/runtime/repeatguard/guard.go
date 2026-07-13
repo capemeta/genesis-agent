@@ -283,7 +283,7 @@ func (g *Guard) clearDependencyMissingLocked(skill string) {
 		if st == nil || st.LastFailureKind != "dependency_missing" {
 			continue
 		}
-		// 有 skill 时：优先清匹配 skill 的条目；无 SkillHint 的 run_skill_script 也清（保守）
+		// 有 skill 时：优先清匹配 skill 的条目；无 SkillHint 的 run_skill_command 也清（保守）
 		if skill != "" {
 			if st.SkillHint != "" && !strings.EqualFold(st.SkillHint, skill) {
 				continue
@@ -441,3 +441,4 @@ func buildNoProgressJSON(stagnant int) string {
 	}
 	return string(data)
 }
+

@@ -4,7 +4,7 @@
 
 **Goal:** 打通「Skill 脚本三模式可跑 + 缺依赖结构化回传 + 显式安装后再执行」闭环，使 Agent 能看见 `dependency_missing` 并经审批安装后重跑同一脚本。
 
-**Architecture:** 统一入口仍是 `run_skill_script` → `SkillScriptService`；三模式只换 backend。依赖闭环不采用隐藏 auto-pip：先保证失败 JSON 到达模型（修 ReAct/调度丢 stdout），再落地 `install_skill_dependencies`（build profile + 审批），由 Agent 显式二次调用脚本。设计真源：`docs/Skill三模式执行与依赖闭环设计.md`（尤其 §6、§9、§14）。
+**Architecture:** 统一入口仍是 `run_skill_command` → `SkillScriptService`；三模式只换 backend。依赖闭环不采用隐藏 auto-pip：先保证失败 JSON 到达模型（修 ReAct/调度丢 stdout），再落地 `install_skill_dependencies`（build profile + 审批），由 Agent 显式二次调用脚本。设计真源：`docs/Skill三模式执行与依赖闭环设计.md`（尤其 §6、§9、§14）。
 
 **Tech Stack:** Go；既有 `skill/script`、`react`、`execution`、`approval`。
 
@@ -45,7 +45,7 @@ go test ./path/to/pkg -count=1
 | --- | --- |
 | Phase A 若同时含「失败回传 + Enterprise 全三模式 + 远程联调」，单 PR 过大、难验收 | **Gate A0** 只交付「模型看得见失败」；三模式接线分 Task，远程/Enterprise 可 stop 后开下一里程碑 |
 | 丢 stdout 有两处：`runToolCall` 返回 error，以及 `scheduler` 结果处理用 `Err` 覆盖 `Output` | Task 1 必须改 **两处**（约 `react_loop.go:450-454` 与 `:484-490` / `:564-584`） |
-| `run_skill_script` 已是 `(json, err)` 双返回，数据在；根因是 ReAct 丢弃 | Task 1 **先**验证「双返回被保留」，再扩 `failure_kind` |
+| `run_skill_command` 已是 `(json, err)` 双返回，数据在；根因是 ReAct 丢弃 | Task 1 **先**验证「双返回被保留」，再扩 `failure_kind` |
 | genesis-sandbox 镜像预装属外部仓 | Phase C 镜像项标 **External**，本仓只做契约/文档/本地 scope |
 
 ### 反思 Round 2 — 因果顺序与 YAGNI
@@ -67,7 +67,7 @@ go test ./path/to/pkg -count=1
 | `internal/runtime/strategy/react/react_loop.go` | 工具失败时保留 `Output` JSON |
 | `internal/capabilities/skill/script/contract/runner.go` | `RunResult` 增 `failure_kind` / `missing` / `suggested_*` |
 | `internal/capabilities/skill/script/service/service.go` | 解析 hint/stderr → 填充失败字段；optional 降级对齐（后续 Task） |
-| `internal/capabilities/skill/tool/run_skill_script/tool.go` | 保证 `ok=false` 仍返回完整 JSON + error |
+| `internal/capabilities/skill/tool/run_skill_command/tool.go` | 保证 `ok=false` 仍返回完整 JSON + error |
 | `internal/capabilities/skill/tool/install_skill_dependencies/` | **新建** 安装工具 |
 | `internal/capabilities/skill/model/model.go` + `parser/markdown.go` | `dependencies.runtime` |
 | `internal/runtime/strategy/react/react_loop.go`（narrow） | meta 工具含 install |
@@ -100,7 +100,7 @@ go test ./path/to/pkg -count=1
 | [ ] | P1 | `D:\workspace\go\go-project\Kode-CLI\packages\tools\src\tools\system\BashTool\executeForeground.tsx` | 非零 exit 写入 stderr 的方式 | `RunResult.Stderr` / `ExitCode` |
 | [ ] | P1 | `D:\workspace\go\go-project\Kode-CLI\packages\tools\src\tools\system\BashTool\prompt.ts` | 沙箱失败 vs 其他失败分流 | `sandbox_violation` vs `dependency_missing` |
 | [ ] | P1 | `D:\workspace\go\go-project\Kode-CLI\kode-agent-sdk\src\tools\scripts.ts` | `execute_script` 失败结构 `{ok,error,data:{stdout,stderr}}` | `script/contract.RunResult` |
-| [ ] | P1 | `D:\workspace\go\go-project\Kode-CLI\packages\tools\src\tools\interaction\SkillTool\SkillTool.tsx` | Skill 只注入、不执行脚本 | `Skill` ≠ `run_skill_script` |
+| [ ] | P1 | `D:\workspace\go\go-project\Kode-CLI\packages\tools\src\tools\interaction\SkillTool\SkillTool.tsx` | Skill 只注入、不执行脚本 | `Skill` ≠ `run_skill_command` |
 | [ ] | P1 | `D:\workspace\go\go-project\Kode-CLI\apps\cli\src\services\customCommands\discovery.ts` | `Base directory for this skill` 注入 | 保持 `SKILL_DIR`；勿退回宿主机 embed 路径 |
 
 #### Step 0b — 本仓库落点先读
@@ -108,13 +108,13 @@ go test ./path/to/pkg -count=1
 - [ ] `internal/runtime/strategy/react/react_loop.go`（`runToolCall` / `executeOneToolCall` / scheduler 结果，约 450–490、564–585）
 - [ ] `internal/capabilities/skill/script/service/service.go`
 - [ ] `internal/capabilities/skill/script/contract/runner.go`
-- [ ] `internal/capabilities/skill/tool/run_skill_script/tool.go`（约 109–116）
+- [ ] `internal/capabilities/skill/tool/run_skill_command/tool.go`（约 109–116）
 - [ ] `products/cli/bootstrap/container.go`（sandbox / SessionClient）
 - [ ] `docs/执行工作空间与Sandbox文件路径契约.md`
 
 #### Step 0c — 精读产出（写进 PR/笔记，不可空）
 
-- [ ] 断点一句话：*`run_skill_script` 返回 JSON+err，但 scheduler/`executeOneToolCall` 在 Err!=nil 时丢掉 Output*
+- [ ] 断点一句话：*`run_skill_command` 返回 JSON+err，但 scheduler/`executeOneToolCall` 在 Err!=nil 时丢掉 Output*
 - [ ] 从 Codex/Kode 各记一条「要借鉴」+ 一条「不要抄」（对齐 §14.5）
 - [ ] 勾选设计 §14.6 Phase A 四项
 
@@ -180,7 +180,7 @@ Retryable       bool              `json:"retryable,omitempty"`
 断言 `FailureKind=="dependency_missing"`、`Missing` 含 npm/pptxgenjs、`SuggestedAction=="install_then_retry"`（此时 install 工具可尚不存在，`suggested_install.tool` 可先写目标名）。
 
 - [ ] **Step 3: 在 `Service.Run` 成功收集 stdout 后**解析 hint / 常见 stderr（`ModuleNotFoundError`、`Cannot find module`）；填充字段；保持既有 `OK=false` + gate 逻辑
-- [ ] **Step 4: 确认 `run_skill_script` tool 仍 `return string(data), fmt.Errorf(msg)`**，使 Task1 能把完整 data 送出
+- [ ] **Step 4: 确认 `run_skill_command` tool 仍 `return string(data), fmt.Errorf(msg)`**，使 Task1 能把完整 data 送出
 - [ ] **Step 5: 跑** `go test ./internal/capabilities/skill/script/... ./internal/capabilities/skill/tool/... -count=1`
 - [ ] **Step 6: Commit** — `feat(skill-script): classify dependency_missing failures`
 
@@ -194,7 +194,7 @@ Retryable       bool              `json:"retryable,omitempty"`
 - Modify: `internal/capabilities/skill/adapter/embedded/skills/office-ppt/SKILL.md`
 - Modify: CLI skill prompt injector 或短硬规则（若有集中 skills_instructions；`products/cli/bootstrap/container.go` / `shared/skillstack`）
 
-- [ ] **Step 1:** SKILL 增加：若返回 `failure_kind=dependency_missing` → 安装通道（写明即将落地的工具名）→ **相同参数**再 `run_skill_script`；区分 `sandbox_violation`
+- [ ] **Step 1:** SKILL 增加：若返回 `failure_kind=dependency_missing` → 安装通道（写明即将落地的工具名）→ **相同参数**再 `run_skill_command`；区分 `sandbox_violation`
 - [ ] **Step 2:** 硬规则一句写入 skills_instructions（对齐 Codex on_request「不要先闲聊」）
 - [ ] **Step 3:** Commit — `docs(office-ppt): install_then_retry guidance`
 
@@ -292,7 +292,7 @@ Retryable       bool              `json:"retryable,omitempty"`
 - Modify: `internal/runtime/strategy/react/react_loop.go`（`narrowToolNames`）
 - Test: 既有 skill narrow 测试或新建
 
-- [ ] **Step 1: 测试** — 加载 office-ppt 后可见 `install_skill_dependencies` 与 `run_skill_script`
+- [ ] **Step 1: 测试** — 加载 office-ppt 后可见 `install_skill_dependencies` 与 `run_skill_command`
 - [ ] **Step 2: 实现并跑测；Commit** — `fix(react): keep install_skill_dependencies under skill narrow`
 
 ---
@@ -421,3 +421,4 @@ Retryable       bool              `json:"retryable,omitempty"`
 | 6–10 | §5、§6.5、§7 | Task 5 清单 |
 | 10.5 | §14.4、§14.6 C | install_system_skills；Dockerfile.secure |
 | 11–14 | §4、§5.3、§6.7–6.9、I6 | Task 10.5 + 本仓 materialize |
+

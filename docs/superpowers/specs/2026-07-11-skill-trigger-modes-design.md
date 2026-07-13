@@ -280,7 +280,7 @@ UserInput:
 | T1 mention/slash/UI | false | `Skill(name)`（可同键，策略区分） | `invocation=explicit` |
 | 未来 T2 硬注入 | false | 同上 | `invocation=router` |
 
-Codex 的 Implicit 遥测（检测到读 SKILL.md / 跑 scripts）Genesis **可不做主路径**；若要统计「模型绕过网关读资源」，可在 `read_skill_resource` / `run_skill_script` 上打点，而不是放开 read_file 主路径。
+Codex 的 Implicit 遥测（检测到读 SKILL.md / 跑 scripts）Genesis **可不做主路径**；若要统计「模型绕过网关读资源」，可在 `read_skill_resource` / `run_skill_command` 上打点，而不是放开 read_file 主路径。
 
 验收上必须检查 audit / usage 事件，而不只检查注入成功：
 
@@ -361,5 +361,6 @@ Phase C（可选）
 3. **T1 slash / UI picker 是产品体验缺口，不是协议缺口。**  
 4. **T2 硬意图匹配 Kode/Codex 都没有；Genesis 默认也不做**；若要做，只做 catalog 重排，不静默灌正文。  
 5. 实现时继续遵守：mention/slash **增强 UX，不替代** `Skill` 网关；正文单份 injection；Approval 不绕过。
+
 
 

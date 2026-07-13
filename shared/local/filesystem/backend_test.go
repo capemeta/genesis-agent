@@ -113,6 +113,23 @@ func TestBackendWalkRejectsFollowSymlinks(t *testing.T) {
 	}
 }
 
+func TestBackendRemoveDirectoryRequiresRecursive(t *testing.T) {
+	root := t.TempDir()
+	dir := resolved(root, "dir")
+	if err := os.MkdirAll(dir.BackendPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	err := New().Remove(context.Background(), dir, fscontract.RemoveOptions{})
+	if fscontract.CodeOf(err) != fscontract.ErrCodeInvalidInput {
+		t.Fatalf("Remove error code = %q, want invalid_input", fscontract.CodeOf(err))
+	}
+	if err := New().Remove(context.Background(), dir, fscontract.RemoveOptions{Recursive: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dir.BackendPath); !os.IsNotExist(err) {
+		t.Fatalf("dir still exists err=%v", err)
+	}
+}
 func TestBackendWalkRejectsExcessiveLimits(t *testing.T) {
 	root := t.TempDir()
 	_, err := New().Walk(context.Background(), resolved(root, ""), fscontract.WalkOptions{MaxDepth: 65})

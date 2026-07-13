@@ -50,7 +50,7 @@ import (
 	installskilldeps "genesis-agent/internal/capabilities/skill/tool/install_skill_dependencies"
 	listskillresources "genesis-agent/internal/capabilities/skill/tool/list_skill_resources"
 	readskillresource "genesis-agent/internal/capabilities/skill/tool/read_skill_resource"
-	runskillscript "genesis-agent/internal/capabilities/skill/tool/run_skill_script"
+	runskillcommand "genesis-agent/internal/capabilities/skill/tool/run_skill_command"
 	searchskillresources "genesis-agent/internal/capabilities/skill/tool/search_skill_resources"
 	skilltool "genesis-agent/internal/capabilities/skill/tool/skill"
 	toolcapability "genesis-agent/internal/capabilities/tool/adapter/capability"
@@ -316,19 +316,15 @@ func buildProductRuntime(ctx context.Context, configDir string, cfg *platformcon
 		_ = runtimeLogging.Close()
 		return productRuntime{}, nil, err
 	}
-	sharedScriptsFS, err := skillembedded.OfficeCommonScriptsFS()
-	if err != nil {
-		_ = runtimeLogging.Close()
-		return productRuntime{}, nil, fmt.Errorf("加载共享 office scripts失败: %w", err)
-	}
+
 	skillScriptSvc, err := scriptservice.New(scriptservice.Deps{
 		Skills:                skillSvc,
 		Runner:                execStack.Runner,
 		Approval:              baseApprovalSvc,
 		SessionClient:         execStack.SessionClient,
+		FileClient:            execStack.FileClient,
 		WorkspaceRef:          execStack.WorkspaceRef,
 		Logger:                log,
-		SharedScriptsFS:       sharedScriptsFS,
 		EnablePreflight:       cfg.Skills.EnablePreflight,
 		AutoRetryAfterInstall: cfg.Skills.AutoRetryAfterInstall,
 	})
@@ -336,7 +332,7 @@ func buildProductRuntime(ctx context.Context, configDir string, cfg *platformcon
 		_ = runtimeLogging.Close()
 		return productRuntime{}, nil, err
 	}
-	runSkillScript, err := runskillscript.New(runskillscript.Deps{
+	runSkillCommand, err := runskillcommand.New(runskillcommand.Deps{
 		Runner:         skillScriptSvc,
 		CatalogRequest: catalogReq,
 		Sandbox:        sandboxCfg.ExecutionProfile(),
@@ -358,13 +354,13 @@ func buildProductRuntime(ctx context.Context, configDir string, cfg *platformcon
 		_ = runtimeLogging.Close()
 		return productRuntime{}, nil, err
 	}
-	tools = append(tools, skillGateway, listResources, readResource, searchResources, runSkillScript, installDeps)
+	tools = append(tools, skillGateway, listResources, readResource, searchResources, runSkillCommand, installDeps)
 	skillMatcher := &skillcollision.Matcher{Service: skillSvc, CatalogRequest: catalogReq}
 	skillMentions := &react.MentionSelector{Service: skillSvc, CatalogRequest: catalogReq}
 	// system 仅短硬规则；完整 catalog 挂在 Skill 工具 DescriptionFunc。
 	injector := promptbuilder.ContextInjectorFunc(func(ctx context.Context, req promptbuilder.BuildRequest) (promptbuilder.Fragment, error) {
 		var b strings.Builder
-		b.WriteString("Skills 是任务流程包，不是可执行工具。加载技能必须调用 Skill(skill=...)；禁止把 office-ppt 等技能名当作独立工具调用。用户输入中的 $skill 或 skill:// 引用会在回合开始自动注入。可用技能列表见 Skill 工具描述中的 <available_skills>。若 run_skill_script 返回 failure_kind=dependency_missing：调用 install_skill_dependencies（须审批，仅装 runtime 白名单包）后，用相同参数再跑脚本（安装成功会清零重复失败计数）；sandbox_violation 勿当成缺包。收到 failure_kind=repeated_failure：禁止再次提交相同调用，必须改参或改策略。收到 failure_kind=no_progress：必须总结阻塞或询问用户，禁止继续空转。")
+		b.WriteString("Skills 是任务流程包，不是可执行工具。加载技能必须调用 Skill(skill=...)；禁止把 office-ppt 等技能名当作独立工具调用。用户输入中的 $skill 或 skill:// 引用会在回合开始自动注入。可用技能列表见 Skill 工具描述中的 <available_skills>。若 run_skill_command 返回 failure_kind=dependency_missing：调用 install_skill_dependencies（须审批，仅装 runtime 白名单包）后，用相同参数再跑命令（安装成功会清零重复失败计数）；sandbox_violation 勿当成缺包。收到 failure_kind=repeated_failure：禁止再次提交相同调用，必须改参或改策略。收到 failure_kind=no_progress：必须总结阻塞或询问用户，禁止继续空转。")
 		b.WriteString("\n\nRun 文件落点：中间脚本/临时文件用 write_file(\"$WORK_DIR/...\")；最终交付进 $OUTPUT_DIR；禁止写到仓库根目录。")
 		if req.Run != nil && strings.TrimSpace(req.Run.ID) != "" {
 			if ws, err := scriptworkspace.PrepareLocalTask(workspaceRoot, req.Run.ID); err == nil {
@@ -416,10 +412,11 @@ func buildBaseApprovalService(quiet bool, policyCfg platformconfig.PolicyConfig,
 	return baseApprovalSvc, nil
 }
 
-// productExecStack 是 CLI 执行栈，供 run_command 与 run_skill_script 复用。
+// productExecStack 是 CLI 执行栈，供 run_command 与 run_skill_command 复用。
 type productExecStack struct {
 	Runner        execcontract.ExecutionRunner
 	SessionClient sandboxcontract.SessionClient
+	FileClient    sandboxcontract.FileSystemClient
 	WorkspaceRef  sandboxcontract.WorkspaceRef
 }
 
@@ -441,7 +438,7 @@ func buildProductTools(sandboxCfg clisandbox.Config, baseApprovalSvc approvalcon
 		tools = append(tools, t)
 	}
 	directRunner := localexec.NewRunner()
-	sandboxRunner, sessionClient, workspaceRef, err := buildSandboxStack(directRunner, sandboxCfg)
+	sandboxRunner, sessionClient, fileClient, workspaceRef, err := buildSandboxStack(directRunner, sandboxCfg)
 	if err != nil {
 		return nil, productExecStack{}, err
 	}
@@ -479,11 +476,12 @@ func buildProductTools(sandboxCfg clisandbox.Config, baseApprovalSvc approvalcon
 	return tools, productExecStack{
 		Runner:        executionRunner,
 		SessionClient: sessionClient,
+		FileClient:    fileClient,
 		WorkspaceRef:  workspaceRef,
 	}, nil
 }
 
-func buildSandboxStack(directRunner *localexec.Runner, sandboxCfg clisandbox.Config) (execcontract.SandboxRunner, sandboxcontract.SessionClient, sandboxcontract.WorkspaceRef, error) {
+func buildSandboxStack(directRunner *localexec.Runner, sandboxCfg clisandbox.Config) (execcontract.SandboxRunner, sandboxcontract.SessionClient, sandboxcontract.FileSystemClient, sandboxcontract.WorkspaceRef, error) {
 	switch sandboxCfg.Mode {
 	case clisandbox.ModeDockerSandbox, clisandbox.ModeRemoteSandbox:
 		client, err := sandboxhttp.New(sandboxhttp.Config{
@@ -493,7 +491,7 @@ func buildSandboxStack(directRunner *localexec.Runner, sandboxCfg clisandbox.Con
 			LocalArtifactRoot: filepath.Join(".", ".genesis", "artifacts"),
 		})
 		if err != nil {
-			return nil, nil, sandboxcontract.WorkspaceRef{}, fmt.Errorf("初始化genesis-sandbox HTTP client失败: %w", err)
+			return nil, nil, nil, sandboxcontract.WorkspaceRef{}, fmt.Errorf("初始化genesis-sandbox HTTP client失败: %w", err)
 		}
 		workspaceRef := sandboxcontract.WorkspaceRef{
 			ID:       sandboxCfg.WorkspaceID,
@@ -501,17 +499,17 @@ func buildSandboxStack(directRunner *localexec.Runner, sandboxCfg clisandbox.Con
 		}
 		runner, err := execsandbox.NewRunner(client, workspaceRef)
 		if err != nil {
-			return nil, nil, sandboxcontract.WorkspaceRef{}, err
+			return nil, nil, nil, sandboxcontract.WorkspaceRef{}, err
 		}
-		return runner, client, workspaceRef, nil
+		return runner, client, client, workspaceRef, nil
 	case clisandbox.ModePlatform:
 		runner, err := localexec.NewSandboxRunner(directRunner, localexec.SandboxRunnerOptions{})
 		if err != nil {
-			return nil, nil, sandboxcontract.WorkspaceRef{}, err
+			return nil, nil, nil, sandboxcontract.WorkspaceRef{}, err
 		}
-		return runner, nil, sandboxcontract.WorkspaceRef{}, nil
+		return runner, nil, nil, sandboxcontract.WorkspaceRef{}, nil
 	default:
-		return nil, nil, sandboxcontract.WorkspaceRef{}, nil
+		return nil, nil, nil, sandboxcontract.WorkspaceRef{}, nil
 	}
 }
 

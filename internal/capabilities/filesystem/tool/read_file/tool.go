@@ -4,6 +4,7 @@ package read_file
 import (
 	"context"
 
+	"genesis-agent/internal/capabilities/filesystem/binarygate"
 	fscontract "genesis-agent/internal/capabilities/filesystem/contract"
 	"genesis-agent/internal/capabilities/filesystem/permission"
 	"genesis-agent/internal/capabilities/filesystem/tool/toolkit"
@@ -27,6 +28,9 @@ type output struct {
 	Size      int64  `json:"size"`
 	Hash      string `json:"hash"`
 	Truncated bool   `json:"truncated"`
+	Binary    bool   `json:"binary,omitempty"`
+	MIME      string `json:"mime,omitempty"`
+	Message   string `json:"message,omitempty"`
 }
 
 // New 创建 read_file 工具。
@@ -40,7 +44,7 @@ func New(deps toolkit.Deps) (tool.Tool, error) {
 func (t *Tool) GetInfo() *tool.Info {
 	return &tool.Info{
 		Name:        "read_file",
-		Description: "读取当前 workspace 内或经审批的外部文本文件。必须提供 path，可用 max_bytes 限制最大读取字节数。",
+		Description: "读取当前 workspace 内或经审批的外部文本文件。必须提供 path，可用 max_bytes 限制最大读取字节数。二进制文件只返回元信息，不返回原始内容。",
 		Parameters: &tool.ParameterSchema{
 			Type: "object",
 			Properties: map[string]*tool.ParameterSchema{
@@ -89,11 +93,19 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 			return "", err
 		}
 	}
-	return toolkit.ToJSON(output{
+	class := binarygate.ClassifyContent(path.DisplayPath, data)
+	out := output{
 		Path:      path.DisplayPath,
-		Content:   string(data),
 		Size:      stat.Size,
 		Hash:      hash,
 		Truncated: truncated,
-	})
+	}
+	if class.Binary {
+		out.Binary = true
+		out.MIME = class.MIME
+		out.Message = "read_file只返回文本内容；该文件是二进制，content已省略。请使用对应的文档/媒体检查工具处理该产物。"
+		return toolkit.ToJSON(out)
+	}
+	out.Content = string(data)
+	return toolkit.ToJSON(out)
 }

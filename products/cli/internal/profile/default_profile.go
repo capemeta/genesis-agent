@@ -27,7 +27,7 @@ func DefaultProfile() profilemodel.Profile {
 				"glob",
 				"grep",
 				"run_command",
-				"run_skill_script",
+				"run_skill_command",
 				"install_skill_dependencies",
 				"Skill",
 				"list_skill_resources",
@@ -40,3 +40,4 @@ func DefaultProfile() profilemodel.Profile {
 		Skills: profilemodel.SkillSet{AllowImplicit: true},
 	}
 }
+

@@ -158,7 +158,7 @@ else:
 | 事件 | 清零范围 |
 | --- | --- |
 | 任意 `call_key` **成功** | 该 key |
-| `install_skill_dependencies` **成功** | 所有 `last_failure_kind=dependency_missing` 的条目；若结果带 `skill`，优先清该 skill 相关 `run_skill_script` key |
+| `install_skill_dependencies` **成功** | 所有 `last_failure_kind=dependency_missing` 的条目；若结果带 `skill`，优先清该 skill 相关 `run_skill_command` key |
 | 用户 **新的批准决策**（approval granted / scope 刷新） | 与该 resource/tool 匹配的条目；保守策略可清整 Run 的 `approval_denied` |
 | 显式 `RepeatGuard.Reset(run)`（测试/运维） | 全部 |
 | 模型换了实质 args | 自然新 key，无需清零 |
@@ -219,7 +219,7 @@ L2 不替代 L1；L1 管同 key，L2 管「换 key 但仍原地打转」。
   "retryable": false,
   "suggested_action": "change_strategy_or_ask_user",
   "prior": {
-    "tool": "run_skill_script",
+    "tool": "run_skill_command",
     "failure_kind": "path_contract_violation",
     "count": 2,
     "suggested_action": "fix_script_paths",
@@ -309,7 +309,7 @@ L2 不替代 L1；L1 管同 key，L2 管「换 key 但仍原地打转」。
 
 ## 10. 验证标准（最终 DoD）
 
-1. 同 `run_skill_script` + 同 args 连续失败 2 次后，第 3 次 **不执行** 并回 `repeated_failure`。  
+1. 同 `run_skill_command` + 同 args 连续失败 2 次后，第 3 次 **不执行** 并回 `repeated_failure`。  
 2. 仅改 args（实质字段）→ 放行。  
 3. `dependency_missing` → install 成功 → 同参再跑 **放行**。  
 4. 连续微调 args 但无成功/无新 kind/无产物，达到 `MaxStagnantIterations` → 出现 `no_progress`，且不会默默烧到 max_iterations 才停（或停在 partial_complete）。  
@@ -339,3 +339,4 @@ L2 不替代 L1；L1 管同 key，L2 管「换 key 但仍原地打转」。
 3. **合法再试靠事件清零与身份变化**，不靠「默认无限重试」。  
 4. **拦截与无进展都必须结构化进入模型上下文**，并驱动 progress / 日志 /（可选）audit。  
 5. 配置落入 **RuntimePolicy**，与 `MaxConsecutiveFail` 并列，模块为 **`internal/runtime/repeatguard`**。
+

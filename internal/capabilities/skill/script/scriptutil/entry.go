@@ -6,7 +6,7 @@ import (
 	"strings"
 )
 
-// IsExecutableScriptEntry 判断 resource id / 文件名是否可作为 run_skill_script 入口。
+// IsExecutableScriptEntry 判断 resource id / 文件名是否可作为 run_skill_command 入口。
 // 辅助模块（如 path_contract.py）仍会 materialize 供 import，但禁止当作主脚本执行。
 func IsExecutableScriptEntry(resourceOrName string) bool {
 	raw := strings.TrimSpace(resourceOrName)
@@ -37,3 +37,4 @@ func IsExecutableScriptEntry(resourceOrName string) bool {
 	}
 	return true
 }
+

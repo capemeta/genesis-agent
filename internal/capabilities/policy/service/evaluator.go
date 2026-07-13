@@ -74,7 +74,7 @@ func (e *Evaluator) metadataFallback(req approvalmodel.Request) (approvalmodel.P
 		return approvalmodel.PolicyResult{Type: approvalmodel.PolicyAllow, Reason: "policy allow", Risk: riskOrDefault(req.Risk)}, true
 	}
 	// Skill 脚本执行：默认 ask，并建议 session 授权，避免同脚本每轮弹一次。
-	if metadata["skill_script"] == "true" || req.ToolName == "run_skill_script" {
+	if metadata["skill_script"] == "true" || req.ToolName == "run_skill_command" {
 		return approvalmodel.PolicyResult{
 			Type:            approvalmodel.PolicyAsk,
 			Reason:          "skill script execution requires approval",
@@ -167,3 +167,4 @@ func riskOrDefault(risk approvalmodel.RiskLevel) approvalmodel.RiskLevel {
 	}
 	return risk
 }
+

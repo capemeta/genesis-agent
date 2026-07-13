@@ -3,7 +3,6 @@ package skillstack
 import (
 	"context"
 	"fmt"
-	"io/fs"
 	"path/filepath"
 	"strings"
 
@@ -23,7 +22,7 @@ import (
 	installskilldeps "genesis-agent/internal/capabilities/skill/tool/install_skill_dependencies"
 	listskillresources "genesis-agent/internal/capabilities/skill/tool/list_skill_resources"
 	readskillresource "genesis-agent/internal/capabilities/skill/tool/read_skill_resource"
-	runskillscript "genesis-agent/internal/capabilities/skill/tool/run_skill_script"
+	runskillcommand "genesis-agent/internal/capabilities/skill/tool/run_skill_command"
 	searchskillresources "genesis-agent/internal/capabilities/skill/tool/search_skill_resources"
 	skilltool "genesis-agent/internal/capabilities/skill/tool/skill"
 	toolcontract "genesis-agent/internal/capabilities/tool/contract"
@@ -36,6 +35,7 @@ import (
 type ExecStack struct {
 	Runner        execcontract.ExecutionRunner
 	SessionClient sandboxcontract.SessionClient
+	FileClient    sandboxcontract.FileSystemClient
 	WorkspaceRef  sandboxcontract.WorkspaceRef
 	Sandbox       execmodel.SandboxProfile
 }
@@ -51,8 +51,7 @@ type Options struct {
 	EnabledSkills  []string
 	DisabledSkills []string
 	WorkspaceRoot  string // 可选；install_skill_dependencies 的 workspace cwd
-	// SharedScriptsFS 可选；默认使用 embedded OfficeCommonScriptsFS。
-	SharedScriptsFS fs.FS
+
 	// EnablePreflight / AutoRetryAfterInstall 对齐 CLI skills.* 配置（默认 false）。
 	EnablePreflight       bool
 	AutoRetryAfterInstall bool
@@ -70,7 +69,7 @@ type Stack struct {
 	CatalogRequest       skillcontract.CatalogRequest
 }
 
-// BuildEmbedded 仅装配内置 embed Skills + run_skill_script（含 SharedScriptsFS）。
+// BuildEmbedded 仅装配内置 embed Skills + run_skill_command。
 // 适用于 Enterprise 等尚未接入本地 Skill 目录/marketplace 的产品；CLI 可继续用更完整装配。
 func BuildEmbedded(opts Options) (*Stack, error) {
 	if opts.Approval == nil {
@@ -105,21 +104,14 @@ func BuildEmbedded(opts Options) (*Stack, error) {
 	}
 	skillSvc := skillservice.New([]skillcontract.Source{systemSource}, skillservice.Options{})
 
-	sharedFS := opts.SharedScriptsFS
-	if sharedFS == nil {
-		sharedFS, err = skillembedded.OfficeCommonScriptsFS()
-		if err != nil {
-			return nil, fmt.Errorf("加载共享 office scripts失败: %w", err)
-		}
-	}
 	scriptSvc, err := scriptservice.New(scriptservice.Deps{
 		Skills:                skillSvc,
 		Runner:                opts.Exec.Runner,
 		Approval:              opts.Approval,
 		SessionClient:         opts.Exec.SessionClient,
+		FileClient:            opts.Exec.FileClient,
 		WorkspaceRef:          opts.Exec.WorkspaceRef,
 		Logger:                log,
-		SharedScriptsFS:       sharedFS,
 		EnablePreflight:       opts.EnablePreflight,
 		AutoRetryAfterInstall: opts.AutoRetryAfterInstall,
 		Installer:             opts.Installer,
@@ -166,10 +158,11 @@ func BuildEmbedded(opts Options) (*Stack, error) {
 	if err != nil {
 		return nil, err
 	}
-	runSkillScript, err := runskillscript.New(runskillscript.Deps{
+	runSkillCommand, err := runskillcommand.New(runskillcommand.Deps{
 		Runner:         scriptSvc,
 		CatalogRequest: catalogReq,
 		Sandbox:        opts.Exec.Sandbox,
+		WorkspaceRoot:  opts.WorkspaceRoot,
 	})
 	if err != nil {
 		return nil, err
@@ -190,7 +183,7 @@ func BuildEmbedded(opts Options) (*Stack, error) {
 	mentions := &react.MentionSelector{Service: skillSvc, CatalogRequest: catalogReq}
 	injector := promptbuilder.ContextInjectorFunc(func(ctx context.Context, req promptbuilder.BuildRequest) (promptbuilder.Fragment, error) {
 		var b strings.Builder
-		b.WriteString("Skills 是任务流程包，不是可执行工具。加载技能必须调用 Skill(skill=...)；禁止把 office-ppt 等技能名当作独立工具调用。用户输入中的 $skill 或 skill:// 引用会在回合开始自动注入。可用技能列表见 Skill 工具描述中的 <available_skills>。若 run_skill_script 返回 failure_kind=dependency_missing：调用 install_skill_dependencies（须审批，仅装 runtime 白名单包）后，用相同参数再跑脚本（安装成功会清零重复失败计数）；sandbox_violation 勿当成缺包。收到 failure_kind=repeated_failure：禁止再次提交相同调用，必须改参或改策略。收到 failure_kind=no_progress：必须总结阻塞或询问用户，禁止继续空转。")
+		b.WriteString("Skills 是任务流程包，不是可执行工具。加载技能必须调用 Skill(skill=...)；禁止把 office-ppt 等技能名当作独立工具调用。用户输入中的 $skill 或 skill:// 引用会在回合开始自动注入。可用技能列表见 Skill 工具描述中的 <available_skills>。若 run_skill_command 返回 failure_kind=dependency_missing：调用 install_skill_dependencies（须审批，仅装 runtime 白名单包）后，用相同参数再跑命令（安装成功会清零重复失败计数）；sandbox_violation 勿当成缺包。收到 failure_kind=repeated_failure：禁止再次提交相同调用，必须改参或改策略。收到 failure_kind=no_progress：必须总结阻塞或询问用户，禁止继续空转。")
 		b.WriteString("\n\nRun 文件落点：中间脚本/临时文件用 write_file(\"$WORK_DIR/...\")；最终交付进 $OUTPUT_DIR；禁止写到仓库根目录。")
 		if req.Run != nil && strings.TrimSpace(req.Run.ID) != "" && strings.TrimSpace(opts.WorkspaceRoot) != "" {
 			if ws, err := scriptworkspace.PrepareLocalTask(opts.WorkspaceRoot, req.Run.ID); err == nil {
@@ -213,7 +206,7 @@ func BuildEmbedded(opts Options) (*Stack, error) {
 	return &Stack{
 		Service: skillSvc,
 		Tools: []toolcontract.Tool{
-			skillGateway, listResources, readResource, searchResources, runSkillScript, installDeps,
+			skillGateway, listResources, readResource, searchResources, runSkillCommand, installDeps,
 		},
 		SkillNameMatcher:     matcher,
 		SkillMentionSelector: mentions,

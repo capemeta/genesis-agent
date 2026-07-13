@@ -7,14 +7,14 @@ allowed-tools:
   - read_file
   - write_file
   - edit_file
-  - run_skill_script
+  - run_skill_command
   - list_skill_resources
   - read_skill_resource
   - search_skill_resources
 dependencies:
   tools:
     - type: tool
-      value: run_skill_script
+      value: run_skill_command
       description: 在受控执行环境中 materialize 并运行 Excel/OpenXML/LibreOffice 脚本
     - type: command
       value: python
@@ -51,7 +51,7 @@ products:
 
 ## 硬约束（必须遵守）
 
-1. **执行脚本必须用 `run_skill_script`**，不要用 `run_command` 拼 `python scripts/...`，也不要用 `python -c`。
+1. **执行脚本必须用 `run_skill_command`**，不要用 `run_command` 拼 `python scripts/...`，也不要用 `python -c`。
 2. **禁止用 `write_file` 写入 `.xlsx/.docx/.pptx/.pdf` 冒充交付物**（CSV/TSV 文本除外）。
 3. `script` 参数必须是 resource id（如 `office-excel/scripts/inspect_xlsx.py`）。
 
@@ -60,9 +60,10 @@ products:
 1. 明确输出是否必须是电子表格；如果只是分析结论，不要过度生成 xlsx。
 2. 读取 `references/validation-checklist.md`，确认公式、格式和错误检查要求。
 3. 对已有文件先运行：
-   `run_skill_script(skill="office-excel", script="office-excel/scripts/inspect_xlsx.py", args=["file.xlsx"], inputs=["path/to/file.xlsx"])`
+   `run_skill_command(skill="office-excel", script="office-excel/scripts/inspect_xlsx.py", args=["file.xlsx"], inputs=["path/to/file.xlsx"])`
 4. 公式必须用 Excel 公式表达，避免把可更新模型硬编码成静态数字。
 5. 输入文件默认从 `INPUT_DIR` 解析，只传文件名即可；最终工作簿默认写入 `OUTPUT_DIR`，不要覆盖 `INPUT_DIR` 中的原始输入。
 6. 使用公式后运行：
-   `run_skill_script(skill="office-excel", script="office-excel/scripts/recalc_xlsx.py", args=["file.xlsx"], inputs=[...])`
+   `run_skill_command(skill="office-excel", script="office-excel/scripts/recalc_xlsx.py", args=["file.xlsx"], inputs=[...])`
 7. 修改既有模板时优先保持原有样式和约定；检查返回的 `ok` 与 `artifacts`。
+

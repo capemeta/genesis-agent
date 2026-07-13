@@ -97,7 +97,7 @@ func TestSystemFSIncludesOfficeSkills(t *testing.T) {
 			if len(entry.AllowedTools) == 0 {
 				t.Fatalf("%s missing allowed tools", entry.Name)
 			}
-			if len(entry.Dependencies.Tools) == 0 {
+			if len(entry.Dependencies.Tools) == 0 && len(entry.Dependencies.Runtime.Node) == 0 && len(entry.Dependencies.Runtime.Python) == 0 && len(entry.Dependencies.Runtime.System) == 0 {
 				t.Fatalf("%s missing dependencies", entry.Name)
 			}
 		}

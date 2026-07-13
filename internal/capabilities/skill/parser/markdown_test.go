@@ -50,7 +50,7 @@ description: PPT skill
 dependencies:
   tools:
     - type: tool
-      value: run_skill_script
+      value: run_skill_command
   runtime:
     node:
       - name: pptxgenjs
@@ -83,3 +83,4 @@ Body`)
 		t.Fatalf("whitelist missing pip:pillow: %+v", wl)
 	}
 }
+

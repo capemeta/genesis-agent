@@ -31,7 +31,7 @@ func TestRunToolCallRepeatGuardBlocksThirdIdentical(t *testing.T) {
 	}}
 	rc := runtime.NewRunContext(&domain.Run{ID: "run-rg"}, agent)
 	args := `{"script":"create_pptx.js","skill":"office-ppt"}`
-	tc := domain.ToolCall{ID: "c1", Function: domain.FunctionCall{Name: "run_skill_script", Arguments: args}}
+	tc := domain.ToolCall{ID: "c1", Function: domain.FunctionCall{Name: "run_skill_command", Arguments: args}}
 
 	for i := 0; i < 2; i++ {
 		content, err := e.runToolCall(context.Background(), rc, tc, logger.NewNop())
@@ -109,3 +109,4 @@ func (f *countingFailRegistry) Execute(context.Context, string, string) (string,
 func (f *countingFailRegistry) ListInfos() []*tool.Info           { return nil }
 func (f *countingFailRegistry) FilterInfos([]string) []*tool.Info { return nil }
 func (f *countingFailRegistry) Names() []string                   { return nil }
+

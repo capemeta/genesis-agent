@@ -46,4 +46,5 @@ type MkdirOptions struct {
 // RemoveOptions 控制文件删除。
 type RemoveOptions struct {
 	ExpectedHash string
+	Recursive    bool
 }

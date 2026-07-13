@@ -15,13 +15,13 @@ This script removes:
 - Content-Type overrides for deleted files
 """
 
-import re
 import sys
 from pathlib import Path
 
 import defusedxml.minidom
 
-from path_contract import resolve_work_path
+
+import re
 
 
 def get_slides_in_sldidlst(unpacked_dir: Path) -> set[str]:
@@ -270,7 +270,7 @@ if __name__ == "__main__":
         print("Example: python clean.py unpacked/", file=sys.stderr)
         sys.exit(1)
 
-    unpacked_dir = Path(resolve_work_path(sys.argv[1]))
+    unpacked_dir = Path(sys.argv[1])
 
     if not unpacked_dir.exists():
         print(f"Error: {unpacked_dir} not found", file=sys.stderr)

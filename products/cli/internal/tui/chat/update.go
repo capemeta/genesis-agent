@@ -222,7 +222,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, spinCmd)
 	}
 
-	// Viewport 处理滚动相关事件（↑↓、PgUp/PgDn、鼠标滚轮）
+	// Viewport 处理滚动相关事件（↑↓、PgUp/PgDn）
+	// 未启用鼠标捕获，以便终端原生拖选复制；滚轮滚动不可用。
 	var vpCmd tea.Cmd
 	m.viewport, vpCmd = m.viewport.Update(msg)
 	cmds = append(cmds, vpCmd)

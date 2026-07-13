@@ -1,323 +1,130 @@
-package service_test
+package service
 
 import (
 	"context"
-	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"testing/fstest"
+	"time"
 
+	approvalmodel "genesis-agent/internal/capabilities/approval/model"
 	execcontract "genesis-agent/internal/capabilities/execution/contract"
 	execmodel "genesis-agent/internal/capabilities/execution/model"
-	profilemodel "genesis-agent/internal/capabilities/profile/model"
+	fscontract "genesis-agent/internal/capabilities/filesystem/contract"
+	fsmodel "genesis-agent/internal/capabilities/filesystem/model"
 	sandboxcontract "genesis-agent/internal/capabilities/sandbox/contract"
 	"genesis-agent/internal/capabilities/skill/adapter/embedded"
 	skillcontract "genesis-agent/internal/capabilities/skill/contract"
+	skillmodel "genesis-agent/internal/capabilities/skill/model"
+	skillparser "genesis-agent/internal/capabilities/skill/parser"
 	scriptcontract "genesis-agent/internal/capabilities/skill/script/contract"
-	scriptservice "genesis-agent/internal/capabilities/skill/script/service"
-	"genesis-agent/internal/platform/logger"
+	skillservice "genesis-agent/internal/capabilities/skill/service"
 )
 
-type recordingSession struct {
-	staged  []string
-	lastRun sandboxcontract.CommandRequest
+type fakeRemoteClient struct {
+	files       map[string][]byte
+	lastCommand execmodel.Command
+	runCount    int
 }
 
-func (s *recordingSession) StageInput(ctx context.Context, req sandboxcontract.StageInputRequest) (*sandboxcontract.StageInputResult, error) {
-	s.staged = append(s.staged, req.Name)
-	if req.Content != nil {
-		_, _ = io.Copy(io.Discard, req.Content)
+func newFakeRemoteClient() *fakeRemoteClient { return &fakeRemoteClient{files: map[string][]byte{}} }
+func (c *fakeRemoteClient) OpenSession(context.Context, sandboxcontract.SessionOptions) (sandboxcontract.SandboxSession, error) {
+	return &fakeRemoteSession{client: c}, nil
+}
+func (c *fakeRemoteClient) ReadFile(_ context.Context, req sandboxcontract.FileRequest, _ fscontract.ReadOptions) ([]byte, error) {
+	return append([]byte(nil), c.files[normalizeSlash(req.Path.WorkspaceRel)]...), nil
+}
+func (c *fakeRemoteClient) WriteFile(_ context.Context, req sandboxcontract.WriteFileRequest) error {
+	c.files[normalizeSlash(req.Path.WorkspaceRel)] = append([]byte(nil), req.Content...)
+	return nil
+}
+func (c *fakeRemoteClient) ListDir(context.Context, sandboxcontract.ListDirRequest) ([]fsmodel.DirEntry, error) {
+	return nil, nil
+}
+func (c *fakeRemoteClient) Walk(_ context.Context, req sandboxcontract.WalkRequest) (*fsmodel.WalkOutcome, error) {
+	entries := make([]fsmodel.DirEntry, 0, len(c.files))
+	modifiedAt := time.Unix(1, 0)
+	for path, data := range c.files {
+		entries = append(entries, fsmodel.DirEntry{Name: path, Path: path, Type: fsmodel.EntryTypeFile, Size: int64(len(data)), ModifiedAt: modifiedAt})
 	}
-	return &sandboxcontract.StageInputResult{
-		Artifact: execmodel.InputArtifactRef{Name: req.Name},
-	}, nil
+	return &fsmodel.WalkOutcome{Root: req.Path.WorkspaceRel, Entries: entries}, nil
 }
-
-func (s *recordingSession) Run(ctx context.Context, req sandboxcontract.CommandRequest) (*execmodel.Result, error) {
-	s.lastRun = req
-	return &execmodel.Result{ExitCode: 0, Stdout: `{"ok":true}`}, nil
-}
-
-func (s *recordingSession) Close(context.Context) error { return nil }
-
-type recordingSessionClient struct {
-	session *recordingSession
-}
-
-func (c *recordingSessionClient) OpenSession(ctx context.Context, opts sandboxcontract.SessionOptions) (sandboxcontract.SandboxSession, error) {
-	if c.session == nil {
-		c.session = &recordingSession{}
+func (c *fakeRemoteClient) Stat(_ context.Context, req sandboxcontract.FileRequest) (*fsmodel.FileStat, error) {
+	path := normalizeSlash(req.Path.WorkspaceRel)
+	data, ok := c.files[path]
+	if !ok {
+		return nil, nil
 	}
-	return c.session, nil
+	return &fsmodel.FileStat{Path: fsmodel.ResolvedPath{WorkspaceRel: path}, Type: fsmodel.EntryTypeFile, Size: int64(len(data)), ModifiedAt: time.Unix(1, 0)}, nil
 }
+func (c *fakeRemoteClient) MkdirAll(context.Context, sandboxcontract.MkdirRequest) error { return nil }
+func (c *fakeRemoteClient) Remove(context.Context, sandboxcontract.RemoveRequest) error  { return nil }
 
-type unavailableSessionClient struct{}
+type fakeRemoteSession struct{ client *fakeRemoteClient }
 
-func (unavailableSessionClient) OpenSession(ctx context.Context, opts sandboxcontract.SessionOptions) (sandboxcontract.SandboxSession, error) {
-	return nil, execcontract.NewError(execcontract.ErrCodeSandboxUnavailable, context.DeadlineExceeded)
+func (s *fakeRemoteSession) Workspace() sandboxcontract.WorkspaceRef {
+	return sandboxcontract.WorkspaceRef{ID: "session-1", Provider: "genesis-sandbox"}
 }
-
-func catalogCLI() skillcontract.CatalogRequest {
-	return skillcontract.CatalogRequest{Product: profilemodel.ChannelCLI, Environment: profilemodel.EnvironmentLocal}
+func (s *fakeRemoteSession) Run(_ context.Context, req sandboxcontract.CommandRequest) (*execmodel.Result, error) {
+	s.client.lastCommand = req.Command
+	s.client.runCount++
+	s.client.files["output.txt"] = []byte("done")
+	return &execmodel.Result{ExitCode: 0, Stdout: "ok"}, nil
 }
+func (s *fakeRemoteSession) Close(context.Context) error { return nil }
 
-func TestRemoteStageInputUsesSkillScriptsZip(t *testing.T) {
-	skillSvc := newEmbeddedSkillService(t)
-	approval := newAllowApproval(t)
-	client := &recordingSessionClient{}
-	shared, err := embedded.OfficeCommonScriptsFS()
+func TestSkillCommandServiceRunsInRemoteSessionWorkspace(t *testing.T) {
+	client := newFakeRemoteClient()
+	source, err := embedded.NewSource(skillmodel.Authority{Kind: skillmodel.SourceKindEmbedded, ID: "test"}, skillmodel.ScopeSystem, fstest.MapFS{
+		"demo/SKILL.md":                {Data: []byte("---\nname: demo\ndescription: demo skill\nallowed-tools:\n  - run_skill_command\ndependencies:\n  runtime:\n    system:\n      - name: libreoffice\n        command: soffice\n---\nDemo")},
+		"demo/scripts/make_output.cmd": {Data: []byte("@echo off\r\necho remote>output.txt\r\n")},
+	}, skillparser.New())
 	if err != nil {
 		t.Fatal(err)
 	}
-	svc, err := scriptservice.New(scriptservice.Deps{
-		Skills:          skillSvc,
-		Runner:          &fakeRunner{},
-		Approval:        approval,
-		SessionClient:   client,
-		Logger:          logger.NewNop(),
-		SharedScriptsFS: shared,
-	})
+	skills := skillservice.New([]skillcontract.Source{source}, skillservice.Options{})
+	svc, err := New(Deps{Skills: skills, Runner: nilRunner{}, Approval: allowAllApproval{}, SessionClient: client, FileClient: client, WorkspaceRef: sandboxcontract.WorkspaceRef{ID: "w1", Provider: "genesis-sandbox"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err := svc.Run(context.Background(), scriptcontract.RunRequest{
-		Catalog: catalogCLI(),
-		Skill:   "office-ppt",
-		Script:  "office-ppt/scripts/office/unpack.py",
-		Sandbox: execmodel.SandboxProfile{
-			Mode:     execmodel.SandboxRequired,
-			Provider: "genesis-sandbox",
-		},
-		WorkspaceRoot: t.TempDir(),
-	})
+	result, err := svc.Run(context.Background(), scriptcontract.RunRequest{Catalog: skillcontract.CatalogRequest{}, Skill: "demo", Command: `./scripts/make_output.cmd`, RunID: "remote-run", WorkspaceRoot: t.TempDir(), Sandbox: execmodel.SandboxProfile{Mode: execmodel.SandboxRequired, Provider: "genesis-sandbox"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result == nil || !result.OK {
+	if !result.OK {
 		t.Fatalf("result=%+v", result)
 	}
-	if client.session == nil {
-		t.Fatal("session not opened")
+	if client.lastCommand.Cwd != "/workspace" {
+		t.Fatalf("cwd=%q", client.lastCommand.Cwd)
 	}
-	found := false
-	for _, name := range client.session.staged {
-		if name == "skill-scripts-office-ppt.zip" {
-			found = true
-			break
-		}
+	if !strings.Contains(client.lastCommand.Command, "scripts") {
+		t.Fatalf("command=%q", client.lastCommand.Command)
 	}
-	if !found {
-		t.Fatalf("skill scripts zip missing; staged=%v", client.session.staged)
+	if _, ok := client.files["scripts/make_output.cmd"]; !ok {
+		t.Fatalf("materialized files=%v", client.files)
 	}
-	if result.Metadata["backend"] != "remote_session" {
-		t.Fatalf("backend=%v", result.Metadata)
+	if !containsProduced(result.Produced, "output.txt") {
+		t.Fatalf("produced=%v", result.Produced)
 	}
-}
-
-func TestRemoteSkillScriptUsesAbsoluteSandboxEntryAndScriptsCwd(t *testing.T) {
-	skillSvc := newEmbeddedSkillService(t)
-	approval := newAllowApproval(t)
-	client := &recordingSessionClient{}
-	shared, err := embedded.OfficeCommonScriptsFS()
-	if err != nil {
-		t.Fatal(err)
+	if len(result.Artifacts) != 1 || result.Artifacts[0].Name != "output.txt" || !result.Artifacts[0].OK {
+		t.Fatalf("artifacts=%+v warnings=%v", result.Artifacts, result.Warnings)
 	}
-	svc, err := scriptservice.New(scriptservice.Deps{
-		Skills:          skillSvc,
-		Runner:          &fakeRunner{},
-		Approval:        approval,
-		SessionClient:   client,
-		Logger:          logger.NewNop(),
-		SharedScriptsFS: shared,
-	})
-	if err != nil {
-		t.Fatal(err)
+	if _, err := os.Stat(result.Artifacts[0].Path); err != nil {
+		t.Fatalf("artifact not materialized locally: %v path=%q", err, result.Artifacts[0].Path)
 	}
-	result, err := svc.Run(context.Background(), scriptcontract.RunRequest{
-		Catalog:       catalogCLI(),
-		Skill:         "office-ppt",
-		Script:        "office-ppt/scripts/run_pptxgen_script.js",
-		Args:          []string{"deck_gen.js"},
-		Sandbox:       execmodel.SandboxProfile{Mode: execmodel.SandboxRequired, Provider: "genesis-sandbox"},
-		WorkspaceRoot: t.TempDir(),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result == nil || !result.OK {
-		t.Fatalf("result=%+v", result)
-	}
-	cmd := client.session.lastRun.Command
-	if !strings.Contains(cmd.Command, "/workspace/input/skill-scripts-office-ppt.zip") {
-		t.Fatalf("command should unzip staged scripts first, got %q", cmd.Command)
-	}
-	if !strings.Contains(cmd.Command, "/workspace/tmp/skills/office-ppt/scripts/run_pptxgen_script.js") {
-		t.Fatalf("command should use absolute sandbox script path, got %q", cmd.Command)
-	}
-	if cmd.Cwd != "/workspace" {
-		t.Fatalf("cwd=%q", cmd.Cwd)
-	}
-	if !strings.Contains(cmd.Command, "cd /workspace/tmp/skills/office-ppt/scripts") {
-		t.Fatalf("command should cd into scripts dir after unzip, got %q", cmd.Command)
-	}
-	if client.session.lastRun.Options.Workspace.SkillDir != "/workspace/tmp/skills/office-ppt" {
-		t.Fatalf("workspace=%+v", client.session.lastRun.Options.Workspace)
+	if !strings.Contains(filepath.ToSlash(result.Artifacts[0].Path), "/artifacts/demo/output.txt") {
+		t.Fatalf("artifact path=%q", result.Artifacts[0].Path)
 	}
 }
 
-func TestRemoteSkillScriptExposesImageNodeModules(t *testing.T) {
-	skillSvc := newEmbeddedSkillService(t)
-	approval := newAllowApproval(t)
-	client := &recordingSessionClient{}
-	shared, err := embedded.OfficeCommonScriptsFS()
-	if err != nil {
-		t.Fatal(err)
-	}
-	svc, err := scriptservice.New(scriptservice.Deps{
-		Skills:          skillSvc,
-		Runner:          &fakeRunner{},
-		Approval:        approval,
-		SessionClient:   client,
-		Logger:          logger.NewNop(),
-		SharedScriptsFS: shared,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	result, err := svc.Run(context.Background(), scriptcontract.RunRequest{
-		Catalog:       catalogCLI(),
-		Skill:         "office-ppt",
-		Script:        "office-ppt/scripts/run_pptxgen_script.js",
-		Args:          []string{"deck_gen.js"},
-		Sandbox:       execmodel.SandboxProfile{Mode: execmodel.SandboxRequired, Provider: "genesis-sandbox"},
-		WorkspaceRoot: t.TempDir(),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result == nil || !result.OK {
-		t.Fatalf("result=%+v", result)
-	}
-	env := client.session.lastRun.Command.Env
-	if !strings.Contains(env["NODE_PATH"], "/opt/genesis-sandbox/image/node_modules") {
-		t.Fatalf("NODE_PATH=%q", env["NODE_PATH"])
-	}
-	if env["PYTHONPATH"] != "/workspace/tmp/skills/office-ppt/scripts" {
-		t.Fatalf("PYTHONPATH=%q", env["PYTHONPATH"])
-	}
+type nilRunner struct{}
+
+func (nilRunner) Run(context.Context, execmodel.Command, execcontract.RunOptions) (*execmodel.Result, error) {
+	return &execmodel.Result{ExitCode: 0}, nil
 }
 
-func TestOptionalRemoteDegradesWhenSessionClientMissing(t *testing.T) {
-	skillSvc := newEmbeddedSkillService(t)
-	approval := newAllowApproval(t)
-	shared, err := embedded.OfficeCommonScriptsFS()
-	if err != nil {
-		t.Fatal(err)
-	}
-	svc, err := scriptservice.New(scriptservice.Deps{
-		Skills:          skillSvc,
-		Runner:          &fakeRunner{},
-		Approval:        approval,
-		Logger:          logger.NewNop(),
-		SharedScriptsFS: shared,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	result, err := svc.Run(context.Background(), scriptcontract.RunRequest{
-		Catalog: catalogCLI(),
-		Skill:   "office-ppt",
-		Script:  "office-ppt/scripts/inspect_pptx.py",
-		Sandbox: execmodel.SandboxProfile{
-			Mode:     execmodel.SandboxOptional,
-			Provider: "genesis-sandbox",
-		},
-		WorkspaceRoot: t.TempDir(),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.Metadata["sandbox_degraded"] != "true" || result.Metadata["backend"] != "local_degraded" {
-		t.Fatalf("metadata=%v", result.Metadata)
-	}
-	joined := strings.Join(result.Warnings, "\n")
-	if !strings.Contains(joined, "skill_script_sandbox_fallback") {
-		t.Fatalf("warnings=%v", result.Warnings)
-	}
-}
-
-func TestRequiredRemoteFailsClosedWithoutSessionClient(t *testing.T) {
-	skillSvc := newEmbeddedSkillService(t)
-	approval := newAllowApproval(t)
-	shared, err := embedded.OfficeCommonScriptsFS()
-	if err != nil {
-		t.Fatal(err)
-	}
-	svc, err := scriptservice.New(scriptservice.Deps{
-		Skills:          skillSvc,
-		Runner:          &fakeRunner{},
-		Approval:        approval,
-		Logger:          logger.NewNop(),
-		SharedScriptsFS: shared,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	result, err := svc.Run(context.Background(), scriptcontract.RunRequest{
-		Catalog: catalogCLI(),
-		Skill:   "office-ppt",
-		Script:  "office-ppt/scripts/inspect_pptx.py",
-		Sandbox: execmodel.SandboxProfile{
-			Mode:     execmodel.SandboxRequired,
-			Provider: "genesis-sandbox",
-		},
-		WorkspaceRoot: t.TempDir(),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.OK {
-		t.Fatal("expected failure")
-	}
-	if !strings.Contains(result.Error, "required") && !strings.Contains(result.Error, "SessionClient") {
-		t.Fatalf("error=%q", result.Error)
-	}
-	if result.Metadata["sandbox_degraded"] == "true" {
-		t.Fatal("required must not degrade")
-	}
-}
-
-func TestOptionalRemoteDegradesOnSandboxUnavailable(t *testing.T) {
-	skillSvc := newEmbeddedSkillService(t)
-	approval := newAllowApproval(t)
-	shared, err := embedded.OfficeCommonScriptsFS()
-	if err != nil {
-		t.Fatal(err)
-	}
-	svc, err := scriptservice.New(scriptservice.Deps{
-		Skills:          skillSvc,
-		Runner:          &fakeRunner{},
-		Approval:        approval,
-		SessionClient:   unavailableSessionClient{},
-		Logger:          logger.NewNop(),
-		SharedScriptsFS: shared,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	result, err := svc.Run(context.Background(), scriptcontract.RunRequest{
-		Catalog: catalogCLI(),
-		Skill:   "office-ppt",
-		Script:  "office-ppt/scripts/inspect_pptx.py",
-		Sandbox: execmodel.SandboxProfile{
-			Mode:     execmodel.SandboxOptional,
-			Provider: "genesis-sandbox",
-		},
-		WorkspaceRoot: t.TempDir(),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.Metadata["sandbox_degraded"] != "true" {
-		t.Fatalf("metadata=%v", result.Metadata)
-	}
+func (allowAllApproval) GetDecision(context.Context, string) (approvalmodel.Decision, bool) {
+	return approvalmodel.Decision{}, false
 }

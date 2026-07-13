@@ -63,7 +63,7 @@
                                 ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │ 4. 执行（仍是原语 Tool）                                           │
-│    模型按说明书调用 read_file / run_command / run_skill_script …   │
+│    模型按说明书调用 read_file / run_command / run_skill_command …   │
 │    Skill 调用本身 ≠ 脚本已执行                                     │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -250,7 +250,7 @@ Skill.Execute
   → React Loop：追加单份 <skill_injection> 承载正文
   → 若 allowed_tools 非空：与当前可见集求交后 Gateway.FilterInfos（只收窄不扩权）
   → 同轮若混有其他 tool call：Skill 独占轮，其余跳过
-  → 下一轮：模型按说明书调用 write_file / run_command / run_skill_script …
+  → 下一轮：模型按说明书调用 write_file / run_command / run_skill_command …
 ```
 
 补充行为：
@@ -260,7 +260,7 @@ Skill.Execute
 | `already_loaded` | 同轮/已注入技能再次 `Skill` 时去重，避免重复灌正文 |
 | Mention / `SelectForTurn` | 用户 `$skill` 可在回合开始注入；**不替代**网关，模型主动加载仍走 `Skill` |
 | `context=fork` | 元数据可声明；当前明确报错，待规范化 subagent 运行时 |
-| 脚本执行 | 走 `run_skill_script` 等原语，带 failure_kind / 依赖闭环，与「加载 Skill」分离 |
+| 脚本执行 | 走 `run_skill_command` 等原语，带 failure_kind / 依赖闭环，与「加载 Skill」分离 |
 
 关键实现：`tool/skill/tool.go`、`runtime/strategy/react/react_loop.go`、`collision/collision.go`、`mention_selector.go`。
 
@@ -287,7 +287,7 @@ Skill.Execute
 | 发现 | 模型在 `Skill` description 看到 `office-ppt`（或同类） | 模型在 developer Skills 列表看到条目 | 同 Kode：`<available_skills>` 含 `office-ppt` |
 | 选择 | `Skill(skill="office-ppt")` | 可能 `$office-ppt`，或 `read` 列表中的 path | `Skill(skill="office-ppt")`；误调 `office-ppt` 可被改写 |
 | 加载 | 注入 SKILL.md 到对话 | mention 注入或读文件结果进上下文 | Approval + Load → `<skill_injection>` |
-| 执行 | 按说明书用原语工具 | 同左 | 同左；脚本走 `run_skill_script` 等治理路径 |
+| 执行 | 按说明书用原语工具 | 同左 | 同左；脚本走 `run_skill_command` 等治理路径 |
 
 ---
 
@@ -318,3 +318,4 @@ Skill.Execute
 | `Kode-CLI/.../SkillTool/SkillTool.tsx` | Kode 参考实现 |
 | `codex-rs/core-skills/src/render.rs` | Codex How to use / catalog 渲染 |
 | `codex-rs/core-skills/src/injection.rs` | Codex mention 注入 |
+

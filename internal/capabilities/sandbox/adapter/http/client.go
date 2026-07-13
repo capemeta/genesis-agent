@@ -10,8 +10,11 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -32,6 +35,7 @@ const (
 	defaultPollMax          = 3 * time.Second
 	defaultCloseTimeout     = 30 * time.Second
 	defaultRenewTimeout     = 15 * time.Second
+	defaultSessionTTL       = 300
 )
 
 // Config 描述 genesis-sandbox HTTP client 配置。
@@ -172,59 +176,71 @@ func (c *Client) OpenSession(ctx context.Context, opts sandboxcontract.SessionOp
 	if c == nil {
 		return nil, execcontract.NewError(execcontract.ErrCodeSandboxUnavailable, fmt.Errorf("sandbox http client未初始化"))
 	}
-	req := sandboxcontract.CommandRequest{
-		Workspace: opts.Workspace,
-		Sandbox:   opts.Sandbox,
-		Options:   opts.Options,
+	progress.Emit(ctx, progress.Event{Kind: progress.KindSandbox, Phase: progress.PhaseStart, Component: "genesis-sandbox", Name: string(opts.Sandbox.RuntimeProfile), Summary: "创建 sandbox session"})
+	payload := createSessionRequestFromOptions(opts)
+	var body bytes.Buffer
+	if err := json.NewEncoder(&body).Encode(payload); err != nil {
+		return nil, execcontract.NewError(execcontract.ErrCodeInvalidInput, fmt.Errorf("编码sandbox session请求失败: %w", err))
 	}
-	lease, err := c.leaseSandbox(ctx, req)
-	if err != nil {
+	var record sessionRecord
+	if err := c.doJSON(ctx, http.MethodPost, "/v1/sessions", &body, &record); err != nil {
+		progress.Emit(ctx, progress.Event{Kind: progress.KindSandbox, Phase: progress.PhaseError, Level: progress.LevelError, Component: "genesis-sandbox", Summary: "sandbox session创建失败", Detail: err.Error()})
 		return nil, err
 	}
-	renewCtx, cancelRenew := context.WithCancel(context.Background())
-	session := &Session{
-		client:      c,
-		lease:       lease,
-		workspace:   opts.Workspace,
-		sandbox:     opts.Sandbox,
-		options:     opts.Options,
-		cancelRenew: cancelRenew,
+	if strings.TrimSpace(record.SessionID) == "" {
+		return nil, execcontract.NewError(execcontract.ErrCodeSandboxUnavailable, fmt.Errorf("sandbox session响应缺少session_id"))
 	}
-	go c.renewLoop(renewCtx, lease.SandboxID)
+	if strings.TrimSpace(record.ActiveSandboxID) == "" {
+		return nil, execcontract.NewError(execcontract.ErrCodeSandboxUnavailable, fmt.Errorf("sandbox session %s缺少active_sandbox_id", record.SessionID))
+	}
+	workspace := opts.Workspace
+	if strings.TrimSpace(workspace.ID) == "" && strings.TrimSpace(record.WorkspaceID) != "" {
+		workspace.ID = record.WorkspaceID
+	}
+	if workspace.Provider == "" {
+		workspace.Provider = "genesis-sandbox"
+	}
+	session := &Session{
+		client:    c,
+		sessionID: record.SessionID,
+		sandboxID: record.ActiveSandboxID,
+		workspace: workspace,
+		sandbox:   opts.Sandbox,
+		options:   opts.Options,
+	}
+	progress.Emit(ctx, progress.Event{Kind: progress.KindSandbox, Phase: progress.PhaseComplete, Component: "genesis-sandbox", Name: record.SessionID, Summary: "sandbox session已就绪"})
 	return session, nil
 }
 
 // Session 实现 sandbox 长会话端口。
 type Session struct {
-	client      *Client
-	lease       *sandboxLease
-	workspace   sandboxcontract.WorkspaceRef
-	sandbox     execmodel.SandboxProfile
-	options     execcontract.RunOptions
-	cancelRenew context.CancelFunc
+	client    *Client
+	sessionID string
+	sandboxID string
+	workspace sandboxcontract.WorkspaceRef
+	sandbox   execmodel.SandboxProfile
+	options   execcontract.RunOptions
 
-	mu         sync.Mutex
-	closed     bool
-	stageJobID string
+	mu     sync.Mutex
+	closed bool
 }
 
-// StageInput 上传输入文件，返回可传给后续 Run 的 input artifact。
-func (s *Session) StageInput(ctx context.Context, req sandboxcontract.StageInputRequest) (*sandboxcontract.StageInputResult, error) {
-	if s == nil || s.client == nil {
-		return nil, execcontract.NewError(execcontract.ErrCodeSandboxUnavailable, fmt.Errorf("sandbox session未初始化"))
+// Workspace 返回 session scoped WorkspaceFS 引用；ID 是 session_id，不是 workspace_id。
+func (s *Session) Workspace() sandboxcontract.WorkspaceRef {
+	metadata := map[string]string{
+		"session_id":   s.sessionID,
+		"sandbox_id":   s.sandboxID,
+		"workspace_id": s.workspace.ID,
 	}
-	jobID, err := s.ensureStageJob(ctx)
-	if err != nil {
-		return nil, err
+	for k, v := range s.workspace.Metadata {
+		if _, exists := metadata[k]; !exists {
+			metadata[k] = v
+		}
 	}
-	artifact, err := s.client.uploadJobFile(ctx, jobID, req.Name, req.Content)
-	if err != nil {
-		return nil, err
-	}
-	return &sandboxcontract.StageInputResult{Artifact: inputArtifactFromRecord(*artifact)}, nil
+	return sandboxcontract.WorkspaceRef{ID: s.sessionID, Provider: "genesis-sandbox", Metadata: metadata}
 }
 
-// Run 在当前 sandbox lease 内执行一个 job，保留 /workspace 根目录状态。
+// Run 在当前 server-side Session 内执行命令，复用 session scoped /workspace。
 func (s *Session) Run(ctx context.Context, req sandboxcontract.CommandRequest) (*execmodel.Result, error) {
 	if s == nil || s.client == nil {
 		return nil, execcontract.NewError(execcontract.ErrCodeSandboxUnavailable, fmt.Errorf("sandbox session未初始化"))
@@ -242,21 +258,47 @@ func (s *Session) Run(ctx context.Context, req sandboxcontract.CommandRequest) (
 		req.Sandbox = s.sandbox
 	}
 	req.Options = mergeRunOptions(s.options, req.Options)
-	payload := execJobRequestFromCommand(req)
-	payload.SandboxID = s.lease.SandboxID
+	sessionCwd := sandboxSessionWorkingDir(req.Command.Cwd, sandboxWorkspace(req))
+	argv := sessionCommandArgv(req)
+	if len(argv) == 0 {
+		return nil, execcontract.NewError(execcontract.ErrCodeInvalidInput, fmt.Errorf("sandbox session command不能为空"))
+	}
+	payload := execSessionRequest{Command: argv}
 	var body bytes.Buffer
 	if err := json.NewEncoder(&body).Encode(payload); err != nil {
-		return nil, execcontract.NewError(execcontract.ErrCodeInvalidInput, fmt.Errorf("编码sandbox session job请求失败: %w", err))
+		return nil, execcontract.NewError(execcontract.ErrCodeInvalidInput, fmt.Errorf("编码sandbox session exec请求失败: %w", err))
 	}
-	var job jobResult
-	if err := s.client.doJSON(ctx, http.MethodPost, "/v1/jobs", &body, &job); err != nil {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	callCtx := ctx
+	cancel := func() {}
+	if timeout := requestTimeout(req); timeout > 0 {
+		callCtx, cancel = context.WithTimeout(ctx, timeout)
+	}
+	defer cancel()
+	started := time.Now()
+	var execResult execSessionResult
+	if err := s.client.doJSON(callCtx, http.MethodPost, "/v1/sessions/"+url.PathEscape(s.sessionID)+"/exec", &body, &execResult); err != nil {
 		return nil, err
 	}
-	finalJob, err := s.client.finalJob(ctx, job, requestTimeout(req))
-	if err != nil {
-		return nil, err
+	duration := time.Since(started)
+	result := &execmodel.Result{
+		Command:         req.Command.Command,
+		Cwd:             sessionCwd,
+		Shell:           req.Command.Shell,
+		Environment:     execmodel.EnvironmentSandbox,
+		SandboxProvider: firstNonEmpty(req.Sandbox.Provider, "genesis-sandbox"),
+		ExitCode:        execResult.ExitCode,
+		Stdout:          execResult.Stdout,
+		Stderr:          execResult.Stderr,
+		Duration:        duration,
+		DurationMS:      duration.Milliseconds(),
 	}
-	return s.client.resultFromJob(ctx, req, *finalJob), nil
+	if execResult.ExitCode != 0 && strings.TrimSpace(execResult.Stderr) != "" {
+		result.Error = execResult.Stderr
+	}
+	return result, nil
 }
 
 func mergeRunOptions(base, override execcontract.RunOptions) execcontract.RunOptions {
@@ -282,7 +324,7 @@ func mergeRunOptions(base, override execcontract.RunOptions) execcontract.RunOpt
 	return out
 }
 
-// Close 停止续租并释放 sandbox；release 失败时 fallback destroy。
+// Close 删除服务端 Session，并释放其 active sandbox。
 func (s *Session) Close(ctx context.Context) error {
 	if s == nil || s.client == nil {
 		return nil
@@ -293,59 +335,14 @@ func (s *Session) Close(ctx context.Context) error {
 		return nil
 	}
 	s.closed = true
-	cancelRenew := s.cancelRenew
 	s.mu.Unlock()
-	if cancelRenew != nil {
-		cancelRenew()
+	baseCtx := context.Background()
+	if ctx != nil {
+		baseCtx = ctx
 	}
-	closeCtx, closeCancel := context.WithTimeout(context.Background(), s.client.closeTimeout)
+	closeCtx, closeCancel := context.WithTimeout(baseCtx, s.client.closeTimeout)
 	defer closeCancel()
-	return s.client.closeSandboxWithContext(closeCtx, s.lease.SandboxID)
-}
-
-func (s *Session) ensureStageJob(ctx context.Context) (string, error) {
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		return "", execcontract.NewError(execcontract.ErrCodeSandboxUnavailable, fmt.Errorf("sandbox session已关闭"))
-	}
-	if s.stageJobID != "" {
-		jobID := s.stageJobID
-		s.mu.Unlock()
-		return jobID, nil
-	}
-	s.mu.Unlock()
-
-	req := sandboxcontract.CommandRequest{
-		Workspace: s.workspace,
-		Command:   execmodel.Command{Command: "true", Shell: execmodel.ShellSh},
-		Sandbox:   s.sandbox,
-		Options:   s.options,
-	}
-	payload := execJobRequestFromCommand(req)
-	payload.SandboxID = s.lease.SandboxID
-	var body bytes.Buffer
-	if err := json.NewEncoder(&body).Encode(payload); err != nil {
-		return "", execcontract.NewError(execcontract.ErrCodeInvalidInput, fmt.Errorf("编码sandbox staging job请求失败: %w", err))
-	}
-	var job jobResult
-	if err := s.client.doJSON(ctx, http.MethodPost, "/v1/jobs", &body, &job); err != nil {
-		return "", err
-	}
-	finalJob, err := s.client.finalJob(ctx, job, requestTimeout(req))
-	if err != nil {
-		return "", err
-	}
-	if strings.TrimSpace(finalJob.JobID) == "" {
-		return "", execcontract.NewError(execcontract.ErrCodeRunnerFailed, fmt.Errorf("sandbox staging job缺少job_id"))
-	}
-	s.mu.Lock()
-	if s.stageJobID == "" {
-		s.stageJobID = finalJob.JobID
-	}
-	jobID := s.stageJobID
-	s.mu.Unlock()
-	return jobID, nil
+	return s.client.doJSON(closeCtx, http.MethodDelete, "/v1/sessions/"+url.PathEscape(s.sessionID), nil, nil)
 }
 
 func (c *Client) resultFromJob(ctx context.Context, req sandboxcontract.CommandRequest, job jobResult) *execmodel.Result {
@@ -677,6 +674,18 @@ type execJobRequest struct {
 	InputArtifactIDs        []string          `json:"input_artifact_ids,omitempty"`
 }
 
+type execSessionRequest struct {
+	Command  []string `json:"command,omitempty"`
+	Code     string   `json:"code,omitempty"`
+	Language string   `json:"language,omitempty"`
+}
+
+type execSessionResult struct {
+	ExitCode int    `json:"exit_code"`
+	Stdout   string `json:"stdout"`
+	Stderr   string `json:"stderr"`
+}
+
 type sandboxSpec struct {
 	WorkingDir string            `json:"working_dir,omitempty"`
 	Env        map[string]string `json:"env,omitempty"`
@@ -926,6 +935,91 @@ func commandArgv(cmd execmodel.Command) []string {
 	}
 }
 
+func sessionCommandArgv(req sandboxcontract.CommandRequest) []string {
+	raw := strings.TrimSpace(req.Command.Command)
+	if raw == "" {
+		return nil
+	}
+	workspace := sandboxWorkspace(req)
+	cwd := sandboxSessionWorkingDir(req.Command.Cwd, workspace)
+	env := sandboxEnv(req.Command.Env, workspace)
+	script := sessionShellScript(raw, cwd, env)
+	return []string{"sh", "-lc", script}
+}
+
+func sandboxSessionWorkingDir(commandCwd string, workspace execmodel.ExecutionWorkspace) string {
+	workDir := cleanSandboxAbsolutePath(firstNonEmpty(workspace.WorkDir, "/workspace"))
+	if workDir == "" {
+		workDir = "/workspace"
+	}
+	cwd := cleanSandboxAbsolutePath(commandCwd)
+	if cwd == workDir || strings.HasPrefix(cwd, workDir+"/") {
+		return cwd
+	}
+	return workDir
+}
+
+func cleanSandboxAbsolutePath(value string) string {
+	value = strings.TrimSpace(filepath.ToSlash(value))
+	if value == "" {
+		return ""
+	}
+	if value == "/workspace" || strings.HasPrefix(value, "/workspace/") {
+		clean := path.Clean(value)
+		if clean == "." || clean == "/" {
+			return ""
+		}
+		return clean
+	}
+	return ""
+}
+
+func sessionShellScript(command, cwd string, env map[string]string) string {
+	parts := make([]string, 0, len(env)+2)
+	if cwd != "" {
+		parts = append(parts, "cd "+shellQuote(cwd))
+	}
+	for _, key := range sortedValidEnvKeys(env) {
+		parts = append(parts, "export "+key+"="+shellQuote(env[key]))
+	}
+	parts = append(parts, command)
+	return strings.Join(parts, " && ")
+}
+
+func sortedValidEnvKeys(env map[string]string) []string {
+	keys := make([]string, 0, len(env))
+	for key := range env {
+		if isValidShellEnvKey(key) {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func isValidShellEnvKey(key string) bool {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return false
+	}
+	for i, r := range key {
+		switch {
+		case r == '_':
+		case r >= 'A' && r <= 'Z':
+		case r >= 'a' && r <= 'z':
+		case i > 0 && r >= '0' && r <= '9':
+		default:
+			return false
+		}
+	}
+	first := rune(key[0])
+	return first == '_' || (first >= 'A' && first <= 'Z') || (first >= 'a' && first <= 'z')
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", `'"'"'`) + "'"
+}
+
 func firstNonEmpty(values ...string) string {
 	for _, value := range values {
 		if strings.TrimSpace(value) != "" {
@@ -956,34 +1050,355 @@ func sanitizePathPart(value string) string {
 	return value
 }
 
-func unsupportedFileSystem(err string) error {
-	return fscontract.NewError(fscontract.ErrCodeInvalidInput, "", fmt.Errorf("genesis-sandbox HTTP workspace file API尚未暴露: %s", err))
+type createSessionRequest struct {
+	WorkspaceID    string            `json:"workspace_id,omitempty"`
+	RuntimeProfile string            `json:"runtime_profile,omitempty"`
+	StatePolicy    string            `json:"state_policy,omitempty"`
+	TTLSeconds     int               `json:"ttl_seconds,omitempty"`
+	Metadata       map[string]string `json:"metadata,omitempty"`
 }
 
-func (c *Client) ReadFile(context.Context, sandboxcontract.FileRequest, fscontract.ReadOptions) ([]byte, error) {
-	return nil, unsupportedFileSystem("read_file")
+type sessionRecord struct {
+	SessionID       string            `json:"session_id"`
+	TenantID        string            `json:"tenant_id"`
+	UserID          string            `json:"user_id,omitempty"`
+	WorkspaceID     string            `json:"workspace_id"`
+	RuntimeProfile  string            `json:"runtime_profile"`
+	StatePolicy     string            `json:"state_policy"`
+	ActiveSandboxID string            `json:"active_sandbox_id,omitempty"`
+	Status          string            `json:"status"`
+	CreatedAt       time.Time         `json:"created_at"`
+	ExpiresAt       time.Time         `json:"expires_at"`
+	Metadata        map[string]string `json:"metadata,omitempty"`
 }
 
-func (c *Client) WriteFile(context.Context, sandboxcontract.WriteFileRequest) error {
-	return unsupportedFileSystem("write_file")
+type workspaceFileInfo struct {
+	Path          string    `json:"path"`
+	ContainerPath string    `json:"container_path,omitempty"`
+	Name          string    `json:"name"`
+	Kind          string    `json:"kind"`
+	Size          int64     `json:"size,omitempty"`
+	MIME          string    `json:"mime,omitempty"`
+	ModTime       time.Time `json:"mod_time,omitempty"`
 }
 
-func (c *Client) ListDir(context.Context, sandboxcontract.ListDirRequest) ([]fsmodel.DirEntry, error) {
-	return nil, unsupportedFileSystem("list_dir")
+type workspaceListResult struct {
+	Path      string              `json:"path"`
+	Entries   []workspaceFileInfo `json:"entries"`
+	Truncated bool                `json:"truncated"`
+	Limit     int                 `json:"limit"`
 }
 
-func (c *Client) Walk(context.Context, sandboxcontract.WalkRequest) (*fsmodel.WalkOutcome, error) {
-	return nil, unsupportedFileSystem("walk")
+func createSessionRequestFromOptions(opts sandboxcontract.SessionOptions) createSessionRequest {
+	ttl := defaultSessionTTL
+	if opts.Options.Timeout > 0 {
+		seconds := int(opts.Options.Timeout.Seconds())
+		if seconds > ttl {
+			ttl = seconds
+		}
+	}
+	metadata := map[string]string{}
+	for k, v := range opts.Sandbox.Metadata {
+		metadata[k] = v
+	}
+	for k, v := range opts.Workspace.Metadata {
+		if _, exists := metadata[k]; !exists {
+			metadata[k] = v
+		}
+	}
+	return createSessionRequest{
+		WorkspaceID:    firstNonEmpty(opts.Workspace.ID, opts.Sandbox.WorkspaceID),
+		RuntimeProfile: string(opts.Sandbox.RuntimeProfile),
+		StatePolicy:    "session",
+		TTLSeconds:     ttl,
+		Metadata:       metadata,
+	}
 }
 
-func (c *Client) Stat(context.Context, sandboxcontract.FileRequest) (*fsmodel.FileStat, error) {
-	return nil, unsupportedFileSystem("stat")
+func (c *Client) ReadFile(ctx context.Context, req sandboxcontract.FileRequest, opts fscontract.ReadOptions) ([]byte, error) {
+	sessionID, workspacePath, err := sessionFileTarget(req.Workspace, req.Path)
+	if err != nil {
+		return nil, err
+	}
+	query := url.Values{}
+	query.Set("path", workspacePath)
+	resp, err := c.doRaw(ctx, http.MethodGet, "/v1/sessions/"+url.PathEscape(sessionID)+"/files", query, "", nil)
+	if err != nil {
+		return nil, fsErrorFromExec(err, workspacePath)
+	}
+	defer resp.Body.Close()
+	reader := io.Reader(resp.Body)
+	if opts.MaxBytes > 0 {
+		reader = io.LimitReader(resp.Body, opts.MaxBytes+1)
+	}
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, fscontract.NewError(fscontract.ErrCodeInvalidInput, workspacePath, fmt.Errorf("读取sandbox session文件失败: %w", err))
+	}
+	if opts.MaxBytes > 0 && int64(len(data)) > opts.MaxBytes {
+		return nil, fscontract.NewError(fscontract.ErrCodeTooLarge, workspacePath, fmt.Errorf("文件超过读取上限: %d", opts.MaxBytes))
+	}
+	return data, nil
 }
 
-func (c *Client) MkdirAll(context.Context, sandboxcontract.MkdirRequest) error {
-	return unsupportedFileSystem("mkdir")
+func (c *Client) WriteFile(ctx context.Context, req sandboxcontract.WriteFileRequest) error {
+	sessionID, workspacePath, err := sessionFileTarget(req.Workspace, req.Path)
+	if err != nil {
+		return err
+	}
+	if !req.Options.Overwrite {
+		if _, err := c.Stat(ctx, sandboxcontract.FileRequest{Workspace: req.Workspace, Path: req.Path}); err == nil {
+			return fscontract.NewError(fscontract.ErrCodeAlreadyExists, workspacePath, fmt.Errorf("目标文件已存在"))
+		} else if fscontract.CodeOf(err) != fscontract.ErrCodeNotFound {
+			return err
+		}
+	}
+	query := url.Values{}
+	query.Set("path", workspacePath)
+	resp, err := c.doRaw(ctx, http.MethodPut, "/v1/sessions/"+url.PathEscape(sessionID)+"/files", query, "application/octet-stream", bytes.NewReader(req.Content))
+	if err != nil {
+		return fsErrorFromExec(err, workspacePath)
+	}
+	defer resp.Body.Close()
+	return nil
 }
 
-func (c *Client) Remove(context.Context, sandboxcontract.RemoveRequest) error {
-	return unsupportedFileSystem("remove")
+func (c *Client) ListDir(ctx context.Context, req sandboxcontract.ListDirRequest) ([]fsmodel.DirEntry, error) {
+	sessionID, workspacePath, err := sessionFileTarget(req.Workspace, req.Path)
+	if err != nil {
+		return nil, err
+	}
+	query := url.Values{}
+	query.Set("path", workspacePath)
+	query.Set("recursive", "false")
+	if req.Options.MaxEntries > 0 {
+		query.Set("limit", strconv.Itoa(req.Options.MaxEntries))
+	}
+	var result workspaceListResult
+	if err := c.doSessionJSON(ctx, http.MethodGet, "/v1/sessions/"+url.PathEscape(sessionID)+"/files:list", query, nil, &result); err != nil {
+		return nil, fsErrorFromExec(err, workspacePath)
+	}
+	return dirEntriesFromWorkspace(result.Entries), nil
+}
+
+func (c *Client) Walk(ctx context.Context, req sandboxcontract.WalkRequest) (*fsmodel.WalkOutcome, error) {
+	sessionID, workspacePath, err := sessionFileTarget(req.Workspace, req.Path)
+	if err != nil {
+		return nil, err
+	}
+	query := url.Values{}
+	query.Set("path", workspacePath)
+	query.Set("recursive", "true")
+	if req.Options.MaxEntries > 0 {
+		query.Set("limit", strconv.Itoa(req.Options.MaxEntries))
+	}
+	var result workspaceListResult
+	if err := c.doSessionJSON(ctx, http.MethodGet, "/v1/sessions/"+url.PathEscape(sessionID)+"/files:list", query, nil, &result); err != nil {
+		return nil, fsErrorFromExec(err, workspacePath)
+	}
+	entries := dirEntriesFromWorkspace(result.Entries)
+	out := &fsmodel.WalkOutcome{Root: workspacePath, Entries: entries, Truncated: result.Truncated}
+	for _, entry := range entries {
+		if entry.Type == fsmodel.EntryTypeDir {
+			out.DirsSeen++
+		} else {
+			out.FilesSeen++
+			out.BytesSeen += entry.Size
+		}
+	}
+	if result.Truncated {
+		out.LimitCause = "max_entries"
+	}
+	return out, nil
+}
+
+func (c *Client) Stat(ctx context.Context, req sandboxcontract.FileRequest) (*fsmodel.FileStat, error) {
+	sessionID, workspacePath, err := sessionFileTarget(req.Workspace, req.Path)
+	if err != nil {
+		return nil, err
+	}
+	query := url.Values{}
+	query.Set("path", workspacePath)
+	var info workspaceFileInfo
+	if err := c.doSessionJSON(ctx, http.MethodGet, "/v1/sessions/"+url.PathEscape(sessionID)+"/files:stat", query, nil, &info); err != nil {
+		return nil, fsErrorFromExec(err, workspacePath)
+	}
+	stat := fileStatFromWorkspace(info, req.Path)
+	return &stat, nil
+}
+
+func (c *Client) MkdirAll(ctx context.Context, req sandboxcontract.MkdirRequest) error {
+	sessionID, workspacePath, err := sessionFileTarget(req.Workspace, req.Path)
+	if err != nil {
+		return err
+	}
+	query := url.Values{}
+	query.Set("path", workspacePath)
+	if req.Options.Parents {
+		query.Set("parents", "true")
+	}
+	if err := c.doSessionJSON(ctx, http.MethodPost, "/v1/sessions/"+url.PathEscape(sessionID)+"/dirs", query, nil, nil); err != nil {
+		return fsErrorFromExec(err, workspacePath)
+	}
+	return nil
+}
+
+func (c *Client) Remove(ctx context.Context, req sandboxcontract.RemoveRequest) error {
+	sessionID, workspacePath, err := sessionFileTarget(req.Workspace, req.Path)
+	if err != nil {
+		return err
+	}
+	query := url.Values{}
+	query.Set("path", workspacePath)
+	query.Set("recursive", strconv.FormatBool(req.Options.Recursive))
+	if err := c.doSessionJSON(ctx, http.MethodDelete, "/v1/sessions/"+url.PathEscape(sessionID)+"/files", query, nil, nil); err != nil {
+		return fsErrorFromExec(err, workspacePath)
+	}
+	return nil
+}
+
+func (c *Client) doSessionJSON(ctx context.Context, method, apiPath string, query url.Values, body io.Reader, out any) error {
+	resp, err := c.doRaw(ctx, method, apiPath, query, "application/json", body)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if out == nil {
+		return nil
+	}
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		return execcontract.NewError(execcontract.ErrCodeRunnerFailed, fmt.Errorf("解析sandbox session文件响应失败: %w", err))
+	}
+	return nil
+}
+
+func (c *Client) doRaw(ctx context.Context, method, apiPath string, query url.Values, contentType string, body io.Reader) (*http.Response, error) {
+	endpoint := c.baseURL.ResolveReference(&url.URL{Path: strings.TrimRight(c.baseURL.Path, "/") + apiPath, RawQuery: query.Encode()})
+	req, err := http.NewRequestWithContext(ctx, method, endpoint.String(), body)
+	if err != nil {
+		return nil, execcontract.NewError(execcontract.ErrCodeInvalidInput, fmt.Errorf("创建sandbox http请求失败: %w", err))
+	}
+	req.Header.Set("Accept", "application/json")
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	if c.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, execcontract.NewError(execcontract.ErrCodeSandboxUnavailable, fmt.Errorf("调用sandbox http失败: %w", err))
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		defer resp.Body.Close()
+		return nil, mapHTTPError(resp)
+	}
+	return resp, nil
+}
+
+func sessionFileTarget(workspace sandboxcontract.WorkspaceRef, resolved fsmodel.ResolvedPath) (string, string, error) {
+	sessionID := strings.TrimSpace(workspace.Metadata["session_id"])
+	if sessionID == "" {
+		sessionID = strings.TrimSpace(workspace.ID)
+	}
+	if sessionID == "" {
+		return "", "", fscontract.NewError(fscontract.ErrCodeInvalidInput, "", fmt.Errorf("sandbox session id不能为空"))
+	}
+	workspacePath, err := cleanWorkspacePath(firstNonEmpty(resolved.WorkspaceRel, resolved.BackendPath, resolved.DisplayPath, resolved.RawPath))
+	if err != nil {
+		return "", "", err
+	}
+	return sessionID, workspacePath, nil
+}
+
+func cleanWorkspacePath(raw string) (string, error) {
+	p := strings.TrimSpace(filepath.ToSlash(raw))
+	if p == "" || p == "." {
+		return ".", nil
+	}
+	if strings.HasPrefix(p, "/workspace/") {
+		p = strings.TrimPrefix(p, "/workspace/")
+	} else if p == "/workspace" {
+		return ".", nil
+	} else if strings.HasPrefix(p, "/") {
+		return "", fscontract.NewError(fscontract.ErrCodeInvalidPath, raw, fmt.Errorf("sandbox session文件路径必须是workspace相对路径或/workspace内路径"))
+	}
+	if strings.Contains(p, ":") {
+		return "", fscontract.NewError(fscontract.ErrCodeInvalidPath, raw, fmt.Errorf("sandbox session文件路径不能是宿主绝对路径"))
+	}
+	for _, segment := range strings.Split(p, "/") {
+		if segment == ".." {
+			return "", fscontract.NewError(fscontract.ErrCodeInvalidPath, raw, fmt.Errorf("sandbox session文件路径不能包含.."))
+		}
+	}
+	clean := path.Clean("/" + p)
+	clean = strings.TrimPrefix(clean, "/")
+	if clean == "" || clean == "." {
+		return ".", nil
+	}
+	return clean, nil
+}
+func dirEntriesFromWorkspace(in []workspaceFileInfo) []fsmodel.DirEntry {
+	out := make([]fsmodel.DirEntry, 0, len(in))
+	for _, info := range in {
+		out = append(out, fsmodel.DirEntry{
+			Name:       firstNonEmpty(info.Name, path.Base(info.Path)),
+			Path:       info.Path,
+			Type:       entryTypeFromKind(info.Kind),
+			Size:       info.Size,
+			ModifiedAt: info.ModTime,
+		})
+	}
+	return out
+}
+
+func fileStatFromWorkspace(info workspaceFileInfo, resolved fsmodel.ResolvedPath) fsmodel.FileStat {
+	return fsmodel.FileStat{
+		Path:       resolved,
+		Type:       entryTypeFromKind(info.Kind),
+		Size:       info.Size,
+		ModifiedAt: info.ModTime,
+	}
+}
+
+func entryTypeFromKind(kind string) fsmodel.EntryType {
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case "file":
+		return fsmodel.EntryTypeFile
+	case "dir", "directory":
+		return fsmodel.EntryTypeDir
+	case "symlink", "link":
+		return fsmodel.EntryTypeSymlink
+	default:
+		return fsmodel.EntryTypeOther
+	}
+}
+
+func fsErrorFromExec(err error, workspacePath string) error {
+	if err == nil {
+		return nil
+	}
+	if isNotFoundExecError(err) {
+		return fscontract.NewError(fscontract.ErrCodeNotFound, workspacePath, err)
+	}
+	switch execcontract.CodeOf(err) {
+	case execcontract.ErrCodePermissionDenied:
+		return fscontract.NewError(fscontract.ErrCodePermissionDenied, workspacePath, err)
+	case execcontract.ErrCodeInvalidInput:
+		return fscontract.NewError(fscontract.ErrCodeInvalidPath, workspacePath, err)
+	default:
+		return fscontract.NewError(fscontract.ErrCodeInvalidInput, workspacePath, err)
+	}
+}
+
+func isNotFoundExecError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "not found") ||
+		strings.Contains(msg, "no such") ||
+		strings.Contains(msg, "could not find the file") ||
+		strings.Contains(msg, "cannot find the file") ||
+		strings.Contains(msg, "404")
 }

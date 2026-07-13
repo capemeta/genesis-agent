@@ -20,7 +20,7 @@
 | R3 | 仓库根残留 `deck_gen.js` 非最佳实践 | 中间脚本强制 `$WORK_DIR`；提示词注入本 Run 逻辑目录 |
 | R1 | 多份 specs 互相矛盾（JSON 版仍自称最终版） | 本文标权威；旧稿标废止 |
 | R2 | `require(user.js)` 有模块缓存，改文件再跑可能脏 | runner 用 **每次新 `node` 进程** 执行 staged 脚本 |
-| R2 | 迁移文仍写 `run_skill_script`/`run_command` 并列 | 产品主路径只认固定 ResourceID runner；`run_command` 不写进 SKILL 默认 |
+| R2 | 迁移文仍写 `run_skill_command`/`run_command` 并列 | 产品主路径只认固定 ResourceID runner；`run_command` 不写进 SKILL 默认 |
 
 **可选 polish**：JSON deck 辅路径整段可从实施切片删除以免复发（本文仍保留「明确不做默认」一句）。  
 **残余风险**：模型写烂 pptxgen / 同级代码执行面——与 Anthropic 相同，靠 QA + 审批，不靠 DSL 假装更安全。
@@ -46,9 +46,9 @@ Anthropic 已验证的方法是「模型写完整 pptxgen 脚本 + 直接用 Nod
 
 | 约束 | 含义 | 正确适配 |
 | --- | --- | --- |
-| I2 | 业务入口 = `run_skill_script(ResourceID)` | 固定 `run_pptxgen_script.js`，内部 `node` 跑用户脚本 |
+| I2 | 业务入口 = `run_skill_command(ResourceID)` | 固定 `run_pptxgen_script.js`，内部 `node` 跑用户脚本 |
 | I1 | 逻辑目录 | 用户脚本经 `inputs` → `INPUT_DIR`；产物 → `OUTPUT_DIR` |
-| 审批/审计 | 可追踪 | 仍走 `run_skill_script`，不另开裸 `run_command` 主路径 |
+| 审批/审计 | 可追踪 | 仍走 `run_skill_command`，不另开裸 `run_command` 主路径 |
 | Windows argv | 中文易坏 | 文案写在 **JS 源文件**（UTF-8），不进 `args[]` |
 
 ### 1.4 失败条件
@@ -67,14 +67,14 @@ Anthropic 已验证的方法是「模型写完整 pptxgen 脚本 + 直接用 Nod
 | --- | --- |
 | 读 `pptxgenjs.md` | 同（保留主教程） |
 | 写出 `foo.js`（顶层脚本） | `write_file("$WORK_DIR/deck_gen.js")`（本 Run work；禁止仓库根） |
-| `node foo.js` | `run_skill_script(script=run_pptxgen_script.js, args=["deck_gen.js"], inputs=["$WORK_DIR/deck_gen.js"])` |
+| `node foo.js` | `run_skill_command(script=run_pptxgen_script.js, args=["deck_gen.js"], inputs=["$WORK_DIR/deck_gen.js"])` |
 | 写 `Presentation.pptx` | 写 `path.join(process.env.OUTPUT_DIR, "….pptx")` |
 | thumbnail / 目视 QA | `inspect` / `thumbnail` / checklist（`inputs` 可指本 Run 产物） |
 
 ```text
 1. 读 references/pptxgenjs.md
 2. write_file("$WORK_DIR/deck_gen.js")   # 顶层脚本；落本 Run work，禁止仓库根
-3. run_skill_script(
+3. run_skill_command(
      script = "office-ppt/scripts/run_pptxgen_script.js",
      args   = ["deck_gen.js"],
      inputs = ["$WORK_DIR/deck_gen.js"]
@@ -118,7 +118,7 @@ Runner 职责：
 ```text
 ## Genesis 执行方式（替代直接 node / bash）
 1. write_file("$WORK_DIR/your_script.js")（禁止写仓库根）
-2. run_skill_script(
+2. run_skill_command(
      script="office-ppt/scripts/run_pptxgen_script.js",
      args=["your_script.js"],
      inputs=["$WORK_DIR/your_script.js"])
@@ -206,3 +206,4 @@ Runner 职责：
 - 劣质 pptxgen / 视觉问题：与 Anthropic 相同，靠 thumbnail/inspect 迭代。  
 - 用户脚本与 Skill 脚本同级执行面：靠 sandbox + 审批，不靠换 DSL。  
 - 模型仍可能误写仓库根：靠 SKILL + 提示词 + `write_file` 描述约束；PathResolver 对 `$WORK_DIR` 强制进本 Run。
+

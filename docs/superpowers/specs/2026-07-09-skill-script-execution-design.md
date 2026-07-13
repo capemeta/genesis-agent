@@ -13,7 +13,7 @@
 
 ## 入口
 
-新增工具 `run_skill_script`：
+新增工具 `run_skill_command`：
 
 ```text
 skill + script(ResourceID) + args[] + inputs[]
@@ -53,7 +53,8 @@ skill + script(ResourceID) + args[] + inputs[]
 | Workspace | `internal/capabilities/skill/script/workspace` |
 | Gate | `internal/capabilities/skill/script/gate` |
 | Service | `internal/capabilities/skill/script/service` |
-| Tool | `internal/capabilities/skill/tool/run_skill_script` |
+| Tool | `internal/capabilities/skill/tool/run_skill_command` |
 | CLI 接线 | `products/cli/bootstrap/container.go` |
 | 共享装配 | `shared/skillstack`（embed Skills + SharedScriptsFS） |
 | Enterprise 接线 | `products/enterprise/bootstrap/container.go` |
+

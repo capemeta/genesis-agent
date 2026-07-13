@@ -3,6 +3,7 @@ package service
 import (
 	"testing"
 
+	skillmodel "genesis-agent/internal/capabilities/skill/model"
 	scriptcontract "genesis-agent/internal/capabilities/skill/script/contract"
 )
 
@@ -144,8 +145,19 @@ func TestClassifyFailureRunnerErrorWithoutExitCode(t *testing.T) {
 		Error: "dial tcp: connection refused",
 	}
 	classifyFailure(out)
-	if out.FailureKind != "script_error" {
-		t.Fatalf("FailureKind=%q, want script_error for zero exit_code failures", out.FailureKind)
+	if out.FailureKind != "sandbox_unavailable" || out.SuggestedAction != "stop_and_report_sandbox_unavailable" || out.Retryable {
+		t.Fatalf("FailureKind=%q action=%q retryable=%v", out.FailureKind, out.SuggestedAction, out.Retryable)
+	}
+}
+
+func TestClassifyFailureDockerCreateErrorIsSandboxUnavailable(t *testing.T) {
+	out := &scriptcontract.RunResult{
+		OK:    false,
+		Error: `runner_failed: 创建沙箱失败: 创建 Docker 容器失败: Error response from daemon: .sandbox\workspaces\tenant-1\ws-1 is not a valid Windows path`,
+	}
+	classifyFailure(out)
+	if out.FailureKind != "sandbox_unavailable" {
+		t.Fatalf("FailureKind=%q action=%q", out.FailureKind, out.SuggestedAction)
 	}
 }
 
@@ -201,5 +213,55 @@ func TestClassifyFailureSystemOnly(t *testing.T) {
 	}
 	if out.SuggestedInstall != nil && out.SuggestedInstall.Tool != "" {
 		t.Fatalf("must not suggest install tool for system-only: %+v", out.SuggestedInstall)
+	}
+}
+func TestClassifyFailureForSkillDoesNotSuggestInstallForUndeclaredRuntime(t *testing.T) {
+	out := &scriptcontract.RunResult{
+		OK:       false,
+		Skill:    "office-ppt",
+		Script:   "office-ppt/scripts/run_pptxgen_script.js",
+		Stderr:   `Error: Cannot find module 'react'`,
+		ExitCode: 1,
+	}
+	deps := skillmodel.Dependencies{Runtime: skillmodel.RuntimeDeps{Node: []skillmodel.RuntimePackage{{Name: "pptxgenjs", Require: "pptxgenjs"}}}}
+	classifyFailureForSkill(out, deps)
+	if out.FailureKind != "dependency_missing" {
+		t.Fatalf("FailureKind=%q", out.FailureKind)
+	}
+	if out.SuggestedInstall != nil {
+		t.Fatalf("undeclared dependency must not suggest install: %+v", out.SuggestedInstall)
+	}
+	if out.SuggestedAction != "rewrite_script_use_declared_dependencies" || !out.Retryable {
+		t.Fatalf("action=%q retryable=%v", out.SuggestedAction, out.Retryable)
+	}
+}
+
+func TestClassifyFailureForSkillAllowsDeclaredRuntimeInstall(t *testing.T) {
+	out := &scriptcontract.RunResult{
+		OK:       false,
+		Skill:    "office-ppt",
+		Script:   "office-ppt/scripts/run_pptxgen_script.js",
+		Stderr:   `Error: Cannot find module 'pptxgenjs'`,
+		ExitCode: 1,
+	}
+	deps := skillmodel.Dependencies{Runtime: skillmodel.RuntimeDeps{Node: []skillmodel.RuntimePackage{{Name: "pptxgenjs", Require: "pptxgenjs"}}}}
+	classifyFailureForSkill(out, deps)
+	if out.SuggestedInstall == nil || out.SuggestedInstall.Tool != "install_skill_dependencies" {
+		t.Fatalf("declared dependency should keep install suggestion: %+v", out.SuggestedInstall)
+	}
+}
+
+func TestClassifyFailureForSkillMatchesPythonImportAlias(t *testing.T) {
+	out := &scriptcontract.RunResult{
+		OK:       false,
+		Skill:    "office-ppt",
+		Script:   "office-ppt/scripts/thumbnail.py",
+		Stderr:   `ModuleNotFoundError: No module named 'PIL'`,
+		ExitCode: 1,
+	}
+	deps := skillmodel.Dependencies{Runtime: skillmodel.RuntimeDeps{Python: []skillmodel.RuntimePackage{{Name: "pillow", Import: "PIL"}}}}
+	classifyFailureForSkill(out, deps)
+	if out.SuggestedInstall == nil || out.SuggestedInstall.Tool != "install_skill_dependencies" {
+		t.Fatalf("declared import alias should keep install suggestion: %+v", out.SuggestedInstall)
 	}
 }

@@ -94,7 +94,7 @@ func (t *Tool) GetInfo() *tool.Info {
 		Name: toolName,
 		Description: strings.TrimSpace(`
 安装 Skill 在 dependencies.runtime 中声明的第三方包（npm/pip）。
-不执行业务脚本；安装成功后须用相同参数再调 run_skill_script。
+不执行业务脚本；安装成功后须用相同参数再调 run_skill_command。
 默认仅允许声明白名单内的包；禁止任意 shell。scope=image 时返回需重建镜像。
 `),
 		Parameters: &tool.ParameterSchema{
@@ -151,7 +151,7 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 			"skill_dep_install": "true",
 			"scope":             scope,
 		},
-		Suggested: "install 完成后用相同参数再调用 run_skill_script",
+		Suggested: "install 完成后用相同参数再调用 run_skill_command",
 	}
 
 	if scope == "image" {
@@ -171,7 +171,7 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 	}
 	if remoteSandboxWorkspaceInstallUnsupported(t.deps.Sandbox) {
 		out.OK = false
-		out.Error = "scope=workspace 在 genesis-sandbox 远程模式下不会被后续 run_skill_script 的 office/skill session 可靠看见；当前请使用 profile/镜像预装，或等待 session scope 安装闭环"
+		out.Error = "scope=workspace 在 genesis-sandbox 远程模式下不会被后续 run_skill_command 的 office/skill session 可靠看见；当前请使用 profile/镜像预装，或等待 session scope 安装闭环"
 		out.Metadata["failure_kind"] = "install_scope_not_visible"
 		out.Metadata["provider"] = t.deps.Sandbox.Provider
 		out.Metadata["sandbox_mode"] = string(t.deps.Sandbox.Mode)
@@ -464,3 +464,4 @@ func marshalFail(out *resultPayload, msg string) (string, error) {
 	}
 	return string(data), fmt.Errorf("%s", msg)
 }
+

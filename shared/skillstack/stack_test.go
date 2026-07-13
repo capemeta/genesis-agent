@@ -44,7 +44,7 @@ func TestBuildEmbeddedIncludesSharedOfficeWiring(t *testing.T) {
 		Approval:    approval,
 		Logger:      logger.NewNop(),
 		EnabledTools: []string{
-			"Skill", "run_skill_script", "install_skill_dependencies", "list_skill_resources", "read_skill_resource", "search_skill_resources",
+			"Skill", "run_skill_command", "install_skill_dependencies", "list_skill_resources", "read_skill_resource", "search_skill_resources",
 		},
 		Exec: skillstack.ExecStack{
 			Runner:  nopRunner{},
@@ -61,7 +61,7 @@ func TestBuildEmbeddedIncludesSharedOfficeWiring(t *testing.T) {
 	for _, tool := range stack.Tools {
 		names[tool.GetInfo().Name] = true
 	}
-	for _, want := range []string{"Skill", "run_skill_script", "install_skill_dependencies", "list_skill_resources", "read_skill_resource", "search_skill_resources"} {
+	for _, want := range []string{"Skill", "run_skill_command", "install_skill_dependencies", "list_skill_resources", "read_skill_resource", "search_skill_resources"} {
 		if !names[want] {
 			t.Fatalf("missing tool %s in %v", want, names)
 		}
@@ -77,3 +77,4 @@ func TestBuildEmbeddedIncludesSharedOfficeWiring(t *testing.T) {
 		t.Fatalf("meta=%+v", meta)
 	}
 }
+

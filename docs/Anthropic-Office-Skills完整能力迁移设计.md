@@ -13,7 +13,7 @@
 | 议题                  | 决策                                                                                                              |
 | ------------------- | --------------------------------------------------------------------------------------------------------------- |
 | 共享 `scripts/office` | **方案 A**：pptx/docx/xlsx 三份字节级一致 → 单份 `_office_common/scripts/office`；materialize / ListResources 合并到 `office-`* |
-| 许可策略                | **原样迁移 + 最小路径契约适配**；仅在有明确优化点时改写（如 `INPUT_DIR`/`OUTPUT_DIR`/`run_skill_script`）                                  |
+| 许可策略                | **原样迁移 + 最小路径契约适配**；仅在有明确优化点时改写（如 `INPUT_DIR`/`OUTPUT_DIR`/`run_skill_command`）                                  |
 | Phase 1 范围          | `office-ppt`：专有脚本 + references + SKILL.md + `_office_common` 接线                                                 |
 
 
@@ -31,7 +31,7 @@
 
 同时必须适配 Genesis 已落地的执行契约：
 
-- 入口：`run_skill_script`（禁止默认 `python -c` / 假 `write_file` 冒充交付物）
+- 入口：`run_skill_command`（禁止默认 `python -c` / 假 `write_file` 冒充交付物）
 - 路径：`INPUT_DIR` / `OUTPUT_DIR` / `WORK_DIR` / `SKILL_DIR` / `TMPDIR`
 - Profile：`office-basic` / `office-ocr`（按内容与操作，不按扩展名）
 - Materialize：embed 与磁盘 Skill 同一 Runner
@@ -102,7 +102,7 @@ pdf-review/scripts/...
 | Excel 重算        | `recalc.py`                                      | `recalc_xlsx.py`（已有，需对齐）           | 小                   |
 | PDF 读/合并/拆分/水印等 | SKILL + reference 大量示例                           | inspect/extract/list_fields/render | **大**               |
 | PDF 表单          | `forms.md` + 多脚本                                 | 仅 list fields                      | **大**               |
-| 执行契约            | 直接 shell/`python scripts/...`                    | `run_skill_script` + workspace     | Genesis 更强，迁移时要改写入口 |
+| 执行契约            | 直接 shell/`python scripts/...`                    | `run_skill_command` + workspace     | Genesis 更强，迁移时要改写入口 |
 
 
 结论：**业务能力差距大；执行底座 Genesis 已具备。迁移重点是资产与 SKILL.md 流程，不是再造 Runner。**
@@ -164,9 +164,9 @@ pdf-review/scripts/...
 
 | Anthropic 写法                         | Genesis 写法                                                                                                      |
 | ------------------------------------ | --------------------------------------------------------------------------------------------------------------- |
-| `python scripts/thumbnail.py a.pptx` | `run_skill_script(skill="office-ppt", script="office-ppt/scripts/thumbnail.py", args=["a.pptx"], inputs=[...])` |
-| `python -m markitdown x.pptx`        | 优先封装为 skill 脚本或声明依赖后由 `run_skill_script` 调包装脚本；禁止脆弱 `python -c`                                                 |
-| `npm`/`npx` 写 pptxgenjs              | 生成脚本写入 `WORK_DIR` 或临时 JS，经 `run_skill_script`/`run_command`（受审批）执行；产物只进 `OUTPUT_DIR`                            |
+| `python scripts/thumbnail.py a.pptx` | `run_skill_command(skill="office-ppt", script="office-ppt/scripts/thumbnail.py", args=["a.pptx"], inputs=[...])` |
+| `python -m markitdown x.pptx`        | 优先封装为 skill 脚本或声明依赖后由 `run_skill_command` 调包装脚本；禁止脆弱 `python -c`                                                 |
+| `npm`/`npx` 写 pptxgenjs              | 生成脚本写入 `WORK_DIR` 或临时 JS，经 `run_skill_command`/`run_command`（受审批）执行；产物只进 `OUTPUT_DIR`                            |
 | 直接改宿主机路径                             | 一律 `INPUT_DIR`/`OUTPUT_DIR`/`SKILL_DIR`                                                                         |
 
 
@@ -203,10 +203,10 @@ pdf-review/scripts/...
 
 | Skill        | 典型依赖                                                                                                              |
 | ------------ | ----------------------------------------------------------------------------------------------------------------- |
-| office-ppt   | `run_skill_script`、`python`、`node`/`pptxgenjs`（生成）、`libreoffice`、`pdftoppm`、可选 `markitdown`                       |
-| office-word  | `run_skill_script`、`python`、`node`/`docx`（docx-js）、`libreoffice`、`pandoc`（可选）                                     |
-| office-excel | `run_skill_script`、`python`、`openpyxl`/`pandas`、`libreoffice`                                                     |
-| pdf-review   | `run_skill_script`、`python`、`pypdf`/`pdfplumber`/`reportlab`、`pdftoppm`/`pdftotext`、`qpdf`（可选）、OCR 时 `office-ocr` |
+| office-ppt   | `run_skill_command`、`python`、`node`/`pptxgenjs`（生成）、`libreoffice`、`pdftoppm`、可选 `markitdown`                       |
+| office-word  | `run_skill_command`、`python`、`node`/`docx`（docx-js）、`libreoffice`、`pandoc`（可选）                                     |
+| office-excel | `run_skill_command`、`python`、`openpyxl`/`pandas`、`libreoffice`                                                     |
+| pdf-review   | `run_skill_command`、`python`、`pypdf`/`pdfplumber`/`reportlab`、`pdftoppm`/`pdftotext`、`qpdf`（可选）、OCR 时 `office-ocr` |
 
 
 依赖安装仍遵守：构建期 / 镜像层安装，运行期默认无网络。
@@ -216,7 +216,7 @@ pdf-review/scripts/...
 继续强制：
 
 - `.pptx/.docx/.xlsx/.pdf` 不得由 `write_file`/`edit_file`/`apply_patch` 用纯文本冒充；
-- `run_skill_script` 对 `OUTPUT_DIR` 产物做 OOXML/PDF 魔数门禁。
+- `run_skill_command` 对 `OUTPUT_DIR` 产物做 OOXML/PDF 魔数门禁。
 
 ---
 
@@ -252,7 +252,7 @@ Materialize 规则：执行 `office-ppt` 脚本时，Materializer 将 `_office_c
 每个 Genesis Skill 的 `SKILL.md` 结构统一为：
 
 1. **Frontmatter**：name/description/allowed-tools/dependencies/products（Genesis 字段）
-2. **硬约束**：`run_skill_script`、禁止假交付物、INPUT/OUTPUT 契约
+2. **硬约束**：`run_skill_command`、禁止假交付物、INPUT/OUTPUT 契约
 3. **Profile 规则**：office-basic / office-ocr
 4. **Quick Reference 表**：任务 → 脚本 resource id（Anthropic 表改写成 Genesis 调用）
 5. **领域流程**：从 Anthropic 吸收（设计、财务、表单等），删 Claude 专属措辞，改成 Genesis 工具名
@@ -272,13 +272,13 @@ Materialize 规则：执行 `office-ppt` 脚本时，Materializer 将 `_office_c
 ### Phase 1 — PPT 完整能力（优先，用户感知最强）
 
 1. [x] 迁入：`thumbnail`、`add_slide`、`clean` + `_office_common/scripts/office/*`（方案 A）
-2. [x] 迁入 references：`pptxgenjs.md`、`editing.md`（入口改为 `run_skill_script`）
+2. [x] 迁入 references：`pptxgenjs.md`、`editing.md`（入口改为 `run_skill_command`）
 3. [x] 重写 `office-ppt/SKILL.md` Quick Reference + 硬约束 + 设计/QA
 4. [x] 保留并接线现有 inspect/render；`path_contract` 三端统一签名
 5. [x] 单测：materialize 含 office 树；嵌套 `office/unpack.py` 相对路径；gate；catalog 跳过 `_office_common`
 6. [x] CLI smoke：`inspect` 真实执行；`thumbnail`/`create_pptx`/`run_pptxgen_script` 缺依赖时 skip
 7. [x] `run_pptxgen_script.js`（Anthropic 对齐主路径：顶层 pptxgen JS）+ `create_pptx.js` 降级为 smoke
-8. [x] Enterprise：`shared/skillstack` + bootstrap 注入 embed Skills / `run_skill_script` / SharedScriptsFS（远程沙箱仍待后续）
+8. [x] Enterprise：`shared/skillstack` + bootstrap 注入 embed Skills / `run_skill_command` / SharedScriptsFS（远程沙箱仍待后续）
 
 ### Phase 2 — Word 完整能力
 
@@ -312,7 +312,7 @@ Materialize 规则：执行 `office-ppt` 脚本时，Materializer 将 `_office_c
 每个 Skill 达到「Anthropic 能力对齐」需同时满足：
 
 1. **文档**：SKILL + references 覆盖 Anthropic 主路径（生成、编辑、预览、QA）
-2. **脚本**：关键脚本可经 `run_skill_script` materialize 并执行（本地或 sandbox）
+2. **脚本**：关键脚本可经 `run_skill_command` materialize 并执行（本地或 sandbox）
 3. **契约**：无宿主机绝对路径泄漏进 strict 命令；产物进 `OUTPUT_DIR`；门禁生效
 4. **Profile**：常规走 `office-basic`；OCR 场景可升级 `office-ocr`
 5. **回归**：`allowed_tools` 与 CLI Profile 对齐测试通过；embed SystemFS 测试包含新资源
@@ -393,5 +393,6 @@ Phase 0 许可
 | Enterprise 远程 sandbox / 租户 credential / 人工审批 | 当前本地 Runner + **headless Ask 自动批准（session）**；生产需替换 requester 与远程 sandbox |
 | 源版本冻结到 third_party                           | 可选治理项                                                                    |
 | thumbnail/create 在 CI 全绿                     | 依赖镜像预装 soffice/Pillow/pptxgenjs                                          |
+
 
 

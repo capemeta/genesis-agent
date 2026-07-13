@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strings"
 
+	skillmodel "genesis-agent/internal/capabilities/skill/model"
 	scriptcontract "genesis-agent/internal/capabilities/skill/script/contract"
 )
 
@@ -102,6 +103,12 @@ func classifyFailure(out *scriptcontract.RunResult) {
 			out.SuggestedInstall = buildSuggestedInstall(out.Skill, out.Missing)
 		}
 	}
+	if out.FailureKind == "dependency_install_forbidden" {
+		if out.SuggestedAction == "" {
+			out.SuggestedAction = "use_declared_runtime_profile_or_install_skill_dependencies"
+		}
+		out.Retryable = false
+	}
 	if out.FailureKind == "sandbox_violation" {
 		out.SuggestedAction = "escalate_or_change_sandbox"
 		out.Retryable = true
@@ -126,8 +133,69 @@ func classifyFailure(out *scriptcontract.RunResult) {
 		out.SuggestedAction = "check_sandbox_input_artifact_transport"
 		out.Retryable = false
 	}
+	if out.FailureKind == "sandbox_unavailable" {
+		out.SuggestedAction = "stop_and_report_sandbox_unavailable"
+		out.Retryable = false
+	}
 }
 
+func classifyFailureForSkill(out *scriptcontract.RunResult, deps skillmodel.Dependencies) {
+	classifyFailure(out)
+	constrainInstallSuggestionToDeclaredRuntime(out, deps)
+}
+
+func constrainInstallSuggestionToDeclaredRuntime(out *scriptcontract.RunResult, deps skillmodel.Dependencies) {
+	if out == nil || out.FailureKind != "dependency_missing" || len(out.Missing) == 0 {
+		return
+	}
+	undeclared := make([]string, 0)
+	for _, missing := range out.Missing {
+		if missing.Manager != "npm" && missing.Manager != "pip" {
+			continue
+		}
+		if !runtimeDependencyDeclared(missing, deps) {
+			undeclared = append(undeclared, missing.Manager+":"+missing.Name)
+		}
+	}
+	if len(undeclared) == 0 {
+		return
+	}
+	out.SuggestedInstall = nil
+	out.SuggestedAction = "rewrite_script_use_declared_dependencies"
+	out.Retryable = true
+	out.Warnings = append(out.Warnings, "dependency_not_declared: "+strings.Join(undeclared, ","))
+}
+
+func runtimeDependencyDeclared(missing scriptcontract.MissingDep, deps skillmodel.Dependencies) bool {
+	manager := strings.ToLower(strings.TrimSpace(missing.Manager))
+	name := strings.ToLower(strings.TrimSpace(missing.Name))
+	require := strings.ToLower(strings.TrimSpace(missing.Require))
+	if require == "" {
+		require = name
+	}
+	switch manager {
+	case "npm":
+		for _, dep := range deps.Runtime.Node {
+			if runtimeNameMatches(name, require, dep.Name, dep.Require) {
+				return true
+			}
+		}
+	case "pip":
+		for _, dep := range deps.Runtime.Python {
+			if runtimeNameMatches(name, require, dep.Name, dep.Import) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func runtimeNameMatches(name, require, declaredName, declaredImport string) bool {
+	declaredName = strings.ToLower(strings.TrimSpace(declaredName))
+	declaredImport = strings.ToLower(strings.TrimSpace(declaredImport))
+	return (declaredName != "" && (name == declaredName || require == declaredName)) ||
+		(declaredImport != "" && (name == declaredImport || require == declaredImport))
+}
 func detectApprovalOrTimeout(errMsg string) string {
 	msg := strings.ToLower(strings.TrimSpace(errMsg))
 	if msg == "" {
@@ -138,6 +206,14 @@ func detectApprovalOrTimeout(errMsg string) string {
 	}
 	if strings.Contains(msg, "timeout") || strings.Contains(msg, "deadline exceeded") || strings.Contains(msg, "context deadline") {
 		return "timeout"
+	}
+	if strings.Contains(msg, "sandbox_unavailable") ||
+		strings.Contains(msg, "sandbox session") ||
+		strings.Contains(msg, "创建沙箱失败") ||
+		strings.Contains(msg, "创建 docker 容器失败") ||
+		strings.Contains(msg, "docker daemon") ||
+		strings.Contains(msg, "connection refused") {
+		return "sandbox_unavailable"
 	}
 	return ""
 }

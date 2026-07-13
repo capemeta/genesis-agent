@@ -32,6 +32,7 @@ func newChatCmd(configDirRef *string, sandboxModeRef *string, factory ServiceFac
   Esc        清空输入框
   ↑ / ↓      滚动消息历史
   PgUp/PgDn  快速翻页
+  鼠标拖选   可直接选中并复制文字（未启用鼠标捕获）
 
 内置命令（以 / 开头）:
   /clear     清空当前会话历史，开始新对话
@@ -53,11 +54,11 @@ func newChatCmd(configDirRef *string, sandboxModeRef *string, factory ServiceFac
 
 			// 启动 TUI 程序
 			// WithAltScreen: 使用备用屏幕，退出后恢复原始终端内容
-			// WithMouseCellMotion: 支持鼠标滚轮滚动消息历史
+			// 故意不启用 WithMouseCellMotion：鼠标捕获会接管终端选区，
+			// 导致无法拖选复制文字；消息历史请用 ↑↓ / PgUp/PgDn 滚动。
 			p := tea.NewProgram(
 				m,
 				tea.WithAltScreen(),
-				tea.WithMouseCellMotion(),
 			)
 
 			// 绑定全局 TUI 审批器对应的 program 实例

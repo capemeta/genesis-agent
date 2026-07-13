@@ -23,8 +23,6 @@ import shutil
 import sys
 from pathlib import Path
 
-from path_contract import resolve_work_path
-
 
 def get_next_slide_number(slides_dir: Path) -> int:
     existing = [int(m.group(1)) for f in slides_dir.glob("slide*.xml")
@@ -182,7 +180,7 @@ if __name__ == "__main__":
         print("To see available layouts: ls <unpacked_dir>/ppt/slideLayouts/", file=sys.stderr)
         sys.exit(1)
 
-    unpacked_dir = Path(resolve_work_path(sys.argv[1]))
+    unpacked_dir = Path(sys.argv[1])
     source = sys.argv[2]
 
     if not unpacked_dir.exists():

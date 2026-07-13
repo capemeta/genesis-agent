@@ -1,133 +1,257 @@
 ---
 name: office-ppt
-description: 处理 PowerPoint 演示文稿的内置 Skill。适用于创建、读取、编辑、优化、拆分合并、套用模板、生成讲稿备注、转换和视觉验证 .pptx 文件。用户提到 slides、deck、presentation、PPT 或 .pptx 文件时，应使用本 Skill。
-short-description: PPT 创建、编辑、模板和视觉 QA
-version: 0.3.3
+description: "Use this skill any time a .pptx file is involved in any way — as input, output, or both. This includes: creating slide decks, pitch decks, or presentations; reading, parsing, or extracting text from any .pptx file (even if the extracted content will be used elsewhere, like in an email or summary); editing, modifying, or updating existing presentations; combining or splitting slide files; working with templates, layouts, speaker notes, or comments. Trigger whenever the user mentions \"deck,\" \"slides,\" \"presentation,\" or references a .pptx filename, regardless of what they plan to do with the content afterward. If a .pptx file needs to be opened, created, or touched, use this skill."
+license: Proprietary. LICENSE.txt has complete terms
 allowed-tools:
-  - read_file
-  - write_file
-  - edit_file
-  - run_skill_script
-  - install_skill_dependencies
+  - Skill
   - list_skill_resources
   - read_skill_resource
   - search_skill_resources
+  - run_skill_command
+  - install_skill_dependencies
+  - read_file
+  - write_file
+  - edit_file
 dependencies:
-  tools:
-    - type: tool
-      value: run_skill_script
-      description: 在受控执行环境中 materialize 并运行 PPT/OpenXML/LibreOffice 脚本
-    - type: tool
-      value: install_skill_dependencies
-      description: 安装本 Skill 声明的 runtime 包（须审批）
-    - type: command
-      value: python
-      description: 执行 pptx 检查、编辑与预览脚本
-    - type: command
-      value: node
-      description: pptxgenjs 从零生成
-    - type: command
-      value: libreoffice
-      description: 转 PDF（soffice；office-basic 镜像通常含）
-    - type: command
-      value: pdftoppm
-      description: PDF 转预览图（Poppler；office-basic 镜像通常含）
   runtime:
+    python:
+      - name: markitdown
+        import: markitdown
+      - name: Pillow
+        import: PIL
     node:
       - name: pptxgenjs
         require: pptxgenjs
-    python:
-      - name: pillow
-        import: PIL
     system:
       - name: libreoffice
         command: soffice
       - name: poppler
         command: pdftoppm
-  install_hints:
-    - npm install pptxgenjs
-    - pip install pillow
-context: inline
-model: inherit
-products:
-  - cli
-  - desktop
-  - enterprise
 ---
-
-# Office PPT Skill
-
-对齐 Anthropic `pptx`：读参考 → 写脚本/改模板 → **必须 QA**。Genesis 仅换执行入口。
+# PPTX Skill
 
 ## Quick Reference
 
-| 任务 | 做法 |
-|------|------|
-| 从零创建 | 读 `references/pptxgenjs.md` + `references/design.md` → `write_file("$WORK_DIR/deck_gen.js")` → `run_pptxgen_script.js` |
-| 读/分析 | `inspect_pptx.py` / `extract_pptx_text.py`；总览用 `thumbnail.py` |
-| 模板编辑 | 读 `references/editing.md` |
-| 视觉 QA（必须） | `render_pptx_preview.py`（或 `thumbnail.py`）→ 看图 → 修 → 再验证 |
+| Task | Guide |
+|------|-------|
+| Read/analyze content | `python -m markitdown presentation.pptx` |
+| Edit or create from template | Read [editing.md](editing.md) |
+| Create from scratch | Read [pptxgenjs.md](pptxgenjs.md) |
 
-脚本一律：`run_skill_script(skill="office-ppt", script="office-ppt/scripts/…", args=[…], inputs=[…])`。  
-`create_pptx.js` 仅 smoke，禁止正式多页交付。
+---
 
-## Genesis 硬约束
+## Reading Content
 
-1. 只用 `run_skill_script`（禁止 `run_command`/`python -c`/裸 `node` 跑业务脚本）。
-2. 禁止 `write_file` 假 `.pptx/.docx/.xlsx/.pdf`；交付物由脚本写入 `OUTPUT_DIR`。
-3. 中间脚本写 `$WORK_DIR/…`（禁止仓库根）；`inputs` 可传 `$WORK_DIR/deck_gen.js`；最终 `.pptx` 在 `OUTPUT_DIR`。
-4. `script` 必须是可执行 resource id（先 `list_skill_resources`）；禁止把 `path_contract`/`helpers`/`validators`/`schemas` 当入口。
-5. `dependency_missing` 且 `retryable`：按 `suggested_install` 装 npm/pip 后**同参重跑**。`soffice`/`pdftoppm` 属 system 依赖（不可对话期安装）；缺则按返回说明环境缺口，**勿假装已做视觉 QA**，也**勿臆测当前是沙箱或已预装**。`sandbox_violation` 勿当缺包。
-6. Profile：普通用 `office-basic`；截图/OCR 用 `office-ocr`（由运行时选镜像，不是当前会话事实）。
+```bash
+# Text extraction
+python -m markitdown presentation.pptx
 
-## 读取
+# Visual overview
+python scripts/thumbnail.py presentation.pptx
 
-1. `inspect_pptx.py` 看页数/媒体/文本。  
-2. 需要全文/备注：`extract_pptx_text.py --format markdown`。  
-3. 视觉总览：`thumbnail.py`；逐页细看：`render_pptx_preview.py`。
-
-## 从零创建
-
-1. 读 `references/pptxgenjs.md` 与 `references/design.md`。  
-2. `write_file("$WORK_DIR/deck_gen.js")`：顶层 pptxgenjs；中文在源码字符串；输出 `path.join(process.env.OUTPUT_DIR||".","Name.pptx")`。  
-3. `run_skill_script(..., script="office-ppt/scripts/run_pptxgen_script.js", args=["deck_gen.js"], inputs=["$WORK_DIR/deck_gen.js"])`。  
-4. 引用返回的 `artifacts[].path`。  
-5. **必须**做下方 QA；未完成至少一轮 fix-and-verify 不得交付。
-
-## 模板编辑
-
-读 `references/editing.md`：`thumbnail`+`inspect` → `unpack` → 改结构/XML → `clean` → `pack` → 再 QA。
-
-## QA（必须）
-
-**默认有问题。** 第一次渲染几乎从不正确；零问题通常说明看得不够仔细。
-
-### 内容 QA
-
-```text
-run_skill_script(skill="office-ppt", script="office-ppt/scripts/extract_pptx_text.py",
-  args=["output.pptx","--format","markdown"], inputs=["$OUTPUT_DIR/output.pptx"])
+# Raw XML
+python scripts/office/unpack.py presentation.pptx unpacked/
 ```
 
-查缺页、错字、顺序；模板任务再搜 `xxxx`/`lorem`/`ipsum`/`this.*(page|slide).*layout`，有命中先修。
+---
 
-### 视觉 QA
+## Editing Workflow
 
-**必须看图，不要只看代码。** 用下方脚本转图（需本机或执行环境 PATH 上有 `soffice`+`pdftoppm`）。有子代理时把预览图交给子代理审查。
+**Read [editing.md](editing.md) for full details.**
 
-```text
-run_skill_script(skill="office-ppt", script="office-ppt/scripts/render_pptx_preview.py",
-  args=["output.pptx"], inputs=["$OUTPUT_DIR/output.pptx"])
+1. Analyze template with `thumbnail.py`
+2. Unpack → manipulate slides → edit content → clean → pack
+
+---
+
+## Creating from Scratch
+
+**Read [pptxgenjs.md](pptxgenjs.md) for full details.**
+
+Use when no template or reference presentation is available.
+
+---
+
+## Design Ideas
+
+**Don't create boring slides.** Plain bullets on a white background won't impress anyone. Consider ideas from this list for each slide.
+
+### Before Starting
+
+- **Pick a bold, content-informed color palette**: The palette should feel designed for THIS topic. If swapping your colors into a completely different presentation would still "work," you haven't made specific enough choices.
+- **Dominance over equality**: One color should dominate (60-70% visual weight), with 1-2 supporting tones and one sharp accent. Never give all colors equal weight.
+- **Dark/light contrast**: Dark backgrounds for title + conclusion slides, light for content ("sandwich" structure). Or commit to dark throughout for a premium feel.
+- **Commit to a visual motif**: Pick ONE distinctive element and repeat it — rounded image frames, icons in colored circles, thick single-side borders. Carry it across every slide.
+
+### Color Palettes
+
+Choose colors that match your topic — don't default to generic blue. Use these palettes as inspiration:
+
+| Theme | Primary | Secondary | Accent |
+|-------|---------|-----------|--------|
+| **Midnight Executive** | `1E2761` (navy) | `CADCFC` (ice blue) | `FFFFFF` (white) |
+| **Forest & Moss** | `2C5F2D` (forest) | `97BC62` (moss) | `F5F5F5` (cream) |
+| **Coral Energy** | `F96167` (coral) | `F9E795` (gold) | `2F3C7E` (navy) |
+| **Warm Terracotta** | `B85042` (terracotta) | `E7E8D1` (sand) | `A7BEAE` (sage) |
+| **Ocean Gradient** | `065A82` (deep blue) | `1C7293` (teal) | `21295C` (midnight) |
+| **Charcoal Minimal** | `36454F` (charcoal) | `F2F2F2` (off-white) | `212121` (black) |
+| **Teal Trust** | `028090` (teal) | `00A896` (seafoam) | `02C39A` (mint) |
+| **Berry & Cream** | `6D2E46` (berry) | `A26769` (dusty rose) | `ECE2D0` (cream) |
+| **Sage Calm** | `84B59F` (sage) | `69A297` (eucalyptus) | `50808E` (slate) |
+| **Cherry Bold** | `990011` (cherry) | `FCF6F5` (off-white) | `2F3C7E` (navy) |
+
+### For Each Slide
+
+**Every slide needs a visual element** — image, chart, icon, or shape. Text-only slides are forgettable.
+
+**Layout options:**
+- Two-column (text left, illustration on right)
+- Icon + text rows (icon in colored circle, bold header, description below)
+- 2x2 or 2x3 grid (image on one side, grid of content blocks on other)
+- Half-bleed image (full left or right side) with content overlay
+
+**Data display:**
+- Large stat callouts (big numbers 60-72pt with small labels below)
+- Comparison columns (before/after, pros/cons, side-by-side options)
+- Timeline or process flow (numbered steps, arrows)
+
+**Visual polish:**
+- Icons in small colored circles next to section headers
+- Italic accent text for key stats or taglines
+
+### Typography
+
+**Choose an interesting font pairing** — don't default to Arial. Pick a header font with personality and pair it with a clean body font.
+
+| Header Font | Body Font |
+|-------------|-----------|
+| Georgia | Calibri |
+| Arial Black | Arial |
+| Calibri | Calibri Light |
+| Cambria | Calibri |
+| Trebuchet MS | Calibri |
+| Impact | Arial |
+| Palatino | Garamond |
+| Consolas | Calibri |
+
+| Element | Size |
+|---------|------|
+| Slide title | 36-44pt bold |
+| Section header | 20-24pt bold |
+| Body text | 14-16pt |
+| Captions | 10-12pt muted |
+
+### Spacing
+
+- 0.5" minimum margins
+- 0.3-0.5" between content blocks
+- Leave breathing room—don't fill every inch
+
+### Avoid (Common Mistakes)
+
+- **Don't repeat the same layout** — vary columns, cards, and callouts across slides
+- **Don't center body text** — left-align paragraphs and lists; center only titles
+- **Don't skimp on size contrast** — titles need 36pt+ to stand out from 14-16pt body
+- **Don't default to blue** — pick colors that reflect the specific topic
+- **Don't mix spacing randomly** — choose 0.3" or 0.5" gaps and use consistently
+- **Don't style one slide and leave the rest plain** — commit fully or keep it simple throughout
+- **Don't create text-only slides** — add images, icons, charts, or visual elements; avoid plain title + bullets
+- **Don't forget text box padding** — when aligning lines or shapes with text edges, set `margin: 0` on the text box or offset the shape to account for padding
+- **Don't use low-contrast elements** — icons AND text need strong contrast against the background; avoid light text on light backgrounds or dark text on dark backgrounds
+- **NEVER use accent lines under titles** — these are a hallmark of AI-generated slides; use whitespace or background color instead
+
+---
+
+## QA (Required)
+
+**Assume there are problems. Your job is to find them.**
+
+Your first render is almost never correct. Approach QA as a bug hunt, not a confirmation step. If you found zero issues on first inspection, you weren't looking hard enough.
+
+### Content QA
+
+```bash
+python -m markitdown output.pptx
 ```
 
-产物在 `$OUTPUT_DIR`（`slide-1.png`…）。用 `read_file` 读图，按 `references/validation-checklist.md` 找：重叠、溢出、裁切、间距过近（<0.3"）、边距不足（<0.5"）、低对比、`colW` 右溢出、占位符残留。总览也可用 `thumbnail.py`。
+Check for missing content, typos, wrong order.
+
+**When using templates, check for leftover placeholder text:**
+
+```bash
+python -m markitdown output.pptx | grep -iE "xxxx|lorem|ipsum|this.*(page|slide).*layout"
+```
+
+If grep returns results, fix them before declaring success.
+
+### Visual QA
+
+**⚠️ USE SUBAGENTS** — even for 2-3 slides. You've been staring at the code and will see what you expect, not what's there. Subagents have fresh eyes.
+
+Convert slides to images (see [Converting to Images](#converting-to-images)), then use this prompt:
+
+```
+Visually inspect these slides. Assume there are issues — find them.
+
+Look for:
+- Overlapping elements (text through shapes, lines through words, stacked elements)
+- Text overflow or cut off at edges/box boundaries
+- Decorative lines positioned for single-line text but title wrapped to two lines
+- Source citations or footers colliding with content above
+- Elements too close (< 0.3" gaps) or cards/sections nearly touching
+- Uneven gaps (large empty area in one place, cramped in another)
+- Insufficient margin from slide edges (< 0.5")
+- Columns or similar elements not aligned consistently
+- Low-contrast text (e.g., light gray text on cream-colored background)
+- Low-contrast icons (e.g., dark icons on dark backgrounds without a contrasting circle)
+- Text boxes too narrow causing excessive wrapping
+- Leftover placeholder content
+
+For each slide, list issues or areas of concern, even if minor.
+
+Read and analyze these images:
+1. /path/to/slide-01.jpg (Expected: [brief description])
+2. /path/to/slide-02.jpg (Expected: [brief description])
+
+Report ALL issues found, including minor ones.
+```
 
 ### Verification Loop
 
-1. 生成 → 转图 → 检查  
-2. **列出问题**（若没有，再更挑剔地看）  
-3. 修 JS/XML → **再验证受影响页**  
-4. 重复直到一轮无新问题  
+1. Generate slides → Convert to images → Inspect
+2. **List issues found** (if none found, look again more critically)
+3. Fix issues
+4. **Re-verify affected slides** — one fix often creates another problem
+5. Repeat until a full pass reveals no new issues
 
-**未完成至少一轮「发现问题 → 修复 → 再验证」前，不得宣称交付成功。**  
-同时确认 `ok` 与 `artifacts[].ok`；勿用同一错误参数死循环。
+**Do not declare success until you've completed at least one fix-and-verify cycle.**
+
+---
+
+## Converting to Images
+
+Convert presentations to individual slide images for visual inspection:
+
+```bash
+python scripts/office/soffice.py --headless --convert-to pdf output.pptx
+pdftoppm -jpeg -r 150 output.pdf slide
+```
+
+This creates `slide-01.jpg`, `slide-02.jpg`, etc.
+
+To re-render specific slides after fixes:
+
+```bash
+pdftoppm -jpeg -r 150 -f N -l N output.pdf slide-fixed
+```
+
+---
+
+## Dependencies
+
+- `pip install "markitdown[pptx]"` - text extraction
+- `pip install Pillow` - thumbnail grids
+- `npm install -g pptxgenjs` - creating from scratch
+- LibreOffice (`soffice`) - PDF conversion (auto-configured for sandboxed environments via `scripts/office/soffice.py`)
+- Poppler (`pdftoppm`) - PDF to images
+

@@ -942,6 +942,7 @@ func renderSkillInjection(injection skillInjectionOutput) string {
 	sb.WriteString(injection.QualifiedName)
 	sb.WriteString("\n\n")
 	sb.WriteString(injection.Content)
+	sb.WriteString(renderSkillScriptBridge(injection))
 	if injection.Truncated {
 		sb.WriteString("\n\n[skill上下文已截断，必要时用 read_skill_resource/search_skill_resources 读取引用资源]")
 	}
@@ -949,6 +950,23 @@ func renderSkillInjection(injection skillInjectionOutput) string {
 	return sb.String()
 }
 
+func renderSkillScriptBridge(injection skillInjectionOutput) string {
+	name := strings.TrimSpace(injection.QualifiedName)
+	if name == "" {
+		return ""
+	}
+	return fmt.Sprintf(`
+
+<skill_runtime_bridge>
+该 Skill 的 Markdown 是可移植规范，不要求其中出现 Genesis 专用工具名。
+当说明要求执行包内脚本（例如 python scripts/foo.py、python3 scripts/foo.py、node scripts/foo.js、npm 脚本包装 scripts/foo.js）时，必须改用 run_skill_command：skill=%q，command 直接填写原始命令行（例如 python scripts/foo.py --arg value）。
+不要把 script resource id、args 拆成旧模型字段；运行时会先 materialize 完整 Skill 包，再在受控工作目录或远端 session workspace 中执行 command。
+如需把现有文件交给脚本处理，使用 run_skill_command.inputs 传入工作区内文件；运行时会自动 stage 到本次 Skill 工作目录。你用 write_file 写出的中间脚本应放在 $WORK_DIR/foo.ext，再以 inputs=["$WORK_DIR/foo.ext"] 传给 run_skill_command，command 使用相对文件名（例如 node foo.ext）。
+不要用 run_skill_command 执行 npm install、pip install、python -m pip install 等依赖安装命令。运行期依赖由 Skill 声明的 runtime/profile 提供；若工具结果明确返回 dependency_missing 和 suggested_install，再使用 install_skill_dependencies 或报告 profile 需要补齐。
+脚本可通过 WORK_DIR、INPUT_DIR、OUTPUT_DIR、TMP_DIR、SKILL_DIR 访问受控目录。
+不要改写第三方 SKILL.md 或 references 才能运行；适配由运行时完成。
+</skill_runtime_bridge>`, name)
+}
 func namesOfToolInfos(infos []*tool.Info) []string {
 	out := make([]string, 0, len(infos))
 	for _, info := range infos {
@@ -983,7 +1001,7 @@ func narrowToolNames(current []string, allowed []string) (names []string, ok boo
 	// 网关与资源元工具：收窄后仍应可用（仅当当前 turn 本来就可见）。
 	// 网关 / 资源 / 脚本 / 依赖安装：收窄后仍应可用（仅当当前 turn 本来就可见）。
 	// install_skill_dependencies 是缺包闭环必需；对齐设计 §7。
-	for _, meta := range []string{"Skill", "list_skill_resources", "read_skill_resource", "search_skill_resources", "run_skill_script", "install_skill_dependencies"} {
+	for _, meta := range []string{"Skill", "list_skill_resources", "read_skill_resource", "search_skill_resources", "run_skill_command", "install_skill_dependencies"} {
 		if _, inCurrent := currentSet[meta]; inCurrent {
 			allowedSet[meta] = struct{}{}
 		}

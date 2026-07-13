@@ -91,7 +91,7 @@ func TestEvaluatorMetadataFallbackAllowsWorkspace(t *testing.T) {
 func TestEvaluatorSkillScriptSuggestsSessionScope(t *testing.T) {
 	evaluator := NewEvaluator(config.PolicyDefaultsConfig{Unknown: "ask", AllowedGrantScopes: []string{"once", "session"}})
 	result, err := evaluator.Evaluate(context.Background(), approvalmodel.Request{
-		ToolName: "run_skill_script",
+		ToolName: "run_skill_command",
 		Action:   approvalmodel.ActionCommandExec,
 		Resource: approvalmodel.Resource{URI: "office-ppt/scripts/inspect_pptx.py"},
 		Metadata: map[string]string{"skill_script": "true"},
@@ -116,3 +116,4 @@ func TestEvaluatorSkillScriptSuggestsSessionScope(t *testing.T) {
 		t.Fatalf("SuggestedScopes = %v, want include session", result.SuggestedScopes)
 	}
 }
+

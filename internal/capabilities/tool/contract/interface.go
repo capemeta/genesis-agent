@@ -121,7 +121,7 @@ func DefaultTraits(name string) ToolTraits {
 		return ToolTraits{Exposure: ToolExposureDirect, ReadOnly: false, ConcurrencySafe: false, NeedsPermission: true, RequiresUserInteraction: true}
 	case "list_skill_resources":
 		return ToolTraits{Exposure: ToolExposureDirect, ReadOnly: true, ConcurrencySafe: true, NeedsPermission: true}
-	case "run_command", "run_skill_script", "http_request":
+	case "run_command", "run_skill_command", "http_request":
 		return ToolTraits{Exposure: ToolExposureDirect, ReadOnly: false, ConcurrencySafe: false, NeedsPermission: true}
 	default:
 		return ToolTraits{Exposure: ToolExposureDirect, ReadOnly: false, ConcurrencySafe: false}
@@ -152,3 +152,4 @@ type Registry interface {
 	// Names 返回所有已注册工具的名称列表
 	Names() []string
 }
+

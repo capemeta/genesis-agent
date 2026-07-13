@@ -3,6 +3,7 @@ package http
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -12,6 +13,8 @@ import (
 
 	execcontract "genesis-agent/internal/capabilities/execution/contract"
 	execmodel "genesis-agent/internal/capabilities/execution/model"
+	fscontract "genesis-agent/internal/capabilities/filesystem/contract"
+	fsmodel "genesis-agent/internal/capabilities/filesystem/model"
 	sandboxcontract "genesis-agent/internal/capabilities/sandbox/contract"
 )
 
@@ -252,41 +255,24 @@ func TestRunCommandUsesSandboxWorkspaceEnvAndInputArtifacts(t *testing.T) {
 	}
 }
 
-func TestSessionStageInputRunAndClose(t *testing.T) {
-	var jobSandboxes []string
-	var runJob execJobRequest
-	uploaded := false
-	released := false
+func TestSessionRunUsesNamedSessionExecAndClose(t *testing.T) {
+	var created createSessionRequest
+	var execReq execSessionRequest
+	deleted := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.URL.Path == "/v1/sandboxes:lease" && r.Method == http.MethodPost:
-			_ = json.NewEncoder(w).Encode(sandboxLease{SandboxID: "sandbox-1", LeaseID: "lease-1", Status: "leased"})
-		case r.URL.Path == "/v1/jobs" && r.Method == http.MethodPost:
-			var got execJobRequest
-			if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+		case r.URL.Path == "/v1/sessions" && r.Method == http.MethodPost:
+			if err := json.NewDecoder(r.Body).Decode(&created); err != nil {
 				t.Fatal(err)
 			}
-			jobSandboxes = append(jobSandboxes, got.SandboxID)
-			if len(jobSandboxes) == 2 {
-				runJob = got
+			_ = json.NewEncoder(w).Encode(sessionRecord{SessionID: "session-1", WorkspaceID: "ws-1", ActiveSandboxID: "sandbox-1", RuntimeProfile: "code-polyglot-basic", StatePolicy: "session"})
+		case r.URL.Path == "/v1/sessions/session-1/exec" && r.Method == http.MethodPost:
+			if err := json.NewDecoder(r.Body).Decode(&execReq); err != nil {
+				t.Fatal(err)
 			}
-			jobID := "stage-job"
-			if len(jobSandboxes) == 2 {
-				jobID = "run-job"
-			}
-			_ = json.NewEncoder(w).Encode(jobResult{JobID: jobID, SandboxID: got.SandboxID, Status: "succeeded"})
-		case r.URL.Path == "/v1/jobs/stage-job" && r.Method == http.MethodGet:
-			_ = json.NewEncoder(w).Encode(jobResult{JobID: "stage-job", SandboxID: "sandbox-1", Status: "succeeded"})
-		case r.URL.Path == "/v1/jobs/run-job" && r.Method == http.MethodGet:
-			_ = json.NewEncoder(w).Encode(jobResult{JobID: "run-job", SandboxID: "sandbox-1", Status: "succeeded", ExitCode: 0, Stdout: "ok"})
-		case r.URL.Path == "/v1/jobs/stage-job/files" && r.Method == http.MethodPost:
-			if r.URL.Query().Get("name") != "data.csv" {
-				t.Fatalf("upload name=%q", r.URL.RawQuery)
-			}
-			uploaded = true
-			_ = json.NewEncoder(w).Encode(artifactRecord{ArtifactID: "artifact-input", JobID: "stage-job", Name: "data.csv"})
-		case r.URL.Path == "/v1/sandboxes/sandbox-1/release" && r.Method == http.MethodPost:
-			released = true
+			_ = json.NewEncoder(w).Encode(execSessionResult{ExitCode: 0, Stdout: "ok"})
+		case r.URL.Path == "/v1/sessions/session-1" && r.Method == http.MethodDelete:
+			deleted = true
 			w.WriteHeader(http.StatusNoContent)
 		default:
 			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
@@ -305,13 +291,12 @@ func TestSessionStageInputRunAndClose(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	staged, err := session.StageInput(context.Background(), sandboxcontract.StageInputRequest{Name: "data.csv", Content: strings.NewReader("a,b\n1,2\n")})
-	if err != nil {
-		t.Fatal(err)
+	workspace := session.Workspace()
+	if workspace.ID != "session-1" || workspace.Metadata["workspace_id"] != "ws-1" || workspace.Metadata["sandbox_id"] != "sandbox-1" {
+		t.Fatalf("session workspace=%+v", workspace)
 	}
 	result, err := session.Run(context.Background(), sandboxcontract.CommandRequest{
 		Command: execmodel.Command{Command: "python process.py", Shell: execmodel.ShellSh},
-		Options: execcontract.RunOptions{InputArtifacts: []execmodel.InputArtifactRef{staged.Artifact}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -319,20 +304,200 @@ func TestSessionStageInputRunAndClose(t *testing.T) {
 	if err := session.Close(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if !uploaded || !released {
-		t.Fatalf("uploaded=%t released=%t", uploaded, released)
+	if created.WorkspaceID != "ws-1" || created.StatePolicy != "session" || created.RuntimeProfile != "code-polyglot-basic" {
+		t.Fatalf("created session=%+v", created)
 	}
-	if len(jobSandboxes) != 2 || jobSandboxes[0] != "sandbox-1" || jobSandboxes[1] != "sandbox-1" {
-		t.Fatalf("job sandboxes=%+v", jobSandboxes)
+	if !deleted {
+		t.Fatalf("deleted=%t", deleted)
 	}
-	if len(runJob.InputArtifactIDs) != 1 || runJob.InputArtifactIDs[0] != "artifact-input" {
-		t.Fatalf("run job=%+v", runJob)
+	if len(execReq.Command) != 3 || execReq.Command[0] != "sh" || execReq.Command[1] != "-lc" {
+		t.Fatalf("exec req=%+v", execReq)
 	}
-	if result.Stdout != "ok" {
+	script := execReq.Command[2]
+	if !strings.Contains(script, "cd '/workspace'") || !strings.Contains(script, "export WORK_DIR='/workspace'") || !strings.Contains(script, "python process.py") {
+		t.Fatalf("session script=%q", script)
+	}
+	if result.Stdout != "ok" || result.Cwd != "/workspace" {
 		t.Fatalf("result=%+v", result)
 	}
 }
 
+func TestSandboxSessionWorkingDirRejectsHostPaths(t *testing.T) {
+	got := sandboxSessionWorkingDir(`D:\workspace\go\genesis-agent`, execmodel.ExecutionWorkspace{WorkDir: "/workspace"})
+	if got != "/workspace" {
+		t.Fatalf("cwd=%q", got)
+	}
+}
+
+func TestSessionRunWrapsCwdAndEnvForNamedSession(t *testing.T) {
+	var execReq execSessionRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v1/sessions" && r.Method == http.MethodPost:
+			_ = json.NewEncoder(w).Encode(sessionRecord{SessionID: "session-1", WorkspaceID: "ws-1", ActiveSandboxID: "sandbox-1", RuntimeProfile: "office-basic", StatePolicy: "session"})
+		case r.URL.Path == "/v1/sessions/session-1/exec" && r.Method == http.MethodPost:
+			if err := json.NewDecoder(r.Body).Decode(&execReq); err != nil {
+				t.Fatal(err)
+			}
+			_ = json.NewEncoder(w).Encode(execSessionResult{ExitCode: 0})
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client, err := New(Config{BaseURL: server.URL, RenewInterval: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := client.OpenSession(context.Background(), sandboxcontract.SessionOptions{
+		Workspace: sandboxcontract.WorkspaceRef{ID: "ws-1"},
+		Sandbox:   execmodel.SandboxProfile{RuntimeProfile: execmodel.RuntimeProfileOfficeBasic},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := session.Run(context.Background(), sandboxcontract.CommandRequest{
+		Command: execmodel.Command{
+			Command: "node deck.js",
+			Cwd:     "/workspace/scripts",
+			Env: map[string]string{
+				"NODE_PATH":    "/opt/genesis-sandbox/image/node_modules",
+				"BAD-KEY":      "ignored",
+				"QUOTED_VALUE": "it's ok",
+			},
+			Shell: execmodel.ShellAuto,
+		},
+		Options: execcontract.RunOptions{Workspace: execmodel.ExecutionWorkspace{WorkDir: "/workspace", InputDir: "/workspace", OutputDir: "/workspace", TmpDir: "/workspace/tmp"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Cwd != "/workspace/scripts" {
+		t.Fatalf("result cwd=%q", result.Cwd)
+	}
+	if len(execReq.Command) != 3 || execReq.Command[0] != "sh" || execReq.Command[1] != "-lc" {
+		t.Fatalf("exec req=%+v", execReq)
+	}
+	script := execReq.Command[2]
+	for _, want := range []string{
+		"cd '/workspace/scripts'",
+		"export NODE_PATH='/opt/genesis-sandbox/image/node_modules'",
+		`export QUOTED_VALUE='it'"'"'s ok'`,
+		"node deck.js",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("session script missing %q: %q", want, script)
+		}
+	}
+	if strings.Contains(script, "BAD-KEY") {
+		t.Fatalf("session script leaked invalid env key: %q", script)
+	}
+}
+
+func TestSessionWorkspaceFileSystemRejectsParentTraversal(t *testing.T) {
+	client, err := New(Config{BaseURL: "http://127.0.0.1:18010"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.ReadFile(context.Background(), sandboxcontract.FileRequest{
+		Workspace: sandboxcontract.WorkspaceRef{ID: "session-1"},
+		Path:      fsmodel.ResolvedPath{WorkspaceRel: "../secret.txt"},
+	}, fscontract.ReadOptions{})
+	if fscontract.CodeOf(err) != fscontract.ErrCodeInvalidPath {
+		t.Fatalf("err=%v code=%s", err, fscontract.CodeOf(err))
+	}
+}
+func TestSessionWorkspaceFileSystemUsesSessionScopedEndpoints(t *testing.T) {
+	calls := make([]string, 0)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls = append(calls, r.Method+" "+r.URL.Path+"?"+r.URL.RawQuery)
+		switch {
+		case r.URL.Path == "/v1/sessions/session-1/files" && r.Method == http.MethodPut:
+			if r.URL.Query().Get("path") != "dir/hello.txt" {
+				t.Fatalf("write path=%q", r.URL.RawQuery)
+			}
+			_ = json.NewEncoder(w).Encode(workspaceFileInfo{Path: "dir/hello.txt", Name: "hello.txt", Kind: "file", Size: 5})
+		case r.URL.Path == "/v1/sessions/session-1/files" && r.Method == http.MethodGet:
+			if r.URL.Query().Get("path") != "dir/hello.txt" {
+				t.Fatalf("read path=%q", r.URL.RawQuery)
+			}
+			w.Header().Set("X-Workspace-Path", "dir/hello.txt")
+			_, _ = w.Write([]byte("hello"))
+		case r.URL.Path == "/v1/sessions/session-1/files:list" && r.Method == http.MethodGet:
+			if r.URL.Query().Get("path") != "dir" || r.URL.Query().Get("recursive") != "false" {
+				t.Fatalf("list query=%q", r.URL.RawQuery)
+			}
+			_ = json.NewEncoder(w).Encode(workspaceListResult{Path: "dir", Entries: []workspaceFileInfo{{Path: "dir/hello.txt", Name: "hello.txt", Kind: "file", Size: 5}}, Limit: 10})
+		case r.URL.Path == "/v1/sessions/session-1/files:stat" && r.Method == http.MethodGet:
+			if r.URL.Query().Get("path") != "dir/hello.txt" {
+				t.Fatalf("stat query=%q", r.URL.RawQuery)
+			}
+			_ = json.NewEncoder(w).Encode(workspaceFileInfo{Path: "dir/hello.txt", Name: "hello.txt", Kind: "file", Size: 5})
+		case r.URL.Path == "/v1/sessions/session-1/dirs" && r.Method == http.MethodPost:
+			if r.URL.Query().Get("path") != "dir/sub" || r.URL.Query().Get("parents") != "true" {
+				t.Fatalf("mkdir query=%q", r.URL.RawQuery)
+			}
+			_ = json.NewEncoder(w).Encode(workspaceFileInfo{Path: "dir/sub", Name: "sub", Kind: "dir"})
+		case r.URL.Path == "/v1/sessions/session-1/files" && r.Method == http.MethodDelete:
+			if r.URL.Query().Get("path") != "dir/hello.txt" || r.URL.Query().Get("recursive") != "true" {
+				t.Fatalf("remove query=%q", r.URL.RawQuery)
+			}
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+
+	client, err := New(Config{BaseURL: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := sandboxcontract.WorkspaceRef{ID: "session-1", Provider: "genesis-sandbox"}
+	filePath := fsmodel.ResolvedPath{WorkspaceRel: "/workspace/dir/hello.txt"}
+	if err := client.WriteFile(context.Background(), sandboxcontract.WriteFileRequest{Workspace: workspace, Path: filePath, Content: []byte("hello"), Options: fscontract.WriteOptions{Overwrite: true}}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := client.ReadFile(context.Background(), sandboxcontract.FileRequest{Workspace: workspace, Path: filePath}, fscontract.ReadOptions{MaxBytes: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "hello" {
+		t.Fatalf("data=%q", data)
+	}
+	entries, err := client.ListDir(context.Background(), sandboxcontract.ListDirRequest{Workspace: workspace, Path: fsmodel.ResolvedPath{WorkspaceRel: "dir"}, Options: fscontract.ListOptions{MaxEntries: 10}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Path != "dir/hello.txt" || entries[0].Type != fsmodel.EntryTypeFile {
+		t.Fatalf("entries=%+v", entries)
+	}
+	stat, err := client.Stat(context.Background(), sandboxcontract.FileRequest{Workspace: workspace, Path: filePath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stat.Size != 5 || stat.Type != fsmodel.EntryTypeFile {
+		t.Fatalf("stat=%+v", stat)
+	}
+	if err := client.MkdirAll(context.Background(), sandboxcontract.MkdirRequest{Workspace: workspace, Path: fsmodel.ResolvedPath{WorkspaceRel: "dir/sub"}, Options: fscontract.MkdirOptions{Parents: true}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Remove(context.Background(), sandboxcontract.RemoveRequest{Workspace: workspace, Path: filePath, Options: fscontract.RemoveOptions{Recursive: true}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 6 {
+		t.Fatalf("calls=%+v", calls)
+	}
+}
+
+func TestFSErrorFromExecMapsDockerStatMissingFileToNotFound(t *testing.T) {
+	err := execcontract.NewError(execcontract.ErrCodeInvalidInput, fmt.Errorf("runner_failed: docker stat file /workspace/deck_gen.js: Error response from daemon: Could not find the file /workspace/deck_gen.js"))
+	got := fsErrorFromExec(err, "deck_gen.js")
+	if fscontract.CodeOf(got) != fscontract.ErrCodeNotFound {
+		t.Fatalf("err=%v code=%s", got, fscontract.CodeOf(got))
+	}
+}
 func TestRunCommandMaterializesArtifacts(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {

@@ -11,8 +11,8 @@ import (
 func TestNormalizeArgsStableAndIgnoresNoise(t *testing.T) {
 	a := `{"b":"  x ","a":1,"request_id":"r1","nonce":"n"}`
 	b := `{"a":1,"b":"x","trace_id":"t"}`
-	ka := BuildCallKey("run_skill_script", a, PathRoots{}, nil)
-	kb := BuildCallKey("run_skill_script", b, PathRoots{}, nil)
+	ka := BuildCallKey("run_skill_command", a, PathRoots{}, nil)
+	kb := BuildCallKey("run_skill_command", b, PathRoots{}, nil)
 	if ka.CallKey != kb.CallKey {
 		t.Fatalf("expected same call key, got %s vs %s\n%q\n%q", ka.CallKey, kb.CallKey, ka.Canonical, kb.Canonical)
 	}
@@ -31,8 +31,8 @@ func TestNormalizeArgsPathRewrite(t *testing.T) {
 }
 
 func TestNormalizeArgsDifferentArgsDifferentKey(t *testing.T) {
-	ka := BuildCallKey("run_skill_script", `{"script":"a.js"}`, PathRoots{}, nil)
-	kb := BuildCallKey("run_skill_script", `{"script":"b.js"}`, PathRoots{}, nil)
+	ka := BuildCallKey("run_skill_command", `{"script":"a.js"}`, PathRoots{}, nil)
+	kb := BuildCallKey("run_skill_command", `{"script":"b.js"}`, PathRoots{}, nil)
 	if ka.CallKey == kb.CallKey {
 		t.Fatal("expected different keys for different args")
 	}
@@ -44,12 +44,12 @@ func TestL1BlocksThirdIdenticalFailure(t *testing.T) {
 	fail := `{"ok":false,"failure_kind":"path_contract_violation","error":"bad path"}`
 
 	for i := 0; i < 2; i++ {
-		if g.Check("run_skill_script", args, nil).Blocked {
+		if g.Check("run_skill_command", args, nil).Blocked {
 			t.Fatalf("attempt %d should not block", i+1)
 		}
-		g.Record("run_skill_script", args, fail, nil, nil)
+		g.Record("run_skill_command", args, fail, nil, nil)
 	}
-	check := g.Check("run_skill_script", args, nil)
+	check := g.Check("run_skill_command", args, nil)
 	if !check.Blocked {
 		t.Fatal("third identical call should be blocked")
 	}
@@ -57,7 +57,7 @@ func TestL1BlocksThirdIdenticalFailure(t *testing.T) {
 		t.Fatalf("unexpected content: %s", check.Content)
 	}
 	// 拦截路径不 Record；再次 Check 仍拦截
-	if !g.Check("run_skill_script", args, nil).Blocked {
+	if !g.Check("run_skill_command", args, nil).Blocked {
 		t.Fatal("should remain blocked without success/clear")
 	}
 }
@@ -65,9 +65,9 @@ func TestL1BlocksThirdIdenticalFailure(t *testing.T) {
 func TestChangedArgsNotBlocked(t *testing.T) {
 	g := New(Config{Enabled: true, MaxIdenticalToolFailures: 2, MaxStagnantIterations: 0})
 	fail := `{"ok":false,"failure_kind":"path_contract_violation"}`
-	g.Record("run_skill_script", `{"script":"a.js"}`, fail, nil, nil)
-	g.Record("run_skill_script", `{"script":"a.js"}`, fail, nil, nil)
-	if g.Check("run_skill_script", `{"script":"b.js"}`, nil).Blocked {
+	g.Record("run_skill_command", `{"script":"a.js"}`, fail, nil, nil)
+	g.Record("run_skill_command", `{"script":"a.js"}`, fail, nil, nil)
+	if g.Check("run_skill_command", `{"script":"b.js"}`, nil).Blocked {
 		t.Fatal("different args must be allowed")
 	}
 }
@@ -76,14 +76,14 @@ func TestInstallSuccessClearsDependencyMissing(t *testing.T) {
 	g := New(Config{Enabled: true, MaxIdenticalToolFailures: 2, MaxStagnantIterations: 0})
 	args := `{"script":"create_pptx.js","skill":"office-ppt"}`
 	fail := `{"ok":false,"failure_kind":"dependency_missing","suggested_action":"install_then_retry"}`
-	g.Record("run_skill_script", args, fail, nil, nil)
-	g.Record("run_skill_script", args, fail, nil, nil)
-	if !g.Check("run_skill_script", args, nil).Blocked {
+	g.Record("run_skill_command", args, fail, nil, nil)
+	g.Record("run_skill_command", args, fail, nil, nil)
+	if !g.Check("run_skill_command", args, nil).Blocked {
 		t.Fatal("expected blocked before install")
 	}
 	g.Record("install_skill_dependencies", `{"skill":"office-ppt","packages":[{"manager":"npm","name":"pptxgenjs"}]}`,
 		`{"ok":true,"skill":"office-ppt"}`, nil, nil)
-	if g.Check("run_skill_script", args, nil).Blocked {
+	if g.Check("run_skill_command", args, nil).Blocked {
 		t.Fatal("same args should be allowed after install clear")
 	}
 }
@@ -93,7 +93,7 @@ func TestProgressGateInjectAndPartialComplete(t *testing.T) {
 
 	// 预热：登记 failure_kind，避免首轮「新 kind」算进展
 	g.BeginIteration()
-	g.Record("run_skill_script", `{"script":"seed.js"}`, `{"ok":false,"failure_kind":"path_contract_violation"}`, nil, nil)
+	g.Record("run_skill_command", `{"script":"seed.js"}`, `{"ok":false,"failure_kind":"path_contract_violation"}`, nil, nil)
 	if dec := g.EndIteration(0, false); !dec.HadProgress {
 		t.Fatal("seed new kind should be progress")
 	}
@@ -102,7 +102,7 @@ func TestProgressGateInjectAndPartialComplete(t *testing.T) {
 	for i := 1; i <= 2; i++ {
 		g.BeginIteration()
 		args := `{"script":"a.js","n":` + string(rune('0'+i)) + `}`
-		g.Record("run_skill_script", args, `{"ok":false,"failure_kind":"path_contract_violation"}`, nil, nil)
+		g.Record("run_skill_command", args, `{"ok":false,"failure_kind":"path_contract_violation"}`, nil, nil)
 		dec := g.EndIteration(i, false)
 		if dec.HadProgress {
 			t.Fatalf("iter %d should not have progress", i)
@@ -116,7 +116,7 @@ func TestProgressGateInjectAndPartialComplete(t *testing.T) {
 	}
 
 	g.BeginIteration()
-	g.Record("run_skill_script", `{"script":"a.js","n":9}`, `{"ok":false,"failure_kind":"path_contract_violation"}`, nil, nil)
+	g.Record("run_skill_command", `{"script":"a.js","n":9}`, `{"ok":false,"failure_kind":"path_contract_violation"}`, nil, nil)
 	dec := g.EndIteration(3, false)
 	if !dec.PartialComplete {
 		t.Fatalf("expected partial_complete, got %+v", dec)
@@ -203,3 +203,4 @@ func TestResetClearsAll(t *testing.T) {
 		t.Fatal("reset should clear blocks")
 	}
 }
+

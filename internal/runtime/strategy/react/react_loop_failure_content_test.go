@@ -17,7 +17,7 @@ import (
 // Kode renderResultForAssistant——失败时仍把 stdout/结构化正文交给模型。
 func TestToolFailureContentPreservesJSON(t *testing.T) {
 	jsonBody := `{"ok":false,"failure_kind":"dependency_missing","suggested_action":"install_then_retry"}`
-	got := toolFailureContent(jsonBody, fmt.Errorf("run_skill_script failed"))
+	got := toolFailureContent(jsonBody, fmt.Errorf("run_skill_command failed"))
 	if !strings.Contains(got, `"ok":false`) || !strings.Contains(got, `dependency_missing`) {
 		t.Fatalf("content discarded json: %q", got)
 	}
@@ -36,14 +36,14 @@ func TestToolFailureContentEmptyOutputFallsBackToError(t *testing.T) {
 func TestExecuteOneToolCallPreservesJSONOnError(t *testing.T) {
 	jsonBody := `{"ok":false,"failure_kind":"dependency_missing"}`
 	e := &ReactLoopEngine{
-		registry: failingJSONRegistry{output: jsonBody, err: fmt.Errorf("run_skill_script failed")},
+		registry: failingJSONRegistry{output: jsonBody, err: fmt.Errorf("run_skill_command failed")},
 		logger:   logger.NewNop(),
 		tracer:   traceadapter.NewNopTracer(),
 	}
 	rc := runtime.NewRunContext(&domain.Run{ID: "run-1"}, &domain.Agent{})
 	got := e.executeOneToolCall(context.Background(), rc, domain.ToolCall{
 		ID:       "c1",
-		Function: domain.FunctionCall{Name: "run_skill_script", Arguments: `{}`},
+		Function: domain.FunctionCall{Name: "run_skill_command", Arguments: `{}`},
 	}, logger.NewNop())
 	if !strings.Contains(got.Content, `"ok":false`) || !strings.Contains(got.Content, `dependency_missing`) {
 		t.Fatalf("content discarded json: %q", got.Content)
@@ -65,3 +65,4 @@ func (f failingJSONRegistry) Execute(context.Context, string, string) (string, e
 func (f failingJSONRegistry) ListInfos() []*tool.Info           { return nil }
 func (f failingJSONRegistry) FilterInfos([]string) []*tool.Info { return nil }
 func (f failingJSONRegistry) Names() []string                   { return nil }
+
