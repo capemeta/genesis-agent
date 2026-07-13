@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -37,7 +38,11 @@ func (c *fakeRemoteClient) ReadFile(_ context.Context, req sandboxcontract.FileR
 	return append([]byte(nil), c.files[normalizeSlash(req.Path.WorkspaceRel)]...), nil
 }
 func (c *fakeRemoteClient) WriteFile(_ context.Context, req sandboxcontract.WriteFileRequest) error {
-	c.files[normalizeSlash(req.Path.WorkspaceRel)] = append([]byte(nil), req.Content...)
+	path := normalizeSlash(req.Path.WorkspaceRel)
+	if _, exists := c.files[path]; exists && !req.Options.Overwrite {
+		return fscontract.NewError(fscontract.ErrCodeAlreadyExists, path, fmt.Errorf("目标文件已存在"))
+	}
+	c.files[path] = append([]byte(nil), req.Content...)
 	return nil
 }
 func (c *fakeRemoteClient) ListDir(context.Context, sandboxcontract.ListDirRequest) ([]fsmodel.DirEntry, error) {
@@ -89,7 +94,8 @@ func TestSkillCommandServiceRunsInRemoteSessionWorkspace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err := svc.Run(context.Background(), scriptcontract.RunRequest{Catalog: skillcontract.CatalogRequest{}, Skill: "demo", Command: `./scripts/make_output.cmd`, RunID: "remote-run", WorkspaceRoot: t.TempDir(), Sandbox: execmodel.SandboxProfile{Mode: execmodel.SandboxRequired, Provider: "genesis-sandbox"}})
+	root := t.TempDir()
+	result, err := svc.Run(context.Background(), scriptcontract.RunRequest{Catalog: skillcontract.CatalogRequest{}, Skill: "demo", Command: `./scripts/make_output.cmd`, RunID: "remote-run", WorkspaceRoot: root, Sandbox: execmodel.SandboxProfile{Mode: execmodel.SandboxRequired, Provider: "genesis-sandbox"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,8 +120,52 @@ func TestSkillCommandServiceRunsInRemoteSessionWorkspace(t *testing.T) {
 	if _, err := os.Stat(result.Artifacts[0].Path); err != nil {
 		t.Fatalf("artifact not materialized locally: %v path=%q", err, result.Artifacts[0].Path)
 	}
-	if !strings.Contains(filepath.ToSlash(result.Artifacts[0].Path), "/artifacts/demo/output.txt") {
-		t.Fatalf("artifact path=%q", result.Artifacts[0].Path)
+	if filepath.Clean(result.Artifacts[0].Path) == filepath.Clean(filepath.Join(root, "output.txt")) {
+		t.Fatalf("artifact leaked to workspace root: %q", result.Artifacts[0].Path)
+	}
+	matDir := filepath.Join(root, ".genesis", "runs", "remote-run-materialize")
+	if _, err := os.Stat(matDir); !os.IsNotExist(err) {
+		t.Fatalf("should not create separate -materialize run dir: %v", err)
+	}
+	wantSuffix := filepath.ToSlash(filepath.Join(".genesis", "runs", "remote-run", "output", "demo", "output.txt"))
+	if !strings.Contains(filepath.ToSlash(result.Artifacts[0].Path), wantSuffix) {
+		t.Fatalf("artifact should land under run output dir: %q", result.Artifacts[0].Path)
+	}
+}
+
+func TestSkillCommandServiceRestagesInputsOverExistingRemoteFiles(t *testing.T) {
+	client := newFakeRemoteClient()
+	source, err := embedded.NewSource(skillmodel.Authority{Kind: skillmodel.SourceKindEmbedded, ID: "test"}, skillmodel.ScopeSystem, fstest.MapFS{
+		"demo/SKILL.md":                {Data: []byte("---\nname: demo\ndescription: demo skill\nallowed-tools:\n  - run_skill_command\n---\nDemo")},
+		"demo/scripts/make_output.cmd": {Data: []byte("@echo off\r\necho remote>output.txt\r\n")},
+	}, skillparser.New())
+	if err != nil {
+		t.Fatal(err)
+	}
+	skills := skillservice.New([]skillcontract.Source{source}, skillservice.Options{})
+	svc, err := New(Deps{Skills: skills, Runner: nilRunner{}, Approval: allowAllApproval{}, SessionClient: client, FileClient: client, WorkspaceRef: sandboxcontract.WorkspaceRef{ID: "w1", Provider: "genesis-sandbox"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	req := scriptcontract.RunRequest{Catalog: skillcontract.CatalogRequest{}, Skill: "demo", Command: `./scripts/make_output.cmd`, RunID: "remote-run", WorkspaceRoot: root, Sandbox: execmodel.SandboxProfile{Mode: execmodel.SandboxRequired, Provider: "genesis-sandbox"}}
+	first, err := svc.Run(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !first.OK || !containsProduced(first.Produced, "output.txt") {
+		t.Fatalf("first result=%+v", first)
+	}
+	if err := os.WriteFile(filepath.Join(root, "output.txt"), []byte("fresh input"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	req.Inputs = []string{"output.txt"}
+	second, err := svc.Run(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !second.OK {
+		t.Fatalf("second result=%+v", second)
 	}
 }
 

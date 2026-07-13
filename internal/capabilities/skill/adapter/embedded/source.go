@@ -177,11 +177,18 @@ func (s *Source) Search(ctx context.Context, req contract.SearchRequest) (contra
 			return nil
 		}
 		text := string(data)
+		pathLower := strings.ToLower(p)
+		baseLower := strings.ToLower(path.Base(p))
 		idx := strings.Index(strings.ToLower(text), query)
-		if idx < 0 {
+		pathHit := strings.Contains(pathLower, query) || strings.Contains(baseLower, query)
+		if idx < 0 && !pathHit {
 			return nil
 		}
-		matches = append(matches, model.SearchMatch{Resource: resource, Title: path.Base(p), Snippet: snippet(text, idx, len(query))})
+		snippetAt := idx
+		if snippetAt < 0 {
+			snippetAt = 0
+		}
+		matches = append(matches, model.SearchMatch{Resource: resource, Title: path.Base(p), Snippet: snippet(text, snippetAt, len(query))})
 		return nil
 	})
 	if err != nil {

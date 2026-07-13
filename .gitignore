@@ -17,6 +17,9 @@ products/desktop/web/.github
 .genesis/logs/
 .genesis/
 
+# ── 本地头脑风暴 / Visual Companion 会话（不入库）────────
+.superpowers/
+
 # ── Go ────────────────────────────────────────────────────
 *.exe
 *.exe~

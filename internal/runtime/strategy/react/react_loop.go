@@ -476,12 +476,17 @@ func (e *ReactLoopEngine) executeToolCalls(ctx context.Context, rc *runtime.RunC
 		}})
 	}
 	results := scheduler.NewQueue().Run(ctx, tasks)
+	argsByID := map[string]string{}
+	for _, tc := range calls {
+		argsByID[tc.ID] = tc.Function.Arguments
+	}
 	out := make([]toolExecutionResult, 0, len(results))
 	for _, result := range results {
 		content := result.Output
 		if result.Err != nil {
 			content = toolFailureContent(result.Output, result.Err)
 		}
+		content = annotateSkillFollowHints(rc, result.Name, argsByID[result.ID], content)
 		out = append(out, toolExecutionResult{ID: result.ID, Name: result.Name, Content: content})
 	}
 	return out
@@ -531,6 +536,7 @@ func (e *ReactLoopEngine) executeOneToolCall(ctx context.Context, rc *runtime.Ru
 	if err != nil {
 		content = toolFailureContent(content, err)
 	}
+	content = annotateSkillFollowHints(rc, tc.Function.Name, tc.Function.Arguments, content)
 	return toolExecutionResult{ID: tc.ID, Name: tc.Function.Name, Content: content}
 }
 
@@ -944,7 +950,7 @@ func renderSkillInjection(injection skillInjectionOutput) string {
 	sb.WriteString(injection.Content)
 	sb.WriteString(renderSkillScriptBridge(injection))
 	if injection.Truncated {
-		sb.WriteString("\n\n[skill上下文已截断，必要时用 read_skill_resource/search_skill_resources 读取引用资源]")
+		sb.WriteString("\n\n[skill上下文已截断：开始写脚本或跑命令前，必须先用 read_skill_resource/search_skill_resources 读齐文中链接的 .md 参考，并完成 QA Required 步骤]")
 	}
 	sb.WriteString("\n</skill_injection>")
 	return sb.String()
@@ -959,9 +965,12 @@ func renderSkillScriptBridge(injection skillInjectionOutput) string {
 
 <skill_runtime_bridge>
 该 Skill 的 Markdown 是可移植规范，不要求其中出现 Genesis 专用工具名。
-当说明要求执行包内脚本（例如 python scripts/foo.py、python3 scripts/foo.py、node scripts/foo.js、npm 脚本包装 scripts/foo.js）时，必须改用 run_skill_command：skill=%q，command 直接填写原始命令行（例如 python scripts/foo.py --arg value）。
+当说明要求执行包内脚本或命令（例如 python scripts/foo.py、python3 scripts/foo.py、node scripts/foo.js、python -m some_module、npm 脚本包装 scripts/foo.js）时，必须改用 run_skill_command：skill=%q，command 直接填写原始命令行。
+按技能文档示例选择解释器：文档是 require()/'.js'/node 则用 node；是 python/python -m 则用 python。不要把 Node 包当成 python -m <pkg> 执行。
+SKILL 中写明须先 Read 的链接文档（如 *.md），以及 QA Required / Content QA 中的校验命令，必须实际执行，不可跳过。
 不要把 script resource id、args 拆成旧模型字段；运行时会先 materialize 完整 Skill 包，再在受控工作目录或远端 session workspace 中执行 command。
 如需把现有文件交给脚本处理，使用 run_skill_command.inputs 传入工作区内文件；运行时会自动 stage 到本次 Skill 工作目录。你用 write_file 写出的中间脚本应放在 $WORK_DIR/foo.ext，再以 inputs=["$WORK_DIR/foo.ext"] 传给 run_skill_command，command 使用相对文件名（例如 node foo.ext）。
+run_skill_command 返回的 artifacts 是受控产物引用；不要为了“交付”而把中间文件、解包 XML、pyc 或压缩包内部文件复制到仓库根目录。
 不要用 run_skill_command 执行 npm install、pip install、python -m pip install 等依赖安装命令。运行期依赖由 Skill 声明的 runtime/profile 提供；若工具结果明确返回 dependency_missing 和 suggested_install，再使用 install_skill_dependencies 或报告 profile 需要补齐。
 脚本可通过 WORK_DIR、INPUT_DIR、OUTPUT_DIR、TMP_DIR、SKILL_DIR 访问受控目录。
 不要改写第三方 SKILL.md 或 references 才能运行；适配由运行时完成。

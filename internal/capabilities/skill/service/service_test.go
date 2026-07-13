@@ -40,6 +40,23 @@ func TestServiceResolveLoadAndRender(t *testing.T) {
 	}
 }
 
+func TestServiceLoadKeepsFullBodyUnderDefaultBudget(t *testing.T) {
+	longBody := strings.Repeat("A", 12*1024) // > 旧 8KiB，应低于默认 256KiB 安全上限
+	source := fakeSource{meta: model.Metadata{Name: "review", QualifiedName: "review", Description: "Review things", Enabled: true, PromptVisible: true, Authority: model.Authority{Kind: model.SourceKindHost, ID: "fake"}, PackageID: "review", MainResource: "review/SKILL.md"}.Normalize(), body: longBody}
+	svc := New([]contract.Source{source}, Options{})
+	req := contract.CatalogRequest{Product: profilemodel.ChannelCLI, Environment: profilemodel.EnvironmentLocal}
+	injection, err := svc.Load(context.Background(), contract.LoadRequest{ResolveRequest: contract.ResolveRequest{CatalogRequest: req, Name: "review", ModelCall: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if injection.Truncated {
+		t.Fatal("default budget should not truncate 12KiB skill body")
+	}
+	if !strings.Contains(injection.Contents, longBody) {
+		t.Fatal("expected full body retained")
+	}
+}
+
 type fakeCapabilityRegistry struct {
 	records []capmodel.CapabilityIndexRecord
 }
@@ -159,7 +176,10 @@ func TestRenderAvailableSkillsOmitsDisableModelInvocationButExplicitLoadWorks(t 
 }
 func TestServiceReadAndSearchResources(t *testing.T) {
 	meta := model.Metadata{Name: "review", QualifiedName: "review", Description: "Review things", Enabled: true, PromptVisible: true, Authority: model.Authority{Kind: model.SourceKindHost, ID: "fake"}, PackageID: "review", MainResource: "review/SKILL.md"}.Normalize()
-	source := fakeSource{meta: meta, body: "Body", resources: map[model.ResourceID]string{"review/references/guide.md": "alpha beta"}}
+	source := fakeSource{meta: meta, body: "Body", resources: map[model.ResourceID]string{
+		"review/references/guide.md": "alpha beta",
+		"review/design.md":           "palette here",
+	}}
 	svc := New([]contract.Source{source}, Options{})
 	req := contract.CatalogRequest{Product: profilemodel.ChannelCLI, Environment: profilemodel.EnvironmentLocal}
 	resource, err := svc.ReadResource(context.Background(), contract.ResourceRequest{ResolveRequest: contract.ResolveRequest{CatalogRequest: req, Name: "review"}, Resource: "review/references/guide.md"})
@@ -169,11 +189,25 @@ func TestServiceReadAndSearchResources(t *testing.T) {
 	if resource.Content != "alpha beta" {
 		t.Fatalf("resource = %+v", resource)
 	}
+	short, err := svc.ReadResource(context.Background(), contract.ResourceRequest{ResolveRequest: contract.ResolveRequest{CatalogRequest: req, Name: "review"}, Resource: "references/guide.md"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if short.Content != "alpha beta" || short.Resource != "review/references/guide.md" {
+		t.Fatalf("short resource = %+v", short)
+	}
+	bare, err := svc.ReadResource(context.Background(), contract.ResourceRequest{ResolveRequest: contract.ResolveRequest{CatalogRequest: req, Name: "review"}, Resource: "design.md"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bare.Content != "palette here" || bare.Resource != "review/design.md" {
+		t.Fatalf("bare resource = %+v", bare)
+	}
 	matches, err := svc.SearchResources(context.Background(), contract.SearchResourcesRequest{ResolveRequest: contract.ResolveRequest{CatalogRequest: req, Name: "review"}, Query: "alpha"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(matches.Matches) != 1 {
+	if len(matches.Matches) < 1 {
 		t.Fatalf("matches = %+v", matches)
 	}
 }

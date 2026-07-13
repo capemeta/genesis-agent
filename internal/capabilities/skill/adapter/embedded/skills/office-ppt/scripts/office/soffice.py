@@ -1,24 +1,48 @@
 """
 Helper for running LibreOffice (soffice) in environments where AF_UNIX
-sockets may be blocked (e.g., sandboxed VMs).  Detects the restriction
+sockets may be blocked (e.g., sandboxed Linux VMs).  Detects the restriction
 at runtime and applies an LD_PRELOAD shim if needed.
 
+On Windows / platforms without AF_UNIX, the shim is skipped and soffice is
+invoked directly (typical host install: soffice.exe on PATH).
+
 Usage:
-    from office.soffice import run_soffice, get_soffice_env
+    from office.soffice import run_soffice, get_soffice_env, resolve_soffice_bin
 
     # Option 1 – run soffice directly
     result = run_soffice(["--headless", "--convert-to", "pdf", "input.docx"])
 
     # Option 2 – get env dict for your own subprocess calls
     env = get_soffice_env()
-    subprocess.run(["soffice", ...], env=env)
+    subprocess.run([resolve_soffice_bin(), ...], env=env)
 """
 
 import os
+import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
+
+
+def resolve_soffice_bin() -> str:
+    """Locate LibreOffice binary; prefer PATH, then common Windows install dirs."""
+    for name in ("soffice", "soffice.exe", "libreoffice", "libreoffice.exe"):
+        found = shutil.which(name)
+        if found:
+            return found
+    if sys.platform == "win32":
+        candidates = [
+            Path(os.environ.get("PROGRAMFILES", r"C:\Program Files")) / "LibreOffice" / "program" / "soffice.exe",
+            Path(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")) / "LibreOffice" / "program" / "soffice.exe",
+        ]
+        for path in candidates:
+            if path.is_file():
+                return str(path)
+    raise FileNotFoundError(
+        "soffice/libreoffice not found on PATH; install LibreOffice or add soffice to PATH"
+    )
 
 
 def get_soffice_env() -> dict:
@@ -34,14 +58,17 @@ def get_soffice_env() -> dict:
 
 def run_soffice(args: list[str], **kwargs) -> subprocess.CompletedProcess:
     env = get_soffice_env()
-    return subprocess.run(["soffice"] + args, env=env, **kwargs)
-
+    bin_path = resolve_soffice_bin()
+    return subprocess.run([bin_path] + args, env=env, **kwargs)
 
 
 _SHIM_SO = Path(tempfile.gettempdir()) / "lo_socket_shim.so"
 
 
 def _needs_shim() -> bool:
+    # Linux sandbox only. Windows has no AF_UNIX; accessing it raises AttributeError.
+    if sys.platform == "win32" or not hasattr(socket, "AF_UNIX"):
+        return False
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.close()
@@ -63,7 +90,6 @@ def _ensure_shim() -> Path:
     )
     src.unlink()
     return _SHIM_SO
-
 
 
 _SHIM_SOURCE = r"""
@@ -176,8 +202,6 @@ int close(int fd) {
 """
 
 
-
 if __name__ == "__main__":
-    import sys
     result = run_soffice(sys.argv[1:])
     sys.exit(result.returncode)

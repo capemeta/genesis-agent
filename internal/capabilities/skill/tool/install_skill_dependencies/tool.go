@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"time"
 
@@ -25,7 +27,11 @@ const (
 )
 
 // 包名白名单字符：对齐 npm/pypi 常见命名，拒绝 shell 元字符。
-var safePackageName = regexp.MustCompile(`^[A-Za-z0-9@][A-Za-z0-9@._+\-/]*$`)
+// pip 允许 extras：markitdown[pptx]；白名单按 base name 匹配。
+var (
+	safePackageName    = regexp.MustCompile(`^[A-Za-z0-9@][A-Za-z0-9@._+\-/]*$`)
+	safePipPackageSpec = regexp.MustCompile(`^[A-Za-z0-9@][A-Za-z0-9@._+\-/]*(\[[A-Za-z0-9][A-Za-z0-9,_]*\])?$`)
+)
 
 // SkillResolver 解析 Skill 元数据（产品注入完整 skill.Service 即可）。
 type SkillResolver interface {
@@ -197,12 +203,22 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 		return marshalFail(out, out.Error)
 	}
 
-	commands, err := buildInstallCommands(pkgs)
+	wsRoot := strings.TrimSpace(t.deps.WorkspaceRoot)
+	if wsRoot == "" {
+		wsRoot = "."
+	}
+	absRoot, err := filepath.Abs(wsRoot)
+	if err != nil {
+		return "", fmt.Errorf("解析工作区失败: %w", err)
+	}
+	installRoot := skillDependencyInstallRoot(absRoot, meta)
+	steps, err := buildInstallSteps(pkgs, installRoot)
 	if err != nil {
 		return "", err
 	}
-	out.Commands = commands
+	out.Commands = installStepCommands(steps)
 	out.Installed = pkgs
+	out.Metadata["install_root"] = installRoot
 
 	decision, err := t.deps.Approval.Authorize(ctx, approvalmodel.Request{
 		ToolName: toolName,
@@ -228,7 +244,7 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 		},
 		Metadata: map[string]string{
 			"skill_dep_install": "true",
-			"commands":          strings.Join(commands, " && "),
+			"commands":          strings.Join(out.Commands, " && "),
 		},
 	})
 	if err != nil {
@@ -242,13 +258,10 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 		return marshalFail(out, out.Error)
 	}
 
-	wsRoot := strings.TrimSpace(t.deps.WorkspaceRoot)
-	if wsRoot == "" {
-		wsRoot = "."
-	}
-	absRoot, err := filepath.Abs(wsRoot)
-	if err != nil {
-		return "", fmt.Errorf("解析工作区失败: %w", err)
+	for _, dir := range installTargetDirs(pkgs, installRoot) {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return "", fmt.Errorf("创建依赖安装目录失败: %w", err)
+		}
 	}
 
 	sandbox := cloneSandbox(t.deps.Sandbox)
@@ -269,17 +282,19 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 
 	var stdoutBuf, stderrBuf strings.Builder
 	lastCode := 0
-	for _, cmdLine := range commands {
+	// cwd 相对安装：禁止 npm --prefix / pip --target 拼绝对路径引号（Windows cmd 会弄坏路径）。
+	// 远程 genesis-sandbox 在上方已 early-return，不会进入此循环。
+	for _, step := range steps {
 		result, runErr := t.deps.Runner.Run(ctx, execmodel.Command{
-			Command: cmdLine,
-			Cwd:     absRoot,
+			Command: step.Command,
+			Cwd:     step.Cwd,
 			Shell:   "auto",
 		}, execcontract.RunOptions{
 			Timeout: defaultTimeout,
 			Sandbox: sandbox,
 			Workspace: execmodel.ExecutionWorkspace{
-				WorkDir: absRoot,
-				TmpDir:  absRoot,
+				WorkDir: step.Cwd,
+				TmpDir:  step.Cwd,
 			},
 		})
 		if runErr != nil {
@@ -314,7 +329,7 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 			out.ExitCode = result.ExitCode
 			out.Stdout = stdoutBuf.String()
 			out.Stderr = stderrBuf.String()
-			out.Error = fmt.Sprintf("install exit_code=%d for %q", result.ExitCode, cmdLine)
+			out.Error = fmt.Sprintf("install exit_code=%d for %q (cwd=%s)", result.ExitCode, step.Command, step.Cwd)
 			if result.Error != "" {
 				out.Error = result.Error
 			}
@@ -353,12 +368,18 @@ func normalizeAndAuthorizePackages(in []packageInput, deps model.Dependencies) (
 		if manager == "system" {
 			return nil, fmt.Errorf("system 依赖（如 libreoffice）不可对话期安装，请使用预装镜像/profile")
 		}
-		if !isSafePackageName(name) {
+		baseName := name
+		if manager == "pip" {
+			if !isSafePipPackageSpec(name) {
+				return nil, fmt.Errorf("非法包名: %q", name)
+			}
+			baseName = pipBaseName(name)
+		} else if !isSafePackageName(name) {
 			return nil, fmt.Errorf("非法包名: %q", name)
 		}
-		key := manager + ":" + strings.ToLower(name)
+		key := manager + ":" + strings.ToLower(baseName)
 		if _, ok := wl[key]; !ok {
-			return nil, fmt.Errorf("包 %s/%s 不在 skill dependencies.runtime 白名单", manager, name)
+			return nil, fmt.Errorf("包 %s/%s 不在 skill dependencies.runtime 白名单", manager, baseName)
 		}
 		if _, dup := seen[key]; dup {
 			continue
@@ -402,12 +423,43 @@ func isSafePackageName(name string) bool {
 	return true
 }
 
-func buildInstallCommands(pkgs []packageInput) ([]string, error) {
+func isSafePipPackageSpec(name string) bool {
+	if !safePipPackageSpec.MatchString(name) {
+		return false
+	}
+	if strings.ContainsAny(name, " \t\n;&|`$<>(){}") {
+		return false
+	}
+	if strings.Contains(name, "..") || strings.HasPrefix(name, "/") || strings.HasPrefix(name, "\\") {
+		return false
+	}
+	if len(name) >= 2 && name[1] == ':' {
+		return false
+	}
+	return true
+}
+
+func pipBaseName(name string) string {
+	name = strings.TrimSpace(name)
+	if idx := strings.Index(name, "["); idx > 0 {
+		return name[:idx]
+	}
+	return name
+}
+
+// installStep 是本地 L0 / 本地平台共用的安装步骤：cwd 指向落点，命令不含绝对路径。
+type installStep struct {
+	Manager string
+	Cwd     string
+	Command string
+}
+
+func buildInstallSteps(pkgs []packageInput, installRoot string) ([]installStep, error) {
 	byManager := map[string][]string{}
 	for _, p := range pkgs {
 		byManager[p.Manager] = append(byManager[p.Manager], p.Name)
 	}
-	cmds := make([]string, 0, len(byManager))
+	steps := make([]installStep, 0, len(byManager)+1)
 	// 固定顺序便于测试稳定。
 	for _, manager := range []string{"npm", "pip"} {
 		names := byManager[manager]
@@ -416,16 +468,129 @@ func buildInstallCommands(pkgs []packageInput) ([]string, error) {
 		}
 		switch manager {
 		case "npm":
-			// 模板白名单：仅 npm install <pkg...>，禁止额外 flags。
-			cmds = append(cmds, "npm install "+strings.Join(names, " "))
+			steps = append(steps, installStep{
+				Manager: manager,
+				Cwd:     filepath.Join(installRoot, "node"),
+				Command: "npm install " + strings.Join(names, " "),
+			})
 		case "pip":
-			cmds = append(cmds, "python -m pip install "+strings.Join(names, " "))
+			venvDir := filepath.Join(installRoot, "venv")
+			if !venvPythonExists(venvDir) {
+				steps = append(steps, installStep{
+					Manager: "venv",
+					Cwd:     installRoot,
+					Command: "python -m venv venv",
+				})
+			}
+			steps = append(steps, installStep{
+				Manager: manager,
+				Cwd:     venvDir,
+				// 引号保护 extras（markitdown[pptx]），避免 bash 字符类 glob。
+				Command: venvPythonRel() + " -m pip install " + quotePipPackageArgs(names),
+			})
 		}
 	}
-	if len(cmds) == 0 {
+	if len(steps) == 0 {
 		return nil, fmt.Errorf("无法生成安装命令")
 	}
-	return cmds, nil
+	return steps, nil
+}
+
+func installStepCommands(steps []installStep) []string {
+	out := make([]string, 0, len(steps))
+	for _, step := range steps {
+		out = append(out, step.Command)
+	}
+	return out
+}
+
+func installTargetDirs(pkgs []packageInput, installRoot string) []string {
+	dirs := make([]string, 0, 2)
+	seen := map[string]struct{}{}
+	for _, p := range pkgs {
+		var dir string
+		switch p.Manager {
+		case "npm":
+			dir = filepath.Join(installRoot, "node")
+		case "pip":
+			dir = installRoot // venv 由 python -m venv 创建
+		default:
+			continue
+		}
+		if _, ok := seen[dir]; ok {
+			continue
+		}
+		seen[dir] = struct{}{}
+		dirs = append(dirs, dir)
+	}
+	return dirs
+}
+
+func quotePipPackageArgs(names []string) string {
+	parts := make([]string, 0, len(names))
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if strings.ContainsAny(name, "[]") {
+			parts = append(parts, `"`+name+`"`)
+			continue
+		}
+		parts = append(parts, name)
+	}
+	return strings.Join(parts, " ")
+}
+
+func venvPythonRel() string {
+	if runtime.GOOS == "windows" {
+		return `Scripts\python.exe`
+	}
+	return "bin/python"
+}
+
+func venvPythonExists(venvDir string) bool {
+	name := "python"
+	if runtime.GOOS == "windows" {
+		name = "python.exe"
+	}
+	info, err := os.Stat(filepath.Join(venvDir, venvBinDirName(), name))
+	return err == nil && !info.IsDir()
+}
+
+func venvBinDirName() string {
+	if runtime.GOOS == "windows" {
+		return "Scripts"
+	}
+	return "bin"
+}
+
+func skillDependencyInstallRoot(workspaceRoot string, meta model.Metadata) string {
+	skillID := sanitizePathPart(firstNonEmpty(string(meta.PackageID), meta.QualifiedName, meta.Name))
+	return filepath.Join(workspaceRoot, ".genesis", "skill-deps", skillID)
+}
+
+func sanitizePathPart(raw string) string {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return "skill"
+	}
+	replacer := strings.NewReplacer(`/`, `_`, `\`, `_`, `:`, `_`, `*`, `_`, `?`, `_`, `"`, `_`, `<`, `_`, `>`, `_`, `|`, `_`)
+	value = replacer.Replace(value)
+	value = strings.Trim(value, ". ")
+	if value == "" {
+		return "skill"
+	}
+	return value
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func joinPkgNames(pkgs []packageInput) string {
@@ -464,4 +629,3 @@ func marshalFail(out *resultPayload, msg string) (string, error) {
 	}
 	return string(data), fmt.Errorf("%s", msg)
 }
-

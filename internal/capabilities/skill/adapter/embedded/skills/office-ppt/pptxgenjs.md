@@ -1,5 +1,7 @@
 # PptxGenJS Tutorial
 
+PptxGenJS is a **Node.js** library (`require("pptxgenjs")`). Write a `.js` file and run `node your_script.js`. Do **not** use `python -m pptxgenjs`.
+
 ## Setup & Basic Structure
 
 ```javascript
@@ -15,6 +17,8 @@ slide.addText("Hello World!", { x: 0.5, y: 0.5, fontSize: 36, color: "363636" })
 
 pres.writeFile({ fileName: "Presentation.pptx" });
 ```
+
+**Important:** `pres.addSlide()` takes no content properties. Always capture the returned slide, then call `slide.addText` / `slide.addTable` / `slide.addShape` / …. Passing `{ title, table, bullet, layout }` (or similar) into `addSlide(...)` is invalid and produces blank slides even when the script exits 0.
 
 ## Layout Dimensions
 
@@ -50,6 +54,10 @@ slide.addText([
   { text: "Line 2", options: { breakLine: true } },
   { text: "Line 3" }  // Last item doesn't need breakLine
 ], { x: 0.5, y: 0.5, w: 8, h: 2 });
+
+// ❌ WRONG: CSS-style lineSpacing multipliers / raw \n for layout
+// lineSpacing is POINTS (e.g. 28), NOT 1.4x. Using 1.4 collapses lines on top of each other.
+// Prefer breakLine arrays + paraSpaceAfter; do not rely on "\n\n" in a single string.
 
 // Text box margin (internal padding)
 slide.addText("Title", {
@@ -379,15 +387,27 @@ titleSlide.addText("My Title", { placeholder: "title" });
    shadow: { type: "outer", blur: 6, offset: 2, color: "000000", opacity: 0.12 }  // ✅ CORRECT
    ```
 
-3. **Use `bullet: true`** - NEVER unicode symbols like "•" (creates double bullets)
+3. **Use `bullet: true`** - NEVER unicode symbols like "•" or emoji (💡/✅) as bullets (double bullets / glyph overlap). Prefer `bullet: true` plus plain text.
 
-4. **Use `breakLine: true`** between array items or text runs together
+4. **Use `breakLine: true`** between array items — do **not** rely on `"\\n"` / `"\\n\\n"` inside one string for paragraph layout.
 
-5. **Avoid `lineSpacing` with bullets** - causes excessive gaps; use `paraSpaceAfter` instead
+5. **`lineSpacing` is POINTS, not a CSS multiplier** — `lineSpacing: 1.4` means **1.4pt** and causes overlapping text. Use ~fontSize+4–8 (e.g. fontSize 22 → `lineSpacing: 28`) or skip it and use `paraSpaceAfter`. Never pass values like `1.2` / `1.5` expecting “1.5× spacing”.
+   ```javascript
+   // ❌ OVERLAPS: multiplier mistaken for points
+   slide.addText("Line A\\n\\nLine B", { fontSize: 22, lineSpacing: 1.4 });
 
-6. **Each presentation needs fresh instance** - don't reuse `pptxgen()` objects
+   // ✅ CORRECT: breakLine + optional paraSpaceAfter
+   slide.addText([
+     { text: "Line A", options: { breakLine: true, paraSpaceAfter: 12 } },
+     { text: "Line B" }
+   ], { x: 0.5, y: 1.2, w: 9, h: 3, fontSize: 22 });
+   ```
 
-7. **NEVER reuse option objects across calls** - PptxGenJS mutates objects in-place (e.g. converting shadow values to EMU). Sharing one object between multiple calls corrupts the second shape.
+6. **Avoid `lineSpacing` with bullets** - causes excessive gaps; use `paraSpaceAfter` instead
+
+7. **Each presentation needs fresh instance** - don't reuse `pptxgen()` objects
+
+8. **NEVER reuse option objects across calls** - PptxGenJS mutates objects in-place (e.g. converting shadow values to EMU). Sharing one object between multiple calls corrupts the second shape.
    ```javascript
    const shadow = { type: "outer", blur: 6, offset: 2, color: "000000", opacity: 0.15 };
    slide.addShape(pres.shapes.RECTANGLE, { shadow, ... });  // ❌ second call gets already-converted values
@@ -398,7 +418,7 @@ titleSlide.addText("My Title", { placeholder: "title" });
    slide.addShape(pres.shapes.RECTANGLE, { shadow: makeShadow(), ... });
    ```
 
-8. **Don't use `ROUNDED_RECTANGLE` with accent borders** - rectangular overlay bars won't cover rounded corners. Use `RECTANGLE` instead.
+9. **Don't use `ROUNDED_RECTANGLE` with accent borders** - rectangular overlay bars won't cover rounded corners. Use `RECTANGLE` instead.
    ```javascript
    // ❌ WRONG: Accent bar doesn't cover rounded corners
    slide.addShape(pres.shapes.ROUNDED_RECTANGLE, { x: 1, y: 1, w: 3, h: 1.5, fill: { color: "FFFFFF" } });

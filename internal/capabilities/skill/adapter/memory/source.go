@@ -4,6 +4,7 @@ package memory
 import (
 	"context"
 	"fmt"
+	"path"
 	"sort"
 	"strings"
 	"sync"
@@ -145,11 +146,18 @@ func (s *Source) Search(ctx context.Context, req contract.SearchRequest) (contra
 	}
 	matches := make([]model.SearchMatch, 0)
 	for resource, content := range skill.Resources {
+		pathLower := strings.ToLower(string(resource))
+		baseLower := strings.ToLower(path.Base(string(resource)))
 		idx := strings.Index(strings.ToLower(content), query)
-		if idx < 0 {
+		pathHit := strings.Contains(pathLower, query) || strings.Contains(baseLower, query)
+		if idx < 0 && !pathHit {
 			continue
 		}
-		matches = append(matches, model.SearchMatch{Resource: resource, Title: string(resource), Snippet: snippet(content, idx, len(query))})
+		snippetAt := idx
+		if snippetAt < 0 {
+			snippetAt = 0
+		}
+		matches = append(matches, model.SearchMatch{Resource: resource, Title: string(resource), Snippet: snippet(content, snippetAt, len(query))})
 		if len(matches) >= limit {
 			break
 		}

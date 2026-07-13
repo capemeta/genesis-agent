@@ -2,7 +2,9 @@ package service
 
 import (
 	"context"
+	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -43,6 +45,13 @@ func TestSkillCommandServiceRunsLocalSkillCommand(t *testing.T) {
 	}
 	if got := filepath.Join(result.WorkDir, "made.txt"); !containsProduced(result.Produced, "made.txt") {
 		t.Fatalf("expected produced made.txt, produced=%v path=%s", result.Produced, got)
+	}
+	wantArtifact := filepath.Join(result.WorkDir, "made.txt")
+	if len(result.Artifacts) != 1 || filepath.Clean(result.Artifacts[0].Path) != filepath.Clean(wantArtifact) {
+		t.Fatalf("artifact should stay in skill work dir: %+v", result.Artifacts)
+	}
+	if _, err := os.Stat(filepath.Join(root, "made.txt")); !os.IsNotExist(err) {
+		t.Fatalf("skill artifact leaked to workspace root, err=%v", err)
 	}
 }
 
@@ -94,6 +103,38 @@ func TestSkillEnvIncludesRemoteNodeRuntimeSearchPath(t *testing.T) {
 	}
 }
 
+func TestSkillEnvUsesControlledLocalDependencyPaths(t *testing.T) {
+	root := t.TempDir()
+	workDir := filepath.Join(root, ".genesis", "runs", "run-1", "work", "skills", "office-ppt")
+	depRoot := filepath.Join(root, ".genesis", "skill-deps", "office-ppt")
+	binDir := filepath.Join(depRoot, "venv", "bin")
+	pyName := "python"
+	if runtime.GOOS == "windows" {
+		binDir = filepath.Join(depRoot, "venv", "Scripts")
+		pyName = "python.exe"
+	}
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(binDir, pyName), []byte(""), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	env := skillEnv(workDir, filepath.Join(root, ".genesis", "runs", "run-1", "tmp"))
+
+	if !strings.Contains(env["NODE_PATH"], filepath.Join(depRoot, "node", "node_modules")) {
+		t.Fatalf("NODE_PATH missing controlled dependency dir: %s", env["NODE_PATH"])
+	}
+	if env["VIRTUAL_ENV"] != filepath.Join(depRoot, "venv") {
+		t.Fatalf("VIRTUAL_ENV=%q", env["VIRTUAL_ENV"])
+	}
+	if !strings.Contains(env["PATH"], binDir) {
+		t.Fatalf("PATH missing venv bin: %s", env["PATH"])
+	}
+	if strings.Contains(env["NODE_PATH"], filepath.Join(root, "node_modules")) {
+		t.Fatalf("NODE_PATH should not include workspace root node_modules: %s", env["NODE_PATH"])
+	}
+}
+
 func skillRunRequest(skill, command, root string) scriptcontract.RunRequest {
 	return scriptcontract.RunRequest{Catalog: skillcontract.CatalogRequest{}, Skill: skill, Command: command, RunID: "test-run", WorkspaceRoot: root, Sandbox: execmodel.SandboxProfile{Mode: execmodel.SandboxDisabled}}
 }
@@ -123,4 +164,19 @@ func containsProduced(values []string, suffix string) bool {
 		}
 	}
 	return false
+}
+
+func TestShouldIgnoreProducedPath(t *testing.T) {
+	if !shouldIgnoreProducedPath("scripts/office/__pycache__/soffice.cpython-312.pyc") {
+		t.Fatal("expected ignore pycache pyc")
+	}
+	if !shouldIgnoreProducedPath("__pycache__/x.pyc") {
+		t.Fatal("expected ignore root pycache")
+	}
+	if shouldIgnoreProducedPath("thumbnails.jpg") {
+		t.Fatal("should keep thumbnails")
+	}
+	if shouldIgnoreProducedPath("ultra5-comparison-summary.pptx") {
+		t.Fatal("should keep pptx")
+	}
 }

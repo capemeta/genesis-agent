@@ -93,6 +93,7 @@ func (e *ReactLoopEngine) applySkillToolResult(rc *runtime.RunContext, toolResul
 	rc.Messages = append(rc.Messages, domain.NewToolResultMessage(toolResult.ID, renderSkillToolAck(injection, narrowOK)))
 	rc.Messages = append(rc.Messages, domain.NewSystemMessage(renderSkillInjection(injection)))
 	rc.MarkInjectedSkill(key)
+	registerSkillInjectionFollow(rc, injection.Content)
 	if narrowOK {
 		*activeToolNames = narrowed
 		*toolInfos = e.filterToolInfos(context.Background(), *activeToolNames)
@@ -143,6 +144,7 @@ func (e *ReactLoopEngine) injectMentionedSkills(ctx context.Context, rc *runtime
 		narrowed, narrowOK := narrowToolNames(*activeToolNames, injection.AllowedTools)
 		rc.Messages = append(rc.Messages, domain.NewSystemMessage(renderSkillInjection(injection)))
 		rc.MarkInjectedSkill(key)
+		registerSkillInjectionFollow(rc, injection.Content)
 		if narrowOK {
 			*activeToolNames = narrowed
 			*toolInfos = e.filterToolInfos(ctx, *activeToolNames)

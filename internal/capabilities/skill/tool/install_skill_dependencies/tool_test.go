@@ -3,6 +3,7 @@ package install_skill_dependencies
 import (
 	"context"
 	"encoding/json"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -33,6 +34,15 @@ type fakeRunner struct {
 func (f *fakeRunner) Run(ctx context.Context, cmd execmodel.Command, opts execcontract.RunOptions) (*execmodel.Result, error) {
 	f.lastCmd = cmd
 	f.lastOpts = opts
+	return &execmodel.Result{ExitCode: 0, Stdout: "ok"}, nil
+}
+
+type recordingRunner struct {
+	cmds []execmodel.Command
+}
+
+func (r *recordingRunner) Run(ctx context.Context, cmd execmodel.Command, opts execcontract.RunOptions) (*execmodel.Result, error) {
+	r.cmds = append(r.cmds, cmd)
 	return &execmodel.Result{ExitCode: 0, Stdout: "ok"}, nil
 }
 
@@ -106,11 +116,12 @@ func TestInstallDeniedByApproval(t *testing.T) {
 
 func TestInstallSuccessRunsWhitelistedCommand(t *testing.T) {
 	runner := &fakeRunner{}
+	root := t.TempDir()
 	tool, err := New(Deps{
 		Skills:        fakeSkills{meta: testMeta(skillmodel.RuntimeDeps{Node: []skillmodel.RuntimePackage{{Name: "pptxgenjs"}}})},
 		Runner:        runner,
 		Approval:      allowAllApproval{},
-		WorkspaceRoot: t.TempDir(),
+		WorkspaceRoot: root,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -126,8 +137,17 @@ func TestInstallSuccessRunsWhitelistedCommand(t *testing.T) {
 	if !payload.OK || payload.Scope != "workspace" {
 		t.Fatalf("payload=%+v", payload)
 	}
-	if runner.lastCmd.Command != "npm install pptxgenjs" {
-		t.Fatalf("command=%q", runner.lastCmd.Command)
+	installRoot := filepath.Join(root, ".genesis", "skill-deps", "office-ppt")
+	wantCwd := filepath.Join(installRoot, "node")
+	wantCommand := "npm install pptxgenjs"
+	if runner.lastCmd.Command != wantCommand {
+		t.Fatalf("command=%q want=%q", runner.lastCmd.Command, wantCommand)
+	}
+	if runner.lastCmd.Cwd != wantCwd {
+		t.Fatalf("cwd=%q want=%q", runner.lastCmd.Cwd, wantCwd)
+	}
+	if runner.lastOpts.Workspace.WorkDir != wantCwd {
+		t.Fatalf("workspace=%+v want workdir=%q", runner.lastOpts.Workspace, wantCwd)
 	}
 	if runner.lastOpts.Sandbox.Operation != execmodel.SandboxOperationBuildDependencies {
 		t.Fatalf("operation=%s", runner.lastOpts.Sandbox.Operation)
@@ -137,6 +157,94 @@ func TestInstallSuccessRunsWhitelistedCommand(t *testing.T) {
 	}
 	if runner.lastOpts.Sandbox.Metadata["skill_dep_install"] != "true" {
 		t.Fatalf("metadata=%v", runner.lastOpts.Sandbox.Metadata)
+	}
+	if payload.Metadata["install_root"] != installRoot {
+		t.Fatalf("metadata install_root=%q want=%q", payload.Metadata["install_root"], installRoot)
+	}
+}
+
+func TestBuildInstallStepsAvoidsQuotedAbsolutePrefix(t *testing.T) {
+	// 模拟 Windows 绝对路径字符串（任意 OS 可断言），禁止回归到 --prefix "D:\..." 形态。
+	installRoot := `D:\workspace\go\genesis-agent\.genesis\skill-deps\office-ppt`
+	steps, err := buildInstallSteps(
+		[]packageInput{
+			{Manager: "npm", Name: "pptxgenjs"},
+			{Manager: "pip", Name: "markitdown[pptx]"},
+		},
+		installRoot,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(steps) < 2 {
+		t.Fatalf("steps=%d %+v", len(steps), steps)
+	}
+	npm := steps[0]
+	if npm.Command != "npm install pptxgenjs" {
+		t.Fatalf("npm command=%q", npm.Command)
+	}
+	if npm.Cwd != filepath.Join(installRoot, "node") {
+		t.Fatalf("npm cwd=%q", npm.Cwd)
+	}
+	if strings.Contains(npm.Command, "--prefix") || strings.Contains(npm.Command, `"`) {
+		t.Fatalf("npm command must not use quoted --prefix: %q", npm.Command)
+	}
+	pip := steps[len(steps)-1]
+	wantPip := venvPythonRel() + ` -m pip install "markitdown[pptx]"`
+	if pip.Command != wantPip {
+		t.Fatalf("pip command=%q want=%q", pip.Command, wantPip)
+	}
+	if pip.Cwd != filepath.Join(installRoot, "venv") {
+		t.Fatalf("pip cwd=%q", pip.Cwd)
+	}
+	if strings.Contains(pip.Command, "--target") || strings.Contains(pip.Command, installRoot) {
+		t.Fatalf("pip command must use venv relative python without abs path: %q", pip.Command)
+	}
+}
+
+func TestInstallPipUsesVenv(t *testing.T) {
+	runner := &recordingRunner{}
+	root := t.TempDir()
+	tool, err := New(Deps{
+		Skills: fakeSkills{meta: testMeta(skillmodel.RuntimeDeps{
+			Python: []skillmodel.RuntimePackage{{Name: "markitdown"}},
+		})},
+		Runner:        runner,
+		Approval:      allowAllApproval{},
+		WorkspaceRoot: root,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := tool.Execute(context.Background(), `{"skill":"office-ppt","packages":[{"manager":"pip","name":"markitdown[pptx]"}],"scope":"workspace"}`)
+	if err != nil {
+		t.Fatalf("Execute: %v body=%s", err, body)
+	}
+	if len(runner.cmds) < 2 {
+		t.Fatalf("cmds=%+v", runner.cmds)
+	}
+	installRoot := filepath.Join(root, ".genesis", "skill-deps", "office-ppt")
+	if runner.cmds[0].Command != "python -m venv venv" || runner.cmds[0].Cwd != installRoot {
+		t.Fatalf("venv step=%+v", runner.cmds[0])
+	}
+	wantCwd := filepath.Join(installRoot, "venv")
+	wantCmd := venvPythonRel() + ` -m pip install "markitdown[pptx]"`
+	last := runner.cmds[len(runner.cmds)-1]
+	if last.Command != wantCmd || last.Cwd != wantCwd {
+		t.Fatalf("pip step=%+v want cmd=%q cwd=%q", last, wantCmd, wantCwd)
+	}
+}
+
+func TestNormalizeAllowsPipExtrasAgainstBaseWhitelist(t *testing.T) {
+	pkgs, err := normalizeAndAuthorizePackages(
+		[]packageInput{{Manager: "pip", Name: "markitdown[pptx]"}},
+		skillmodel.Dependencies{Runtime: skillmodel.RuntimeDeps{Python: []skillmodel.RuntimePackage{{Name: "markitdown"}}}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pkgs) != 1 || pkgs[0].Name != "markitdown[pptx]" {
+		t.Fatalf("pkgs=%+v", pkgs)
 	}
 }
 

@@ -109,6 +109,15 @@ func TestRemoteSkillCommandStagesWorkDirInputAndUsesImageNodeModules(t *testing.
 	if !containsProduced(result.Produced, "smoke.pptx") {
 		t.Fatalf("produced=%v", result.Produced)
 	}
+	if len(result.Artifacts) != 1 || !strings.Contains(filepath.ToSlash(result.Artifacts[0].Path), "/.genesis/runs/remote-smoke/output/office-ppt/smoke.pptx") {
+		t.Fatalf("artifact should land under run output dir: %+v", result.Artifacts)
+	}
+	if _, err := os.Stat(filepath.Join(root, ".genesis", "runs", "remote-smoke-materialize")); !os.IsNotExist(err) {
+		t.Fatalf("should not create separate -materialize run dir: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "smoke.pptx")); !os.IsNotExist(err) {
+		t.Fatalf("remote artifact leaked to workspace root, err=%v", err)
+	}
 }
 
 type noopExecutionRunner struct{}

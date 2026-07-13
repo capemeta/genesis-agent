@@ -11,10 +11,12 @@ import (
 )
 
 const (
-	MaxNameLen             = 64
-	MaxQualifiedNameLen    = 128
-	MaxDescriptionLen      = 1024
-	MaxPromptBytes         = 8 * 1024
+	MaxNameLen          = 64
+	MaxQualifiedNameLen = 128
+	MaxDescriptionLen   = 1024
+	// MaxPromptBytes 是显式 Skill() 注入 SKILL.md 正文的异常安全上限（对齐 Kode/Codex：
+	// 常规不截断正文；8KiB 预算只作用于可用技能 catalog，见 MaxAvailableSkillsSize）。
+	MaxPromptBytes         = 256 * 1024
 	MaxAvailableSkillsSize = 8 * 1024
 	// MaxAvailableSkillsTokens 是 catalog 列表的近似 token 上限（按 rune/4 估算，与字节上限取更严者）。
 	MaxAvailableSkillsTokens = 2000

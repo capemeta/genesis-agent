@@ -53,7 +53,6 @@ type Service struct {
 type remoteSession struct {
 	session      *sandboxsession.Session
 	skillDir     string
-	staged       map[string]struct{}
 	materialized bool
 	lastUsed     time.Time
 }
@@ -407,19 +406,23 @@ func (s *Service) runRemote(ctx context.Context, meta skillmodel.Metadata, runID
 			warnings = append([]string{"genesis-sandbox session打开失败，sandbox optional 已降级到本地执行: " + openErr.Error()}, warnings...)
 			return result, produced, workDir, staged, artifacts, warnings, err
 		}
-		cached = &remoteSession{session: sess, skillDir: "/workspace", staged: map[string]struct{}{}, lastUsed: time.Now()}
+		cached = &remoteSession{session: sess, skillDir: "/workspace", lastUsed: time.Now()}
 		s.mu.Lock()
 		s.sessions[key] = cached
 		s.mu.Unlock()
 	}
 	cached.lastUsed = time.Now()
+	// 同一 runID 下只建一套本地 runs 目录：materialize / stage / 产物回收都落在这里，禁止 -materialize 旁路目录。
+	ws, err := scriptworkspace.PrepareLocalTask(req.WorkspaceRoot, runID)
+	if err != nil {
+		return nil, nil, cached.skillDir, nil, nil, nil, err
+	}
+	localSkillDir := filepath.Join(ws.WorkDir, "skills", sanitize(string(meta.PackageID)))
+	if err := os.MkdirAll(localSkillDir, 0o755); err != nil {
+		return nil, nil, cached.skillDir, nil, nil, nil, err
+	}
 	if !cached.materialized {
 		mat := &materialize.Materializer{Service: s.skills}
-		localWS, err := scriptworkspace.PrepareLocalTask(req.WorkspaceRoot, runID+"-materialize")
-		if err != nil {
-			return nil, nil, cached.skillDir, nil, nil, nil, err
-		}
-		localSkillDir := filepath.Join(localWS.WorkDir, "skills", sanitize(string(meta.PackageID)))
 		matResult, err := mat.MaterializePackageScripts(ctx, req.Catalog, meta, localSkillDir)
 		if err != nil {
 			return nil, nil, cached.skillDir, nil, nil, nil, err
@@ -435,30 +438,18 @@ func (s *Service) runRemote(ctx context.Context, meta skillmodel.Metadata, runID
 		}
 		cached.materialized = true
 	}
-	ws, err := scriptworkspace.PrepareLocalTask(req.WorkspaceRoot, runID)
-	if err != nil {
-		return nil, nil, cached.skillDir, nil, nil, nil, err
-	}
-	localStageDir := filepath.Join(ws.WorkDir, "skills", sanitize(string(meta.PackageID)))
-	if err := os.MkdirAll(localStageDir, 0o755); err != nil {
-		return nil, nil, cached.skillDir, nil, nil, nil, err
-	}
-	staged, err := stageInputs(req.WorkspaceRoot, ws, localStageDir, req.Inputs)
+	staged, err := stageInputs(req.WorkspaceRoot, ws, localSkillDir, req.Inputs)
 	if err != nil {
 		return nil, nil, cached.skillDir, nil, nil, nil, err
 	}
 	for _, name := range staged {
-		if _, ok := cached.staged[name]; ok {
-			continue
-		}
-		data, err := os.ReadFile(filepath.Join(localStageDir, name))
+		data, err := os.ReadFile(filepath.Join(localSkillDir, name))
 		if err != nil {
 			return nil, nil, cached.skillDir, staged, nil, nil, err
 		}
-		if err := cached.session.WriteFile(ctx, name, data, fscontract.WriteOptions{}); err != nil {
+		if err := cached.session.WriteFile(ctx, name, data, fscontract.WriteOptions{CreateParents: true, Overwrite: true}); err != nil {
 			return nil, nil, cached.skillDir, staged, nil, nil, err
 		}
-		cached.staged[name] = struct{}{}
 	}
 	before, err := snapshotRemoteFiles(ctx, cached.session)
 	if err != nil {
@@ -473,7 +464,8 @@ func (s *Service) runRemote(ctx context.Context, meta skillmodel.Metadata, runID
 		return nil, nil, cached.skillDir, staged, nil, nil, err
 	}
 	produced := diffSnapshots(before, after)
-	artifacts, warnings := collectRemoteArtifactsByProduced(ctx, cached.session, filepath.Join(ws.WorkDir, "artifacts", sanitize(string(meta.PackageID))), produced)
+	// 远程产物回收到本 Run output/<skill>/，与设计「落回本 Run output」对齐。
+	artifacts, warnings := collectRemoteArtifactsByProduced(ctx, cached.session, filepath.Join(ws.OutputDir, sanitize(string(meta.PackageID))), produced)
 	return result, produced, cached.skillDir, staged, artifacts, warnings, nil
 }
 
@@ -507,8 +499,24 @@ func skillEnv(workDir, tmpDir string) map[string]string {
 	if strings.HasPrefix(workDir, "/") {
 		pyPath = strings.TrimRight(workDir, "/") + "/scripts"
 	}
-	env["PYTHONPATH"] = pyPath
+	env["PYTHONPATH"] = pythonRuntimeSearchPath(workDir, pyPath)
 	env["NODE_PATH"] = nodeRuntimeSearchPath(workDir)
+	// 宿主：优先使用 skill-deps 下 venv，使 `python -m markitdown` 走受控解释器。
+	// 远程路径以 / 开头，不注入宿主机 venv（镜像预装）。
+	if !strings.HasPrefix(strings.TrimSpace(workDir), "/") {
+		if depRoot := skillDependencyRoot(workDir); depRoot != "" {
+			venvDir := filepath.Join(depRoot, "venv")
+			if venvPythonExists(venvDir) {
+				env["VIRTUAL_ENV"] = venvDir
+				binDir := venvBinDir(venvDir)
+				path := binDir
+				if existing := os.Getenv("PATH"); existing != "" {
+					path = binDir + string(os.PathListSeparator) + existing
+				}
+				env["PATH"] = path
+			}
+		}
+	}
 	return env
 }
 
@@ -595,7 +603,7 @@ func stageInputs(workspaceRoot string, ws execmodel.ExecutionWorkspace, destDir 
 		if raw == "" {
 			continue
 		}
-		srcReal, tried, err := resolveStageSource(raw, rootReal, ws)
+		srcReal, tried, err := resolveStageSource(raw, rootReal, ws, destDir)
 		if err != nil {
 			return nil, fmt.Errorf("解析输入失败 %s: %w（已尝试: %s）", raw, err, strings.Join(tried, ", "))
 		}
@@ -616,7 +624,7 @@ func stageInputs(workspaceRoot string, ws execmodel.ExecutionWorkspace, destDir 
 	return staged, nil
 }
 
-func resolveStageSource(raw, workspaceRoot string, ws execmodel.ExecutionWorkspace) (string, []string, error) {
+func resolveStageSource(raw, workspaceRoot string, ws execmodel.ExecutionWorkspace, skillDir string) (string, []string, error) {
 	tried := make([]string, 0, 8)
 	tryFile := func(candidate string) (string, bool) {
 		candidate = strings.TrimSpace(candidate)
@@ -643,6 +651,14 @@ func resolveStageSource(raw, workspaceRoot string, ws execmodel.ExecutionWorkspa
 		if found, ok := tryFile(filepath.Join(base, filepath.FromSlash(rel.Rest))); ok {
 			return found, tried, nil
 		}
+		// 宿主：run 根 $WORK_DIR 与 skill cwd 可能不一致；产物常在 skillDir。
+		// 远程 /workspace 扁平时 skillDir 与 WorkDir 等价，此 fallback 无额外副作用。
+		if (rel.Prefix == scriptworkspace.LogicalWorkDir || rel.Prefix == scriptworkspace.LogicalSkillDir) &&
+			strings.TrimSpace(skillDir) != "" && !samePath(base, skillDir) {
+			if found, ok := tryFile(filepath.Join(skillDir, filepath.FromSlash(rel.Rest))); ok {
+				return found, tried, nil
+			}
+		}
 		return "", tried, fmt.Errorf("文件不存在")
 	}
 	if filepath.IsAbs(raw) {
@@ -651,7 +667,15 @@ func resolveStageSource(raw, workspaceRoot string, ws execmodel.ExecutionWorkspa
 		}
 		return "", tried, fmt.Errorf("文件不存在")
 	}
-	candidates := []string{filepath.Join(workspaceRoot, raw), filepath.Join(ws.WorkDir, raw), filepath.Join(ws.OutputDir, raw), filepath.Join(ws.InputDir, raw), filepath.Join(ws.TmpDir, raw)}
+	candidates := []string{
+		filepath.Join(workspaceRoot, raw),
+		filepath.Join(ws.WorkDir, raw),
+		filepath.Join(ws.OutputDir, raw),
+		filepath.Join(ws.InputDir, raw),
+		filepath.Join(ws.TmpDir, raw),
+		filepath.Join(ws.SkillDir, raw),
+		filepath.Join(skillDir, raw),
+	}
 	for _, c := range candidates {
 		if found, ok := tryFile(c); ok {
 			return found, tried, nil
@@ -705,6 +729,9 @@ type fileFingerprint struct {
 func diffSnapshots(before, after map[string]fileFingerprint) []string {
 	produced := make([]string, 0)
 	for path, now := range after {
+		if shouldIgnoreProducedPath(path) {
+			continue
+		}
 		prev, ok := before[path]
 		if !ok || prev != now {
 			produced = append(produced, path)
@@ -714,10 +741,31 @@ func diffSnapshots(before, after map[string]fileFingerprint) []string {
 	return produced
 }
 
+func shouldIgnoreProducedPath(rel string) bool {
+	slash := strings.ToLower(filepath.ToSlash(strings.TrimSpace(rel)))
+	if slash == "" {
+		return true
+	}
+	base := filepath.Base(slash)
+	if strings.Contains(slash, "/__pycache__/") || strings.HasPrefix(slash, "__pycache__/") {
+		return true
+	}
+	if strings.Contains(slash, "/node_modules/") || strings.HasPrefix(slash, "node_modules/") {
+		return true
+	}
+	if strings.HasSuffix(base, ".pyc") || strings.HasSuffix(base, ".pyo") || base == ".ds_store" {
+		return true
+	}
+	return false
+}
+
 func collectArtifactsByProduced(workDir string, produced []string) ([]scriptcontract.Artifact, []string) {
 	artifacts := make([]scriptcontract.Artifact, 0, len(produced))
 	warnings := make([]string, 0)
 	for _, rel := range produced {
+		if shouldIgnoreProducedPath(rel) {
+			continue
+		}
 		path := filepath.Join(workDir, filepath.FromSlash(rel))
 		info, err := os.Stat(path)
 		if err != nil || info.IsDir() {
@@ -744,6 +792,9 @@ func collectRemoteArtifactsByProduced(ctx context.Context, sess *sandboxsession.
 		return artifacts, []string{"artifact_root: " + err.Error()}
 	}
 	for _, rel := range produced {
+		if shouldIgnoreProducedPath(rel) {
+			continue
+		}
 		remotePath := normalizeSlash(rel)
 		if remotePath == "" || remotePath == "." {
 			continue
@@ -875,6 +926,21 @@ func nodeRuntimeSearchPath(workDir string) string {
 	return nodeModuleSearchPath(workDir)
 }
 
+func pythonRuntimeSearchPath(workDir, scriptPath string) string {
+	if strings.HasPrefix(strings.TrimSpace(workDir), "/") {
+		return scriptPath
+	}
+	parts := []string{scriptPath}
+	if depRoot := skillDependencyRoot(workDir); depRoot != "" {
+		// 兼容旧 --target 落点；优先依赖 PATH 上的 venv python。
+		legacy := filepath.Join(depRoot, "python")
+		if st, err := os.Stat(legacy); err == nil && st.IsDir() {
+			parts = append(parts, legacy)
+		}
+	}
+	return joinUniquePaths(string(os.PathListSeparator), parts)
+}
+
 func joinUniquePaths(sep string, values []string) string {
 	parts := make([]string, 0, len(values))
 	seen := map[string]struct{}{}
@@ -893,46 +959,63 @@ func joinUniquePaths(sep string, values []string) string {
 }
 
 func nodeModuleSearchPath(workspaceRoot string) string {
-	parts := make([]string, 0, 8)
-	seen := map[string]struct{}{}
-	addNodeModuleAncestors := func(root string) {
-		root = strings.TrimSpace(root)
-		if root == "" {
-			return
-		}
-		if abs, err := filepath.Abs(root); err == nil {
-			root = abs
-		}
-		for {
-			nodeModules := filepath.Clean(filepath.Join(root, "node_modules"))
-			if _, ok := seen[nodeModules]; !ok {
-				seen[nodeModules] = struct{}{}
-				parts = append(parts, nodeModules)
-			}
-			parent := filepath.Dir(root)
-			if parent == root {
-				break
-			}
-			root = parent
-		}
-	}
 	root := strings.TrimSpace(workspaceRoot)
 	if root == "" {
 		if wd, err := os.Getwd(); err == nil {
 			root = wd
 		}
 	}
-	addNodeModuleAncestors(root)
-	if cwd, err := os.Getwd(); err == nil {
-		addNodeModuleAncestors(cwd)
+	if abs, err := filepath.Abs(root); err == nil {
+		root = abs
 	}
-	if home, err := os.UserHomeDir(); err == nil && home != "" {
-		legacy := filepath.Join(home, ".node_modules")
-		if _, ok := seen[legacy]; !ok {
-			parts = append(parts, legacy)
+	parts := []string{
+		filepath.Join(root, "node_modules"),
+		filepath.Join(root, "scripts", "node_modules"),
+	}
+	if depRoot := skillDependencyRoot(root); depRoot != "" {
+		parts = append(parts, filepath.Join(depRoot, "node", "node_modules"))
+	}
+	return joinUniquePaths(string(os.PathListSeparator), parts)
+}
+
+func skillDependencyRoot(workDir string) string {
+	root := strings.TrimSpace(workDir)
+	if root == "" {
+		return ""
+	}
+	if abs, err := filepath.Abs(root); err == nil {
+		root = abs
+	}
+	skillID := filepath.Base(root)
+	if skillID == "" || skillID == "." || skillID == string(filepath.Separator) {
+		return ""
+	}
+	for dir := root; ; {
+		if strings.EqualFold(filepath.Base(dir), ".genesis") {
+			return filepath.Join(dir, "skill-deps", skillID)
 		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return ""
+		}
+		dir = parent
 	}
-	return strings.Join(parts, string(os.PathListSeparator))
+}
+
+func venvBinDir(venvDir string) string {
+	if runtime.GOOS == "windows" {
+		return filepath.Join(venvDir, "Scripts")
+	}
+	return filepath.Join(venvDir, "bin")
+}
+
+func venvPythonExists(venvDir string) bool {
+	py := filepath.Join(venvBinDir(venvDir), "python")
+	if runtime.GOOS == "windows" {
+		py = filepath.Join(venvBinDir(venvDir), "python.exe")
+	}
+	info, err := os.Stat(py)
+	return err == nil && !info.IsDir()
 }
 
 func materializeResultArtifacts(outputDir string, resultArtifacts []execmodel.Artifact) ([]scriptcontract.Artifact, []string) {

@@ -26,4 +26,8 @@ func TestSourceListReadSearch(t *testing.T) {
 	if err != nil || len(search.Matches) != 1 {
 		t.Fatalf("search=%+v err=%v", search, err)
 	}
+	byName, err := source.Search(context.Background(), contract.SearchRequest{PackageID: "review", Query: "guide.md"})
+	if err != nil || len(byName.Matches) != 1 {
+		t.Fatalf("filename search=%+v err=%v", byName, err)
+	}
 }

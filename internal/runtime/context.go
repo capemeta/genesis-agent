@@ -30,6 +30,9 @@ type RunContext struct {
 	injectedMu     sync.Mutex
 	injectedSkills map[string]struct{} // key = opaque resource 或 authority:package
 
+	// --- Skill 必做步骤软门禁跟踪（本 Run 内）---
+	SkillFollow *SkillFollowState
+
 	// --- Repeat Guard（本 Run 内；Resume 时须随可恢复状态一并恢复）---
 	RepeatGuard *repeatguard.Guard
 }
@@ -42,6 +45,7 @@ func NewRunContext(run *domain.Run, agent *domain.Agent) *RunContext {
 		Messages:       make([]*domain.Message, 0, 16),
 		blockSeq:       -1, // 第一个分配的将是 0
 		injectedSkills: make(map[string]struct{}),
+		SkillFollow:    NewSkillFollowState(),
 	}
 	policy := domain.RuntimePolicy{}
 	if agent != nil {

@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -156,15 +157,43 @@ func windowsShell() string {
 	return "cmd.exe"
 }
 
+// mergeEnv 以 extra 覆盖 base 中同名变量；Windows 下按大小写不敏感匹配键（PATH/Path）。
+// 禁止重复追加同名键：Unix 上通常取首个，重复 PATH 会导致 venv 注入失效。
 func mergeEnv(base []string, extra map[string]string) []string {
 	if len(extra) == 0 {
 		return base
 	}
-	out := append([]string{}, base...)
+	out := make([]string, 0, len(base)+len(extra))
+	seen := make(map[string]int, len(base)+len(extra)) // canonical key -> index in out
+	put := func(key, value string) {
+		canon := envKeyCanon(key)
+		entry := key + "=" + value
+		if idx, ok := seen[canon]; ok {
+			out[idx] = entry
+			return
+		}
+		seen[canon] = len(out)
+		out = append(out, entry)
+	}
+	for _, item := range base {
+		key, value, ok := strings.Cut(item, "=")
+		if !ok {
+			out = append(out, item)
+			continue
+		}
+		put(key, value)
+	}
 	for key, value := range extra {
-		out = append(out, key+"="+value)
+		put(key, value)
 	}
 	return out
+}
+
+func envKeyCanon(key string) string {
+	if runtime.GOOS == "windows" {
+		return strings.ToUpper(key)
+	}
+	return key
 }
 
 func exitCode(err error) int {

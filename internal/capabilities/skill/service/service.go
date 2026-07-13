@@ -23,6 +23,8 @@ import (
 
 // Options 控制 Skill Service 行为。
 type Options struct {
+	// MaxPromptBytes 显式加载 SKILL.md 正文的异常安全上限；<=0 时用 model.MaxPromptBytes（256KiB）。
+	// 可用技能 catalog 预算由 MaxListBytes 控制（默认 8KiB），二者分层，对齐 Kode/Codex。
 	MaxPromptBytes int
 	MaxListBytes   int
 	MaxListTokens  int // 近似 token 上限；<=0 时用 model.MaxAvailableSkillsTokens
@@ -279,7 +281,8 @@ func (s *Service) ReadResource(ctx context.Context, req contract.ResourceRequest
 	if source == nil {
 		return model.ResourceContent{}, fmt.Errorf("skill source不可用: %s", meta.Authority.String())
 	}
-	read, err := source.Read(ctx, contract.ReadRequest{PackageID: meta.PackageID, Resource: req.Resource, MaxBytes: req.MaxBytes})
+	resource := model.QualifySkillResource(string(meta.PackageID), firstNonEmpty(req.ResolveRequest.Name, meta.Name, meta.QualifiedName), string(req.Resource))
+	read, err := source.Read(ctx, contract.ReadRequest{PackageID: meta.PackageID, Resource: resource, MaxBytes: req.MaxBytes})
 	if err != nil {
 		s.record(ctx, "resource.read", false, started, skillMetadata(meta))
 		return model.ResourceContent{}, err

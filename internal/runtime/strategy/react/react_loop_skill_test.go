@@ -129,9 +129,14 @@ func TestInjectMentionedSkillsUsesExplicitLoader(t *testing.T) {
 }
 func TestRenderSkillInjectionAddsRuntimeBridge(t *testing.T) {
 	body := renderSkillInjection(skillInjectionOutput{QualifiedName: "third-party", Content: "Run python scripts/do_work.py"})
-	for _, want := range []string{"<skill_runtime_bridge>", "run_skill_command", "完整 Skill 包", "third-party", "不要用 run_skill_command 执行 npm install"} {
+	for _, want := range []string{"<skill_runtime_bridge>", "run_skill_command", "完整 Skill 包", "third-party", "不要用 run_skill_command 执行 npm install", "按技能文档示例选择解释器", "不要把 Node 包当成", "须先 Read", "QA Required"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("missing %q in %s", want, body)
+		}
+	}
+	for _, unexpected := range []string{"office-ppt", "pptxgenjs", "slide.addText", "禁止 pptx.addSlide"} {
+		if strings.Contains(body, unexpected) {
+			t.Fatalf("bridge must stay skill-agnostic, found %q in %s", unexpected, body)
 		}
 	}
 }

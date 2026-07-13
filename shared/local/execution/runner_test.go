@@ -29,6 +29,38 @@ func longOutputCommand() string {
 	return "printf 1234567890"
 }
 
+func TestMergeEnvOverridesDuplicateKeys(t *testing.T) {
+	base := []string{"PATH=/usr/bin", "FOO=1", "Bar=keep"}
+	got := mergeEnv(base, map[string]string{"PATH": "/venv/bin:/usr/bin", "FOO": "2"})
+	pathVal, fooVal, barVal := "", "", ""
+	pathCount, fooCount := 0, 0
+	for _, item := range got {
+		key, value, ok := strings.Cut(item, "=")
+		if !ok {
+			continue
+		}
+		switch envKeyCanon(key) {
+		case envKeyCanon("PATH"):
+			pathCount++
+			pathVal = value
+		case envKeyCanon("FOO"):
+			fooCount++
+			fooVal = value
+		case envKeyCanon("Bar"):
+			barVal = value
+		}
+	}
+	if pathCount != 1 || pathVal != "/venv/bin:/usr/bin" {
+		t.Fatalf("PATH override failed: count=%d val=%q env=%v", pathCount, pathVal, got)
+	}
+	if fooCount != 1 || fooVal != "2" {
+		t.Fatalf("FOO override failed: count=%d val=%q env=%v", fooCount, fooVal, got)
+	}
+	if barVal != "keep" {
+		t.Fatalf("Bar should remain: %q env=%v", barVal, got)
+	}
+}
+
 func TestRunnerRejectsPowerShellWithoutDedicatedRunner(t *testing.T) {
 	runner := NewRunner()
 	_, err := runner.Run(context.Background(), execmodel.Command{Command: echoCommand(), Shell: execmodel.ShellPowerShell}, execcontract.RunOptions{Timeout: 30 * time.Second})

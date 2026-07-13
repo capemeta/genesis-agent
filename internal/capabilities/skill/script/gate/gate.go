@@ -3,6 +3,7 @@ package gate
 import (
 	"archive/zip"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -66,7 +67,85 @@ func checkOOXML(path, ext string) (bool, string, string) {
 	if need != "" && !hasOfficePart {
 		return false, kind, "缺少 Office 部件前缀 " + need
 	}
+	if ext == ".pptx" {
+		if reason := checkPPTXSlideContent(zr); reason != "" {
+			return false, kind, reason
+		}
+	}
 	return true, kind, "ooxml ok"
+}
+
+// checkPPTXSlideContent 拒绝空幻灯片（常见于误用 addSlide({title,...}) 而未调用 addText/addTable）。
+func checkPPTXSlideContent(zr *zip.ReadCloser) string {
+	slideCount := 0
+	blankCount := 0
+	for _, file := range zr.File {
+		name := file.Name
+		if !strings.HasPrefix(name, "ppt/slides/slide") || !strings.HasSuffix(name, ".xml") {
+			continue
+		}
+		if strings.Contains(name, "_rels") {
+			continue
+		}
+		slideCount++
+		rc, err := file.Open()
+		if err != nil {
+			return "无法读取幻灯片: " + name + ": " + err.Error()
+		}
+		data, err := io.ReadAll(rc)
+		_ = rc.Close()
+		if err != nil {
+			return "无法读取幻灯片: " + name + ": " + err.Error()
+		}
+		if !pptxSlideHasContent(string(data)) {
+			blankCount++
+		}
+	}
+	if slideCount == 0 {
+		return ""
+	}
+	if blankCount > 0 {
+		return fmt.Sprintf("检测到 %d/%d 张空白幻灯片（无文本/形状）；常见原因是误用 addSlide({title,...}) 而非 let slide=pptx.addSlide(); slide.addText/addTable", blankCount, slideCount)
+	}
+	return ""
+}
+
+func pptxSlideHasContent(xml string) bool {
+	if hasNonEmptyDrawingText(xml) {
+		return true
+	}
+	markers := []string{"<p:sp ", "<p:sp>", "<p:pic", "<p:graphicFrame", "<p:cxnSp"}
+	for _, m := range markers {
+		if strings.Contains(xml, m) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasNonEmptyDrawingText(xml string) bool {
+	const open = "<a:t"
+	rest := xml
+	for {
+		i := strings.Index(rest, open)
+		if i < 0 {
+			return false
+		}
+		rest = rest[i+len(open):]
+		gt := strings.IndexByte(rest, '>')
+		if gt < 0 {
+			return false
+		}
+		rest = rest[gt+1:]
+		end := strings.Index(rest, "</a:t>")
+		if end < 0 {
+			return false
+		}
+		if strings.TrimSpace(rest[:end]) != "" {
+			return true
+		}
+		rest = rest[end+len("</a:t>"):]
+	}
 }
 
 func checkPDF(path string) (bool, string, string) {

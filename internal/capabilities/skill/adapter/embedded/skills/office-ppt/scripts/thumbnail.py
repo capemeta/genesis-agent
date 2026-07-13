@@ -23,7 +23,7 @@ import zipfile
 from pathlib import Path
 
 import defusedxml.minidom
-from office.soffice import get_soffice_env
+from office.soffice import get_soffice_env, resolve_soffice_bin
 from PIL import Image, ImageDraw, ImageFont
 
 THUMBNAIL_WIDTH = 300
@@ -160,7 +160,7 @@ def convert_to_images(pptx_path: Path, temp_dir: Path) -> list[Path]:
 
     result = subprocess.run(
         [
-            "soffice",
+            resolve_soffice_bin(),
             "--headless",
             "--convert-to",
             "pdf",

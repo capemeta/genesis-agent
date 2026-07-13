@@ -1,1 +1,0 @@
-# Office shared package marker.

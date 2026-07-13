@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	capmodel "genesis-agent/internal/capabilities/capability/model"
+	"path"
 	"strings"
 
 	approvalcontract "genesis-agent/internal/capabilities/approval/contract"
@@ -50,7 +51,23 @@ func New(deps Deps) (tool.Tool, error) {
 }
 
 func (t *Tool) GetInfo() *tool.Info {
-	return &tool.Info{Name: "read_skill_resource", Description: "读取已加载或已发现 Skill 包内 references、scripts、assets 的 UTF-8 文本资源。二进制 assets 只能先通过 list_skill_resources 发现，不能用本工具直接读取。resource 是不透明ID，不能当本地路径使用。", Parameters: &tool.ParameterSchema{Type: "object", Properties: map[string]*tool.ParameterSchema{"name": {Type: "string", Description: "Skill 名称或 qualified_name"}, "package": {Type: "string", Description: "可选 package id，用于直接定位 skill"}, "resource": {Type: "string", Description: "Skill ResourceID，例如 review/references/guide.md"}, "max_bytes": {Type: "integer", Description: "最大读取字节数"}}, Required: []string{"resource"}}, Traits: tool.ToolTraits{Exposure: tool.ToolExposureDirect, ReadOnly: true, ConcurrencySafe: true, NeedsPermission: true}}
+	return &tool.Info{
+		Name: "read_skill_resource",
+		Description: "读取已加载或已发现 Skill 包内 references、scripts、assets 的 UTF-8 文本资源。" +
+			"resource 可为完整 ResourceID（如 office-ppt/design.md），也可在提供 name/package 时使用短名（如 design.md、references/guide.md），运行时会按包自动限定。" +
+			"二进制 assets 只能先通过 list_skill_resources 发现，不能用本工具直接读取。",
+		Parameters: &tool.ParameterSchema{
+			Type: "object",
+			Properties: map[string]*tool.ParameterSchema{
+				"name":      {Type: "string", Description: "Skill 名称或 qualified_name"},
+				"package":   {Type: "string", Description: "可选 package id，用于直接定位 skill"},
+				"resource":  {Type: "string", Description: "ResourceID 或短名：office-ppt/design.md 或 design.md"},
+				"max_bytes": {Type: "integer", Description: "最大读取字节数"},
+			},
+			Required: []string{"resource"},
+		},
+		Traits: tool.ToolTraits{Exposure: tool.ToolExposureDirect, ReadOnly: true, ConcurrencySafe: true, NeedsPermission: true},
+	}
 }
 
 func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
@@ -58,18 +75,24 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 	if err := json.Unmarshal([]byte(params), &in); err != nil {
 		return "", fmt.Errorf("解析read_skill_resource参数失败: %w", err)
 	}
-	resource := model.ResourceID(strings.TrimSpace(in.Resource))
+	name := strings.TrimSpace(in.Name)
+	pkg := model.PackageID(strings.TrimSpace(in.Package))
+	resource := model.QualifySkillResource(string(pkg), name, strings.TrimSpace(in.Resource))
 	if resource == "" {
 		return "", fmt.Errorf("resource不能为空")
 	}
-	pkg := model.PackageID(strings.TrimSpace(in.Package))
 	if err := t.authorize(ctx, pkg, resource); err != nil {
 		return "", err
 	}
-	if err := t.ensureIndexed(ctx, pkg, strings.TrimSpace(in.Name), resource); err != nil {
+	if err := t.ensureIndexed(ctx, pkg, name, resource); err != nil {
 		return "", err
 	}
-	content, err := t.deps.Service.ReadResource(ctx, skillcontract.ResourceRequest{ResolveRequest: skillcontract.ResolveRequest{CatalogRequest: t.deps.CatalogRequest, Name: strings.TrimSpace(in.Name)}, PackageID: pkg, Resource: resource, MaxBytes: in.MaxBytes})
+	content, err := t.deps.Service.ReadResource(ctx, skillcontract.ResourceRequest{
+		ResolveRequest: skillcontract.ResolveRequest{CatalogRequest: t.deps.CatalogRequest, Name: name},
+		PackageID:      pkg,
+		Resource:       resource,
+		MaxBytes:       in.MaxBytes,
+	})
 	if err != nil {
 		return "", err
 	}
@@ -88,14 +111,21 @@ func (t *Tool) ensureIndexed(ctx context.Context, pkg model.PackageID, name stri
 	if err != nil {
 		return err
 	}
-	needle := normalizeResourcePath(string(resource))
+	needles := map[string]struct{}{}
+	for _, c := range model.ResourceLookupCandidates(string(pkg), name, string(resource)) {
+		needles[normalizeResourcePath(c)] = struct{}{}
+	}
 	matchedScope := false
 	for _, record := range records {
 		if !matchesPackageOrSkill(record, pkg, name) {
 			continue
 		}
 		matchedScope = true
-		if normalizeResourcePath(record.ResourcePath) == needle {
+		rp := normalizeResourcePath(record.ResourcePath)
+		if _, ok := needles[rp]; ok {
+			return nil
+		}
+		if _, ok := needles[path.Base(rp)]; ok && (string(pkg) == "" || strings.HasPrefix(rp, string(pkg)+"/") || strings.Contains(strings.ToLower(record.Name), strings.ToLower(name))) {
 			return nil
 		}
 	}
@@ -127,6 +157,7 @@ func normalizeResourcePath(value string) string {
 	}
 	return strings.Trim(value, "/")
 }
+
 func (t *Tool) authorize(ctx context.Context, pkg model.PackageID, resource model.ResourceID) error {
 	decision, err := t.deps.Approval.Authorize(ctx, approvalmodel.Request{ToolName: "read_skill_resource", Action: approvalmodel.ActionSkillResourceRead, Resource: approvalmodel.Resource{Type: "skill_resource", URI: string(pkg) + ":" + string(resource), Display: string(resource), Metadata: map[string]string{"trusted": "true", "package": string(pkg), "resource": string(resource)}}, Reason: "读取Skill包内资源", Risk: approvalmodel.RiskLow})
 	if err != nil {

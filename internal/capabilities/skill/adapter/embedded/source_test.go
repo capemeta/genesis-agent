@@ -33,6 +33,10 @@ func TestSourceListReadSearch(t *testing.T) {
 	if err != nil || len(search.Matches) != 1 {
 		t.Fatalf("search=%+v err=%v", search, err)
 	}
+	byName, err := source.Search(context.Background(), contract.SearchRequest{PackageID: "review", Query: "guide.md"})
+	if err != nil || len(byName.Matches) != 1 {
+		t.Fatalf("filename search=%+v err=%v", byName, err)
+	}
 	resources, err := source.ListResources(context.Background(), contract.SourceListResourcesRequest{PackageID: "review"})
 	if err != nil {
 		t.Fatal(err)
@@ -89,7 +93,7 @@ func TestSystemFSIncludesOfficeSkills(t *testing.T) {
 		"pdf-review":   false,
 	}
 	for _, entry := range listed.Entries {
-		if entry.Name == OfficeCommonPackage || strings.HasPrefix(entry.Name, "_") {
+		if strings.HasPrefix(entry.Name, "_") {
 			t.Fatalf("shared package should not appear in catalog: %s", entry.Name)
 		}
 		if _, ok := want[entry.Name]; ok {
@@ -140,5 +144,25 @@ func TestSystemFSIncludesOfficeSkills(t *testing.T) {
 	}
 	if !hasThumb || !hasUnpack {
 		t.Fatalf("office-ppt missing migrated scripts: thumb=%v unpack=%v count=%d", hasThumb, hasUnpack, len(pptResources.Resources))
+	}
+
+	design, err := source.Read(context.Background(), contract.ReadRequest{PackageID: "office-ppt", Resource: "office-ppt/design.md"})
+	if err != nil || !strings.Contains(design.Content, "Design Ideas") {
+		t.Fatalf("design.md read=%+v err=%v", design, err)
+	}
+}
+
+func TestOfficePPTShortResourceRejectedAtSourceWithoutQualify(t *testing.T) {
+	fsys, err := SystemFS()
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := NewSource(model.Authority{Kind: model.SourceKindEmbedded, ID: "system-test"}, model.ScopeSystem, fsys, parser.New())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = source.Read(context.Background(), contract.ReadRequest{PackageID: "office-ppt", Resource: "design.md"})
+	if err == nil {
+		t.Fatal("bare design.md should fail at source; service layer must Qualify first")
 	}
 }
