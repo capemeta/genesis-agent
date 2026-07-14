@@ -34,7 +34,7 @@ func TestEmbeddedOfficeAllowedToolsAlignWithCLIProfile(t *testing.T) {
 	checked := 0
 	for _, meta := range listed.Entries {
 		switch meta.Name {
-		case "office-ppt", "office-word", "office-excel", "pdf-review":
+		case "office-ppt", "office-word", "office-excel", "office-pdf":
 		default:
 			continue
 		}

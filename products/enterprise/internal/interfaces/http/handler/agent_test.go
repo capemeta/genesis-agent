@@ -36,6 +36,9 @@ func (m mockAgentService) RunOnce(ctx context.Context, req app.RunRequest) (*app
 }
 
 func (mockAgentService) ClearSession(context.Context, string) error { return nil }
+func (mockAgentService) ListSessionMessages(context.Context, string) ([]*domain.Message, error) {
+	return nil, nil
+}
 func (mockAgentService) NewSession() *domain.Session {
 	return &domain.Session{ID: "sess-test"}
 }

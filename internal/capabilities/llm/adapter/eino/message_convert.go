@@ -47,6 +47,7 @@ func schemaToDomain(m *schema.Message) *domain.Message {
 			},
 		})
 	}
+	msg.EnsureKind() // LLM 回写默认 assistant/tool；不覆盖调用方已设 Kind
 	return msg
 }
 

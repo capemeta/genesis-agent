@@ -155,6 +155,80 @@ func TestStageInputsResolvesRelativeNameFromSkillDir(t *testing.T) {
 	}
 }
 
+func TestFindLogicalPrefixInCommand(t *testing.T) {
+	if got := findLogicalPrefixInCommand("python $WORK_DIR/create_pdfs.py"); got != "$WORK_DIR" {
+		t.Fatalf("got=%q", got)
+	}
+	if got := findLogicalPrefixInCommand("python create_pdfs.py"); got != "" {
+		t.Fatalf("got=%q", got)
+	}
+	if got := findLogicalPrefixInCommand("node $SKILL_DIR/scripts/foo.js"); got != "$SKILL_DIR" {
+		t.Fatalf("got=%q", got)
+	}
+}
+
+func TestStageInputsRejectsExecutionPlaneWorkspacePrefix(t *testing.T) {
+	root := t.TempDir()
+	ws := execmodel.ExecutionWorkspace{
+		InputDir:  filepath.Join(root, "input"),
+		OutputDir: filepath.Join(root, "output"),
+		WorkDir:   filepath.Join(root, "work"),
+		TmpDir:    filepath.Join(root, "tmp"),
+	}
+	for _, d := range []string{ws.InputDir, ws.OutputDir, ws.WorkDir, ws.TmpDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	skillDir := filepath.Join(ws.WorkDir, "skills", "office-pdf")
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, err := stageInputs(root, ws, skillDir, []string{"/workspace/.genesis/runs/r1/work/create_weekly_report.py"})
+	if err == nil {
+		t.Fatal("expected namespace mismatch")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, ErrInputPathNamespaceMismatch) {
+		t.Fatalf("want code %s in err, got %v", ErrInputPathNamespaceMismatch, err)
+	}
+	if strings.Contains(msg, "已尝试:") {
+		t.Fatalf("namespace errors must not dump host tried paths: %v", err)
+	}
+	if !strings.Contains(msg, "$WORK_DIR") {
+		t.Fatalf("want fix hint with $WORK_DIR, got %v", err)
+	}
+}
+
+func TestStageInputsStillAllowsLogicalWorkPrefix(t *testing.T) {
+	root := t.TempDir()
+	ws := execmodel.ExecutionWorkspace{
+		InputDir:  filepath.Join(root, "input"),
+		OutputDir: filepath.Join(root, "output"),
+		WorkDir:   filepath.Join(root, "work"),
+		TmpDir:    filepath.Join(root, "tmp"),
+	}
+	for _, d := range []string{ws.InputDir, ws.OutputDir, ws.WorkDir, ws.TmpDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	skillDir := filepath.Join(ws.WorkDir, "skills", "office-pdf")
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ws.WorkDir, "create_report.py"), []byte("print(1)"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	staged, err := stageInputs(root, ws, skillDir, []string{"$WORK_DIR/create_report.py"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(staged) != 1 || staged[0] != "create_report.py" {
+		t.Fatalf("staged=%v", staged)
+	}
+}
+
 func TestStageInputsStillRejectsOutsideWorkspace(t *testing.T) {
 	parent := t.TempDir()
 	root := filepath.Join(parent, "workspace")

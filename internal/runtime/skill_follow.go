@@ -53,6 +53,7 @@ type SkillFollowState struct {
 	qaMatched     map[string]struct{} // 已成功匹配的声明命令
 	requiresQA    bool
 	qaDone        bool
+	delivered     map[string]struct{} // 已交付产物 basename（通用，不绑扩展名）
 }
 
 // NewSkillFollowState 创建空跟踪状态。
@@ -62,6 +63,7 @@ func NewSkillFollowState() *SkillFollowState {
 		creatingReads: make(map[string]struct{}),
 		readSet:       make(map[string]struct{}),
 		qaMatched:     make(map[string]struct{}),
+		delivered:     make(map[string]struct{}),
 	}
 }
 
@@ -121,6 +123,50 @@ func (s *SkillFollowState) MarkResourceRead(resource string) {
 	if base := path.Base(rel); base != "" && base != rel {
 		s.readSet[base] = struct{}{}
 	}
+}
+
+// NoteDeliveredArtifacts 记录 run_skill_command 已交付的产物名（basename），供后续 write_file 软提示。
+func (s *SkillFollowState) NoteDeliveredArtifacts(names []string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.delivered == nil {
+		s.delivered = make(map[string]struct{})
+	}
+	for _, name := range names {
+		base := strings.ToLower(path.Base(strings.ReplaceAll(strings.TrimSpace(name), `\`, `/`)))
+		if base == "" || base == "." {
+			continue
+		}
+		s.delivered[base] = struct{}{}
+	}
+}
+
+// HasDeliveredArtifacts 是否已有受控产物交付记录。
+func (s *SkillFollowState) HasDeliveredArtifacts() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.delivered) > 0
+}
+
+// IsDeliveredName 判断 basename 是否已交付。
+func (s *SkillFollowState) IsDeliveredName(name string) bool {
+	if s == nil {
+		return false
+	}
+	base := strings.ToLower(path.Base(strings.ReplaceAll(strings.TrimSpace(name), `\`, `/`)))
+	if base == "" || base == "." {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.delivered[base]
+	return ok
 }
 
 // NoteExecutedCommand 根据实际执行的命令判断是否完成技能声明的 QA。
@@ -250,6 +296,20 @@ func (s *SkillFollowState) QADone() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.qaDone
+}
+
+// IncompleteDelivery 终态是否应标 Incomplete：技能声明了 QA、已有交付物、但 QA 未成功完成。
+// 三端统一语义（不绑定技能名 / backend）：
+//   - 无沙箱 / 本地平台沙箱：宿主缺 soffice 等 → QA 失败 → Incomplete（产物可仍交付）
+//   - 远程：镜像有依赖且 QA 成功 → 不触发；镜像缺依赖同 Incomplete
+// 不把任意业务命令失败都标 Incomplete。
+func (s *SkillFollowState) IncompleteDelivery() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.requiresQA && !s.qaDone && len(s.delivered) > 0
 }
 
 // QACommands 返回已解析的 QA 命令副本。

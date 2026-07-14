@@ -70,6 +70,42 @@ func TestClassifyFailureFromPythonStderr(t *testing.T) {
 	}
 }
 
+func TestClassifyFailureSofficeNotFoundOnPATH(t *testing.T) {
+	out := &scriptcontract.RunResult{
+		OK:       false,
+		Skill:    "office-ppt",
+		Script:   "office-ppt/scripts/thumbnail.py",
+		Stderr:   `FileNotFoundError: soffice/libreoffice not found on PATH; install LibreOffice or add soffice to PATH`,
+		ExitCode: 1,
+	}
+	classifyFailure(out)
+	if out.FailureKind != "dependency_missing" {
+		t.Fatalf("FailureKind=%q", out.FailureKind)
+	}
+	if len(out.Missing) != 1 || out.Missing[0].Name != "libreoffice" || out.Missing[0].Manager != "system" || out.Missing[0].Require != "soffice" {
+		t.Fatalf("Missing=%+v", out.Missing)
+	}
+	if out.SuggestedAction != "use_preinstalled_image_or_local_toolchain" || out.Retryable {
+		t.Fatalf("SuggestedAction=%q retryable=%v", out.SuggestedAction, out.Retryable)
+	}
+}
+
+func TestClassifyFailureSofficeInWrappedError(t *testing.T) {
+	out := &scriptcontract.RunResult{
+		OK:       false,
+		Script:   "thumbnail.py",
+		Error:    `script exit_code=1: soffice/libreoffice not found on PATH`,
+		ExitCode: 1,
+	}
+	classifyFailure(out)
+	if out.FailureKind != "dependency_missing" {
+		t.Fatalf("FailureKind=%q", out.FailureKind)
+	}
+	if len(out.Missing) != 1 || out.Missing[0].Manager != "system" {
+		t.Fatalf("Missing=%+v", out.Missing)
+	}
+}
+
 func TestClassifyFailureFromNodeStderr(t *testing.T) {
 	out := &scriptcontract.RunResult{
 		OK:       false,

@@ -101,7 +101,7 @@ func (t *Tool) GetInfo() *tool.Info {
 		Description: strings.TrimSpace(`
 安装 Skill 在 dependencies.runtime 中声明的第三方包（npm/pip）。
 不执行业务脚本；安装成功后须用相同参数再调 run_skill_command。
-默认仅允许声明白名单内的包；禁止任意 shell。scope=image 时返回需重建镜像。
+仅安装该 skill 已在 dependencies.runtime 中声明的包；禁止任意 shell。scope=image 时返回需重建镜像。
 `),
 		Parameters: &tool.ParameterSchema{
 			Type: "object",
@@ -236,7 +236,7 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 				"network":           "registry",
 			},
 		},
-		Reason: "安装 Skill runtime 依赖（npm/pip）；对齐 Kode：装包需用户确认",
+		Reason: "安装 Skill runtime 依赖（npm/pip）；",
 		Risk:   approvalmodel.RiskHigh,
 		SuggestedScopes: []approvalmodel.GrantScope{
 			approvalmodel.GrantScopeOnce,
@@ -379,7 +379,7 @@ func normalizeAndAuthorizePackages(in []packageInput, deps model.Dependencies) (
 		}
 		key := manager + ":" + strings.ToLower(baseName)
 		if _, ok := wl[key]; !ok {
-			return nil, fmt.Errorf("包 %s/%s 不在 skill dependencies.runtime 白名单", manager, baseName)
+			return nil, fmt.Errorf("包 %s/%s 未在该 skill 的 dependencies.runtime 中声明，本次安装被拒绝；可安装已声明包后重跑，或按 skill 文档用已声明能力改实现，或先扩展该 skill 的 dependencies.runtime 声明后再安装", manager, baseName)
 		}
 		if _, dup := seen[key]; dup {
 			continue
@@ -533,13 +533,22 @@ func quotePipPackageArgs(names []string) string {
 		if name == "" {
 			continue
 		}
-		if strings.ContainsAny(name, "[]") {
-			parts = append(parts, `"`+name+`"`)
-			continue
-		}
-		parts = append(parts, name)
+		parts = append(parts, quotePipPackageArg(name))
 	}
 	return strings.Join(parts, " ")
+}
+
+// quotePipPackageArg 处理 pip extras（如 markitdown[pptx]）的 shell 安全拼参。
+// Windows cmd：双引号会原样进入 pip argv → Invalid requirement: '"pkg[extra]"'；
+// cmd 不对 [] 做 glob，故不加引号。Unix bash：需要引号防止字符类 glob。
+func quotePipPackageArg(name string) string {
+	if !strings.ContainsAny(name, "[]") {
+		return name
+	}
+	if runtime.GOOS == "windows" {
+		return name
+	}
+	return `"` + name + `"`
 }
 
 func venvPythonRel() string {

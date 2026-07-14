@@ -26,6 +26,7 @@ import (
 	"genesis-agent/internal/runtime/progress"
 	"genesis-agent/internal/runtime/prompt"
 	"genesis-agent/internal/runtime/repeatguard"
+	"genesis-agent/internal/runtime/transcript"
 )
 
 // SkillNameMatcher 识别「把 Skill 名当成 Tool 名」的误调用（由产品注入，Gateway 不依赖 skill）。
@@ -174,6 +175,12 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 	if err != nil {
 		log.Warn("加载历史记录失败，将从空历史开始", "error", err)
 	}
+	for _, m := range history {
+		if m != nil {
+			m.EnsureKind()
+		}
+	}
+	historyLen := len(history)
 	rc.Messages = append(rc.Messages, history...)
 
 	// 本轮用户输入
@@ -281,7 +288,8 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 			})
 		}
 
-		llmResp, err := e.llm.StreamGenerate(ctx, rc.Messages, toolInfos, onDelta)
+		// ForModel：完整链送给 LLM（含 skill_injection / tool）；UI 另走 ForUI，禁止双写存储
+		llmResp, err := e.llm.StreamGenerate(ctx, transcript.ProjectForModel(rc.Messages), toolInfos, onDelta)
 		if err != nil {
 			e.tracer.EndSpan(ctx, stepSpan, err)
 			progress.Emit(ctx, progress.Event{
@@ -358,6 +366,9 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 				step.FinishedAt = &now
 				rc.AddStep(step)
 				e.tracer.EndSpan(ctx, stepSpan, stopErr)
+				if rc.Run.Incomplete {
+					e.persistRunSessionMessages(ctx, req.SessionID, rc, historyLen, log)
+				}
 				return stopErr
 			}
 
@@ -367,6 +378,14 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 			iterLog.Info("获得最终回答", "content_preview", truncate(llmResp.Content, 100))
 			if rc.RepeatGuard != nil {
 				_ = rc.RepeatGuard.EndIteration(rc.Iteration, true)
+			}
+
+			rc.Run.FinalAnswer = llmResp.Content
+			rc.Run.Status = domain.RunStatusCompleted
+			applySkillFollowIncomplete(rc, iterLog)
+			stopReason := "complete"
+			if rc.Run.Incomplete {
+				stopReason = "partial_complete"
 			}
 
 			// 流式阶段未向对话区展示正文；此处一次性写入 final_answer。
@@ -395,6 +414,11 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 				DeltaType:  "text_delta",
 				Detail:     llmResp.Content,
 			})
+			meta := map[string]string{}
+			if rc.Run.Incomplete {
+				meta["incomplete"] = "true"
+				meta["incomplete_reason"] = "skill_qa_pending"
+			}
 			progress.Emit(ctx, progress.Event{
 				Kind:       progress.KindRun,
 				Phase:      progress.PhaseComplete,
@@ -404,20 +428,15 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 				BlockType:  "final_answer",
 				StepIndex:  &stepIdx,
 				Display:    &displayTrue,
-				StopReason: "complete",
+				StopReason: stopReason,
+				Metadata:   meta,
 			})
 
-			rc.Run.FinalAnswer = llmResp.Content
-			rc.Run.Status = domain.RunStatusCompleted
+			llmResp.EnsureKind()
+			rc.Messages = append(rc.Messages, llmResp)
 
-			// 保存本轮对话到Session历史（方便下次对话加载）
-			saveErr := e.memory.AppendMessages(ctx, req.SessionID, []*domain.Message{
-				domain.NewUserMessage(req.UserInput),
-				llmResp,
-			})
-			if saveErr != nil {
-				log.Warn("保存对话历史失败", "error", saveErr)
-			}
+			// 本 Run 完整消息链写入短期记忆（含 tool / skill_injection；不含重建的基线 system）
+			e.persistRunSessionMessages(ctx, req.SessionID, rc, historyLen, log)
 
 			now := time.Now()
 			step.Status = domain.StepStatusCompleted
@@ -743,7 +762,7 @@ func (e *ReactLoopEngine) applyRepeatGuardProgress(ctx context.Context, rc *runt
 		})
 		rc.Messages = append(rc.Messages, domain.NewSystemMessage(
 			"<repeat_guard>\n"+dec.NoProgressJSON+"\n</repeat_guard>",
-		))
+		).WithSource(domain.MessageSourceRepeatGuard))
 		return false, nil
 	}
 	if dec.PartialComplete {
@@ -768,9 +787,37 @@ func (e *ReactLoopEngine) applyRepeatGuardProgress(ctx context.Context, rc *runt
 		}
 		rc.Run.Incomplete = true
 		rc.Run.Status = domain.RunStatusCompleted
+		// 将 partial 结论写入消息链，便于短期记忆恢复工具轨迹 + 结论
+		if !lastMessageIsAssistantWithContent(rc.Messages, rc.Run.FinalAnswer) {
+			rc.Messages = append(rc.Messages, domain.NewAssistantMessage(rc.Run.FinalAnswer))
+		}
 		return true, nil
 	}
 	return false, nil
+}
+
+func lastMessageIsAssistantWithContent(msgs []*domain.Message, content string) bool {
+	if len(msgs) == 0 || strings.TrimSpace(content) == "" {
+		return false
+	}
+	last := msgs[len(msgs)-1]
+	return last != nil && last.Role == domain.RoleAssistant && last.Content == content
+}
+
+// persistRunSessionMessages 将本 Run 新增的完整消息链追加到短期记忆。
+func (e *ReactLoopEngine) persistRunSessionMessages(ctx context.Context, sessionID string, rc *runtime.RunContext, historyLen int, log logger.Logger) {
+	if e.memory == nil || rc == nil || strings.TrimSpace(sessionID) == "" {
+		return
+	}
+	toSave := domain.SessionMessagesFromRun(rc.Messages, historyLen)
+	if len(toSave) == 0 {
+		return
+	}
+	if err := e.memory.AppendMessages(ctx, sessionID, toSave); err != nil {
+		log.Warn("保存对话历史失败", "error", err, "message_count", len(toSave))
+		return
+	}
+	log.Info("已保存本 Run 完整消息链", "message_count", len(toSave), "history_len", historyLen)
 }
 
 func indexOfLoadSkill(calls []domain.ToolCall) int {
@@ -967,12 +1014,16 @@ func renderSkillScriptBridge(injection skillInjectionOutput) string {
 该 Skill 的 Markdown 是可移植规范，不要求其中出现 Genesis 专用工具名。
 当说明要求执行包内脚本或命令（例如 python scripts/foo.py、python3 scripts/foo.py、node scripts/foo.js、python -m some_module、npm 脚本包装 scripts/foo.js）时，必须改用 run_skill_command：skill=%q，command 直接填写原始命令行。
 按技能文档示例选择解释器：文档是 require()/'.js'/node 则用 node；是 python/python -m 则用 python。不要把 Node 包当成 python -m <pkg> 执行。
+需要执行 JS/Python 时，默认先 write_file("$WORK_DIR/foo.py|.js")，再 run_skill_command(command="python foo.py"|"node foo.js", inputs=["$WORK_DIR/foo.py|.js"])。禁止用 python -c / node -e / node --eval 塞多行或长串内联（Windows 与远程 sandbox 的 shell 嵌套引号极易 SyntaxError）；仅允许极短单行探测（无换行、载荷约≤80字符、无嵌套引号），短探测若失败，先区分引号/语法问题与真正的缺模块，再决定是否 install_skill_dependencies。
 SKILL 中写明须先 Read 的链接文档（如 *.md），以及 QA Required / Content QA 中的校验命令，必须实际执行，不可跳过。
 不要把 script resource id、args 拆成旧模型字段；运行时会先 materialize 完整 Skill 包，再在受控工作目录或远端 session workspace 中执行 command。
-如需把现有文件交给脚本处理，使用 run_skill_command.inputs 传入工作区内文件；运行时会自动 stage 到本次 Skill 工作目录。你用 write_file 写出的中间脚本应放在 $WORK_DIR/foo.ext，再以 inputs=["$WORK_DIR/foo.ext"] 传给 run_skill_command，command 使用相对文件名（例如 node foo.ext）。
-run_skill_command 返回的 artifacts 是受控产物引用；不要为了“交付”而把中间文件、解包 XML、pyc 或压缩包内部文件复制到仓库根目录。
-不要用 run_skill_command 执行 npm install、pip install、python -m pip install 等依赖安装命令。运行期依赖由 Skill 声明的 runtime/profile 提供；若工具结果明确返回 dependency_missing 和 suggested_install，再使用 install_skill_dependencies 或报告 profile 需要补齐。
-脚本可通过 WORK_DIR、INPUT_DIR、OUTPUT_DIR、TMP_DIR、SKILL_DIR 访问受控目录。
+如需把现有文件交给脚本处理，使用 run_skill_command.inputs 传入**控制面**路径：优先 $WORK_DIR/foo.ext 或工作区相对路径；运行时会 stage 到 Skill 工作目录，command 必须使用相对文件名（例如 python foo.ext / node foo.ext）。禁止：① 把执行面绝对路径（如 /workspace/...）写入 inputs 或 write_file.path；② 把 $WORK_DIR/$INPUT_DIR/$OUTPUT_DIR/$TMPDIR/$SKILL_DIR 写进 command 字符串（本地宿主与远程 sandbox API 均不展开这些字面量）。正确示例：write_file("$WORK_DIR/create_pdfs.py") → run_skill_command(command="python create_pdfs.py", inputs=["$WORK_DIR/create_pdfs.py"])。文件已在 Skill 工作目录或仅跑包内 scripts/ 时省略 inputs。
+run_skill_command 返回的 metadata.execution_backend / degraded 表示本次生效执行环境；首次或 backend/降级变化时另含 path_map（仅说明执行面环境变量映射，禁止把 path_map 右侧抄进 inputs 或 command）。artifacts[].path 是工作区相对的受控交付路径（形如 .genesis/runs/<run>/output/<skill>/file.pptx；远程 session 回收到同等相对路径，不会回传宿主机绝对路径）。成功生成后直接以此为交付结果，不要再 copy/cp/write_file 搬到 $OUTPUT_DIR 或仓库根；禁止用 write_file 伪造 .pptx/.docx/.xlsx/.pdf。
+不要用 run_skill_command 执行 npm install、npm install -g、pip install、python -m pip install 等依赖安装命令（含 SKILL 正文里写成示例的 npm/pip 安装行——那是依赖说明，不是要你执行的安装步骤）。
+运行期依赖由 Skill frontmatter 的 dependencies.runtime 与 profile/镜像提供；缺包且工具结果返回 dependency_missing / suggested_install 时，再用 install_skill_dependencies 安装已声明包，或报告 profile 需补齐。
+禁止为绕过声明而全局装包；需要额外包时先扩展该 Skill 的 dependencies.runtime，再安装。
+生成含中文/日文/韩文的 PDF（reportlab 等）时，必须先注册支持 CJK 的字体：若技能包提供 scripts/register_cjk_font.py，先 python scripts/register_cjk_font.py 确认路径，生成脚本内 from register_cjk_font import ensure_reportlab_cjk 并 fontName=ensure_reportlab_cjk()；禁止仅用 Helvetica/Times 等默认英文字体导致缺字黑块。缺字体时如实报错，不要交付黑块 PDF。
+脚本执行期可通过 WORK_DIR、INPUT_DIR、OUTPUT_DIR、TMP_DIR、SKILL_DIR 访问受控目录（执行 cwd 内）；最终交付以返回的 artifacts 为准，不要假设 $OUTPUT_DIR 等于 runs/.../output。
 不要改写第三方 SKILL.md 或 references 才能运行；适配由运行时完成。
 </skill_runtime_bridge>`, name)
 }

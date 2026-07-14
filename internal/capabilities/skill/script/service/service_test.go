@@ -43,12 +43,23 @@ func TestSkillCommandServiceRunsLocalSkillCommand(t *testing.T) {
 	if result.WorkDir == "" || result.SkillDir == "" {
 		t.Fatalf("missing workdir: %+v", result)
 	}
-	if got := filepath.Join(result.WorkDir, "made.txt"); !containsProduced(result.Produced, "made.txt") {
+	wantWorkRel := filepath.ToSlash(filepath.Join(".genesis", "runs", "test-run", "work", "skills", "demo"))
+	if result.WorkDir != wantWorkRel || result.SkillDir != wantWorkRel {
+		t.Fatalf("host-backed work/skill dir should be workspace-relative: work=%q skill=%q want=%q", result.WorkDir, result.SkillDir, wantWorkRel)
+	}
+	if got := filepath.Join(root, filepath.FromSlash(result.WorkDir), "made.txt"); !containsProduced(result.Produced, "made.txt") {
 		t.Fatalf("expected produced made.txt, produced=%v path=%s", result.Produced, got)
 	}
-	wantArtifact := filepath.Join(result.WorkDir, "made.txt")
-	if len(result.Artifacts) != 1 || filepath.Clean(result.Artifacts[0].Path) != filepath.Clean(wantArtifact) {
-		t.Fatalf("artifact should stay in skill work dir: %+v", result.Artifacts)
+	wantArtifactRel := filepath.ToSlash(filepath.Join(".genesis", "runs", "test-run", "output", "demo", "made.txt"))
+	wantArtifactAbs := filepath.Join(root, filepath.FromSlash(wantArtifactRel))
+	if len(result.Artifacts) != 1 || result.Artifacts[0].Path != wantArtifactRel {
+		t.Fatalf("artifact path for model should be workspace-relative: %+v want=%q", result.Artifacts, wantArtifactRel)
+	}
+	if _, err := os.Stat(wantArtifactAbs); err != nil {
+		t.Fatalf("artifact missing under output: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(result.WorkDir), "made.txt")); err != nil {
+		t.Fatalf("produced file should still exist in skill work dir: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(root, "made.txt")); !os.IsNotExist(err) {
 		t.Fatalf("skill artifact leaked to workspace root, err=%v", err)

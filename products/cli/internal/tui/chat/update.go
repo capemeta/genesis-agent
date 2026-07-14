@@ -255,9 +255,9 @@ func (m Model) handleWindowSize(msg tea.WindowSizeMsg) (tea.Model, tea.Cmd) {
 	m.textinput.Width = inputWidth
 
 	if !m.ready {
-		// 首次收到窗口尺寸：初始化完成，显示欢迎消息
+		// 首次收到窗口尺寸：初始化完成；有历史则 ForUI 水合，否则欢迎语
 		m.ready = true
-		m.messages = append(m.messages, welcomeMsg(m.modelName(), m.shortSessionID()))
+		m.hydrateFromSession()
 		m.refreshViewportContent()
 		m.viewport.GotoBottom()
 		return m, textinput.Blink

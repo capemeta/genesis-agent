@@ -109,8 +109,12 @@ func TestRemoteSkillCommandStagesWorkDirInputAndUsesImageNodeModules(t *testing.
 	if !containsProduced(result.Produced, "smoke.pptx") {
 		t.Fatalf("produced=%v", result.Produced)
 	}
-	if len(result.Artifacts) != 1 || !strings.Contains(filepath.ToSlash(result.Artifacts[0].Path), "/.genesis/runs/remote-smoke/output/office-ppt/smoke.pptx") {
-		t.Fatalf("artifact should land under run output dir: %+v", result.Artifacts)
+	wantRel := ".genesis/runs/remote-smoke/output/office-ppt/smoke.pptx"
+	if len(result.Artifacts) != 1 || result.Artifacts[0].Path != wantRel {
+		t.Fatalf("artifact path for model should be workspace-relative: %+v want=%q", result.Artifacts, wantRel)
+	}
+	if filepath.IsAbs(filepath.FromSlash(result.Artifacts[0].Path)) {
+		t.Fatalf("artifact must not expose host absolute path: %q", result.Artifacts[0].Path)
 	}
 	if _, err := os.Stat(filepath.Join(root, ".genesis", "runs", "remote-smoke-materialize")); !os.IsNotExist(err) {
 		t.Fatalf("should not create separate -materialize run dir: %v", err)

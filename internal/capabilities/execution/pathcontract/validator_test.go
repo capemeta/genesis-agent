@@ -378,6 +378,58 @@ func TestValidateCommandRejectsPathInsideSkillManifest(t *testing.T) {
 	}
 }
 
+func TestValidateCommandAllowsSystemDiscoveryPathsInSource(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "find_tool.py")
+	content := "import os\nfrom pathlib import Path\n" +
+		"p = Path(os.environ.get('PROGRAMFILES', r'C:\\Program Files')) / 'LibreOffice' / 'program' / 'soffice.exe'\n" +
+		"q = '/usr/bin/soffice'\n"
+	if err := os.WriteFile(script, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := ValidateCommand(execmodel.Command{
+		Command: "python find_tool.py input.pptx",
+		Cwd:     dir,
+	}, strictOptions())
+	if err != nil {
+		t.Fatalf("system discovery paths in source should be allowed, err=%v", err)
+	}
+}
+
+func TestValidateCommandAllowsCJKFontDiscoveryPathsInSource(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "register_cjk_font.py")
+	content := "from pathlib import Path\nimport os\n" +
+		"windir = Path(os.environ.get('WINDIR', r'C:\\Windows'))\n" +
+		"fontdir = windir / 'Fonts'\n" +
+		"candidates = [\n" +
+		"  fontdir / 'msyh.ttc',\n" +
+		"  Path('/System/Library/Fonts/PingFang.ttc'),\n" +
+		"  Path('/Library/Fonts/Arial Unicode.ttf'),\n" +
+		"  Path('/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc'),\n" +
+		"  Path('/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc'),\n" +
+		"]\n"
+	if err := os.WriteFile(script, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := ValidateCommand(execmodel.Command{
+		Command: "python register_cjk_font.py",
+		Cwd:     dir,
+	}, strictOptions())
+	if err != nil {
+		t.Fatalf("CJK font discovery paths in source should be allowed, err=%v", err)
+	}
+}
+
+func TestValidateCommandStillRejectsHostDataPathInShell(t *testing.T) {
+	err := ValidateCommand(execmodel.Command{
+		Command: `python process.py "C:\Program Files\secret\data.xlsx"`,
+	}, strictOptions())
+	if code := execcontract.CodeOf(err); code != execcontract.ErrCodeInvalidInput {
+		t.Fatalf("CodeOf(err)=%s err=%v", code, err)
+	}
+}
+
 func TestCustomRegistryAnalyzerCanExtendPreflight(t *testing.T) {
 	registry := NewRegistry(staticAnalyzer{violations: []Violation{{
 		Fragment: "custom://bad",

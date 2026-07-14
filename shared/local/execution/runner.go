@@ -13,9 +13,12 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	execcontract "genesis-agent/internal/capabilities/execution/contract"
 	execmodel "genesis-agent/internal/capabilities/execution/model"
+
+	"golang.org/x/text/encoding/simplifiedchinese"
 )
 
 const defaultMaxOutputBytes = int64(128 * 1024)
@@ -242,7 +245,22 @@ func (b *limitBuffer) Write(p []byte) (int, error) {
 func (b *limitBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.buf.String()
+	return decodeCommandOutput(b.buf.Bytes())
+}
+
+// decodeCommandOutput 将命令输出转为 UTF-8 文本。
+// 若字节不是合法 UTF-8，尝试按 GBK 解码（常见于 Windows 控制台/部分工具），减少 ToolResult 乱码。
+func decodeCommandOutput(raw []byte) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	if utf8.Valid(raw) {
+		return string(raw)
+	}
+	if decoded, err := simplifiedchinese.GBK.NewDecoder().Bytes(raw); err == nil && utf8.Valid(decoded) {
+		return string(decoded)
+	}
+	return string(raw)
 }
 
 func (b *limitBuffer) Truncated() bool {

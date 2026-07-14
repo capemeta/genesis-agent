@@ -36,6 +36,10 @@ func (fakeAgentService) ClearSession(context.Context, string) error {
 	return nil
 }
 
+func (fakeAgentService) ListSessionMessages(context.Context, string) ([]*domain.Message, error) {
+	return nil, nil
+}
+
 func (fakeAgentService) NewSession() *domain.Session {
 	return &domain.Session{}
 }

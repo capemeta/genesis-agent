@@ -7,7 +7,7 @@
 - **Pick a bold, content-informed color palette**: The palette should feel designed for THIS topic. If swapping your colors into a completely different presentation would still "work," you haven't made specific enough choices.
 - **Dominance over equality**: One color should dominate (60-70% visual weight), with 1-2 supporting tones and one sharp accent. Never give all colors equal weight.
 - **Dark/light contrast**: Dark backgrounds for title + conclusion slides, light for content ("sandwich" structure). Or commit to dark throughout for a premium feel.
-- **Commit to a visual motif**: Pick ONE distinctive element and repeat it — rounded image frames, icons in colored circles, thick single-side borders. Carry it across every slide.
+- **Commit to a visual motif**: Pick ONE distinctive element and repeat it — rounded image frames, icon-like shapes in colored circles (pptxgenjs `addShape`, not third-party icon npm packages), thick single-side borders. Carry it across every slide.
 
 ### Color Palettes
 
@@ -32,7 +32,7 @@ Choose colors that match your topic — don't default to generic blue. Use these
 
 **Layout options:**
 - Two-column (text left, illustration on right)
-- Icon + text rows (icon in colored circle, bold header, description below)
+- Icon + text rows (shape-based icon in a colored circle, bold header, description below)
 - 2x2 or 2x3 grid (image on one side, grid of content blocks on other)
 - Half-bleed image (full left or right side) with content overlay
 
@@ -42,7 +42,7 @@ Choose colors that match your topic — don't default to generic blue. Use these
 - Timeline or process flow (numbered steps, arrows)
 
 **Visual polish:**
-- Icons in small colored circles next to section headers
+- Shape-based icons in small colored circles next to section headers (default: `addShape` + text; do not pull in undeclared icon libraries)
 - Italic accent text for key stats or taglines
 
 ### Typography

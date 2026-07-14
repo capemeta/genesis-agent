@@ -54,10 +54,36 @@ func classifyFailure(out *scriptcontract.RunResult) {
 				mgr = manager
 			}
 			if len(out.Missing) == 0 && name != "" {
+				require := name
+				if manager == "system" {
+					if _, req := detectSystemBinaryMissing(out.Stderr); req != "" {
+						require = req
+					}
+				}
 				out.Missing = []scriptcontract.MissingDep{{
 					Manager: manager,
 					Name:    name,
-					Require: name,
+					Require: require,
+				}}
+			}
+		}
+	}
+	// Error/Stdout 也可能带系统二进制缺失（Python FileNotFoundError 常被包装进 Error）。
+	if out.FailureKind == "" || (out.FailureKind == "script_error" && len(out.Missing) == 0) {
+		blob := out.Error + "\n" + out.Stdout + "\n" + out.Stderr
+		if name, require := detectSystemBinaryMissing(blob); name != "" {
+			out.FailureKind = "dependency_missing"
+			if dep == "" {
+				dep = name
+			}
+			if mgr == "" {
+				mgr = "system"
+			}
+			if len(out.Missing) == 0 {
+				out.Missing = []scriptcontract.MissingDep{{
+					Manager: "system",
+					Name:    name,
+					Require: require,
 				}}
 			}
 		}
@@ -201,6 +227,15 @@ func detectApprovalOrTimeout(errMsg string) string {
 	if msg == "" {
 		return ""
 	}
+	if strings.Contains(errMsg, ErrCommandInlineRisky) {
+		return "command_inline_risky"
+	}
+	if strings.Contains(errMsg, ErrCommandLogicalPrefix) {
+		return "command_logical_prefix_forbidden"
+	}
+	if strings.Contains(errMsg, ErrInputPathNamespaceMismatch) {
+		return "input_path_namespace_mismatch"
+	}
 	if strings.HasPrefix(msg, "approval ") || strings.Contains(msg, "approval denied") || strings.Contains(msg, "decisiondenied") {
 		return "approval_denied"
 	}
@@ -297,7 +332,43 @@ func detectStderrDependency(stderr, script string) (kind, name, manager string) 
 	if m := reNpmNotFound.FindStringSubmatch(stderr); len(m) == 2 {
 		return "dependency_missing", m[1], "npm"
 	}
+	if name, _ := detectSystemBinaryMissing(stderr); name != "" {
+		return "dependency_missing", name, "system"
+	}
 	return "", "", ""
+}
+
+// detectSystemBinaryMissing 识别常见系统二进制缺失（三端 stderr 文案差异大，按关键词统一归类）。
+// 不绑定技能名；仅覆盖 Office/文档链路常见工具，避免把普通 FileNotFound 误判为 system 依赖。
+func detectSystemBinaryMissing(text string) (name, require string) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return "", ""
+	}
+	lower := strings.ToLower(text)
+	missingSignal := strings.Contains(lower, "not found") ||
+		strings.Contains(lower, "is not recognized") ||
+		strings.Contains(lower, "command not found") ||
+		strings.Contains(lower, "no such file") ||
+		strings.Contains(lower, "无法将") // Windows PowerShell 常见
+	if !missingSignal {
+		return "", ""
+	}
+	type sysBin struct {
+		name, require string
+		needles       []string
+	}
+	for _, b := range []sysBin{
+		{name: "libreoffice", require: "soffice", needles: []string{"soffice", "libreoffice"}},
+		{name: "poppler", require: "pdftoppm", needles: []string{"pdftoppm", "poppler"}},
+	} {
+		for _, n := range b.needles {
+			if strings.Contains(lower, n) {
+				return b.name, b.require
+			}
+		}
+	}
+	return "", ""
 }
 
 func isMissingScriptEntry(missing, script string) bool {

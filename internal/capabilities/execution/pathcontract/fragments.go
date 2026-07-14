@@ -8,7 +8,21 @@ import (
 var pathLikePattern = regexp.MustCompile(`(?i)(\$?\{?(?:INPUT_DIR|OUTPUT_DIR|TMPDIR|WORK_DIR|SKILL_DIR|GENESIS_WORKSPACE)\}?[/\\][^\s"'` + "`" + `;|&)]*|%?(?:INPUT_DIR|OUTPUT_DIR|TMPDIR|WORK_DIR|SKILL_DIR|GENESIS_WORKSPACE)%?[/\\][^\s"'` + "`" + `;|&)]*|[a-z]:[/\\][^\s"'` + "`" + `;|&)]*|\\\\[^\s"'` + "`" + `;|&)]*|/[A-Za-z0-9._~${%][^\s"'` + "`" + `;|&)]*)`)
 var windowsAbsPattern = regexp.MustCompile(`^[a-z]:/`)
 
+// pathScanMode 控制路径片段放行策略。
+// shell 命令行保持严格；源码字面量允许「系统工具探测根」（which/PROGRAMFILES 回退），
+// 避免把 LibreOffice 等安装目录探测误判为业务访问宿主机路径。
+type pathScanMode int
+
+const (
+	pathScanStrict pathScanMode = iota
+	pathScanSource
+)
+
 func violationsFromText(analyzer, location, text string) []Violation {
+	return violationsFromTextMode(analyzer, location, text, pathScanStrict)
+}
+
+func violationsFromTextMode(analyzer, location, text string, mode pathScanMode) []Violation {
 	matches := pathFragmentsInText(text)
 	if len(matches) == 0 {
 		return nil
@@ -20,12 +34,51 @@ func violationsFromText(analyzer, location, text string) []Violation {
 		if fragment == "" || seen[fragment] || !isMeaningfulPathFragment(fragment) || allowedStrictFragment(fragment) {
 			continue
 		}
+		if mode == pathScanSource && isSystemToolDiscoveryFragment(fragment) {
+			continue
+		}
 		seen[fragment] = true
 		v := violationFor(fragment, location)
 		v.Analyzer = analyzer
 		violations = append(violations, v)
 	}
 	return violations
+}
+
+// isSystemToolDiscoveryFragment 识别源码中常见的系统工具/字体安装与探测路径。
+// 路径契约扫描器在空格处截断，故 "C:\\Program Files\\..." 可能只剩 "C:\\Program"；
+// 字体探测同理（如 "/System/Library/Fonts/STHeiti Light.ttc" 可能截成 ".../STHeiti"）。
+func isSystemToolDiscoveryFragment(fragment string) bool {
+	normalized := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(fragment), `\`, `/`))
+	if windowsAbsPattern.MatchString(normalized) {
+		rest := normalized[2:] // 去掉 "c:"
+		if strings.HasPrefix(rest, "/program") {
+			after := strings.TrimPrefix(rest, "/program")
+			// C:/Program | C:/Program Files | C:/Program Files (x86)/...
+			if after == "" || strings.HasPrefix(after, " files") {
+				return true
+			}
+		}
+		// Windows 字体目录探测（reportlab CJK 等）
+		if rest == "/windows" || strings.HasPrefix(rest, "/windows/fonts") {
+			return true
+		}
+	}
+	unixRoots := []string{
+		"/usr/bin/",
+		"/usr/local/bin/",
+		"/bin/",
+		"/opt/",
+		"/usr/share/fonts/",
+		"/library/fonts/",
+		"/system/library/fonts/",
+	}
+	for _, root := range unixRoots {
+		if strings.HasPrefix(normalized, root) || normalized == strings.TrimSuffix(root, "/") {
+			return true
+		}
+	}
+	return false
 }
 
 func pathFragmentsInText(text string) []string {

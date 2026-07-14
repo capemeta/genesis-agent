@@ -99,6 +99,33 @@ func NewModel(
 	}
 }
 
+// hydrateFromSession 用短期记忆完整链经 ForUI 投影水合聊天气泡。
+// 本轮运行中的进度条仍由 progress 事件驱动；水合只负责历史/恢复场景。
+func (m *Model) hydrateFromSession() {
+	m.messages = nil
+	if m.svc == nil || m.session == nil || m.session.ID == "" {
+		m.messages = append(m.messages, welcomeMsg(m.modelName(), m.shortSessionID()))
+		return
+	}
+	hist, err := m.svc.ListSessionMessages(m.ctx, m.session.ID)
+	if err != nil {
+		m.messages = append(m.messages, uiMessage{
+			role:    "system",
+			content: "加载会话历史失败：" + err.Error(),
+		})
+		m.messages = append(m.messages, welcomeMsg(m.modelName(), m.shortSessionID()))
+		return
+	}
+	if len(hist) == 0 {
+		m.messages = append(m.messages, welcomeMsg(m.modelName(), m.shortSessionID()))
+		return
+	}
+	m.messages = projectUIMessages(hist)
+	if len(m.messages) == 0 {
+		m.messages = append(m.messages, welcomeMsg(m.modelName(), m.shortSessionID()))
+	}
+}
+
 // Init 返回 Bubble Tea 初始化命令（启动光标闪烁）
 func (m Model) Init() tea.Cmd {
 	return textinput.Blink

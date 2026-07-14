@@ -166,13 +166,49 @@ run_skill_command(skill, script ResourceID, args[], inputs[])
 | `INPUT_DIR` | `.genesis/runs/<id>/input` | `/workspace/input` |
 | `OUTPUT_DIR` | `.genesis/runs/<id>/output` | `/workspace/output` |
 | `TMPDIR` | `.genesis/runs/<id>/tmp` | `/workspace/tmp` |
-| `SKILL_DIR` | `WORK_DIR/skills/<pkg>` | `/workspace/tmp/skills/<pkg>` |
+| `SKILL_DIR` | `WORK_DIR/skills/<pkg>` | `/workspace/tmp/skills/<pkg>`（实现可落在 `/workspace` 下等价 skill 根） |
 | `PYTHONPATH` / `NODE_PATH` | `PYTHONPATH` 指向 `SKILL_DIR/scripts`；`NODE_PATH` 指向工作区/祖先 `node_modules` | `PYTHONPATH=/workspace/tmp/skills/<pkg>/scripts`；`NODE_PATH` 必须包含 `/opt/genesis-sandbox/image/node_modules`，并可包含 `/workspace/node_modules` 等 session 落点 |
 
 远程 StageInput 命名：
 
 - Skill 脚本：`skill-scripts-<pkg>.zip` → `/workspace/input/skill-scripts-<pkg>.zip`，job 内解压到 `/workspace/tmp/skills/<pkg>/scripts`
 - 用户输入：`<basename>` → `/workspace/input/<basename>`
+
+#### 4.3.1 对外路径展示（LLM / 工具 JSON / UI）——三端冻结
+
+本地平台沙箱**只换隔离实现**（seatbelt / bwrap / Windows ACL），**不另开业务路径空间**；与「无沙箱」共用宿主工作区相对路径。远程才使用 sandbox path `/workspace`。
+
+| Backend | 执行态物理 cwd | `skill_dir` / `work_dir` 回传 | `artifacts[].path` 回传 |
+| --- | --- | --- | --- |
+| 无沙箱 (`disabled`) | 宿主 `.genesis/runs/.../work/skills/<pkg>` | **workspace-relative** 同上 | **workspace-relative** `.genesis/runs/<id>/output/<skill>/...` |
+| 本地平台沙箱 (`local-platform`) | 同左（平台沙箱挂载/约束该目录） | **同无沙箱**（禁止另造 `/workspace` 展示） | **同无沙箱** |
+| 远程 (`genesis-sandbox`) | 容器 `/workspace` | **sandbox path** `/workspace` | **workspace-relative**（回收到宿主 output 后相对化；禁止 `D:\`/`/Users`） |
+
+硬约束：
+
+1. 业务路径不得回传宿主机绝对路径（含本地平台沙箱）。
+2. 本地平台沙箱不得把「隔离」误做成「第二套路径契约」；落地与无沙箱同一 `landLocalProducedToRunOutput`。
+3. 远程 `artifacts` 落盘在宿主，但 JSON 只给相对路径；执行态 cwd 仍报 `/workspace`。
+4. PathResolver / `read_file` 消费相对路径时，相对工作区根解析（已有能力）。
+
+实现入口：`internal/capabilities/skill/script/service` 的 `projectArtifactsForModel` / `projectHostWorkDirsForModel` / `pathForModel`。
+
+#### 4.3.2 技能 QA 与 Run.Incomplete（三端统一语义）
+
+| 维度 | 统一（三端同一契约） | 独立（按 backend 自然分化） |
+| --- | --- | --- |
+| 系统二进制缺失 | `stderr/error` 含 soffice/pdftoppm 等 → `failure_kind=dependency_missing` + `manager=system` + `suggested_action=use_preinstalled_image_or_local_toolchain` | 宿主/本地平台：本机 PATH；远程：镜像内 PATH |
+| 技能声明 QA | 从 SKILL 正文 QA 章节解析命令（不绑技能名）；失败不记 `QADone` | 镜像有 LibreOffice 时远程常能过；宿主未装则失败 |
+| 终态 Incomplete | **已交付产物** 且 **RequiresQA && !QADone** → `Run.Incomplete=true`（`StopReason=partial_complete`） | 仅影响审计/进度摘要；产物路径契约仍按 §4.3.1 |
+| 不 Incomplete | 任意非 QA 业务命令失败；未交付且未宣称完成的中间轮 | — |
+
+硬约束：
+
+1. 不把任意 `run_skill_command` 失败都标 Incomplete。
+2. 不按技能名硬编码；规则来自 SkillFollow（正文结构）+ 通用 failure 分类。
+3. 宿主运维日志中的绝对 `cwd` 不属于模型契约，不要求相对化。
+
+实现入口：`SkillFollowState.IncompleteDelivery`、`applySkillFollowIncomplete`、`classifyFailure` / `detectSystemBinaryMissing`。
 
 ### 4.4 三模式验收
 

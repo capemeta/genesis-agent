@@ -82,7 +82,7 @@ llm:
 
     default:
       provider: qwen
-      model: qwen-plus
+      model: deepseek-v4-flash
       strategy: balanced
       timeout: 90s
       temperature: 0.4
@@ -93,7 +93,7 @@ llm:
 
     reasoning:
       provider: qwen
-      model: qwen-plus
+      model: deepseek-v4-flash
       strategy: high_quality
       timeout: 180s
       temperature: 0.2

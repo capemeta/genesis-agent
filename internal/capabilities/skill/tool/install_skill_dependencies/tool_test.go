@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -76,7 +77,7 @@ func TestInstallRejectsPackageNotInWhitelist(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = tool.Execute(context.Background(), `{"skill":"office-ppt","packages":[{"manager":"npm","name":"left-pad"}]}`)
-	if err == nil || !strings.Contains(err.Error(), "白名单") {
+	if err == nil || !strings.Contains(err.Error(), "未在该 skill 的 dependencies.runtime 中声明") {
 		t.Fatalf("err=%v", err)
 	}
 }
@@ -190,7 +191,7 @@ func TestBuildInstallStepsAvoidsQuotedAbsolutePrefix(t *testing.T) {
 		t.Fatalf("npm command must not use quoted --prefix: %q", npm.Command)
 	}
 	pip := steps[len(steps)-1]
-	wantPip := venvPythonRel() + ` -m pip install "markitdown[pptx]"`
+	wantPip := venvPythonRel() + " -m pip install " + quotePipPackageArg("markitdown[pptx]")
 	if pip.Command != wantPip {
 		t.Fatalf("pip command=%q want=%q", pip.Command, wantPip)
 	}
@@ -199,6 +200,9 @@ func TestBuildInstallStepsAvoidsQuotedAbsolutePrefix(t *testing.T) {
 	}
 	if strings.Contains(pip.Command, "--target") || strings.Contains(pip.Command, installRoot) {
 		t.Fatalf("pip command must use venv relative python without abs path: %q", pip.Command)
+	}
+	if runtime.GOOS == "windows" && strings.Contains(pip.Command, `"`) {
+		t.Fatalf("windows pip extras must not be double-quoted (cmd keeps quotes): %q", pip.Command)
 	}
 }
 
@@ -228,7 +232,7 @@ func TestInstallPipUsesVenv(t *testing.T) {
 		t.Fatalf("venv step=%+v", runner.cmds[0])
 	}
 	wantCwd := filepath.Join(installRoot, "venv")
-	wantCmd := venvPythonRel() + ` -m pip install "markitdown[pptx]"`
+	wantCmd := venvPythonRel() + " -m pip install " + quotePipPackageArg("markitdown[pptx]")
 	last := runner.cmds[len(runner.cmds)-1]
 	if last.Command != wantCmd || last.Cwd != wantCwd {
 		t.Fatalf("pip step=%+v want cmd=%q cwd=%q", last, wantCmd, wantCwd)

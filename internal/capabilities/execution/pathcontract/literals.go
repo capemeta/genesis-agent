@@ -17,7 +17,7 @@ func sourceLiteralViolations(analyzer string, sources []analyzedSource, styles l
 	var out []Violation
 	for _, source := range sources {
 		for _, literal := range stringLiterals(source.Content, styles) {
-			out = append(out, violationsFromText(analyzer, source.Location, literal)...)
+			out = append(out, violationsFromTextMode(analyzer, source.Location, literal, pathScanSource)...)
 		}
 	}
 	return out
@@ -30,7 +30,7 @@ func wholeSourceViolations(analyzer string, sources []analyzedSource, commentPre
 		if commentPrefix != "" {
 			content = stripLineComments(content, commentPrefix)
 		}
-		out = append(out, violationsFromText(analyzer, source.Location, content)...)
+		out = append(out, violationsFromTextMode(analyzer, source.Location, content, pathScanSource)...)
 	}
 	return out
 }

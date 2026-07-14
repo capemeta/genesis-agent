@@ -33,10 +33,11 @@ def resolve_soffice_bin() -> str:
         if found:
             return found
     if sys.platform == "win32":
-        candidates = [
-            Path(os.environ.get("PROGRAMFILES", r"C:\Program Files")) / "LibreOffice" / "program" / "soffice.exe",
-            Path(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")) / "LibreOffice" / "program" / "soffice.exe",
-        ]
+        candidates = []
+        for key in ("PROGRAMFILES", "PROGRAMFILES(X86)"):
+            root = os.environ.get(key)
+            if root:
+                candidates.append(Path(root) / "LibreOffice" / "program" / "soffice.exe")
         for path in candidates:
             if path.is_file():
                 return str(path)

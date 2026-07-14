@@ -399,7 +399,7 @@ SDK 方式调用 Skill 时推荐链路：
 2. `internal/capabilities/sandbox/adapter/http` 已实现同步命令执行主路径：Bearer 认证、lease/renew/release 生命周期、绑定 sandbox 的 `POST /v1/jobs`、`GET /v1/jobs/{id}` 轮询和产物收集、超时、stdout/stderr/exit_code、错误码映射。
 3. CLI sandbox config 已支持 `mode=docker_sandbox|remote_sandbox`、`endpoint`、`api_key`、`workspace_id`、`default_runtime_profile`、会话级覆盖。
 4. CLI bootstrap 在外部 sandbox 模式下已注入 genesis-sandbox HTTP `CommandClient` 和 execution sandbox runner；本地平台模式继续使用 `shared/local` runner。
-5. 内置 Office Skills 已提供最小 Skill 包和 JSON inspect 脚本，作为 Office profile 规则的第一批落地点。
+5. 内置 Office Skills 已按 Anthropic verbatim 迁入（ppt/word/pdf/excel）；Excel 主 QA 为 `scripts/recalc.py`，不再使用旧 inspect/`recalc_xlsx`。
 6. `execution/pathcontract` 已实现可插拔 PathValidator/Analyzer Registry，默认包含 `shell_text`、`python_source`、`javascript_source`、`go_source`、`java_source`、`powershell_source`、`shell_script_source` 和 `skill_manifest` 分析器；`execution/service.Runner` 支持产品侧注入自定义 validator。
 7. `run_skill_command` + SkillScriptService 已落地：Materialize（embed/磁盘）、本地任务工作空间、`SKILL_DIR` 注入、Office profile 覆盖、产物门禁；CLI 已接线；远程 genesis-sandbox 走 Session StageInput，Skill 脚本以 zip 包上传到 `/workspace/input` 并在 job 内解压到 `/workspace/tmp/skills/<pkg>` 后执行。
 8. Skill 远程 **optional** 在 SessionClient 缺失或 `sandbox_unavailable` 时可降级本地并写 warning（`skill_script_sandbox_fallback`）；**required** fail closed。远程脚本包 zip staging、job 内解压、绝对入口路径已有单测。
@@ -414,11 +414,19 @@ SDK 方式调用 Skill 时推荐链路：
 | 类别 | 包/命令 | 用途 |
 | --- | --- | --- |
 | Runtime | `python3`、`node` | 跑 Office Skill 脚本 |
-| Node | `pptxgenjs` | `create_pptx.js` 从零生成 |
+| Node | `pptxgenjs` | PPT 从零生成 |
+| Node | `docx` | Word 从零生成（office-word / docx-js） |
 | Python | `Pillow`（`PIL`） | 缩略图/预览图处理 |
-| System | `soffice` / LibreOffice | PPT/DOCX/XLSX→PDF |
-| System | `pdftoppm`（Poppler） | PDF→预览图 |
-| 可选 | `python-pptx`、`pypdf`、`pdfplumber`、`openpyxl`、`python-docx` | inspect/编辑类脚本 |
+| Python | `defusedxml`、`lxml` | OOXML unpack/pack/validate、批注脚本（word/ppt；excel 主路径只需 defusedxml） |
+| Python | `openpyxl`、`pandas` | Excel 创建/编辑/分析与 `scripts/recalc.py` 扫错（office-excel） |
+| Python | `markitdown` | PPT/通用文本抽取（office-ppt） |
+| System | `soffice` / LibreOffice | PPT/DOCX→PDF、接受修订、**Excel 公式重算**（`recalc.py`） |
+| System | `pdftoppm` / `pdftotext` / `pdfimages`（Poppler） | PDF→预览图 / 文本 / 抽图（office-ppt/word/pdf） |
+| System | `pandoc` | DOCX 文本抽取（含 tracked changes） |
+| System | `qpdf` | PDF 合并拆分/旋转/解密（office-pdf） |
+| Python | `pypdf`、`pdfplumber`、`reportlab`、`pdf2image`、`pytesseract` | office-pdf 主路径与 OCR（tesseract 二进制在 office-ocr） |
+| Node | `pdf-lib` | office-pdf 高级 JS 路径（REFERENCE） |
+| 可选 | `python-pptx`、`python-docx`、`pypdfium2` | 其它高级示例；不进各 Skill 主 frontmatter |
 
 本仓 DoD：文档已列；镜像构建与 profile 健康检查属 sandbox 仓任务。
 

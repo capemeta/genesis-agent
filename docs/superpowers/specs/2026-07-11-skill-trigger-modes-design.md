@@ -23,7 +23,7 @@
 
 1. **Kode / Codex 都没有真正的 T2 引擎**（无 embedding 分类器、无独立 intent router）。所谓「任务匹配 description」是写在 prompt 里的 **T3 指令**，不是宿主硬匹配。
 2. Genesis **主加载路径必须经 `Skill` 网关**（I4）；禁止把「模型 `read_file` 读 SKILL.md」当主路径（绕过 Approval）。
-3. T1 可以「不伪造 tool_call」直接 system 注入，但**加载动作仍应走同一套 Resolve → 依赖预检 → Approval → Load**，只是 `ModelCall=false`。
+3. T1 可以「不伪造 tool_call」直接 **user 注入** `<skill_injection>`，但**加载动作仍应走同一套 Resolve → 依赖预检 → Approval → Load**，只是 `ModelCall=false`。
 4. T1 的实现不应复用 LLM Tool 执行入口来“假装模型调用”；应抽一个 runtime 内部显式加载端口（如 `ExplicitSkillLoader`），由 Skill 网关实现复用相同加载核心，调用方只传 `invocation=explicit` / `ModelCall=false`。
 
 ```text
@@ -147,7 +147,7 @@ Catalog → Skill.description(<available_skills>)
   → injectMentionedSkills（首轮 LLM 前）
   → SelectForTurn
   → registry.Execute("Skill", ...)   // 当前实现
-  → system <skill_injection>（不伪造 tool_call）
+  → user <skill_injection>（不伪造 tool_call）
 ```
 
 ### 4.3 已知缺口（实现时必须修）

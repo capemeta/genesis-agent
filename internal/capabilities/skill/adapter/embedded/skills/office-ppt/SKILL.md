@@ -1,6 +1,6 @@
 ---
 name: office-ppt
-description: "Use this skill any time a .pptx file is involved in any way — as input, output, or both. This includes: creating slide decks, pitch decks, or presentations; reading, parsing, or extracting text from any .pptx file (even if the extracted content will be used elsewhere, like in an email or summary); editing, modifying, or updating existing presentations; combining or splitting slide files; working with templates, layouts, speaker notes, or comments. Trigger whenever the user mentions \"deck,\" \"slides,\" \"presentation,\" or references a .pptx filename, regardless of what they plan to do with the content afterward. If a .pptx file needs to be opened, created, or touched, use this skill."
+description: "Use this skill any time a .pptx file is involved in any way — as input, output, or both. This includes: creating slide decks, pitch decks, or presentations; reading, parsing, or extracting text from any .pptx file (even if the extracted content will be used elsewhere, like in an email or summary); editing, modifying, or updating existing presentations; combining or splitting slide files; working with templates, layouts, speaker notes, or comments. Trigger whenever the user mentions deck, slides, presentation, or references a .pptx filename, regardless of what they plan to do with the content afterward. If a .pptx file needs to be opened, created, or touched, use this skill."
 license: Proprietary. LICENSE.txt has complete terms
 allowed-tools:
   - Skill
@@ -30,17 +30,26 @@ dependencies:
       - name: poppler
         command: pdftoppm
 ---
+
+
+
 # PPTX Skill
+
+
 
 ## Quick Reference
 
-| Task | Guide |
-|------|-------|
-| Read/analyze content | `python -m markitdown presentation.pptx` |
-| Edit or create from template | Read [editing.md](editing.md) |
-| Create from scratch | Write a Node `.js` using [pptxgenjs.md](pptxgenjs.md), then `node your_script.js` |
+
+| Task                         | Guide                                                                             |
+| ---------------------------- | --------------------------------------------------------------------------------- |
+| Read/analyze content         | `python -m markitdown presentation.pptx`                                          |
+| Edit or create from template | Read [editing.md](editing.md)                                                     |
+| Create from scratch          | Write a Node `.js` using [pptxgenjs.md](pptxgenjs.md), then `node your_script.js` |
+
 
 ---
+
+
 
 ## Reading Content
 
@@ -57,6 +66,8 @@ python scripts/office/unpack.py presentation.pptx unpacked/
 
 ---
 
+
+
 ## Editing Workflow
 
 **Read [editing.md](editing.md) for full details.**
@@ -66,14 +77,16 @@ python scripts/office/unpack.py presentation.pptx unpacked/
 
 ---
 
+
+
 ## Creating from Scratch
 
-**Mandatory order — do not skip:**
+**Mandatory order — step by step ,do not skip:**
 
 1. **Read [pptxgenjs.md](pptxgenjs.md) completely** before writing any creation script (especially Common Pitfalls: `lineSpacing` is points, multi-line needs `breakLine`).
 2. **Read [design.md](design.md)** and pick one palette + one visual motif; apply them in the script (do not ship plain white slides with default gray tables).
-3. Write a **Node.js** script that `require("pptxgenjs")` (not Python).
-4. Run it with `node your_script.js`.
+3. Write a **Node.js** script that `require("pptxgenjs")` (not Python). Default creation depends only on declared runtime (`pptxgenjs`); use shapes for icons — see [pptxgenjs.md](pptxgenjs.md).
+4. Run it with `node your_script.js` (write the script to a file first; avoid long `node -e` one-liners).
 5. **Content QA:** `python -m markitdown your.pptx` and confirm text was extracted.
 6. **Visual QA (required):** `python scripts/thumbnail.py your.pptx` — open the thumbnail and check for overlapping text, cramped rows, and low contrast. `markitdown` cannot catch layout bugs.
 
@@ -85,11 +98,15 @@ Never use `lineSpacing: 1.2` / `1.4` / `1.5` as if it were CSS line-height — t
 
 ---
 
+
+
 ## Design Ideas
 
 **Required for create-from-scratch.** Read [design.md](design.md) for palettes, typography, layout motifs, and common visual mistakes before writing the creation script.
 
 ---
+
+
 
 ## QA (Required)
 
@@ -153,6 +170,8 @@ Read and analyze these images:
 Report ALL issues found, including minor ones.
 ```
 
+
+
 ### Verification Loop
 
 1. Generate slides → Convert to images → Inspect
@@ -164,6 +183,8 @@ Report ALL issues found, including minor ones.
 **Do not declare success until you've completed at least one fix-and-verify cycle.**
 
 ---
+
+
 
 ## Converting to Images
 
@@ -184,12 +205,12 @@ pdftoppm -jpeg -r 150 -f N -l N output.pdf slide-fixed
 
 ---
 
+
+
 ## Dependencies
 
 - `pip install "markitdown[pptx]"` - text extraction
 - `pip install Pillow` - thumbnail grids
-- `pip install defusedxml` - safe XML parsing for thumbnail/edit scripts
 - `npm install -g pptxgenjs` - creating from scratch
 - LibreOffice (`soffice`) - PDF conversion (auto-configured for sandboxed environments via `scripts/office/soffice.py`)
 - Poppler (`pdftoppm`) - PDF to images
-

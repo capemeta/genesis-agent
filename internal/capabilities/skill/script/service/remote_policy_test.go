@@ -117,19 +117,19 @@ func TestSkillCommandServiceRunsInRemoteSessionWorkspace(t *testing.T) {
 	if len(result.Artifacts) != 1 || result.Artifacts[0].Name != "output.txt" || !result.Artifacts[0].OK {
 		t.Fatalf("artifacts=%+v warnings=%v", result.Artifacts, result.Warnings)
 	}
-	if _, err := os.Stat(result.Artifacts[0].Path); err != nil {
-		t.Fatalf("artifact not materialized locally: %v path=%q", err, result.Artifacts[0].Path)
+	wantRel := filepath.ToSlash(filepath.Join(".genesis", "runs", "remote-run", "output", "demo", "output.txt"))
+	if result.Artifacts[0].Path != wantRel {
+		t.Fatalf("artifact path for model should be workspace-relative: %q want %q", result.Artifacts[0].Path, wantRel)
 	}
-	if filepath.Clean(result.Artifacts[0].Path) == filepath.Clean(filepath.Join(root, "output.txt")) {
-		t.Fatalf("artifact leaked to workspace root: %q", result.Artifacts[0].Path)
+	if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(wantRel))); err != nil {
+		t.Fatalf("artifact not materialized locally: %v", err)
+	}
+	if filepath.IsAbs(filepath.FromSlash(result.Artifacts[0].Path)) {
+		t.Fatalf("artifact must not expose host absolute path: %q", result.Artifacts[0].Path)
 	}
 	matDir := filepath.Join(root, ".genesis", "runs", "remote-run-materialize")
 	if _, err := os.Stat(matDir); !os.IsNotExist(err) {
 		t.Fatalf("should not create separate -materialize run dir: %v", err)
-	}
-	wantSuffix := filepath.ToSlash(filepath.Join(".genesis", "runs", "remote-run", "output", "demo", "output.txt"))
-	if !strings.Contains(filepath.ToSlash(result.Artifacts[0].Path), wantSuffix) {
-		t.Fatalf("artifact should land under run output dir: %q", result.Artifacts[0].Path)
 	}
 }
 

@@ -90,7 +90,7 @@ func TestSystemFSIncludesOfficeSkills(t *testing.T) {
 		"office-word":  false,
 		"office-excel": false,
 		"office-ppt":   false,
-		"pdf-review":   false,
+		"office-pdf":   false,
 	}
 	for _, entry := range listed.Entries {
 		if strings.HasPrefix(entry.Name, "_") {
@@ -116,17 +116,17 @@ func TestSystemFSIncludesOfficeSkills(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var hasScript, hasReference bool
+	var hasComment, hasValidate bool
 	for _, resource := range resources.Resources {
-		if resource.Resource == "office-word/scripts/inspect_docx.py" && resource.Text {
-			hasScript = true
+		if resource.Resource == "office-word/scripts/comment.py" && resource.Text {
+			hasComment = true
 		}
-		if resource.Resource == "office-word/references/validation-checklist.md" && resource.Text {
-			hasReference = true
+		if resource.Resource == "office-word/scripts/office/validate.py" && resource.Text {
+			hasValidate = true
 		}
 	}
-	if !hasScript || !hasReference {
-		t.Fatalf("office-word resources=%+v", resources.Resources)
+	if !hasComment || !hasValidate {
+		t.Fatalf("office-word missing migrated scripts: comment=%v validate=%v count=%d resources=%+v", hasComment, hasValidate, len(resources.Resources), resources.Resources)
 	}
 
 	pptResources, err := source.ListResources(context.Background(), contract.SourceListResourcesRequest{PackageID: "office-ppt"})
@@ -149,6 +149,46 @@ func TestSystemFSIncludesOfficeSkills(t *testing.T) {
 	design, err := source.Read(context.Background(), contract.ReadRequest{PackageID: "office-ppt", Resource: "office-ppt/design.md"})
 	if err != nil || !strings.Contains(design.Content, "Design Ideas") {
 		t.Fatalf("design.md read=%+v err=%v", design, err)
+	}
+
+	pdfResources, err := source.ListResources(context.Background(), contract.SourceListResourcesRequest{PackageID: "office-pdf"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var hasFill, hasForms, hasCJK bool
+	for _, resource := range pdfResources.Resources {
+		if resource.Resource == "office-pdf/scripts/fill_fillable_fields.py" && resource.Text {
+			hasFill = true
+		}
+		if resource.Resource == "office-pdf/FORMS.md" && resource.Text {
+			hasForms = true
+		}
+		if resource.Resource == "office-pdf/scripts/register_cjk_font.py" && resource.Text {
+			hasCJK = true
+		}
+	}
+	if !hasFill || !hasForms || !hasCJK {
+		t.Fatalf("office-pdf missing migrated assets: fill=%v forms=%v cjk=%v count=%d", hasFill, hasForms, hasCJK, len(pdfResources.Resources))
+	}
+
+	excelResources, err := source.ListResources(context.Background(), contract.SourceListResourcesRequest{PackageID: "office-excel"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var hasRecalc, hasSoffice bool
+	for _, resource := range excelResources.Resources {
+		if resource.Resource == "office-excel/scripts/recalc.py" && resource.Text {
+			hasRecalc = true
+		}
+		if resource.Resource == "office-excel/scripts/office/soffice.py" && resource.Text {
+			hasSoffice = true
+		}
+		if strings.Contains(string(resource.Resource), "inspect_xlsx") || strings.Contains(string(resource.Resource), "recalc_xlsx") || strings.Contains(string(resource.Resource), "path_contract") || strings.Contains(string(resource.Resource), "validation-checklist") {
+			t.Fatalf("office-excel still has forbidden legacy resource: %s", resource.Resource)
+		}
+	}
+	if !hasRecalc || !hasSoffice {
+		t.Fatalf("office-excel missing migrated scripts: recalc=%v soffice=%v count=%d", hasRecalc, hasSoffice, len(excelResources.Resources))
 	}
 }
 

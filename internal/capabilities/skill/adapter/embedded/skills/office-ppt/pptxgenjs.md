@@ -205,51 +205,23 @@ slide.addImage({ path: "image.png", x: centerX, y: 1.2, w: calcWidth, h: maxHeig
 
 ## Icons
 
-Use react-icons to generate SVG icons, then rasterize to PNG for universal compatibility.
-
-### Setup
+**Default (recommended):** build icons with `pptxgenjs` shapes — colored circles/rects + short label text. This skill’s declared runtime only includes `pptxgenjs`; do not assume `react-icons` / `sharp` / `react` are available.
 
 ```javascript
-const React = require("react");
-const ReactDOMServer = require("react-dom/server");
-const sharp = require("sharp");
-const { FaCheckCircle, FaChartLine } = require("react-icons/fa");
-
-function renderIconSvg(IconComponent, color = "#000000", size = 256) {
-  return ReactDOMServer.renderToStaticMarkup(
-    React.createElement(IconComponent, { color, size: String(size) })
-  );
-}
-
-async function iconToBase64Png(IconComponent, color, size = 256) {
-  const svg = renderIconSvg(IconComponent, color, size);
-  const pngBuffer = await sharp(Buffer.from(svg)).png().toBuffer();
-  return "image/png;base64," + pngBuffer.toString("base64");
-}
-```
-
-### Add Icon to Slide
-
-```javascript
-const iconData = await iconToBase64Png(FaCheckCircle, "#4472C4", 256);
-
-slide.addImage({
-  data: iconData,
-  x: 1, y: 1, w: 0.5, h: 0.5  // Size in inches
+// Icon = circle + glyph/label (no extra npm packages)
+slide.addShape(pres.shapes.OVAL, {
+  x: 0.5, y: 1.0, w: 0.45, h: 0.45,
+  fill: { color: "4472C4" }
+});
+slide.addText("✓", {
+  x: 0.5, y: 1.0, w: 0.45, h: 0.45,
+  fontSize: 14, color: "FFFFFF", align: "center", valign: "middle", margin: 0
 });
 ```
 
-**Note**: Use size 256 or higher for crisp icons. The size parameter controls the rasterization resolution, not the display size on the slide (which is set by `w` and `h` in inches).
+Use `pres.shapes.RECTANGLE` / `OVAL` / `LINE` / `ROUNDED_RECTANGLE` (see Shapes above). Do **not** use undefined APIs like `pptxgen.ShapeType.line`.
 
-### Icon Libraries
-
-Install: `npm install -g react-icons react react-dom sharp`
-
-Popular icon sets in react-icons:
-- `react-icons/fa` - Font Awesome
-- `react-icons/md` - Material Design
-- `react-icons/hi` - Heroicons
-- `react-icons/bi` - Bootstrap Icons
+**Optional (advanced):** SVG/PNG icon pipelines (e.g. `react-icons` + `sharp`) when those packages are available in the execution environment. Prefer shape-based icons above when they are not. Skill-doc install lines (e.g. `npm install -g …`) are dependency notes for the host runtime — do not run them via skill commands.
 
 ---
 

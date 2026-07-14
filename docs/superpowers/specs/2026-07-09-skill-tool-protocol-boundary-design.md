@@ -270,7 +270,7 @@ Skill.call
 
 1. 解析 `$office-ppt`、`[$name](skill://...)`。
 2. 调用已有 `SelectForTurn`。
-3. 对命中技能自动 `Load` 并 **system 注入**（受 `disable-model-invocation`、Approval、`AllowImplicit` 约束）；不伪造 tool_call。
+3. 对命中技能自动 `Load` 并 **user 注入** `<skill_injection>`（对齐 Kode/Codex；受 `disable-model-invocation`、Approval、`AllowImplicit` 约束）；不伪造 tool_call。
 4. Plain name 仅当全局唯一且允许隐式调用时解析。
 
 ### 3.5 权限模型
@@ -381,7 +381,7 @@ Model: tool_call(name="office-ppt", arguments={action:create,...})
 
 ### Phase 2（Codex 能力；不含规范化 subagent）
 
-1. 接线 `SelectForTurn` + mention 消歧与自动注入（system injection，不伪造 tool_call）。
+1. 接线 `SelectForTurn` + mention 消歧与自动注入（user `<skill_injection>`，不伪造 tool_call）。
 2. Catalog 字节 + 近似 token 双预算与截断策略。
 3. 注入去重 `InjectedSkillSet` / `already_loaded`。
 4. Approval 键对齐 `Skill(name)` / `Skill(name)+dependencies`。

@@ -123,13 +123,56 @@ func TestInjectMentionedSkillsUsesExplicitLoader(t *testing.T) {
 	if loader.calls != 1 {
 		t.Fatalf("explicit loader calls = %d", loader.calls)
 	}
-	if len(rc.Messages) != 1 || !strings.Contains(rc.Messages[0].Content, "Manual body") {
+	if len(rc.Messages) != 1 {
 		t.Fatalf("messages = %+v", rc.Messages)
+	}
+	if rc.Messages[0].Role != domain.RoleUser {
+		t.Fatalf("skill injection role = %q, want user", rc.Messages[0].Role)
+	}
+	if rc.Messages[0].Kind != domain.MessageKindSkillInjection {
+		t.Fatalf("skill injection kind = %q, want skill_injection", rc.Messages[0].Kind)
+	}
+	if rc.Messages[0].Source != domain.MessageSourceSkillMention {
+		t.Fatalf("source = %q", rc.Messages[0].Source)
+	}
+	if !strings.Contains(rc.Messages[0].Content, "Manual body") || !strings.Contains(rc.Messages[0].Content, "<skill_injection>") {
+		t.Fatalf("messages = %+v", rc.Messages)
+	}
+}
+
+func TestApplySkillToolResultInjectsUserMessage(t *testing.T) {
+	e := &ReactLoopEngine{registry: emptyRegistry{}}
+	rc := runtime.NewRunContext(&domain.Run{ID: "run-skill-tool"}, &domain.Agent{})
+	active := []string{"Skill", "read_file", "run_skill_command"}
+	var infos []*tool.Info
+	payload := `{"type":"skill_injection","name":"demo","qualified_name":"demo","resource":"embedded:demo","content":"Demo body","truncated":false,"allowed_tools":["read_file"]}`
+	ok := e.applySkillToolResult(rc, toolExecutionResult{ID: "call-1", Name: "Skill", Content: payload}, &active, &infos, logger.NewNop())
+	if !ok {
+		t.Fatal("expected skill tool result applied")
+	}
+	if len(rc.Messages) != 2 {
+		t.Fatalf("messages = %+v", rc.Messages)
+	}
+	if rc.Messages[0].Role != domain.RoleTool || rc.Messages[0].Kind != domain.MessageKindToolResult {
+		t.Fatalf("first = %+v", rc.Messages[0])
+	}
+	if rc.Messages[1].Role != domain.RoleUser || rc.Messages[1].Kind != domain.MessageKindSkillInjection {
+		t.Fatalf("injection = %+v", rc.Messages[1])
+	}
+	if rc.Messages[1].Source != domain.MessageSourceSkillGateway {
+		t.Fatalf("source = %q", rc.Messages[1].Source)
+	}
+	if !strings.Contains(rc.Messages[1].Content, "Demo body") || !strings.Contains(rc.Messages[1].Content, "<skill_runtime_bridge>") {
+		t.Fatalf("injection = %s", rc.Messages[1].Content)
+	}
+	ui := domain.ForUI(rc.Messages)
+	if len(ui) != 0 {
+		t.Fatalf("ForUI should hide skill/tool, got %+v", ui)
 	}
 }
 func TestRenderSkillInjectionAddsRuntimeBridge(t *testing.T) {
 	body := renderSkillInjection(skillInjectionOutput{QualifiedName: "third-party", Content: "Run python scripts/do_work.py"})
-	for _, want := range []string{"<skill_runtime_bridge>", "run_skill_command", "完整 Skill 包", "third-party", "不要用 run_skill_command 执行 npm install", "按技能文档示例选择解释器", "不要把 Node 包当成", "须先 Read", "QA Required"} {
+	for _, want := range []string{"<skill_runtime_bridge>", "run_skill_command", "完整 Skill 包", "third-party", "不要用 run_skill_command 执行 npm install", "npm install -g", "dependencies.runtime", "按技能文档示例选择解释器", "不要把 Node 包当成", "须先 Read", "QA Required", "node -e", "python -c", "默认先 write_file", "register_cjk_font", "缺字黑块", "控制面", "/workspace", "execution_backend", "path_map", "写进 command", "inputs=[\"$WORK_DIR/create_pdfs.py\"]", "相对文件名", "极短单行探测"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("missing %q in %s", want, body)
 		}

@@ -34,6 +34,10 @@ type AgentService interface {
 	// 适合 TUI /clear 命令、HTTP API 重置会话接口
 	ClearSession(ctx context.Context, sessionID string) error
 
+	// ListSessionMessages 返回短期记忆完整链（含 Kind；EnsureKind 后）。
+	// 产品侧自行用 transcript.ProjectForUI / ProjectForModel 投影；禁止在 app 层写死 UI 策略。
+	ListSessionMessages(ctx context.Context, sessionID string) ([]*domain.Message, error)
+
 	// NewSession 创建新的对话会话（每次独立对话前调用）
 	NewSession() *domain.Session
 

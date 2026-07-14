@@ -91,7 +91,8 @@ func (e *ReactLoopEngine) applySkillToolResult(rc *runtime.RunContext, toolResul
 	}
 	narrowed, narrowOK := narrowToolNames(*activeToolNames, injection.AllowedTools)
 	rc.Messages = append(rc.Messages, domain.NewToolResultMessage(toolResult.ID, renderSkillToolAck(injection, narrowOK)))
-	rc.Messages = append(rc.Messages, domain.NewSystemMessage(renderSkillInjection(injection)))
+	// 对齐 Kode newMessages / Codex <skill>：SKILL 全文以 user + Kind=skill_injection 注入。
+	rc.Messages = append(rc.Messages, domain.NewSkillInjectionMessage(renderSkillInjection(injection)).WithSource(domain.MessageSourceSkillGateway))
 	rc.MarkInjectedSkill(key)
 	registerSkillInjectionFollow(rc, injection.Content)
 	if narrowOK {
@@ -104,7 +105,7 @@ func (e *ReactLoopEngine) applySkillToolResult(rc *runtime.RunContext, toolResul
 }
 
 // injectMentionedSkills 在首轮 LLM 前按 mention 自动加载 skill。
-// 只追加 system injection，不伪造 tool_call/tool_result，避免破坏对话协议。
+// 只追加 user 侧 <skill_injection>（对齐 Kode/Codex），不伪造 tool_call/tool_result。
 func (e *ReactLoopEngine) injectMentionedSkills(ctx context.Context, rc *runtime.RunContext, userInput string, activeToolNames *[]string, toolInfos *[]*tool.Info, log logger.Logger) {
 	if e.skillMentionSelector == nil || strings.TrimSpace(userInput) == "" {
 		return
@@ -128,7 +129,7 @@ func (e *ReactLoopEngine) injectMentionedSkills(ctx context.Context, rc *runtime
 			rc.Messages = append(rc.Messages, domain.NewSystemMessage(fmt.Sprintf(
 				"<skill_mention_error>\n自动加载 mention skill 失败: %s\nerror: %s\n</skill_mention_error>",
 				firstNonEmpty(mention.Skill, mention.Resource), execErr.Error(),
-			)))
+			)).WithSource(domain.MessageSourceSkillMention))
 			continue
 		}
 		tr := toolExecutionResult{ID: "mention", Name: "Skill", Content: result}
@@ -142,7 +143,7 @@ func (e *ReactLoopEngine) injectMentionedSkills(ctx context.Context, rc *runtime
 			continue
 		}
 		narrowed, narrowOK := narrowToolNames(*activeToolNames, injection.AllowedTools)
-		rc.Messages = append(rc.Messages, domain.NewSystemMessage(renderSkillInjection(injection)))
+		rc.Messages = append(rc.Messages, domain.NewSkillInjectionMessage(renderSkillInjection(injection)).WithSource(domain.MessageSourceSkillMention))
 		rc.MarkInjectedSkill(key)
 		registerSkillInjectionFollow(rc, injection.Content)
 		if narrowOK {

@@ -445,6 +445,91 @@ Runner
 4. 对用户脚本和第三方脚本，远程 strict 模式下宁可显式失败，也不自动重写路径或隐式搬运成果物。
 5. CI 可对内置 Skills 启用 analyzer 作为质量门，防止 Office/PDF 脚本重新引入硬编码 `/tmp`、Windows 盘符或宿主机 HOME。
 
+### 6.5 Agent 路径提示：控制面统一 + 生效 backend 地图
+
+> 审查结论（review-fix-rereview）：「按环境区分提示词」**可行**，但**禁止**做成「每种 backend 教一套 `inputs` 绝对路径」。正确做法是控制面词汇全环境同一套，仅把**已生效** backend 的物理映射作为执行面说明；降级必须刷新说明，且与 `stageInputs` 硬校验配套。
+
+#### 6.5.1 第一性原理
+
+| 项 | 内容 |
+| --- | --- |
+| 根问题 | 模型把**执行面**路径（如 `/workspace/...`）写进**控制面**参数（`run_skill_command.inputs`、部分 `write_file.path`），导致宿主机 stage 失败 |
+| 最小目标 | 任意 backend（含 optional 降级后）下，tool JSON 路径可解析；脚本内路径可移植 |
+| 不变量 | 逻辑目录契约；业务路径不回传宿主机绝对路径；`SandboxRequire` 不静默降级；optional 降级必须 warning/trace/audit |
+| 失败条件 | 按环境教不同 `inputs` 写法；仅在 Run 开始的 System 里写死远程地图；降级后不刷新；无硬校验只靠 prompt |
+
+#### 6.5.2 两平面（全环境同一规则）
+
+| 平面 | 载体 | 合法形态 | 禁止 |
+| --- | --- | --- | --- |
+| **控制面** | `inputs`、`write_file.path`、其它需 PathResolver/stage 的 tool 参数 | `$WORK_DIR/...`、`$INPUT_DIR/...`、`$OUTPUT_DIR/...`、工作区相对路径 | `/workspace/...`、盘符/`/Users`/`/home` 绝对路径、把 path_map 右侧抄进 tool JSON |
+| **执行面** | `run_skill_command.command`、命令内脚本、`os.environ["WORK_DIR"]` 等 | cwd 相对名、包内 `scripts/...`、进程环境变量名（非 `$WORK_DIR` 字面量） | 硬编码宿主机路径；在远程脚本里写 `.genesis/runs/...`；**把 `$WORK_DIR`/`$INPUT_DIR`/`$OUTPUT_DIR`/`$TMPDIR`/`$SKILL_DIR` 写进 command**（本地宿主与远程 sandbox API 均不展开） |
+
+`inputs` 语义（冻结）：仅表示「把**控制面已存在**的文件 stage 进本次 Skill 工作目录，供 command 用**相对文件名**访问」。文件已在同一执行 cwd / 仅跑包内脚本时，**省略 inputs**。
+
+正确组合（全 backend 相同）：`write_file("$WORK_DIR/foo.py")` → `run_skill_command(command="python foo.py", inputs=["$WORK_DIR/foo.py"])`。错误示例：`command="python $WORK_DIR/foo.py"`（会触发 `COMMAND_LOGICAL_PREFIX_FORBIDDEN`）。
+
+`python -c` / `node -e`：**默认禁止多行/长串内联**（`COMMAND_INLINE_RISKY`）；仅极短单行探测可放行。检查、生成、循环读写一律走 `$WORK_DIR` 脚本文件。
+
+#### 6.5.3 按环境区分什么、不区分什么
+
+Backend 枚举与 §6 / Skill 三模式对齐，不另造「三环境」平行分类：
+
+`local_host` | `local_platform_sandbox` | `docker_sandbox` | `remote_sandbox`
+
+| 内容 | 是否随 backend 变 | 说明 |
+| --- | --- | --- |
+| 控制面写法（`$WORK_DIR` / 相对路径） | **否** | 降级零成本；本地平台沙箱与无沙箱**同一展示契约**（见 Skill 三模式 §4.3.1） |
+| `execution_backend` + `degraded` + 逻辑→物理 **path_map** | **是** | 只说明「当前进程里 env 对应哪里」；标注 **RHS 禁止写入 tool JSON** |
+| 编程模式 `permission_only` | 不适用本小节 skill/task 地图 | 不把远程 `/workspace` 地图注入本地编码工具上下文 |
+
+**不推荐**：远程提示「`inputs` 用 `/workspace/...`」、本地提示「`inputs` 用 `D:\...`」。那会在 optional 降级时直接教错。
+
+#### 6.5.4 注入时机（对齐现有提示词架构）
+
+现状：`BuildSystem` **仅在 Run 开始调用一次**，主循环不重建 System（见 `提示词分层设计方案.md`）。因此**不能**把「最终生效 backend」只写进 Run 级 System 就以为闭环。
+
+| 时机 | 注入什么 | 通道 |
+| --- | --- | --- |
+| Skill 加载 / 稳定 bridge | **静态控制面规则**（逻辑前缀、`inputs` 禁 `/workspace`、中间脚本 `$WORK_DIR` + 相对 command） | `<skill_runtime_bridge>` |
+| 每次 `run_skill_command` 返回 | 至少：生效 `execution_backend`、`degraded`、`runtime_profile` | tool result metadata（及既有 warning） |
+| 首次成功选定 backend，或 `degraded`/backend **发生变化**时 | 完整逻辑→物理 **path_map** + 「RHS 禁止写入 tool JSON」 | 同上；降级时加「旧地图作废」一句 |
+| `SandboxRequire` 失败 | 不注入「假装仍在远程」的地图 | fail closed |
+
+说明：不必每个成功响应都重复完整 path_map（省 token）；但 **backend/degraded 每次都要有**，以便模型在降级后立刻感知。现有实现若已用 `backend=remote_session` 等别名，对外可保留，文档枚举以 §6 为准并允许等价映射。
+
+`path_map` 示例（执行面说明，非 inputs 模板）：
+
+```text
+execution_backend: remote_sandbox
+degraded: false
+path_map:
+  WORK_DIR   -> /workspace
+  INPUT_DIR  -> /workspace/input
+  OUTPUT_DIR -> /workspace/output
+  TMPDIR     -> /workspace/tmp
+note: 脚本内用环境变量；inputs/write_file 仍只用 $WORK_DIR/... ，禁止把右侧路径写入 tool JSON
+```
+
+降级到本地后同一结构，右侧改为 `.genesis/runs/<run_id>/...` 的**工作区相对**展示（禁止盘符绝对路径进模型契约）。
+
+#### 6.5.5 与硬校验配套（提示词非唯一防线）
+
+| 层 | 行为 |
+| --- | --- |
+| `stageInputs` / `resolveStageSource` | 控制面参数若呈执行面绝对根（如 `/workspace` 前缀）→ 结构化错误（建议码 `INPUT_PATH_NAMESPACE_MISMATCH`），附修复提示；勿再堆一长串宿主 tried 路径冒充「友好」 |
+| `run_skill_command.command` | 若含 `$WORK_DIR` 等逻辑前缀字面量 → `COMMAND_LOGICAL_PREFIX_FORBIDDEN`；若 `python -c`/`node -e` 多行、过长或嵌套引号 → `COMMAND_INLINE_RISKY`（本地与远程同一规则） |
+| pathcontract 源码扫描 | 继续拦脚本内宿主机绝对路径等（既有） |
+| bridge / tool Description | 与上表措辞一致，避免示例教坏 |
+
+#### 6.5.6 验收要点
+
+1. 远程成功跑 Skill：tool result 含 `execution_backend=remote_sandbox`（或实现等价名）与 path_map；`inputs` 仍为 `$WORK_DIR/...` 或省略。
+2. optional 远程不可用：降级 warning + 新 path_map；随后 `inputs` 用逻辑前缀仍成功。
+3. required 远程不可用：失败，无「本地地图」误导。
+4. `inputs=["/workspace/..."]`：早失败，错误可修复，不误伤合法 `$WORK_DIR`。
+5. 本地平台沙箱：path_map / 回传路径与无沙箱一致，不出现第二套 `/workspace` 业务路径。
+
 ## 7. Sandbox-Service Artifact 收集策略
 
 sandbox-service 的 artifact 收集策略应保持严格、简单和可审计：**只扫描 `/workspace/output`**。
@@ -561,6 +646,8 @@ Profile 选择解决“用什么 runtime 执行”的问题，执行工作空间
 6. 改造内置 Office Skills 脚本，统一使用逻辑目录。
 7. 客户端在没有 `output_artifacts` 时返回 `NO_OUTPUT_ARTIFACTS` 诊断，不从其他目录兜底收集。
 8. 新增 `SandboxSession` 端口，作为 Agent 代码执行、Office/Skill 多步处理和文件处理任务的默认执行上下文；单次 `RunCommand` 只保留给明确原子命令。
+9. 按 §6.5：稳定 bridge 只保留控制面规则；`run_skill_command` result 回传生效 `execution_backend`/`degraded`/`path_map`；optional 降级刷新地图；`stageInputs` 对执行面绝对根做 `INPUT_PATH_NAMESPACE_MISMATCH` 硬校验。（**已落地**）
+10. 与 `提示词分层设计方案` 对齐：路径地图走 tool result / notify，不依赖 Run 级 System 重建（待 TurnEnhancer 落地前的务实通道）。
 
 ## 11. 非目标
 

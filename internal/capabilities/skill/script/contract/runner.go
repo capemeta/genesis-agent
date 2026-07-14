@@ -17,7 +17,7 @@ type RunRequest struct {
 	Catalog       skillcontract.CatalogRequest
 	Skill         string
 	Command       string
-	Inputs        []string // 可选：工作区相对路径或文件名；将复制到 session 工作目录
+	Inputs        []string // 可选控制面路径（$WORK_DIR/... 或工作区相对）；禁止 /workspace 等执行面绝对路径；将 stage 到 session 工作目录
 	RunID         string
 	TimeoutMS     int64
 	Sandbox       execmodel.SandboxProfile
@@ -64,6 +64,8 @@ type SuggestedInstall struct {
 }
 
 // Artifact 描述工作目录中显式回收的交付物。
+// Path 对外契约为工作区相对路径（如 .genesis/runs/<run>/output/<skill>/file.pptx）。
+// 无沙箱与本地平台沙箱同一展示契约；远程产物回收后同样相对化（执行态 cwd 另见 /workspace）。
 type Artifact struct {
 	Name   string `json:"name"`
 	Path   string `json:"path"`

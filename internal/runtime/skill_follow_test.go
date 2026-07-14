@@ -54,9 +54,16 @@ Read [editing.md](editing.md).
 	if s.QADone() {
 		t.Fatal("failed QA must not mark done")
 	}
+	s.NoteDeliveredArtifacts([]string{"output.json"})
+	if !s.IncompleteDelivery() {
+		t.Fatal("delivered + pending QA should be IncompleteDelivery")
+	}
 	s.NoteExecutedCommand("python scripts/verify.py output.json", true)
 	if !s.QADone() {
 		t.Fatal("expected QA done")
+	}
+	if s.IncompleteDelivery() {
+		t.Fatal("QA done must clear IncompleteDelivery")
 	}
 }
 

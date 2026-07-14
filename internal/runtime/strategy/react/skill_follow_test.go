@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"genesis-agent/internal/domain"
+	"genesis-agent/internal/platform/logger"
 	"genesis-agent/internal/runtime"
 )
 
@@ -57,6 +58,9 @@ Read [design.md](design.md).
 	if runObj["qa_pending"] != true {
 		t.Fatalf("expected qa_pending, got %s", runOut)
 	}
+	if hint, _ := runObj["delivery_hint"].(string); !strings.Contains(hint, "artifacts[].path") {
+		t.Fatalf("expected delivery_hint, got %s", runOut)
+	}
 	hint, _ := runObj["qa_hint"].(string)
 	if !strings.Contains(hint, "verify.py") {
 		t.Fatalf("qa_hint should list skill QA command, got %s", hint)
@@ -69,5 +73,73 @@ Read [design.md](design.md).
 	runOut2 := annotateSkillFollowHints(rc, "run_skill_command", `{"command":"python build.py"}`, `{"ok":true,"produced":["out.json"],"artifacts":[{"name":"out.json","kind":"json"}]}`)
 	if strings.Contains(runOut2, `"qa_pending":true`) {
 		t.Fatalf("qa should be cleared: %s", runOut2)
+	}
+}
+
+func TestAnnotateSkillFollowWarnsRedeiveryWrite(t *testing.T) {
+	rc := runtime.NewRunContext(&domain.Run{ID: "r2"}, &domain.Agent{})
+	_ = annotateSkillFollowHints(rc, "run_skill_command", `{"command":"node build.js"}`,
+		`{"ok":true,"produced":["deck.pptx"],"artifacts":[{"name":"deck.pptx","path":"/tmp/out/deck.pptx","kind":"pptx","ok":true}]}`)
+
+	out := annotateSkillFollowHints(rc, "write_file",
+		`{"path":"$OUTPUT_DIR/deck.pptx","content":""}`,
+		`工具执行失败: invalid_input: 禁止用纯文本冒充 .pptx`)
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(out), &obj); err != nil {
+		t.Fatal(err)
+	}
+	if obj["skill_follow"] != "delivery_complete" {
+		t.Fatalf("expected delivery_complete, got %s", out)
+	}
+	hint, _ := obj["delivery_hint"].(string)
+	if !strings.Contains(hint, "artifacts[].path") {
+		t.Fatalf("expected delivery_hint, got %s", out)
+	}
+}
+
+func TestAnnotateSkillFollowQAFailed(t *testing.T) {
+	rc := runtime.NewRunContext(&domain.Run{ID: "r1"}, &domain.Agent{})
+	registerSkillInjectionFollow(rc, `## Creating
+
+Read [guide.md](guide.md).
+
+## QA (Required)
+
+`+"```bash\n"+`python scripts/thumbnail.py out.pptx
+`+"```\n")
+	_ = annotateSkillFollowHints(rc, "read_skill_resource", `{"resource":"guide.md"}`, `{"resource":"guide.md"}`)
+	_ = annotateSkillFollowHints(rc, "run_skill_command", `{"command":"node build.js"}`,
+		`{"ok":true,"artifacts":[{"name":"out.pptx","path":".genesis/runs/r1/output/out.pptx"}]}`)
+	failed := annotateSkillFollowHints(rc, "run_skill_command",
+		`{"command":"python scripts/thumbnail.py out.pptx"}`,
+		`{"ok":false,"failure_kind":"dependency_missing","error":"soffice not found"}`)
+	if !strings.Contains(failed, `"qa_failed":true`) {
+		t.Fatalf("expected qa_failed: %s", failed)
+	}
+	if !strings.Contains(failed, `"qa_failure_kind":"dependency_missing"`) {
+		t.Fatalf("expected qa_failure_kind: %s", failed)
+	}
+	if !rc.SkillFollow.IncompleteDelivery() {
+		t.Fatal("expected IncompleteDelivery after failed QA with delivery")
+	}
+}
+
+func TestApplySkillFollowIncomplete(t *testing.T) {
+	rc := runtime.NewRunContext(&domain.Run{ID: "r1"}, &domain.Agent{})
+	registerSkillInjectionFollow(rc, `## QA (Required)
+
+`+"```\n"+`python scripts/verify.py out.json
+`+"```\n")
+	rc.SkillFollow.NoteDeliveredArtifacts([]string{"out.json"})
+	if !applySkillFollowIncomplete(rc, logger.NewNop()) {
+		t.Fatal("expected incomplete")
+	}
+	if !rc.Run.Incomplete {
+		t.Fatal("Run.Incomplete should be true")
+	}
+	rc.SkillFollow.NoteExecutedCommand("python scripts/verify.py out.json", true)
+	rc.Run.Incomplete = false
+	if applySkillFollowIncomplete(rc, logger.NewNop()) {
+		t.Fatal("QA done should not mark incomplete")
 	}
 }

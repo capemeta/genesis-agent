@@ -61,6 +61,18 @@ func TestMergeEnvOverridesDuplicateKeys(t *testing.T) {
 	}
 }
 
+func TestDecodeCommandOutputPrefersUTF8AndFallsBackGBK(t *testing.T) {
+	if got := decodeCommandOutput([]byte("hello")); got != "hello" {
+		t.Fatalf("utf8=%q", got)
+	}
+	// 「价格」的 GBK 字节
+	gbkPrice := []byte{0xbc, 0xdb, 0xb8, 0xf1}
+	got := decodeCommandOutput(gbkPrice)
+	if !strings.Contains(got, "价格") {
+		t.Fatalf("gbk decode got %q (%v)", got, []byte(got))
+	}
+}
+
 func TestRunnerRejectsPowerShellWithoutDedicatedRunner(t *testing.T) {
 	runner := NewRunner()
 	_, err := runner.Run(context.Background(), execmodel.Command{Command: echoCommand(), Shell: execmodel.ShellPowerShell}, execcontract.RunOptions{Timeout: 30 * time.Second})

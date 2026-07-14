@@ -46,8 +46,9 @@ type Service struct {
 	autoRetryAfterInstall bool
 	installer             DependencyInstaller
 
-	mu       sync.Mutex
-	sessions map[string]*remoteSession
+	mu        sync.Mutex
+	sessions  map[string]*remoteSession
+	pathHints map[string]pathHintState
 }
 
 type remoteSession struct {
@@ -104,6 +105,7 @@ func New(deps Deps) (*Service, error) {
 		autoRetryAfterInstall: deps.AutoRetryAfterInstall,
 		installer:             deps.Installer,
 		sessions:              make(map[string]*remoteSession),
+		pathHints:             make(map[string]pathHintState),
 	}, nil
 }
 
@@ -120,6 +122,7 @@ func (s *Service) Close(ctx context.Context) error {
 		}
 		delete(s.sessions, key)
 	}
+	s.pathHints = make(map[string]pathHintState)
 	s.mu.Unlock()
 	var firstErr error
 	for _, sess := range sessions {
@@ -138,6 +141,38 @@ func (s *Service) Run(ctx context.Context, req scriptcontract.RunRequest) (*scri
 		return nil, fmt.Errorf("skill与command不能为空")
 	}
 	req.Command = command
+	s.cleanupStaleSessions(context.Background())
+	if prefix := findLogicalPrefixInCommand(command); prefix != "" {
+		out := &scriptcontract.RunResult{
+			OK:              false,
+			Skill:           skillName,
+			Command:         command,
+			Error:           errCommandLogicalPrefix(command, prefix).Error(),
+			FailureKind:     "command_logical_prefix_forbidden",
+			Retryable:       true,
+			SuggestedAction: "stage_via_inputs_then_relative_command",
+			DurationMS:      time.Since(started).Milliseconds(),
+		}
+		classifyFailure(out)
+		return out, nil
+	}
+	if risk, risky := detectRiskyInlineCommand(command); risky {
+		out := &scriptcontract.RunResult{
+			OK:              false,
+			Skill:           skillName,
+			Command:         command,
+			Error:           errCommandInlineRisky(command, risk).Error(),
+			FailureKind:     "command_inline_risky",
+			Retryable:       true,
+			SuggestedAction: "write_workdir_script_then_run_relative",
+			DurationMS:      time.Since(started).Milliseconds(),
+			Warnings: []string{
+				"python -c / node -e 多行或长串内联在 Windows 与远程 shell 下极易因引号失败；请写入 $WORK_DIR 脚本后执行。",
+			},
+		}
+		classifyFailure(out)
+		return out, nil
+	}
 	scriptHint := commandScriptHint(command)
 	if scriptHint != "" && !isExecutableSkillEntry(scriptHint) {
 		out := &scriptcontract.RunResult{OK: false, Skill: skillName, Script: scriptHint, Command: command, Error: "禁止将辅助模块作为入口执行（如 path_contract.py）；请改用业务脚本入口"}
@@ -264,22 +299,29 @@ func (s *Service) Run(ctx context.Context, req scriptcontract.RunRequest) (*scri
 		var staged []string
 		var artifacts []scriptcontract.Artifact
 		var warnings []string
-		if useRemoteSession(sandbox) {
+		intendedRemote := useRemoteSession(sandbox)
+		if intendedRemote {
 			result, produced, workDir, staged, artifacts, warnings, err = s.runRemote(ctx, meta, runID, req, timeout, sandbox)
-			if out.Metadata["backend"] == "" {
-				out.Metadata["backend"] = "remote_session"
-			}
 		} else {
-			result, produced, workDir, staged, err = s.runLocal(ctx, meta, runID, req, timeout, sandbox)
-			if out.Metadata["backend"] == "" {
-				out.Metadata["backend"] = "local"
-			}
-			artifacts, warnings = collectArtifactsByProduced(workDir, produced)
+			result, produced, workDir, staged, artifacts, warnings, err = s.runLocal(ctx, meta, runID, req, timeout, sandbox)
 		}
+		degraded := detectDegradedFromWarnings(warnings)
+		executionBackend := resolveExecutionBackend(sandbox, intendedRemote, degraded)
+		includeMap := s.shouldIncludePathMap(formatPathContextKey(runID, meta.Name), executionBackend, degraded)
+		attachExecutionPathContext(out, executionBackend, degraded, includeMap, runID, sanitize(string(meta.PackageID)))
 		out.WorkDir = workDir
 		out.SkillDir = workDir
+		// 按路径命名空间投影：/workspace 保留；宿主 abs（含远程 optional 降级到本地）相对化。
+		// 本地平台沙箱与无沙箱同属宿主工作区命名空间。
+		if !isSandboxNamespacePath(workDir) {
+			out.WorkDir = projectHostWorkDirsForModel(req.WorkspaceRoot, workDir)
+			out.SkillDir = out.WorkDir
+		}
 		out.Produced = append([]string(nil), produced...)
 		out.StagedInputs = append([]string(nil), staged...)
+		if len(warnings) > 0 {
+			out.Warnings = append(out.Warnings, warnings...)
+		}
 		if err != nil {
 			out.Error = err.Error()
 			classifyFailure(out)
@@ -316,8 +358,8 @@ func (s *Service) Run(ctx context.Context, req scriptcontract.RunRequest) (*scri
 				out.Error = result.Error
 			}
 		}
-		out.Artifacts = artifacts
-		out.Warnings = append(out.Warnings, warnings...)
+		// 对外 Path 一律工作区相对；磁盘落地仍用绝对路径（land/collect 内部）
+		out.Artifacts = projectArtifactsForModel(req.WorkspaceRoot, artifacts)
 		for _, art := range out.Artifacts {
 			ext := strings.ToLower(filepath.Ext(art.Name))
 			if (ext == ".pptx" || ext == ".docx" || ext == ".xlsx" || ext == ".pdf") && !art.OK {
@@ -345,38 +387,42 @@ func (s *Service) Run(ctx context.Context, req scriptcontract.RunRequest) (*scri
 	return out, nil
 }
 
-func (s *Service) runLocal(ctx context.Context, meta skillmodel.Metadata, runID string, req scriptcontract.RunRequest, timeout time.Duration, sandbox execmodel.SandboxProfile) (*execmodel.Result, []string, string, []string, error) {
+func (s *Service) runLocal(ctx context.Context, meta skillmodel.Metadata, runID string, req scriptcontract.RunRequest, timeout time.Duration, sandbox execmodel.SandboxProfile) (*execmodel.Result, []string, string, []string, []scriptcontract.Artifact, []string, error) {
 	ws, err := scriptworkspace.PrepareLocalTask(req.WorkspaceRoot, runID)
 	if err != nil {
-		return nil, nil, "", nil, err
+		return nil, nil, "", nil, nil, nil, err
 	}
 	skillDir := filepath.Join(ws.WorkDir, "skills", sanitize(string(meta.PackageID)))
 	if err := os.MkdirAll(skillDir, 0o755); err != nil {
-		return nil, nil, "", nil, err
+		return nil, nil, "", nil, nil, nil, err
 	}
 	mat := &materialize.Materializer{Service: s.skills}
 	if _, err := mat.MaterializePackageScripts(ctx, req.Catalog, meta, skillDir); err != nil {
-		return nil, nil, "", nil, err
+		return nil, nil, "", nil, nil, nil, err
 	}
 	staged, err := stageInputs(req.WorkspaceRoot, ws, skillDir, req.Inputs)
 	if err != nil {
-		return nil, nil, skillDir, nil, err
+		return nil, nil, skillDir, nil, nil, nil, err
 	}
 	before, err := snapshotLocalFiles(skillDir)
 	if err != nil {
-		return nil, nil, skillDir, staged, err
+		return nil, nil, skillDir, staged, nil, nil, err
 	}
+	// 执行期 cwd/env 仍钉在 skillDir（与 PathPolicy 一致）；OUTPUT_DIR 故意等于 skillDir，
+	// 避免脚本写到 runs/output 被路径契约拒绝。交付对齐远程：执行后再落到 output/<skill>/。
 	cmd := execmodel.Command{Command: req.Command, Cwd: skillDir, Shell: "auto", Env: skillEnv(skillDir, ws.TmpDir)}
 	result, err := s.runner.Run(ctx, cmd, execcontract.RunOptions{Timeout: timeout, Sandbox: sandbox, Workspace: buildSkillWorkspace(ws, skillDir)})
 	if err != nil {
-		return nil, nil, skillDir, staged, err
+		return nil, nil, skillDir, staged, nil, nil, err
 	}
 	after, err := snapshotLocalFiles(skillDir)
 	if err != nil {
-		return nil, nil, skillDir, staged, err
+		return nil, nil, skillDir, staged, nil, nil, err
 	}
 	produced := diffSnapshots(before, after)
-	return result, produced, skillDir, staged, nil
+	artifactRoot := filepath.Join(ws.OutputDir, sanitize(string(meta.PackageID)))
+	artifacts, warnings := landLocalProducedToRunOutput(skillDir, artifactRoot, produced)
+	return result, produced, skillDir, staged, artifacts, warnings, nil
 }
 
 func (s *Service) runRemote(ctx context.Context, meta skillmodel.Metadata, runID string, req scriptcontract.RunRequest, timeout time.Duration, sandbox execmodel.SandboxProfile) (*execmodel.Result, []string, string, []string, []scriptcontract.Artifact, []string, error) {
@@ -384,8 +430,7 @@ func (s *Service) runRemote(ctx context.Context, meta skillmodel.Metadata, runID
 		if sandbox.Mode == execmodel.SandboxRequired {
 			return nil, nil, "", nil, nil, nil, fmt.Errorf("genesis-sandbox session/file client未配置，且 sandbox.mode=required，拒绝降级")
 		}
-		result, produced, workDir, staged, err := s.runLocal(ctx, meta, runID, req, timeout, sandboxLocalDisabled(sandbox))
-		artifacts, warnings := collectArtifactsByProduced(workDir, produced)
+		result, produced, workDir, staged, artifacts, warnings, err := s.runLocal(ctx, meta, runID, req, timeout, sandboxLocalDisabled(sandbox))
 		warnings = append([]string{"genesis-sandbox session/file client未配置，sandbox optional 已降级到本地执行"}, warnings...)
 		return result, produced, workDir, staged, artifacts, warnings, err
 	}
@@ -401,8 +446,7 @@ func (s *Service) runRemote(ctx context.Context, meta skillmodel.Metadata, runID
 			if sandbox.Mode == execmodel.SandboxRequired {
 				return nil, nil, "", nil, nil, nil, err
 			}
-			result, produced, workDir, staged, err := s.runLocal(ctx, meta, runID, req, timeout, sandboxLocalDisabled(sandbox))
-			artifacts, warnings := collectArtifactsByProduced(workDir, produced)
+			result, produced, workDir, staged, artifacts, warnings, err := s.runLocal(ctx, meta, runID, req, timeout, sandboxLocalDisabled(sandbox))
 			warnings = append([]string{"genesis-sandbox session打开失败，sandbox optional 已降级到本地执行: " + openErr.Error()}, warnings...)
 			return result, produced, workDir, staged, artifacts, warnings, err
 		}
@@ -480,6 +524,11 @@ func (s *Service) cleanupStaleSessions(ctx context.Context) {
 		stale = append(stale, item.session)
 		delete(s.sessions, key)
 	}
+	for key, hint := range s.pathHints {
+		if now.Sub(hint.lastUsed) > sessionIdleTTL {
+			delete(s.pathHints, key)
+		}
+	}
 	s.mu.Unlock()
 	for _, sess := range stale {
 		_ = sess.Close(ctx)
@@ -501,6 +550,9 @@ func skillEnv(workDir, tmpDir string) map[string]string {
 	}
 	env["PYTHONPATH"] = pythonRuntimeSearchPath(workDir, pyPath)
 	env["NODE_PATH"] = nodeRuntimeSearchPath(workDir)
+	// 统一 Python 标准流为 UTF-8，减少 Windows 控制台 GBK 导致的 ToolResult 乱码。
+	env["PYTHONUTF8"] = "1"
+	env["PYTHONIOENCODING"] = "utf-8"
 	// 宿主：优先使用 skill-deps 下 venv，使 `python -m markitdown` 走受控解释器。
 	// 远程路径以 / 开头，不注入宿主机 venv（镜像预装）。
 	if !strings.HasPrefix(strings.TrimSpace(workDir), "/") {
@@ -602,6 +654,9 @@ func stageInputs(workspaceRoot string, ws execmodel.ExecutionWorkspace, destDir 
 		raw = strings.TrimSpace(raw)
 		if raw == "" {
 			continue
+		}
+		if isExecutionPlaneAbsoluteInput(raw) {
+			return nil, errInputPathNamespaceMismatch(raw)
 		}
 		srcReal, tried, err := resolveStageSource(raw, rootReal, ws, destDir)
 		if err != nil {
@@ -773,6 +828,62 @@ func collectArtifactsByProduced(workDir string, produced []string) ([]scriptcont
 		}
 		ok, kind, reason := gate.CheckDelivery(path)
 		artifact := scriptcontract.Artifact{Name: filepath.Base(path), Path: path, Size: info.Size(), Kind: kind, OK: ok, Reason: reason}
+		artifacts = append(artifacts, artifact)
+		if !ok {
+			warnings = append(warnings, artifact.Name+": "+reason)
+		}
+	}
+	return artifacts, warnings
+}
+
+// landLocalProducedToRunOutput 把宿主 skill cwd 中的 produced 复制到 runs/<id>/output/<skill>/。
+// 对齐远程 collectRemoteArtifactsByProduced 的交付落点；不改变执行期 cwd/env，不碰 remote 路径。
+func landLocalProducedToRunOutput(skillDir, artifactRoot string, produced []string) ([]scriptcontract.Artifact, []string) {
+	if len(produced) == 0 {
+		return nil, nil
+	}
+	root, err := boundaryPath(artifactRoot)
+	if err != nil {
+		arts, warns := collectArtifactsByProduced(skillDir, produced)
+		return arts, append([]string{"artifact_root: " + err.Error()}, warns...)
+	}
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		arts, warns := collectArtifactsByProduced(skillDir, produced)
+		return arts, append([]string{"artifact_root: " + err.Error()}, warns...)
+	}
+	artifacts := make([]scriptcontract.Artifact, 0, len(produced))
+	warnings := make([]string, 0)
+	for _, rel := range produced {
+		if shouldIgnoreProducedPath(rel) {
+			continue
+		}
+		src := filepath.Join(skillDir, filepath.FromSlash(rel))
+		srcReal, err := boundaryPath(src)
+		if err != nil {
+			warnings = append(warnings, rel+": "+err.Error())
+			continue
+		}
+		info, err := os.Stat(srcReal)
+		if err != nil || info.IsDir() {
+			continue
+		}
+		dest := filepath.Join(root, filepath.Base(srcReal))
+		destReal, err := boundaryPath(dest)
+		if err != nil || !isWithinPath(destReal, root) {
+			warnings = append(warnings, rel+": artifact path outside root")
+			continue
+		}
+		data, err := os.ReadFile(srcReal)
+		if err != nil {
+			warnings = append(warnings, rel+": "+err.Error())
+			continue
+		}
+		if err := os.WriteFile(destReal, data, 0o644); err != nil {
+			warnings = append(warnings, rel+": "+err.Error())
+			continue
+		}
+		ok, kind, reason := gate.CheckDelivery(destReal)
+		artifact := scriptcontract.Artifact{Name: filepath.Base(destReal), Path: destReal, Size: int64(len(data)), Kind: kind, OK: ok, Reason: reason}
 		artifacts = append(artifacts, artifact)
 		if !ok {
 			warnings = append(warnings, artifact.Name+": "+reason)

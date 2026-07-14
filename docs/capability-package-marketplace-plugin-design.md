@@ -298,7 +298,7 @@ run_command python scripts/create_docx.py
 
 ```text
 genesis-office-plugin
-  -> 提供 office-word / office-excel / office-ppt / pdf-review
+  -> 提供 office-word / office-excel / office-ppt / office-pdf
   -> 声明 python / libreoffice / microsoft-graph 等依赖
   -> 提供模板、脚本、验证清单和 UI 元数据
 ```
