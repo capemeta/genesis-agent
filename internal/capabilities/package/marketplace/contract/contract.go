@@ -38,10 +38,45 @@ type SourceParser interface {
 	Parse(input string) (marketmodel.MarketplaceSource, error)
 }
 
+// AllowedSourcePolicy 校验来源是否允许安装（产品注入；Enterprise 默认 deny）。
+type AllowedSourcePolicy interface {
+	Check(ctx context.Context, source marketmodel.MarketplaceSource, product string) error
+}
+
+// CatalogReloader 安装后刷新运行时 Catalog；未注入则 Effective=next_turn。
+type CatalogReloader interface {
+	Reload(ctx context.Context) error
+}
+
 // Fetcher 把 marketplace source 拉取或导入到产品侧 cache，并返回 manifest。
+// 若目录无 marketplace manifest 但可含 Skill，Manifest.Packages 可为空，由 Service Detect。
 type Fetcher interface {
 	Fetch(ctx context.Context, req FetchRequest) (FetchResult, error)
 	RemoveCache(ctx context.Context, record marketmodel.MarketplaceRecord) error
+}
+
+// InstallFromSourceRequest 是从 URL / github source / package@marketplace 安装的请求。
+type InstallFromSourceRequest struct {
+	SourceInput string
+	Scope       marketmodel.InstallScope
+	Force       bool
+	Package     string
+	SkillPath   string
+	SkillPaths  []string
+	AllowURL    bool
+	Product     string
+}
+
+// InstallFromSourceResult 是 InstallFromSource 的结构化结果。
+type InstallFromSourceResult struct {
+	Records     []marketmodel.InstallRecord
+	Skills      []string
+	Specs       []string
+	NeedsChoice bool
+	Candidates  []string
+	Effective   string
+	Message     string
+	FailureKind string
 }
 
 type FetchRequest struct {

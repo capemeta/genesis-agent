@@ -1,6 +1,11 @@
 package domain
 
-import "testing"
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+	"time"
+)
 
 func TestFactoriesSetKind(t *testing.T) {
 	if NewUserMessage("hi").Kind != MessageKindUserTurn {
@@ -63,6 +68,61 @@ func TestForModelKeepsSkillInjection(t *testing.T) {
 	model := ForModel(msgs)
 	if len(model) != 2 || model[1].Kind != MessageKindSkillInjection {
 		t.Fatalf("model=%+v", model)
+	}
+}
+
+func TestForModelConvertsLatestPlanSnapshotToReminder(t *testing.T) {
+	now := time.Now()
+	oldPlan := Plan{
+		ID:        "plan-1",
+		SessionID: "sess-1",
+		Title:     "旧计划",
+		Items: []PlanItem{
+			{ID: "a", Text: "旧任务", Status: PlanItemPending},
+		},
+		Version:   1,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	latestPlan := Plan{
+		ID:        "plan-1",
+		SessionID: "sess-1",
+		Title:     "新计划",
+		Items: []PlanItem{
+			{ID: "a", Text: "已完成任务", Status: PlanItemDone},
+			{ID: "b", Text: "进行中任务", Status: PlanItemDoing},
+		},
+		Version:   2,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	oldJSON, _ := json.Marshal(oldPlan)
+	latestJSON, _ := json.Marshal(latestPlan)
+
+	model := ForModel([]*Message{
+		NewUserMessage("开始"),
+		{Role: RoleAssistant, Content: string(oldJSON), Kind: MessageKindPlanSnapshot},
+		NewAssistantMessage("处理中"),
+		{Role: RoleAssistant, Content: string(latestJSON), Kind: MessageKindPlanSnapshot},
+	})
+
+	if len(model) != 3 {
+		t.Fatalf("len=%d model=%+v", len(model), model)
+	}
+	last := model[len(model)-1]
+	if last.Kind != MessageKindReminder || last.Role != RoleUser {
+		t.Fatalf("last=%+v", last)
+	}
+	if strings.Contains(last.Content, "旧计划") || strings.Contains(last.Content, "旧任务") {
+		t.Fatalf("reminder contains stale plan: %s", last.Content)
+	}
+	if !strings.Contains(last.Content, "新计划") || !strings.Contains(last.Content, "进行中任务") {
+		t.Fatalf("reminder missing latest plan: %s", last.Content)
+	}
+	for _, msg := range model {
+		if msg.Kind == MessageKindPlanSnapshot {
+			t.Fatalf("plan_snapshot leaked to model: %+v", msg)
+		}
 	}
 }
 

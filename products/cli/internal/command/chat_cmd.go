@@ -4,9 +4,12 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 
-	"genesis-agent/products/cli/internal/tui/chat"
+	"genesis-agent/internal/app"
+	"genesis-agent/internal/domain"
 	cliapproval "genesis-agent/products/cli/internal/approval"
+	"genesis-agent/products/cli/internal/tui/chat"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/spf13/cobra"
 )
@@ -14,6 +17,8 @@ import (
 // newChatCmd 创建 chat 子命令
 // 启动基于 Bubble Tea + Lip Gloss 的全功能 TUI 对话界面
 func newChatCmd(configDirRef *string, sandboxModeRef *string, factory ServiceFactory) *cobra.Command {
+	var resumeID string
+	var continueLatest bool
 	cmd := &cobra.Command{
 		Use:   "chat",
 		Short: "启动交互式 TUI 对话（推荐）",
@@ -28,14 +33,20 @@ func newChatCmd(configDirRef *string, sandboxModeRef *string, factory ServiceFac
 
 快捷键:
   Enter      发送消息
-  Ctrl+C     退出程序
-  Esc        清空输入框
+  Ctrl+C     推理中取消本轮 / 空闲时按两次退出
+  Ctrl+D     退出程序
+  Ctrl+Y     复制最近一次 Agent 回答到系统剪贴板
+  Esc        推理中取消本轮 / 空闲时清空输入框
   ↑ / ↓      滚动消息历史
   PgUp/PgDn  快速翻页
-  鼠标拖选   可直接选中并复制文字（未启用鼠标捕获）
+  鼠标拖选   终端原生拖选（需按住 Shift，若终端支持）
 
 内置命令（以 / 开头）:
   /clear     清空当前会话历史，开始新对话
+  /copy      复制最近一次 Agent 回答到系统剪贴板
+  /copy user 复制最近一次用户消息到系统剪贴板
+  /copy all  复制整段对话到系统剪贴板
+  /resume ID 恢复指定会话
   /help      显示帮助信息
   /quit      退出程序`,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -47,18 +58,29 @@ func newChatCmd(configDirRef *string, sandboxModeRef *string, factory ServiceFac
 				return fmt.Errorf("初始化失败: %w\n\n请检查配置文件或 API Key 是否正确", err)
 			}
 
-			session := svc.NewSession()
+			var session *domain.Session
+			switch {
+			case strings.TrimSpace(resumeID) != "":
+				session, err = svc.ResumeSession(ctx, strings.TrimSpace(resumeID), app.SessionScope{})
+			case continueLatest:
+				session, err = svc.ContinueSession(ctx, app.SessionScope{})
+			default:
+				session, err = svc.CreateSession(ctx, app.SessionScope{})
+			}
+			if err != nil {
+				return fmt.Errorf("准备会话失败: %w", err)
+			}
 
 			// 构建 Bubble Tea 初始 Model
 			m := chat.NewModel(ctx, svc, session)
 
 			// 启动 TUI 程序
-			// WithAltScreen: 使用备用屏幕，退出后恢复原始终端内容
-			// 故意不启用 WithMouseCellMotion：鼠标捕获会接管终端选区，
-			// 导致无法拖选复制文字；消息历史请用 ↑↓ / PgUp/PgDn 滚动。
+			// WithAltScreen: 使用备用屏幕，退出后恢复原始终端内容。
+			// 捕获鼠标以支持消息区滚轮；需要终端原生拖选时可按住 Shift。
 			p := tea.NewProgram(
 				m,
 				tea.WithAltScreen(),
+				tea.WithMouseCellMotion(),
 			)
 
 			// 绑定全局 TUI 审批器对应的 program 实例
@@ -72,6 +94,9 @@ func newChatCmd(configDirRef *string, sandboxModeRef *string, factory ServiceFac
 			return nil
 		},
 	}
+	cmd.Flags().StringVar(&resumeID, "resume", "", "恢复指定会话 ID")
+	cmd.Flags().BoolVar(&continueLatest, "continue", false, "恢复最近一次会话")
+	cmd.MarkFlagsMutuallyExclusive("resume", "continue")
 
 	return cmd
 }

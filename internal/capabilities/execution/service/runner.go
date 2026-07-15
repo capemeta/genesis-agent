@@ -13,6 +13,7 @@ import (
 	"genesis-agent/internal/capabilities/execution/pathcontract"
 	"genesis-agent/internal/platform/logger"
 	"genesis-agent/internal/platform/logger/correl"
+	"genesis-agent/internal/runtime/progress"
 )
 
 const sandboxFallbackWarning = "sandbox runner unavailable; fell back to local execution"
@@ -89,17 +90,48 @@ func (r *Runner) Run(ctx context.Context, cmd execmodel.Command, opts execcontra
 	switch mode {
 	case execmodel.SandboxDisabled:
 		l.Info("准备在[本地宿主机]执行命令")
+		progress.Emit(ctx, progress.Event{
+			Kind:      progress.KindSandbox,
+			Phase:     progress.PhaseStart,
+			Component: "execution-runner",
+			Name:      "local_host",
+			Summary:   "本地宿主机直接执行 (沙箱未启用)",
+		})
 		result, err := r.direct.Run(ctx, cmd, opts)
 		ensureEnvironment(result, execmodel.EnvironmentLocal, "")
 		if err != nil {
 			l.Error("本地宿主机命令执行失败", "error", err)
+			progress.Emit(ctx, progress.Event{
+				Kind:      progress.KindSandbox,
+				Phase:     progress.PhaseError,
+				Level:     progress.LevelError,
+				Component: "execution-runner",
+				Name:      "local_host",
+				Summary:   "本地宿主机执行失败",
+				Detail:    err.Error(),
+			})
 		} else {
 			l.Info("本地宿主机命令执行完成", "exit_code", result.ExitCode)
+			progress.Emit(ctx, progress.Event{
+				Kind:      progress.KindSandbox,
+				Phase:     progress.PhaseComplete,
+				Component: "execution-runner",
+				Name:      "local_host",
+				Summary:   "本地宿主机执行结束",
+			})
 		}
 		return result, err
 	case execmodel.SandboxOptional:
 		if r.sandbox == nil {
 			l.Info("准备在[本地宿主机]执行命令 (未配置沙箱，降级到本地)")
+			progress.Emit(ctx, progress.Event{
+				Kind:      progress.KindSandbox,
+				Phase:     progress.PhaseError,
+				Level:     progress.LevelWarn,
+				Component: "execution-runner",
+				Name:      "local_host",
+				Summary:   "自动降级：本地宿主机直接执行 (沙箱未配置)",
+			})
 			result, err := r.direct.Run(ctx, cmd, opts)
 			ensureEnvironment(result, execmodel.EnvironmentLocal, "")
 			addWarning(result, sandboxFallbackWarning)
@@ -112,8 +144,17 @@ func (r *Runner) Run(ctx context.Context, cmd execmodel.Command, opts execcontra
 		}
 		l.Info("准备在[沙箱环境]执行命令 (可选沙箱)", "provider", opts.Sandbox.Provider, "sandbox_type", resolveSandboxType(opts.Sandbox.Provider), "runtime_profile", string(opts.Sandbox.RuntimeProfile))
 		result, err := r.sandbox.RunInSandbox(ctx, cmd, opts.Sandbox, opts)
-		if err != nil && execcontract.CodeOf(err) == execcontract.ErrCodeSandboxUnavailable {
-			l.Warn("沙箱服务不可用，自动降级至本地宿主机执行", "error", err)
+		if err != nil && (execcontract.CodeOf(err) == execcontract.ErrCodeSandboxUnavailable || execcontract.CodeOf(err) == execcontract.ErrCodeSandboxPolicyUnsupported) {
+			l.Warn("沙箱服务不可用或不支持当前策略，自动降级至本地宿主机执行", "error", err)
+			progress.Emit(ctx, progress.Event{
+				Kind:      progress.KindSandbox,
+				Phase:     progress.PhaseError,
+				Level:     progress.LevelWarn,
+				Component: "execution-runner",
+				Name:      "local_host",
+				Summary:   "自动降级：本地宿主机直接执行 (沙箱策略未就绪)",
+				Detail:    err.Error(),
+			})
 			result, directErr := r.direct.Run(ctx, cmd, opts)
 			ensureEnvironment(result, execmodel.EnvironmentLocal, "")
 			addWarning(result, sandboxFallbackWarning+": "+err.Error())
@@ -133,6 +174,14 @@ func (r *Runner) Run(ctx context.Context, cmd execmodel.Command, opts execcontra
 	case execmodel.SandboxRequired:
 		if r.sandbox == nil {
 			l.Error("沙箱必填但未配置SandboxRunner，执行中止")
+			progress.Emit(ctx, progress.Event{
+				Kind:      progress.KindSandbox,
+				Phase:     progress.PhaseError,
+				Level:     progress.LevelError,
+				Component: "execution-runner",
+				Name:      "local_host",
+				Summary:   "安全隔离阻断：未配置沙箱执行器",
+			})
 			return nil, execcontract.NewError(execcontract.ErrCodeSandboxUnavailable, fmt.Errorf("SandboxRunner未配置"))
 		}
 		l.Info("准备在[沙箱环境]执行命令 (强制沙箱)", "provider", opts.Sandbox.Provider, "sandbox_type", resolveSandboxType(opts.Sandbox.Provider), "runtime_profile", string(opts.Sandbox.RuntimeProfile))

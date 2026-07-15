@@ -1,6 +1,6 @@
 # CLI TUI 体验重构设计
 
-> 状态：设计待评审  
+> 状态：实现完成，待 Windows 真实终端手工验收  
 > 日期：2026-07-13  
 > 范围：`products/cli` 交互式 `chat` TUI（Bubble Tea + Lip Gloss）  
 > 目标：在 Cursor 内置终端 / bat(cmd) 双击启动等 Windows 常见环境下，达到接近 Claude Code / Codex 的可读性、可控性与「拿走内容」体验  
@@ -14,7 +14,7 @@
 ### 1.1 已确认痛点
 
 1. **无法选中文字**：用户在 bat 双击启动与 Cursor/VS Code 内置终端中，均无法对 TUI 内容做可靠鼠标拖选。
-2. **根因**：全屏 Alt Screen + raw mode 下，这两类终端对原生选区支持差；当前虽未启用 `WithMouseCellMotion`，仍不能把「终端拖选」当作主复制手段。推理期间 Spinner 高频重绘会进一步恶化选区稳定性。
+2. **根因**：全屏 Alt Screen + raw mode 下，这两类终端对原生选区支持差；即使启用 `WithMouseCellMotion` 支持滚轮，也不能把「终端拖选」当作主复制手段。推理期间 Spinner 高频重绘会进一步恶化选区稳定性。
 3. **体验债**：厚重紫色顶栏/气泡、单行输入、Ctrl+C 直接退出、过程日志与最终回答抢视觉焦点、帮助栏静态且弱引导。
 
 ### 1.2 成功标准
@@ -56,7 +56,7 @@
 
 ```text
 ┌ header（极简 + 状态 chips）─────────────────────────────┐
-│ genesis / chat          qwen3-max · sandbox · ctx%     │
+│ genesis / chat          qwen3-max · sandbox · ctx~%    │
 ├ transcript（消息主区，可滚动）───────────────────────────┤
 │  [你] 用户消息                                          │
 │  [Ag] Agent 回答 + 行内动作提示（复制/展开过程）         │
@@ -68,7 +68,7 @@
 
 ### 3.2 视觉原则（基线 = 体验细节版）
 
-1. **顶栏安静**：去掉满宽厚重紫色色块；用文字层级 + 小号 status chip（模型、sandbox、上下文占用近似值）。
+1. **顶栏安静**：去掉满宽厚重紫色色块；用文字层级 + 小号 status chip（模型、sandbox、基于 transcript 字符估算的 `ctx~` 上下文占用）。该估算仅用于提示，不用于计费或截断决策。
 2. **消息去气泡化**：user/agent 用小头像块或安静标签，正文为正常前景色，避免大面积色块背景（利于阅读；也为将来选择模式留空间）。
 3. **过程不抢戏**：运行过程默认折叠为一行摘要（步数 / tokens / 耗时 / 成败）；`o` 或点击等价快捷键展开。
 4. **反馈可见**：复制成功、取消本轮、审批结果等用短时 toast（约 2s），不永久污染 transcript。
@@ -127,9 +127,9 @@
 | 按键 | 行为 |
 | --- | --- |
 | `Ctrl+C` | 若正在推理：取消本轮（cancel context），回到可输入；**不退出** |
-| `Ctrl+C`（空闲连续两次或空闲一次可配置） | 可选：空闲时第一次提示「再按一次退出」，或空闲直接忽略并提示用 `/quit`——**推荐空闲提示，二次确认退出**，避免误杀 |
+| `Ctrl+C`（空闲态） | 第一次：toast 提示「再按一次退出，或输入 `/quit`」；第二次（1s 内）：退出 TUI。**已拍板：二次确认方案。** |
 | `Ctrl+D` 或 `/quit` `/exit` | 退出 TUI |
-| `Esc` | 推理中：请求中断；输入非空：清空输入；审批中：不作为「允许」 |
+| `Esc` | 优先级从高到低：① 推理态 → 请求取消本轮（同 Ctrl+C），忽略输入框内容；② 空闲且 Composer 有内容 → 清空输入；③ 空闲且输入为空 → no-op。审批态：不作为「允许」，保持审批焦点。 |
 
 > 实现注意：取消本轮需复用现有 `cancelFn`，并在取消后重建可取消的子 context，保证后续轮次仍可取消。
 
@@ -142,19 +142,19 @@
 | 换行 | `Shift+Enter` |
 | 字数 | 底栏显示 `len/limit`（limit 可高于当前 2000，建议 4000–8000，与后端约束对齐时再定） |
 | 输入历史 | `↑` / `↓` 在输入为空或历史浏览态下翻阅已发送 user 消息 |
-| 斜杠命令 | `/` 开头；后续可做简易补全（P1） |
+| 斜杠命令 | 输入（可含前导空格的）`/` 自动显示匹配命令菜单；`↑` / `↓` 选择，`Enter` 填入，`Esc` 关闭，`Tab` 保留为补全快捷键 |
 | 推理中 | Composer 禁用发送，边框改为非聚焦态；仍允许 `Ctrl+C` / `Esc` |
 
 ### 5.3 消息区快捷键（输入框为空或失焦时）
 
 | 按键 | 行为 |
 | --- | --- |
-| `y` | 复制最近 Agent 回答 |
+| `y` | 复制最近 Agent 回答（仅在 **Composer 失焦**或处于**历史浏览态**时生效，避免与正常打字冲突） |
 | `o` | 展开/折叠最近一轮运行过程 |
 | `↑↓` `PgUp/PgDn` | 滚动 transcript |
 | `?` | 打开快捷键帮助（等同 `/help` 的键位篇） |
 
-与 Composer 焦点冲突时：以「正在编辑非空输入」为编辑态，编辑态优先把字符交给输入框。
+焦点判定原则：Bubble Tea 以「组件是否 Focus()」为准，不以内容是否为空为准。Composer 聚焦时，所有字符键优先交给输入框；Composer 失焦或处于历史浏览态时，消息区快捷键生效。
 
 ### 5.4 斜杠命令
 
@@ -176,7 +176,7 @@
 ### 6.1 运行过程
 
 - 进度事件仍来自现有 `OnProgress` / `progress.Event`。
-- UI 层维护「当前 turn 的 activity 摘要」：默认折叠；展开后为条目列表（工具/技能/sandbox）。
+- UI 层维护「当前 turn 的 activity 摘要」：默认折叠；展开后为条目列表（工具/技能/sandbox）。完成或失败后摘要包含步骤数、tokens、耗时和结果。
 - 最终回答与 activity **分区**：activity 不写入 assistant 气泡正文（避免和最终回答混排）；与当前「system 过程摘要」可收敛为统一 activity 组件。
 
 ### 6.2 流式展示
@@ -202,45 +202,51 @@ Idle:
   - Composer focused
   - Ctrl+Y / y / /copy 可用
   - Enter 发送 → Running
+  - Ctrl+C 第一次：toast「再按一次退出」，第二次（1s 内）：Quit
 
 Running:
-  - cancelable via Ctrl+C / Esc
+  - cancelable via Ctrl+C / Esc（优先级：① 取消推理，不退出）
+  - 取消后须重建 cancelFn：ctx, cancelFn = context.WithCancel(parentCtx)
   - progress → status + activity
   - stream → assistant bubble
   - complete/error → Idle (+ toast)
 
 Approval:
   - keyboard Y/S/N/A
+  - Esc 不作为「允许」，保持 Approval 态
   - resolve → back to Running or Idle
 ```
 
 Toast 为正交短时状态，不改变 Mode。
+实现机制：Toast 由一次性延迟命令在约 2 秒后发送 `clearToastMsg` 清除，不依赖 Ticker，不影响 Spinner 帧率。
 
 ---
 
 ## 八、分阶段交付
 
-### Phase 1 — 复制与中断正确性（P0）
+### Phase 1 — 复制与中断正确性（P0，已完成）
 
-1. 系统剪贴板封装 + `Ctrl+Y` / `/copy` + toast  
+1. 系统剪贴板封装（`products/cli/internal/tui/clipboard/`）+ `Ctrl+Y` / `/copy` + toast  
 2. Ctrl+C 取消本轮（不退出）+ 退出入口调整  
-3. Spinner/进度降频  
-4. `/help` 与 footer 文案更新  
+   - 取消后须重建可取消子 context：`ctx, cancelFn = context.WithCancel(parentCtx)`，保证后续轮次仍可取消  
+   - 空闲态 Ctrl+C 二次确认：第一次 toast 提示，第二次（1s 内）退出  
+3. Spinner/进度降频（状态栏 8–10 Hz 上限，`time.Tick` 节流或合并帧）  
+4. `/help` 与 footer 文案更新（Ctrl+C 改为「取消」而非「退出」；复制快捷键加入 footer）  
 
-### Phase 2 — 布局与 Composer（体验基线）
+### Phase 2 — 布局与 Composer（体验基线，已完成）
 
 1. 顶栏 chips、去厚重气泡、activity 折叠组件  
 2. 多行 Composer（Enter / Shift+Enter）  
 3. 输入历史  
 4. 审批焦点防误触  
 
-### Phase 3 — 增强
+### Phase 3 — 增强（已完成）
 
 1. 鼠标滚轮 + Shift 拖选说明  
 2. `/copy` 子命令  
-3. 上下文占用 chip（有可靠数据源再做）  
+3. 上下文占用 chip（当前为基于 transcript 的 `ctx~` 近似值；后续可替换为 provider usage）  
 4. 应用内选择模式（P2）  
-5. 斜杠补全  
+5. 斜杠命令菜单与补全（输入 `/` 自动展示，`↑/↓` 选择，`Enter` 填入，`Tab` 补全）  
 
 ---
 
@@ -248,9 +254,9 @@ Toast 为正交短时状态，不改变 Mode。
 
 ### 9.1 自动化
 
-- Update 层单测：复制命令选择「最近 assistant」内容；无消息时的 toast/状态。
-- 快捷键：Running 下 Ctrl+C 触发 cancel 且不 `tea.Quit`；`/quit` 才退出。
-- 布局：WindowSize 变化后 viewport 高度计算不含错位（现有 header/footer/composer 行数常量需与 View 同步）。
+- Update 层单测：无 assistant 时复制 toast、斜杠命令菜单与补全、选择模式、帮助覆盖层、完成 activity 摘要。
+- 快捷键：Running 下 Ctrl+C 触发 cancel 且不 `tea.Quit`；`/quit` 与 Ctrl+D 退出。
+- 布局：WindowSize 变化后 viewport 高度计算正确；窄终端标题栏不超宽。
 
 ### 9.2 手工验收矩阵
 
@@ -275,17 +281,17 @@ Toast 为正交短时状态，不改变 Mode。
 
 ---
 
-## 十一、开放问题（实现前可再确认）
+## 十一、已关闭问题
 
-1. 空闲态 `Ctrl+C`：二次确认退出 vs 仅提示使用 `/quit`（推荐二次确认）。  
-2. Composer 字符上限与后端/LLM 上下文策略的最终数值。  
-3. 上下文占用 chip 的数据源（若 Phase 2 暂无可靠 API，则先隐藏该 chip）。  
+1. ~~空闲态 `Ctrl+C`：已拍板，二次确认退出（§5.1）。~~ ✅ 已关闭  
+2. ~~Composer 字符上限与后端/LLM 上下文策略的最终数值。~~ 当前设为 4000 字符；后续由后端约束统一调整。  
+3. ~~上下文占用 chip 的数据源。~~ 当前使用 transcript 字符估算并标记为 `ctx~`；后续可接入 provider usage。  
 
 ---
 
 ## 十二、参考
 
-- 现实现：`products/cli/internal/command/chat_cmd.go`（故意未开鼠标捕获的注释）  
+- 现实现：`products/cli/internal/command/chat_cmd.go`（Alt Screen + 鼠标滚轮捕获）  
 - 进度展示契约：`docs/运行进度事件与前端展示契约.md`  
 - 目录边界：`docs/项目目录与边界说明.md`（产品 TUI 仅在 `products/cli`）  
 - 头脑风暴稿：`.superpowers/brainstorm/30496-1783949541/content/`（本地，不入库）

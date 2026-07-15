@@ -12,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"genesis-agent/internal/app"
+	"genesis-agent/internal/domain"
 	"genesis-agent/internal/runtime/progress"
 )
 
@@ -31,6 +32,7 @@ func newRunCmd(configDirRef *string, sandboxModeRef *string, factory ServiceFact
 		jsonOutput   bool
 		quiet        bool
 		progressMode string
+		resumeID     string
 	)
 
 	cmd := &cobra.Command{
@@ -64,7 +66,15 @@ func newRunCmd(configDirRef *string, sandboxModeRef *string, factory ServiceFact
 				return fmt.Errorf("初始化失败: %w", err)
 			}
 
-			session := svc.NewSession()
+			var session *domain.Session
+			if id := strings.TrimSpace(resumeID); id != "" {
+				session, err = svc.ResumeSession(ctx, id, app.SessionScope{})
+			} else {
+				session, err = svc.CreateSession(ctx, app.SessionScope{})
+			}
+			if err != nil {
+				return fmt.Errorf("准备会话失败: %w", err)
+			}
 
 			progressSink := runProgressSink(progressMode, quiet, jsonOutput)
 
@@ -80,6 +90,7 @@ func newRunCmd(configDirRef *string, sandboxModeRef *string, factory ServiceFact
 			result, err := svc.RunOnce(ctx, app.RunRequest{
 				SessionID:  session.ID,
 				TenantID:   session.TenantID,
+				UserID:     session.UserID,
 				Input:      input,
 				OnProgress: progressSink,
 			})
@@ -144,6 +155,7 @@ func newRunCmd(configDirRef *string, sandboxModeRef *string, factory ServiceFact
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "以 JSON 格式输出结果（适合脚本解析）")
 	cmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "仅输出最终回答文本（适合管道操作）")
 	cmd.Flags().StringVar(&progressMode, "progress", "auto", "进度输出模式：auto|off|text|jsonl（输出到stderr）")
+	cmd.Flags().StringVar(&resumeID, "resume", "", "在指定会话中继续单次推理")
 
 	return cmd
 }

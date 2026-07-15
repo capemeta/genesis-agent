@@ -3,14 +3,18 @@ package service
 import (
 	"context"
 	"crypto/md5"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
 	"strings"
 	"time"
 
+	memorycontract "genesis-agent/internal/capabilities/memory/contract"
 	"genesis-agent/internal/capabilities/plan/contract"
 	"genesis-agent/internal/capabilities/plan/model"
+	"genesis-agent/internal/domain"
+	"genesis-agent/internal/platform/contextutil"
 )
 
 // PlanService 实现 contract.Service 接口
@@ -18,6 +22,7 @@ type PlanService struct {
 	repo                contract.Repository
 	broadcaster         contract.EventBroadcaster
 	remindIntervalSteps int
+	memStore            memorycontract.ShortTermMemory // 可选注入，用于持久化 plan_snapshot 消息
 }
 
 // NewPlanService 创建 PlanService 实例
@@ -30,6 +35,11 @@ func NewPlanService(repo contract.Repository, broadcaster contract.EventBroadcas
 		broadcaster:         broadcaster,
 		remindIntervalSteps: remindIntervalSteps,
 	}
+}
+
+// SetShortTermMemory 动态注入短期记忆存储
+func (s *PlanService) SetShortTermMemory(mem memorycontract.ShortTermMemory) {
+	s.memStore = mem
 }
 
 // GetPlan 获取指定会话的当前计划
@@ -399,6 +409,28 @@ func (s *PlanService) GeneratePromptReminder(ctx context.Context, sessionID stri
 }
 
 func (s *PlanService) broadcastUpdate(ctx context.Context, sessionID string, plan *model.Plan, explanation string, isNew bool) {
+	// 1. 保存 plan_snapshot 消息到 SessionStore
+	if s.memStore != nil {
+		domainPlan := convertToDomainPlan(plan)
+		detail, err := json.Marshal(domainPlan)
+		if err == nil {
+			tenantID, _ := contextutil.GetTenantID(ctx)
+			userID, _ := contextutil.GetUserID(ctx)
+			ref := memorycontract.SessionRef{
+				TenantID:  tenantID,
+				UserID:    userID,
+				SessionID: sessionID,
+			}
+			snapshotMsg := &domain.Message{
+				Role:    domain.RoleAssistant,
+				Content: string(detail),
+				Kind:    domain.MessageKindPlanSnapshot,
+			}
+			_ = s.memStore.Append(ctx, ref, []*domain.Message{snapshotMsg})
+		}
+	}
+
+	// 2. 广播进度事件
 	eventType := contract.EventPlanUpdated
 	if isNew {
 		eventType = contract.EventPlanCreated
@@ -411,5 +443,60 @@ func (s *PlanService) broadcastUpdate(ctx context.Context, sessionID string, pla
 			Explanation: explanation,
 			Timestamp:   time.Now(),
 		})
+	}
+}
+
+// convertToDomainPlan 将 plan/model.Plan 转换为 domain.Plan 供各端渲染和保存。
+func convertToDomainPlan(p *model.Plan) *domain.Plan {
+	if p == nil {
+		return nil
+	}
+
+	items := make([]domain.PlanItem, len(p.Steps))
+	for i, step := range p.Steps {
+		item := domain.PlanItem{
+			ID:     step.ID,
+			Text:   step.Title,
+			Status: convertStepStatus(step.Status),
+			Note:   step.Notes,
+		}
+		if step.Status == model.StepStatusCompleted && !step.UpdatedAt.IsZero() {
+			t := step.UpdatedAt
+			item.DoneAt = &t
+		}
+		items[i] = item
+	}
+
+	title := p.LatestExplanation
+	if title == "" {
+		title = "当前任务计划"
+	}
+	titleRunes := []rune(title)
+	if len(titleRunes) > 20 {
+		title = string(titleRunes[:20]) + "…"
+	}
+
+	return &domain.Plan{
+		ID:        p.SessionID,
+		SessionID: p.SessionID,
+		Title:     title,
+		Items:     items,
+		Version:   int(p.Version),
+		CreatedAt: p.UpdatedAt,
+		UpdatedAt: p.UpdatedAt,
+	}
+}
+
+// convertStepStatus 将 plan/model.StepStatus 映射为 domain.PlanItemStatus。
+func convertStepStatus(s model.StepStatus) domain.PlanItemStatus {
+	switch s {
+	case model.StepStatusInProgress:
+		return domain.PlanItemDoing
+	case model.StepStatusCompleted:
+		return domain.PlanItemDone
+	case model.StepStatusBlockedByApproval:
+		return domain.PlanItemPending
+	default:
+		return domain.PlanItemPending
 	}
 }

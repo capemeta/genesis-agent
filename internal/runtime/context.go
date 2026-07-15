@@ -22,6 +22,7 @@ type RunContext struct {
 
 	// --- 统计 ---
 	TokenUsed int64 // 本次Run累计Token消耗
+	ToolCalls int   // 本次Run累计工具调用数
 
 	// --- Stream / Block状态 ---
 	blockSeq int64 // 递增分配的BlockIndex，用于流式多端输出，线程安全

@@ -1,0 +1,11 @@
+# Hook 独立配置。外部 command handler 默认需要在 state 中配置 trusted_hash 才会执行。
+enabled: true
+execution: host
+allow_managed_only: false
+default_timeout: 30s
+
+# 事件组按来源追加合并。内置 git/secret 守卫由运行时默认注入，无需在此重复配置。
+events: {}
+
+# 以稳定 handler key 覆盖单条 Hook 的启用状态或信任指纹。
+state: {}

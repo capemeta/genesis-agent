@@ -46,6 +46,7 @@ func (r *Runner) Run(ctx context.Context, command execmodel.Command, opts execco
 		Argv:           argv,
 		Cwd:            command.Cwd,
 		Env:            command.Env,
+		Stdin:          command.Stdin,
 		DisplayCommand: command.Command,
 		Shell:          shell,
 	}, opts)
@@ -56,6 +57,7 @@ type execResultMeta struct {
 	Cwd     string
 	Shell   execmodel.ShellKind
 	Env     map[string]string
+	Stdin   []byte
 }
 
 type afterStartFunc func(*exec.Cmd) error
@@ -96,6 +98,9 @@ func (r *Runner) runArgvWithFactory(ctx context.Context, argv []string, meta exe
 	stderr := newLimitBuffer(limit)
 	prepared.Stdout = stdout
 	prepared.Stderr = stderr
+	if len(meta.Stdin) > 0 {
+		prepared.Stdin = bytes.NewReader(meta.Stdin)
+	}
 
 	started := time.Now()
 	startErr := prepared.Start()

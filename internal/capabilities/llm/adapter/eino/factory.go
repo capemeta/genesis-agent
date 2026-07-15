@@ -65,6 +65,10 @@ type Config struct {
 
 	// Timeout HTTP超时（0=使用默认值60秒）
 	Timeout time.Duration
+	// 生成参数由上层模型配置透传；nil/0 表示交由 Provider 默认值处理。
+	MaxTokens   int
+	Temperature *float64
+	TopP        *float64
 
 	// ---- Azure OpenAI 专用字段（ByAzure=true时使用）----
 	ByAzure    bool   // 是否使用 Azure OpenAI Service
@@ -119,14 +123,21 @@ func createOpenAI(ctx context.Context, cfg *Config, timeout time.Duration) (eino
 	if cfg.APIKey == "" {
 		return nil, fmt.Errorf("Provider=openai 时 APIKey 不能为空")
 	}
-	m, err := einoopenai.NewChatModel(ctx, &einoopenai.ChatModelConfig{
+	modelConfig := &einoopenai.ChatModelConfig{
 		APIKey:     cfg.APIKey,
 		Model:      cfg.Model,
 		Timeout:    timeout,
 		ByAzure:    cfg.ByAzure,
 		BaseURL:    cfg.BaseURL,    // 空=官方；非空=自定义兼容接口
 		APIVersion: cfg.APIVersion, // Azure专用
-	})
+	}
+	if cfg.MaxTokens > 0 {
+		maxTokens := cfg.MaxTokens
+		modelConfig.MaxTokens = &maxTokens
+	}
+	modelConfig.Temperature = float32Ptr(cfg.Temperature)
+	modelConfig.TopP = float32Ptr(cfg.TopP)
+	m, err := einoopenai.NewChatModel(ctx, modelConfig)
 	if err != nil {
 		return nil, fmt.Errorf("创建 OpenAI 模型失败: %w", err)
 	}
@@ -138,18 +149,33 @@ func createArk(ctx context.Context, cfg *Config, timeout time.Duration) (einoMod
 	if cfg.ArkAPIKey == "" && (cfg.ArkAccessKey == "" || cfg.ArkSecretKey == "") {
 		return nil, fmt.Errorf("Provider=ark 时需提供 ArkAPIKey 或 ArkAccessKey+ArkSecretKey")
 	}
-	m, err := einoark.NewChatModel(ctx, &einoark.ChatModelConfig{
+	modelConfig := &einoark.ChatModelConfig{
 		APIKey:    cfg.ArkAPIKey,
 		AccessKey: cfg.ArkAccessKey,
 		SecretKey: cfg.ArkSecretKey,
 		Model:     cfg.Model,
 		Timeout:   &timeout,
 		BaseURL:   cfg.BaseURL,
-	})
+	}
+	if cfg.MaxTokens > 0 {
+		maxTokens := cfg.MaxTokens
+		modelConfig.MaxTokens = &maxTokens
+	}
+	modelConfig.Temperature = float32Ptr(cfg.Temperature)
+	modelConfig.TopP = float32Ptr(cfg.TopP)
+	m, err := einoark.NewChatModel(ctx, modelConfig)
 	if err != nil {
 		return nil, fmt.Errorf("创建 Ark 模型失败: %w", err)
 	}
 	return m, nil
+}
+
+func float32Ptr(value *float64) *float32 {
+	if value == nil {
+		return nil
+	}
+	converted := float32(*value)
+	return &converted
 }
 
 // createOllama 创建本地 Ollama 的 eino 模型
@@ -162,9 +188,24 @@ func createOllama(ctx context.Context, cfg *Config, timeout time.Duration) (eino
 		BaseURL: baseURL,
 		Model:   cfg.Model,
 		Timeout: timeout,
+		Options: ollamaOptions(cfg),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("创建 Ollama 模型失败: %w", err)
 	}
 	return m, nil
+}
+
+func ollamaOptions(cfg *Config) *einoollama.Options {
+	if cfg.MaxTokens <= 0 && cfg.Temperature == nil && cfg.TopP == nil {
+		return nil
+	}
+	options := &einoollama.Options{NumPredict: cfg.MaxTokens}
+	if cfg.Temperature != nil {
+		options.Temperature = float32(*cfg.Temperature)
+	}
+	if cfg.TopP != nil {
+		options.TopP = float32(*cfg.TopP)
+	}
+	return options
 }

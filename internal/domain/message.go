@@ -3,7 +3,11 @@
 // 语义上与 OpenAI、Anthropic、eino 等主流框架的消息结构保持一致
 package domain
 
-import "strings"
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+)
 
 // RoleType 消息发送方的角色类型（LLM 协议角色）
 type RoleType string
@@ -20,13 +24,14 @@ const (
 type MessageKind string
 
 const (
-	MessageKindUserTurn            MessageKind = "user_turn"             // 真人输入
-	MessageKindAssistant           MessageKind = "assistant"             // 模型回复（可含 tool_calls）
-	MessageKindToolResult          MessageKind = "tool_result"           // role=tool
-	MessageKindSkillInjection      MessageKind = "skill_injection"       // runtime 注入的 SKILL 全文（role=user）
-	MessageKindConversationSummary MessageKind = "conversation_summary"  // compact 回填摘要（role=user）
-	MessageKindReminder            MessageKind = "reminder"              // 提示词分层 L4 turn reminder 等
-	MessageKindSystem              MessageKind = "system"                // 稳定 system / 宿主诊断
+	MessageKindUserTurn            MessageKind = "user_turn"            // 真人输入
+	MessageKindAssistant           MessageKind = "assistant"            // 模型回复（可含 tool_calls）
+	MessageKindToolResult          MessageKind = "tool_result"          // role=tool
+	MessageKindSkillInjection      MessageKind = "skill_injection"      // runtime 注入的 SKILL 全文（role=user）
+	MessageKindConversationSummary MessageKind = "conversation_summary" // compact 回填摘要（role=user）
+	MessageKindReminder            MessageKind = "reminder"             // 提示词分层 L4 turn reminder 等
+	MessageKindSystem              MessageKind = "system"               // 稳定 system / 宿主诊断
+	MessageKindPlanSnapshot        MessageKind = "plan_snapshot"        // 规划技能计划快照（role=assistant，Content=Plan JSON）
 )
 
 // 常见 Source（可选审计字段，不参与 UI/压缩主策略）
@@ -55,6 +60,8 @@ type ToolCall struct {
 // Message 对话消息
 // 不持有任何外部框架类型，可被任意层直接使用
 type Message struct {
+	// UUID 消息的唯一标识，用于持久化对应与 resume 恢复定位
+	UUID string `json:"uuid,omitempty"`
 	// Role 消息发送方角色（协议层）
 	Role RoleType `json:"role"`
 	// Content 文本内容（assistant发起工具调用时可能为空）
@@ -213,20 +220,73 @@ func ForUI(msgs []*Message) []*Message {
 	return out
 }
 
-// ForModel 投影为送给 LLM 的上下文（当前为全链；预算裁剪由 ContextAssembler 后续负责）。
+// ForModel 投影为送给 LLM 的上下文。
+//
+// plan_snapshot 是持久化/UI 恢复快照，不应把历史全量 JSON 逐条喂给模型；
+// 只把最新快照转为 reminder 注入上下文，避免模型参考过期计划版本。
 func ForModel(msgs []*Message) []*Message {
 	if len(msgs) == 0 {
 		return nil
 	}
 	out := make([]*Message, 0, len(msgs))
+	var latestPlan *Plan
 	for _, m := range msgs {
 		if m == nil {
 			continue
 		}
 		m.EnsureKind()
+		if m.Kind == MessageKindPlanSnapshot {
+			if p := parsePlanSnapshot(m.Content); p != nil {
+				latestPlan = p
+			}
+			continue
+		}
 		out = append(out, m)
 	}
+	if latestPlan != nil {
+		out = append(out, NewReminderMessage(planReminderContent(latestPlan)))
+	}
 	return out
+}
+
+func parsePlanSnapshot(content string) *Plan {
+	if strings.TrimSpace(content) == "" {
+		return nil
+	}
+	var plan Plan
+	if err := json.Unmarshal([]byte(content), &plan); err != nil {
+		return nil
+	}
+	return &plan
+}
+
+func planReminderContent(p *Plan) string {
+	var sb strings.Builder
+	sb.WriteString("【系统提醒】当前会话已有结构化计划快照，请基于该进度继续执行。")
+	if p.Title != "" {
+		sb.WriteString("\n计划：")
+		sb.WriteString(p.Title)
+	}
+	if p.Version > 0 {
+		sb.WriteString(fmt.Sprintf(" (v%d)", p.Version))
+	}
+	total := p.TotalCount()
+	if total > 0 {
+		sb.WriteString(fmt.Sprintf("\n进度：%d/%d (%d%%)", p.DoneCount(), total, p.ProgressPct()))
+	}
+	for i, item := range p.Items {
+		if i == 0 {
+			sb.WriteString("\n任务：")
+		}
+		sb.WriteString(fmt.Sprintf("\n- [%s] %s", item.Status, item.Text))
+		if item.Note != "" {
+			sb.WriteString("（")
+			sb.WriteString(item.Note)
+			sb.WriteString("）")
+		}
+	}
+	sb.WriteString("\n若完成或变更任务，请继续通过计划工具更新计划状态。")
+	return sb.String()
 }
 
 // SessionMessagesFromRun 截取本 Run 应写入短期记忆的消息。

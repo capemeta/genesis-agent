@@ -31,10 +31,15 @@ type ServiceFactory func(ctx context.Context, opts ServiceOptions) (app.AgentSer
 
 // ExecuteWithFactory 使用产品分发层注入的 service factory 执行 CLI。
 func ExecuteWithFactory(factory ServiceFactory) error {
+	return ExecuteWithFactories(factory, nil)
+}
+
+// ExecuteWithFactories 注入 AgentService 与可选 MCP 管理面 factory。
+func ExecuteWithFactories(factory ServiceFactory, mcpFactory MCPAdminFactory) error {
 	if factory == nil {
 		return fmt.Errorf("CLI service factory 未配置，请通过产品入口注入 bootstrap")
 	}
-	return newRootCmd(factory).Execute()
+	return newRootCmd(factory, mcpFactory).Execute()
 }
 
 func initService(ctx context.Context, factory ServiceFactory, configDirRef *string, quiet bool, sandboxModeRef *string) (app.AgentService, error) {
@@ -69,7 +74,7 @@ func currentWorkspaceRoot() string {
 }
 
 // newRootCmd 构建 Cobra 根命令树，注册全局 flag 和所有子命令
-func newRootCmd(factory ServiceFactory) *cobra.Command {
+func newRootCmd(factory ServiceFactory, mcpFactory MCPAdminFactory) *cobra.Command {
 	// configDir / sandboxMode 由持久 flag 控制。
 	// 传递指针给各子命令，保证 flag 解析后子命令执行时读取的是最新值。
 	configDir := defaultConfigDir
@@ -102,7 +107,7 @@ func newRootCmd(factory ServiceFactory) *cobra.Command {
 	// 全局持久 flag：所有子命令均可使用
 	root.PersistentFlags().StringVarP(
 		&configDir, "config", "c", defaultConfigDir,
-		"配置目录路径（含 config.yaml 和可选的 config.local.yaml）",
+		"配置目录路径（含 config.yaml、llm.yaml，以及可选的 mcp.yaml、hooks.yaml、config.local.yaml）",
 	)
 	root.PersistentFlags().StringVar(
 		&sandboxMode, "sandbox", sandboxMode,
@@ -114,12 +119,16 @@ func newRootCmd(factory ServiceFactory) *cobra.Command {
 		newChatCmd(&configDir, &sandboxMode, factory),
 		newRunCmd(&configDir, &sandboxMode, factory),
 		newConfigCmd(&configDir),
+		newHookCmd(&configDir),
 		newConfigureCmd(),
 		newToolsCmd(&configDir, &sandboxMode, factory),
+		newMCPCmd(&configDir, &sandboxMode, mcpFactory),
 		newSkillCmd(),
 		newPackageCmd(),
 		newCapabilityCmd(),
+		newAgentCmd(),
 		newPluginCmd(),
+		newSandboxCmd(),
 		newVersionCmd(),
 	)
 

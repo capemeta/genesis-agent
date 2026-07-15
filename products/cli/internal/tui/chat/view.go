@@ -21,33 +21,101 @@ func (m Model) View() string {
 
 	return lipgloss.JoinVertical(lipgloss.Left,
 		m.headerView(),
-		m.viewport.View(),
+		m.transcriptView(),
 		m.statusView(),
 		m.helpView(),
+		m.commandMenuView(),
 		m.inputView(),
 	)
 }
 
+func (m Model) commandMenuView() string {
+	commands := m.commandMenuCommands()
+	if len(commands) == 0 {
+		return ""
+	}
+	const visibleLimit = 5
+	start := 0
+	if m.commandMenuIndex >= visibleLimit {
+		start = m.commandMenuIndex - visibleLimit + 1
+	}
+	end := start + visibleLimit
+	if end > len(commands) {
+		end = len(commands)
+	}
+	lines := make([]string, 0, end-start+1)
+	for index := start; index < end; index++ {
+		command := commands[index]
+		marker := "  "
+		if index == m.commandMenuIndex {
+			marker = styles.CommandMenuSelected.Render("› ")
+		}
+		commandWidth := m.width - 3
+		if commandWidth < 1 {
+			commandWidth = 1
+		}
+		commandLabel := truncateDisplay(command.value, commandWidth)
+		descriptionWidth := m.width - len([]rune(commandLabel)) - 3
+		if descriptionWidth < 0 {
+			descriptionWidth = 0
+		}
+		line := marker + styles.CommandMenuCommand.Render(commandLabel) + " " + styles.CommandMenuDescription.Render(truncateDisplay(command.description, descriptionWidth))
+		lines = append(lines, line)
+	}
+	lines = append(lines, styles.CommandMenuHint.Render("↑/↓ 选择  Enter 使用  Esc 关闭"))
+	return lipgloss.NewStyle().Width(m.width).Render(strings.Join(lines, "\n"))
+}
+
+func (m Model) transcriptView() string {
+	if !m.helpOverlay {
+		return m.viewport.View()
+	}
+	width := m.width
+	if width < 10 {
+		width = 10
+	}
+	height := m.viewport.Height
+	if height < minViewport {
+		height = minViewport
+	}
+	return styles.HelpOverlay.Width(width).Height(height).Render(helpText)
+}
+
 // headerView 渲染顶部标题栏（2 行：信息行 + 分隔线）
 func (m Model) headerView() string {
-	// 拼接标题区段（程序名 + 模型名 + 策略 + 会话 ID）
-	titlePart := styles.HeaderBar.Render(" Genesis Agent ")
-	modelPart := styles.HeaderBarSub.Render(fmt.Sprintf(" %s ", m.modelName()))
-	strategyPart := styles.HeaderBarSub.Render(" ReAct Loop ")
-	sessionPart := styles.HeaderBarSub.Render(fmt.Sprintf(" %s ", m.shortSessionID()))
-
-	header := lipgloss.JoinHorizontal(lipgloss.Top,
-		titlePart, modelPart, strategyPart, sessionPart,
-	)
-
-	// 计算已用宽度，用主色填充剩余空间（保证满宽背景）
-	usedWidth := lipgloss.Width(header)
-	if usedWidth < m.width {
-		padding := strings.Repeat(" ", m.width-usedWidth)
-		header += styles.HeaderBarFill.Render(padding)
+	// 拼接极简标题区段（左侧品牌 + 右侧状态 chips 与会话 ID）。
+	titleLabel := "genesis/chat"
+	if m.width > 2 {
+		titleLabel = truncateDisplay(titleLabel, m.width-2)
+	}
+	titlePart := styles.HeaderBar.Render(titleLabel)
+	titleWidth := lipgloss.Width(titlePart)
+	available := m.width - titleWidth - 2
+	metaPart := ""
+	if available > 0 {
+		parts := []string{
+			styles.HeaderChip.Render(truncateDisplay(m.modelName(), 24)),
+			styles.HeaderChip.Render(truncateDisplay(m.sandboxLabel(), 18)),
+			styles.HeaderBarSub.Render("sess:" + truncateDisplay(m.shortSessionID(), 14)),
+		}
+		if contextLabel := m.contextUsageLabel(); contextLabel != "" {
+			parts = append(parts[:2], append([]string{styles.HeaderChip.Render(contextLabel)}, parts[2:]...)...)
+		}
+		for len(parts) > 0 {
+			candidate := strings.Join(parts, " ")
+			if lipgloss.Width(candidate) <= available {
+				metaPart = candidate
+				break
+			}
+			parts = parts[:len(parts)-1]
+		}
 	}
 
-	// 分隔线（第 2 行）
+	paddingWidth := m.width - titleWidth - lipgloss.Width(metaPart)
+	if paddingWidth < 0 {
+		paddingWidth = 0
+	}
+	header := titlePart + strings.Repeat(" ", paddingWidth) + metaPart
 	divider := styles.Divider(m.width)
 
 	return lipgloss.JoinVertical(lipgloss.Left, header, divider)
@@ -59,6 +127,8 @@ func (m Model) headerView() string {
 func (m Model) statusView() string {
 	var content string
 	switch {
+	case m.toast != "":
+		content = styles.StatusToast.Render("  " + m.toast)
 	case m.loading:
 		status := m.currentStatus
 		if status == "" {
@@ -93,33 +163,121 @@ func truncateDisplay(value string, max int) string {
 	return string(runes[:max-3]) + "..."
 }
 
-// helpView 渲染帮助栏（1 行，显示常用快捷键）
+// helpView 渲染帮助栏（1 行，显示常用快捷键，随状态切换）
 func (m Model) helpView() string {
-	items := []string{
-		styles.HelpKey.Render("Ctrl+C") + " " + styles.HelpBar.Render("退出"),
-		styles.HelpKey.Render("/clear") + " " + styles.HelpBar.Render("清空"),
-		styles.HelpKey.Render("/help") + " " + styles.HelpBar.Render("帮助"),
-		styles.HelpKey.Render("↑↓") + " " + styles.HelpBar.Render("滚动"),
+	var items []string
+	if m.helpOverlay {
+		items = []string{styles.HelpKey.Render("Esc") + " " + styles.HelpBar.Render("关闭帮助")}
+		bar := "  " + strings.Join(items, styles.HelpBar.Render("   "))
+		return lipgloss.NewStyle().Width(m.width).Render(bar)
 	}
+
+	if m.loading || m.helpOverlay {
+		if m.activeApproval != nil {
+			// 审批态
+			items = []string{
+				styles.HelpKey.Render("Y") + " " + styles.HelpBar.Render("允许本次"),
+				styles.HelpKey.Render("S") + " " + styles.HelpBar.Render("会话允许"),
+				styles.HelpKey.Render("N") + " " + styles.HelpBar.Render("拒绝"),
+				styles.HelpKey.Render("A") + " " + styles.HelpBar.Render("终止任务"),
+			}
+		} else {
+			// 推理中
+			items = []string{
+				styles.HelpKey.Render("Ctrl+C") + " " + styles.HelpBar.Render("取消推理"),
+				styles.HelpKey.Render("↑↓") + " " + styles.HelpBar.Render("滚动"),
+			}
+		}
+	} else {
+		// 空闲态
+		items = []string{
+			styles.HelpKey.Render("Ctrl+C") + " " + styles.HelpBar.Render("退出"),
+			styles.HelpKey.Render("Ctrl+Y") + " " + styles.HelpBar.Render("复制"),
+			styles.HelpKey.Render("/help") + " " + styles.HelpBar.Render("帮助"),
+			styles.HelpKey.Render("↑↓") + " " + styles.HelpBar.Render("滚动"),
+		}
+		// 有运行过程记录时显示 o 键提示
+		hasProgress := len(m.progressLog) > 0
+		if !hasProgress {
+			for _, msg := range m.messages {
+				if msg.isProgress {
+					hasProgress = true
+					break
+				}
+			}
+		}
+		if hasProgress {
+			progressHint := "展开过程"
+			if m.progressExpanded {
+				progressHint = "折叠过程"
+			}
+			items = append(items, styles.HelpKey.Render("o")+" "+styles.HelpBar.Render(progressHint))
+		}
+		// 有活跃计划时显示 p 键提示
+		if m.currentPlan != nil {
+			planHint := "展开计划"
+			if m.planExpanded {
+				planHint = "折叠计划"
+			}
+			items = append(items, styles.HelpKey.Render("p")+" "+styles.HelpBar.Render(planHint))
+		}
+	}
+	if m.selectMode {
+		items = []string{
+			styles.HelpKey.Render("j/k") + " " + styles.HelpBar.Render("移动"),
+			styles.HelpKey.Render("v") + " " + styles.HelpBar.Render("标记起点"),
+			styles.HelpKey.Render("y") + " " + styles.HelpBar.Render("复制选择"),
+			styles.HelpKey.Render("Esc") + " " + styles.HelpBar.Render("退出选择"),
+		}
+	}
+
 	bar := "  " + strings.Join(items, styles.HelpBar.Render("   "))
 	return lipgloss.NewStyle().Width(m.width).Render(bar)
 }
 
-// inputView 渲染输入框（3 行：上边框 + 内容行 + 下边框）
-// 推理期间显示灰色边框，否则显示主色紫边框
+// inputView 渲染输入框（上边框 + 内容/textarea + 字数提示 + 下边框）
 func (m Model) inputView() string {
 	borderStyle := styles.InputBorderFocused
 	if m.loading {
 		// 等待响应时使用灰色边框，暗示禁用状态
 		borderStyle = styles.InputBorder
 	}
-	// Width - 2：减去左右各 1 个边框字符宽度
-	return borderStyle.Width(m.width - 2).Render(m.textinput.View())
+
+	contentWidth := m.width - 4 // border (2) + padding (2)
+	if contentWidth < 10 {
+		contentWidth = 10
+	}
+
+	// 拼接 textarea 视图和右对齐的字数指示行
+	length := m.textarea.Length()
+	limit := m.textarea.CharLimit
+	countStr := fmt.Sprintf("%d/%d", length, limit)
+	paddingWidth := contentWidth - len(countStr)
+	if paddingWidth < 0 {
+		paddingWidth = 0
+	}
+	completionHint := "输入 / 显示命令"
+	if strings.HasPrefix(strings.TrimSpace(m.textarea.Value()), "/") {
+		completionHint = "↑/↓ 选择命令"
+	}
+	hintWidth := contentWidth - len(countStr) - len(completionHint) - 1
+	if hintWidth < 0 {
+		hintWidth = 0
+	}
+	countLine := completionHint + strings.Repeat(" ", hintWidth) + " " + countStr
+	countLineStyled := lipgloss.NewStyle().Foreground(styles.ColorDarkGray).Render(countLine)
+
+	combined := lipgloss.JoinVertical(lipgloss.Left,
+		m.textarea.View(),
+		countLineStyled,
+	)
+
+	return borderStyle.Width(m.width - 2).Render(combined)
 }
 
 // renderMessages 将 uiMessage 列表渲染为带样式的多行字符串
 // 作为 viewport.SetContent() 的输入
-func renderMessages(messages []uiMessage, termWidth int) string {
+func renderMessages(messages []uiMessage, termWidth int, progressExpanded, selectMode bool, selectAnchor, selectCursor int) string {
 	if len(messages) == 0 {
 		return ""
 	}
@@ -132,11 +290,13 @@ func renderMessages(messages []uiMessage, termWidth int) string {
 
 	var sb strings.Builder
 
-	for _, msg := range messages {
+	selectableIndexes := selectableIndexes(messages)
+	for index, msg := range messages {
 		switch msg.role {
 		case "user":
-			// 用户消息：蓝色标签 + 蓝色气泡
+			// 用户消息：蓝色标签 + 平铺正文（无大面积背景色）
 			sb.WriteString("  ")
+			sb.WriteString(renderSelectionMarker(index, selectableIndexes, selectMode, selectAnchor, selectCursor))
 			sb.WriteString(styles.UserLabel.Render("你"))
 			sb.WriteString("\n")
 			sb.WriteString("  ")
@@ -146,6 +306,7 @@ func renderMessages(messages []uiMessage, termWidth int) string {
 		case "assistant":
 			// Agent 回复：紫色标签 + 内容 + 元信息
 			sb.WriteString("  ")
+			sb.WriteString(renderSelectionMarker(index, selectableIndexes, selectMode, selectAnchor, selectCursor))
 			sb.WriteString(styles.AgentLabel.Render("Agent"))
 			sb.WriteString("\n")
 			sb.WriteString("  ")
@@ -164,12 +325,74 @@ func renderMessages(messages []uiMessage, termWidth int) string {
 			sb.WriteString("\n")
 
 		case "system":
-			// 系统消息：斜体灰色，用于 /help、错误提示、欢迎语等
-			sb.WriteString("  ")
-			sb.WriteString(styles.SystemMsg.Width(contentWidth).Render(msg.content))
-			sb.WriteString("\n\n")
+			// 系统消息：如果是运行过程日志，支持折叠/展开渲染
+			if msg.isProgress {
+				var content string
+				if progressExpanded {
+					lines := []string{"▾ " + activitySummary(msg) + " · [o] 折叠:"}
+					for _, item := range msg.progressLog {
+						lines = append(lines, "  - "+item)
+					}
+					content = strings.Join(lines, "\n")
+				} else {
+					content = "▸ " + activitySummary(msg) + " · [o] 展开"
+				}
+				sb.WriteString("  ")
+				sb.WriteString(styles.SystemMsg.Width(contentWidth).Render(content))
+				sb.WriteString("\n\n")
+			} else {
+				// 普通系统消息：斜体灰色，用于 /help、错误提示、欢迎语等
+				sb.WriteString("  ")
+				sb.WriteString(styles.SystemMsg.Width(contentWidth).Render(msg.content))
+				sb.WriteString("\n\n")
+			}
 		}
 	}
 
 	return sb.String()
+}
+
+func activitySummary(msg uiMessage) string {
+	outcome := msg.activityOutcome
+	if outcome == "" {
+		outcome = "完成"
+	}
+	elapsed := msg.activityElapsed.Round(time.Millisecond)
+	if elapsed <= 0 {
+		return fmt.Sprintf("运行过程（%d 步 · %d tokens · %s）", len(msg.progressLog), msg.activityTokens, outcome)
+	}
+	return fmt.Sprintf("运行过程（%d 步 · %d tokens · %s · %s）", len(msg.progressLog), msg.activityTokens, elapsed, outcome)
+}
+
+func selectableIndexes(messages []uiMessage) []int {
+	indexes := make([]int, 0, len(messages))
+	for index, message := range messages {
+		if message.role == "user" || message.role == "assistant" {
+			indexes = append(indexes, index)
+		}
+	}
+	return indexes
+}
+
+func renderSelectionMarker(messageIndex int, selectable []int, selectMode bool, anchor, cursor int) string {
+	if !selectMode {
+		return ""
+	}
+	selectedIndex := -1
+	for index, candidate := range selectable {
+		if candidate == messageIndex {
+			selectedIndex = index
+			break
+		}
+	}
+	if selectedIndex < 0 {
+		return "  "
+	}
+	if selectedIndex == cursor {
+		return styles.SelectionCursor.Render("▶ ")
+	}
+	if anchor >= 0 && ((anchor <= cursor && selectedIndex >= anchor && selectedIndex <= cursor) || (anchor > cursor && selectedIndex >= cursor && selectedIndex <= anchor)) {
+		return styles.SelectionRange.Render("• ")
+	}
+	return "  "
 }

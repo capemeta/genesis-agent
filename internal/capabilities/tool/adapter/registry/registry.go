@@ -31,6 +31,13 @@ func (r *Registry) Register(t tool.Tool) {
 	r.tools[info.Name] = t
 }
 
+// Unregister 按名称移除工具；不存在时为 no-op。
+func (r *Registry) Unregister(name string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.tools, name)
+}
+
 // Get 按名称获取工具，返回 nil 表示未找到。
 func (r *Registry) Get(name string) tool.Tool {
 	r.mu.RLock()

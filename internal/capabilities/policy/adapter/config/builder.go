@@ -4,6 +4,7 @@ package config
 import (
 	policycontract "genesis-agent/internal/capabilities/policy/contract"
 	policyfs "genesis-agent/internal/capabilities/policy/matcher/filesystem"
+	policymcp "genesis-agent/internal/capabilities/policy/matcher/mcp"
 	policyservice "genesis-agent/internal/capabilities/policy/service"
 	platformconfig "genesis-agent/internal/platform/config"
 )
@@ -13,5 +14,6 @@ func BuildEvaluator(cfg platformconfig.PolicyConfig) policycontract.Evaluator {
 	return policyservice.NewEvaluator(
 		cfg.Defaults,
 		policyfs.New(cfg.Defaults, cfg.Files),
+		policymcp.New(cfg.Defaults),
 	)
 }

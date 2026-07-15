@@ -1,139 +1,7 @@
-# Genesis Agent 默认配置
+# Genesis Agent 全局默认配置
 # 此文件提交到版本库，不应包含密钥
 # 密钥请写在 configs/config.local.yaml（已 gitignore）或通过环境变量注入
-
-llm:
-  # 全局默认请求超时；Provider 可单独覆盖
-  timeout: 60s
-
-  # Provider 层：endpoint 与认证只配置一次
-  providers:
-    qwen:
-      type: openai
-      base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
-      timeout: 60s
-      auth:
-        type: api_key
-        api_key: ${QWEN_API_KEY}
-
-    openai:
-      type: openai
-      base_url: https://api.openai.com/v1
-      timeout: 60s
-      auth:
-        type: api_key
-        api_key: ${OPENAI_API_KEY}
-
-    deepseek:
-      type: openai
-      base_url: https://api.deepseek.com/v1
-      timeout: 60s
-      auth:
-        type: api_key
-        api_key: ${DEEPSEEK_API_KEY}
-
-    claude:
-      type: anthropic
-      base_url: https://api.anthropic.com
-      timeout: 60s
-      auth:
-        type: api_key
-        api_key: ${CLAUDE_API_KEY}
-
-    ollama:
-      type: ollama
-      base_url: http://localhost:11434
-      timeout: 120s
-      auth:
-        type: none
-
-    ark:
-      type: ark
-      base_url: ""
-      timeout: 60s
-      auth:
-        type: api_key
-        api_key: ${ARK_API_KEY}
-        access_key: ${ARK_ACCESS_KEY}
-        secret_key: ${ARK_SECRET_KEY}
-
-    azure_openai:
-      type: openai
-      base_url: ${AZURE_OPENAI_BASE_URL}
-      api_version: ${AZURE_OPENAI_API_VERSION}
-      by_azure: true
-      timeout: 60s
-      auth:
-        type: api_key
-        api_key: ${AZURE_OPENAI_API_KEY}
-
-  # Model Pool：业务只选择模型别名，不重复写 endpoint/key
-  models:
-    fast:
-      provider: qwen
-      model: qwen-turbo
-      strategy: low_cost
-      timeout: 45s
-      temperature: 0.2
-      max_tokens: 2048
-      tool_choice: auto
-      supports_tools: true
-      tags: [fast, cheap, tool_call]
-
-    default:
-      provider: qwen
-      model: deepseek-v4-flash
-      strategy: balanced
-      timeout: 90s
-      temperature: 0.4
-      max_tokens: 4096
-      tool_choice: auto
-      supports_tools: true
-      tags: [chat, default]
-
-    reasoning:
-      provider: qwen
-      model: deepseek-v4-flash
-      strategy: high_quality
-      timeout: 180s
-      temperature: 0.2
-      max_tokens: 8192
-      tool_choice: auto
-      supports_tools: true
-      tags: [planning, reasoning]
-
-    coder:
-      provider: qwen
-      model: deepseek-v4-flash
-      strategy: code_quality
-      timeout: 240s
-      temperature: 0.1
-      max_tokens: 8192
-      tool_choice: auto
-      supports_tools: true
-      tags: [coding]
-
-    local:
-      provider: ollama
-      model: qwen2.5:7b
-      strategy: local_private
-      timeout: 300s
-      temperature: 0.3
-      max_tokens: 4096
-      supports_tools: false
-      tags: [local, offline]
-
-  # 路由规则：不同任务选择不同模型别名
-  router:
-    default: default
-    fallback: default
-    tool_call: fast
-    chat: default
-    coding: coder
-    planning: reasoning
-    summarization: fast
-    embedding: default
-    vision: default
+# LLM、MCP、Hook 默认配置分别位于 llm.yaml、mcp.yaml、hooks.yaml
 
 http_client:
   default_timeout: 30s
@@ -232,9 +100,15 @@ skills:
   # - configs/skills
   # - ~/.genesis-agent/cli/skills
   # 额外目录可在 config.local.yaml 或 ~/.genesis-agent/cli/config.yaml 中配置。
-  enabled: []
-  disabled: []
-  sources: []
+  # 远程 Skill 安装来源（install_skill_from_source / genesis skill install <url>）
+  install:
+    # forge（/tree|/blob）与下载站（如 openskills API zip）共用白名单；默认仅 github.com。
+    # 下载时重定向目标也须在此列表（或与首跳同主机）。详见 docs/Skills设计.md §3.4.2。
+    allowed_hosts:
+      - github.com
+      - openskills.cc
+    # 是否允许 dir:/file: 本地安装；省略默认 true
+    # allow_local: true
 agent:
   # ReAct Loop 最大迭代次数（防止无限循环）
   max_iterations: 50
@@ -285,8 +159,3 @@ server:
   # HTTP 服务监听地址
   host: "0.0.0.0"
   port: 8080
-
-
-
-
-

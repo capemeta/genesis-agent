@@ -4,12 +4,52 @@ import (
 	"context"
 	"testing"
 
+	hookcontract "genesis-agent/internal/capabilities/hook/contract"
+	hookmodel "genesis-agent/internal/capabilities/hook/model"
 	profilemodel "genesis-agent/internal/capabilities/profile/model"
 	tool "genesis-agent/internal/capabilities/tool/contract"
 )
 
 type fakeRegistry struct {
 	tools map[string]tool.Tool
+}
+
+type hookDispatcher struct {
+	events []hookmodel.Event
+	result hookmodel.AggregateResult
+}
+
+func (d *hookDispatcher) Dispatch(_ context.Context, event hookmodel.Event) (hookmodel.AggregateResult, error) {
+	d.events = append(d.events, event)
+	return d.result, nil
+}
+
+func TestGatewayDispatchesToolHooksAndAppliesInputUpdate(t *testing.T) {
+	reg := &fakeRegistry{tools: map[string]tool.Tool{}}
+	called := ""
+	reg.Register(funcTool{name: "calculator", execute: func(_ context.Context, params string) (string, error) { called = params; return "ok", nil }})
+	dispatcher := &hookDispatcher{result: hookmodel.AggregateResult{UpdatedInput: map[string]any{"expression": "2+2"}, AdditionalContext: []string{"hook context"}}}
+	ctx := hookcontract.WithDispatcher(context.Background(), dispatcher)
+	g := New(reg, profilemodel.ToolSet{Enabled: []string{"calculator"}})
+	if _, err := g.Execute(ctx, "calculator", `{}`); err != nil {
+		t.Fatal(err)
+	}
+	if called != `{"expression":"2+2"}` || len(dispatcher.events) != 2 {
+		t.Fatalf("called=%q events=%#v", called, dispatcher.events)
+	}
+	if additions := hookcontract.DrainAdditionalContext(ctx); len(additions) != 2 {
+		t.Fatalf("additions=%#v", additions)
+	}
+}
+
+type funcTool struct {
+	name    string
+	execute func(context.Context, string) (string, error)
+}
+
+func (t funcTool) GetInfo() *tool.Info { return &tool.Info{Name: t.name} }
+func (t funcTool) Execute(ctx context.Context, params string) (string, error) {
+	return t.execute(ctx, params)
 }
 
 func newFakeRegistry() *fakeRegistry {
@@ -21,6 +61,7 @@ func newFakeRegistry() *fakeRegistry {
 }
 
 func (r *fakeRegistry) Register(t tool.Tool)      { r.tools[t.GetInfo().Name] = t }
+func (r *fakeRegistry) Unregister(name string)    { delete(r.tools, name) }
 func (r *fakeRegistry) Get(name string) tool.Tool { return r.tools[name] }
 func (r *fakeRegistry) Execute(ctx context.Context, name, params string) (string, error) {
 	return r.tools[name].Execute(ctx, params)

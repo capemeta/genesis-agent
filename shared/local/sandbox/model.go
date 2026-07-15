@@ -194,6 +194,7 @@ type Plan struct {
 	AuditTags               map[string]string `json:"audit_tags,omitempty"`
 	Degraded                bool              `json:"degraded,omitempty"`
 	EffectiveSandboxProfile Profile           `json:"effective_sandbox_profile"`
+	WindowsLevel            string            `json:"windows_level,omitempty"`
 }
 
 // CompleteAuditTags 补齐审计字段。
@@ -205,6 +206,11 @@ func (p *Plan) CompleteAuditTags(preference Preference) {
 	p.AuditTags["sandbox.enforcement_level"] = string(p.Enforcement)
 	p.AuditTags["sandbox.preference"] = string(preference)
 	p.AuditTags["sandbox.effective_network_policy"] = string(p.NetworkPolicy)
+	if p.WindowsLevel != "" {
+		p.AuditTags["sandbox.windows_level"] = p.WindowsLevel
+	} else if p.Type == TypeNone {
+		p.AuditTags["sandbox.windows_level"] = "disabled"
+	}
 	if p.HelperPath != "" {
 		p.AuditTags["sandbox.helper_path"] = p.HelperPath
 	}

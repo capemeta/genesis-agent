@@ -1,7 +1,9 @@
 package chat
 
 import (
+	"encoding/json"
 	"testing"
+	"time"
 
 	"genesis-agent/internal/domain"
 )
@@ -36,5 +38,47 @@ func TestProjectUIMessagesShowsSummaryAsSystem(t *testing.T) {
 	}
 	if got[0].role != "system" {
 		t.Fatalf("summary role=%q", got[0].role)
+	}
+}
+
+func TestLoadPlanFromMessagesUsesLatestSnapshot(t *testing.T) {
+	now := time.Now()
+	oldPlan := domain.Plan{
+		ID:        "plan-1",
+		SessionID: "sess-1",
+		Title:     "旧计划",
+		Version:   1,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	latestPlan := domain.Plan{
+		ID:        "plan-1",
+		SessionID: "sess-1",
+		Title:     "最新计划",
+		Version:   2,
+		Items: []domain.PlanItem{
+			{ID: "a", Text: "继续执行", Status: domain.PlanItemDoing},
+		},
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	oldJSON, _ := json.Marshal(oldPlan)
+	latestJSON, _ := json.Marshal(latestPlan)
+
+	got := loadPlanFromMessages([]*domain.Message{
+		domain.NewUserMessage("开始"),
+		{Role: domain.RoleAssistant, Content: string(oldJSON), Kind: domain.MessageKindPlanSnapshot},
+		domain.NewAssistantMessage("中间回答"),
+		{Role: domain.RoleAssistant, Content: string(latestJSON), Kind: domain.MessageKindPlanSnapshot},
+	})
+
+	if got == nil {
+		t.Fatal("expected plan")
+	}
+	if got.Title != "最新计划" || got.Version != 2 {
+		t.Fatalf("got=%+v", got)
+	}
+	if len(got.Items) != 1 || got.Items[0].Status != domain.PlanItemDoing {
+		t.Fatalf("items=%+v", got.Items)
 	}
 }

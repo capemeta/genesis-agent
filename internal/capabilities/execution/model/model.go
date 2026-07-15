@@ -167,12 +167,14 @@ type SandboxProfile struct {
 
 // Command 描述一次命令执行请求。
 type Command struct {
-	Command    string            `json:"command"`
-	Cwd        string            `json:"cwd,omitempty"`
-	Env        map[string]string `json:"env,omitempty"`
-	Shell      ShellKind         `json:"shell,omitempty"`
-	Background bool              `json:"background,omitempty"`
-	UsePTY     bool              `json:"use_pty,omitempty"`
+	Command string            `json:"command"`
+	Cwd     string            `json:"cwd,omitempty"`
+	Env     map[string]string `json:"env,omitempty"`
+	// Stdin 是传递给命令标准输入的原始字节。远程 sandbox transport 按 JSON base64 编码。
+	Stdin      []byte    `json:"stdin,omitempty"`
+	Shell      ShellKind `json:"shell,omitempty"`
+	Background bool      `json:"background,omitempty"`
+	UsePTY     bool      `json:"use_pty,omitempty"`
 }
 
 // Result 描述命令执行结果。

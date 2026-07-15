@@ -9,6 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	marketcontract "genesis-agent/internal/capabilities/package/marketplace/contract"
 	marketmodel "genesis-agent/internal/capabilities/package/marketplace/model"
 	"genesis-agent/internal/capabilities/skill/contract"
 	"genesis-agent/internal/capabilities/skill/parser"
@@ -135,25 +136,39 @@ func newSkillShowCmd() *cobra.Command {
 func newSkillInstallCmd() *cobra.Command {
 	var scope string
 	var force bool
+	var skillPath string
+	var allowURL bool
 	cmd := &cobra.Command{
-		Use:   "install <package[@marketplace]>",
-		Short: "安装技能包",
+		Use:   "install <package[@marketplace]|source-url>",
+		Short: "安装技能包（支持 package@marketplace 或 GitHub/本地 source）",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			svc, _, err := cliskill.NewMarketplaceService()
 			if err != nil {
 				return err
 			}
-			record, err := svc.Install(cmd.Context(), args[0], marketmodel.InstallScope(scope), force)
-			if err != nil {
-				return err
+			result := svc.InstallFromSource(cmd.Context(), marketcontract.InstallFromSourceRequest{
+				SourceInput: args[0],
+				Scope:       marketmodel.InstallScope(scope),
+				Force:       force,
+				SkillPath:   skillPath,
+				AllowURL:    allowURL,
+				Product:     "cli",
+			})
+			if result.FailureKind != "" || result.NeedsChoice {
+				if result.NeedsChoice {
+					return fmt.Errorf("%s；候选: %s", result.Message, strings.Join(result.Candidates, ", "))
+				}
+				return fmt.Errorf("%s: %s", result.FailureKind, result.Message)
 			}
-			fmt.Printf("已安装 %s，scope=%s，capabilities=%d\n", record.Spec, record.Scope, len(record.Capabilities))
+			fmt.Printf("已安装 skills=%v specs=%v effective=%s\n", result.Skills, result.Specs, result.Effective)
 			return nil
 		},
 	}
 	cmd.Flags().StringVar(&scope, "scope", string(marketmodel.InstallScopeUser), "安装范围：user 或 project")
 	cmd.Flags().BoolVar(&force, "force", false, "覆盖已安装技能")
+	cmd.Flags().StringVar(&skillPath, "skill-path", "", "多 Skill 来源时指定相对路径")
+	cmd.Flags().BoolVar(&allowURL, "allow-url", false, "允许非 GitHub 的公网 URL")
 	return cmd
 }
 

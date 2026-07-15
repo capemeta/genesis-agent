@@ -1,11 +1,13 @@
 // Package config 应用配置加载与管理
 //
 // 配置优先级（从低到高）：
-//  1. configs/config.yaml                         — 默认值，提交到版本库（不含密钥）
-//  2. 启动脚本/普通环境变量占位，例如 ${TAVILY_API_KEY} — 仅通过配置文件占位展开
-//  3. configs/config.local.yaml                   — 项目本地覆盖，已加入 .gitignore
-//  4. ~/.genesis-agent/<product>/config.yaml      — 产品级用户配置
+//  1. 代码内置默认值
+//  2. ~/.genesis-agent/<product>/config.yaml      — 产品级用户配置
+//  3. configs/config.yaml、llm.yaml、mcp.yaml      — 项目共享配置，提交到版本库（不含密钥）
+//  4. configs/config.local.yaml                   — 项目本地覆盖，已加入 .gitignore
 //  5. AGENT_ 环境变量                              — CI/部署/临时强制覆盖，优先级最高
+//
+// 普通 ${ENV_NAME} 占位符属于所在文件层：变量未定义时不覆盖低层值，显式空字符串或空列表仍会覆盖。
 package config
 
 import (
@@ -16,20 +18,82 @@ import (
 	"time"
 
 	"github.com/spf13/viper"
+	"gopkg.in/yaml.v3"
+)
+
+var (
+	globalConfigSections   = []string{"agent", "context_profiles", "http_client", "log", "policy", "sandbox", "secrets", "server", "skills", "web"}
+	llmConfigSections      = []string{"llm"}
+	mcpConfigSections      = []string{"mcp"}
+	overrideConfigSections = []string{"agent", "context_profiles", "http_client", "llm", "log", "mcp", "policy", "sandbox", "secrets", "server", "skills", "web"}
 )
 
 // Config 应用全局配置。
 type Config struct {
-	LLM        LLMConfig        `mapstructure:"llm"`
-	HTTPClient HTTPClientConfig `mapstructure:"http_client"`
-	Secrets    SecretsConfig    `mapstructure:"secrets"`
-	Policy     PolicyConfig     `mapstructure:"policy"`
-	Sandbox    SandboxConfig    `mapstructure:"sandbox"`
-	Skills     SkillsConfig     `mapstructure:"skills"`
-	Agent      AgentConfig      `mapstructure:"agent"`
-	Log        LogConfig        `mapstructure:"log"`
-	Server     ServerConfig     `mapstructure:"server"`
-	Web        WebConfig        `mapstructure:"web"`
+	LLM             LLMConfig                       `mapstructure:"llm"`
+	HTTPClient      HTTPClientConfig                `mapstructure:"http_client"`
+	Secrets         SecretsConfig                   `mapstructure:"secrets"`
+	Policy          PolicyConfig                    `mapstructure:"policy"`
+	Sandbox         SandboxConfig                   `mapstructure:"sandbox"`
+	Skills          SkillsConfig                    `mapstructure:"skills"`
+	MCP             MCPConfig                       `mapstructure:"mcp"`
+	Agent           AgentConfig                     `mapstructure:"agent"`
+	Log             LogConfig                       `mapstructure:"log"`
+	Server          ServerConfig                    `mapstructure:"server"`
+	Web             WebConfig                       `mapstructure:"web"`
+	ContextProfiles map[string]ContextProfileConfig `mapstructure:"context_profiles"` // 新增：场景化预算策略
+}
+
+// ContextProfileConfig 场景化预算配置的 YAML 映射 DTO
+type ContextProfileConfig struct {
+	Weights map[string]float64   `mapstructure:"weights"`
+	Clamp   map[string][]float64 `mapstructure:"clamp"` // 格式 [min, max]
+}
+
+// MCPConfig 描述 MCP Client 全局配置（YAML DTO，仅 primitive 类型）。
+type MCPConfig struct {
+	Enabled bool `mapstructure:"enabled"`
+	// ConnectMode: background（默认，启动不阻塞）| eager（阻塞直到本轮连接结束）。
+	ConnectMode           string                     `mapstructure:"connect_mode"`
+	ConnectBatchSize      int                        `mapstructure:"connect_batch_size"`
+	DefaultStartupTimeout time.Duration              `mapstructure:"default_startup_timeout"`
+	DefaultToolTimeout    time.Duration              `mapstructure:"default_tool_timeout"`
+	Servers               map[string]MCPServerConfig `mapstructure:"servers"`
+}
+
+// MCPServerConfig 是单个 MCP server 的 YAML DTO。
+type MCPServerConfig struct {
+	Type           string            `mapstructure:"type"`
+	Enabled        *bool             `mapstructure:"enabled"`
+	Required       bool              `mapstructure:"required"`
+	Command        string            `mapstructure:"command"`
+	Args           []string          `mapstructure:"args"`
+	Env            map[string]string `mapstructure:"env"`
+	Cwd            string            `mapstructure:"cwd"`
+	URL            string            `mapstructure:"url"`
+	BearerToken    string            `mapstructure:"bearer_token"` // 禁止使用；校验时拒绝
+	BearerTokenEnv string            `mapstructure:"bearer_token_env"`
+	CredentialRef  string            `mapstructure:"credential_ref"`
+	Headers        map[string]string `mapstructure:"headers"`
+	EnvHeaders     map[string]string `mapstructure:"env_headers"`
+	StartupTimeout time.Duration     `mapstructure:"startup_timeout"`
+	ToolTimeout    time.Duration     `mapstructure:"tool_timeout"`
+	EnabledTools   []string          `mapstructure:"enabled_tools"`
+	DisabledTools  []string          `mapstructure:"disabled_tools"`
+	ApprovalMode   string            `mapstructure:"approval_mode"`
+	Exposure       string            `mapstructure:"exposure"`
+	Scope          MCPScopeConfig    `mapstructure:"scope"`
+}
+
+// MCPScopeConfig 是 server 级适用范围 DTO。
+type MCPScopeConfig struct {
+	Channels     []string `mapstructure:"channels"`
+	TenantIDs    []string `mapstructure:"tenant_ids"`
+	ProjectIDs   []string `mapstructure:"project_ids"`
+	AgentIDs     []string `mapstructure:"agent_ids"`
+	UserIDs      []string `mapstructure:"user_ids"`
+	RoleIDs      []string `mapstructure:"role_ids"`
+	Environments []string `mapstructure:"environments"`
 }
 
 // SandboxConfig 描述外部 sandbox API 和产品默认沙箱执行配置。
@@ -62,6 +126,48 @@ type SkillsConfig struct {
 	Sources               []SkillSourceConfig `mapstructure:"sources"`
 	EnablePreflight       bool                `mapstructure:"enable_preflight"`         // 默认 false
 	AutoRetryAfterInstall bool                `mapstructure:"auto_retry_after_install"` // 默认 false
+	Install               SkillsInstallConfig `mapstructure:"install"`
+}
+
+// SkillsInstallConfig 描述远程 Skill 安装来源策略。
+type SkillsInstallConfig struct {
+	// AllowedHosts 允许安装的 Git 兼容主机（支持 github.com 风格 /tree|/blob URL）。
+	// 空则默认仅 github.com。
+	AllowedHosts []string `mapstructure:"allowed_hosts"`
+	// AllowLocal 是否允许 dir:/file: 本地安装；CLI 默认 true。
+	AllowLocal *bool `mapstructure:"allow_local"`
+}
+
+// EffectiveAllowedHosts 返回安装策略主机列表（默认 github.com）。
+func (c SkillsInstallConfig) EffectiveAllowedHosts() []string {
+	out := make([]string, 0, len(c.AllowedHosts))
+	seen := map[string]struct{}{}
+	for _, h := range c.AllowedHosts {
+		h = strings.ToLower(strings.TrimSpace(h))
+		h = strings.TrimPrefix(h, "https://")
+		h = strings.TrimPrefix(h, "http://")
+		h = strings.Trim(h, "/")
+		if h == "" {
+			continue
+		}
+		if _, ok := seen[h]; ok {
+			continue
+		}
+		seen[h] = struct{}{}
+		out = append(out, h)
+	}
+	if len(out) == 0 {
+		return []string{"github.com"}
+	}
+	return out
+}
+
+// EffectiveAllowLocal 本地安装开关，未配置时默认 true。
+func (c SkillsInstallConfig) EffectiveAllowLocal() bool {
+	if c.AllowLocal == nil {
+		return true
+	}
+	return *c.AllowLocal
 }
 
 // SkillSourceConfig 描述一个可扫描的 Skill 来源。
@@ -78,17 +184,6 @@ type LLMConfig struct {
 	Models    map[string]LLMModelConfig    `mapstructure:"models"`
 	Router    LLMRouterConfig              `mapstructure:"router"`
 	Timeout   time.Duration                `mapstructure:"timeout"`
-
-	// 兼容旧配置：configs/config.local.yaml 中的 llm.api_key / llm.model 等。
-	LegacyProvider     string `mapstructure:"provider"`
-	LegacyModel        string `mapstructure:"model"`
-	LegacyAPIKey       string `mapstructure:"api_key"`
-	LegacyBaseURL      string `mapstructure:"base_url"`
-	LegacyByAzure      bool   `mapstructure:"by_azure"`
-	LegacyAPIVersion   string `mapstructure:"api_version"`
-	LegacyArkAPIKey    string `mapstructure:"ark_api_key"`
-	LegacyArkAccessKey string `mapstructure:"ark_access_key"`
-	LegacyArkSecretKey string `mapstructure:"ark_secret_key"`
 }
 
 // LLMRouterConfig 描述用途到模型别名的路由。
@@ -148,44 +243,50 @@ type LLMAuthConfig struct {
 
 // LLMModelConfig Model Pool 中的轻量模型定义。
 type LLMModelConfig struct {
-	Provider       string         `mapstructure:"provider"`
-	Model          string         `mapstructure:"model"`
-	Strategy       string         `mapstructure:"strategy"`
-	Timeout        time.Duration  `mapstructure:"timeout"`
-	Temperature    *float64       `mapstructure:"temperature"`
-	TopP           *float64       `mapstructure:"top_p"`
-	MaxTokens      int            `mapstructure:"max_tokens"`
-	ToolChoice     string         `mapstructure:"tool_choice"`
-	ResponseFormat string         `mapstructure:"response_format"`
-	SupportsTools  *bool          `mapstructure:"supports_tools"`
-	Tags           []string       `mapstructure:"tags"`
-	Metadata       map[string]any `mapstructure:"metadata"`
+	Provider              string         `mapstructure:"provider"`
+	Model                 string         `mapstructure:"model"`
+	Strategy              string         `mapstructure:"strategy"`
+	Timeout               time.Duration  `mapstructure:"timeout"`
+	Temperature           *float64       `mapstructure:"temperature"`
+	TopP                  *float64       `mapstructure:"top_p"`
+	MaxTokens             int            `mapstructure:"max_tokens"`
+	ToolChoice            string         `mapstructure:"tool_choice"`
+	ResponseFormat        string         `mapstructure:"response_format"`
+	SupportsTools         *bool          `mapstructure:"supports_tools"`
+	Tags                  []string       `mapstructure:"tags"`
+	Metadata              map[string]any `mapstructure:"metadata"`
+	ContextWindow         int            `mapstructure:"context_window"`          // 新增：上下文总窗口数
+	EffectiveContextRatio *float64       `mapstructure:"effective_context_ratio"` // 新增：有效比例默认 0.92
+	OutputReserveTokens   int            `mapstructure:"output_reserve_tokens"`   // 新增：输出预留数
 }
 
 // ResolvedLLMConfig 是创建模型前解析完成的配置。
 type ResolvedLLMConfig struct {
-	Alias          string
-	ProviderName   string
-	ProviderKind   string
-	BaseURL        string
-	APIVersion     string
-	ByAzure        bool
-	Headers        map[string]string
-	AuthType       string
-	APIKey         string
-	AccessKey      string
-	SecretKey      string
-	Model          string
-	Strategy       string
-	Timeout        time.Duration
-	Temperature    *float64
-	TopP           *float64
-	MaxTokens      int
-	ToolChoice     string
-	ResponseFormat string
-	SupportsTools  *bool
-	Tags           []string
-	Metadata       map[string]any
+	Alias                 string
+	ProviderName          string
+	ProviderKind          string
+	BaseURL               string
+	APIVersion            string
+	ByAzure               bool
+	Headers               map[string]string
+	AuthType              string
+	APIKey                string
+	AccessKey             string
+	SecretKey             string
+	Model                 string
+	Strategy              string
+	Timeout               time.Duration
+	Temperature           *float64
+	TopP                  *float64
+	MaxTokens             int
+	ToolChoice            string
+	ResponseFormat        string
+	SupportsTools         *bool
+	Tags                  []string
+	Metadata              map[string]any
+	ContextWindow         int      // 新增：解析后的窗口限制
+	EffectiveContextRatio *float64 // 新增：解析后的有效比例
+	OutputReserveTokens   int      // 新增：解析后的输出预留
 }
 
 // HTTPClientConfig HTTP 请求工具默认配置。
@@ -306,10 +407,10 @@ type AgentConfig struct {
 
 // LogConfig 日志配置（agent/audit/usage 三类通道）。
 type LogConfig struct {
-	Level    string                     `mapstructure:"level"`
-	Path     string                     `mapstructure:"path"` // 兼容旧配置：指向 agent.log 时推导 dir
-	Dir      string                     `mapstructure:"dir"`
-	Rotate   LogRotateConfig            `mapstructure:"rotate"`
+	Level    string                      `mapstructure:"level"`
+	Path     string                      `mapstructure:"path"` // 兼容旧配置：指向 agent.log 时推导 dir
+	Dir      string                      `mapstructure:"dir"`
+	Rotate   LogRotateConfig             `mapstructure:"rotate"`
 	Channels map[string]LogChannelConfig `mapstructure:"channels"`
 }
 
@@ -352,36 +453,29 @@ type ServerConfig struct {
 	Port int    `mapstructure:"port"`
 }
 
-const defaultConfigTemplate = `# Genesis Agent CLI User Configuration
-# Generated automatically by Genesis CLI
+const defaultConfigTemplate = `# Genesis Agent CLI 用户配置
+# 由 Genesis CLI 自动生成。仅取消注释需要覆盖仓库默认值的配置。
 
-web:
-  brave_api_key: ""
-  searxng_base_url: ""
-  tavily_api_key: ""
-  exa_api_key: ""
-  serpapi_api_key: ""
+# web:
+#   brave_api_key: ""
 
-sandbox:
-  enabled: false
-  mode: local_host
-  default_execution: disabled
-  allow_session_override: true
-  base_url: ""
-  api_key_env: GENESIS_SANDBOX_API_KEY
-  workspace_id: ""
+# sandbox:
+#   mode: local_host
 
-llm:
-  providers:
-    qwen:
-      auth:
-        api_key: "" # Or set via AGENT_LLM_PROVIDERS_QWEN_AUTH_API_KEY env var
+# llm:
+#   providers:
+#     qwen:
+#       auth:
+#         api_key: "" # 也可设置 AGENT_LLM_PROVIDERS_QWEN_AUTH_API_KEY。
 
 skills:
   # Extra local skill roots scanned by CLI.
   # Project default .genesis/skills and user default ~/.genesis-agent/cli/skills
   # are added automatically; configure additional roots here when needed.
   sources: []
+  install:
+    allowed_hosts:
+      - github.com
 `
 
 // Load 加载 CLI 配置，保留旧调用点兼容。
@@ -401,30 +495,24 @@ type LoadOptions struct {
 	EnsureUserConfig bool
 }
 
-// LoadWithOptions 加载配置，依次读取 config.yaml、config.local.yaml、产品级用户配置和 AGENT_ 环境变量。
+// LoadWithOptions 按用户级、项目共享、项目本地和 AGENT_ 环境变量的优先级加载配置。
 func LoadWithOptions(configDir string, opts LoadOptions) (*Config, error) {
 	product := strings.TrimSpace(opts.Product)
 	if product == "" {
 		product = "cli"
 	}
-	v := viper.New()
-	v.SetConfigName("config")
-	v.SetConfigType("yaml")
-	v.AddConfigPath(configDir)
+	settings := map[string]any{}
+	projectSettings := map[string]any{}
 
-	hasBaseConfig := false
-	if err := v.ReadInConfig(); err == nil {
-		hasBaseConfig = true
+	hasBaseConfig, err := mergeYAMLConfigFile(projectSettings, filepath.Join(configDir, "config.yaml"), false, globalConfigSections)
+	if err != nil {
+		return nil, err
 	}
-
-	local := viper.New()
-	local.SetConfigName("config.local")
-	local.SetConfigType("yaml")
-	local.AddConfigPath(configDir)
-	if err := local.ReadInConfig(); err == nil {
-		for _, key := range local.AllKeys() {
-			v.Set(key, local.Get(key))
-		}
+	if _, err := mergeYAMLConfigFile(projectSettings, filepath.Join(configDir, "llm.yaml"), hasBaseConfig, llmConfigSections); err != nil {
+		return nil, err
+	}
+	if _, err := mergeYAMLConfigFile(projectSettings, filepath.Join(configDir, "mcp.yaml"), false, mcpConfigSections); err != nil {
+		return nil, err
 	}
 
 	userPath, hasUserPath := userConfigPath(opts, product)
@@ -434,13 +522,14 @@ func LoadWithOptions(configDir string, opts LoadOptions) (*Config, error) {
 				return nil, err
 			}
 		}
-		userV := viper.New()
-		userV.SetConfigFile(userPath)
-		if err := userV.ReadInConfig(); err == nil {
-			for _, key := range userV.AllKeys() {
-				v.Set(key, userV.Get(key))
-			}
+		if _, err := mergeYAMLConfigFile(settings, userPath, false, overrideConfigSections); err != nil {
+			return nil, err
 		}
+	}
+
+	mergeConfigMap(settings, projectSettings)
+	if _, err := mergeYAMLConfigFile(settings, filepath.Join(configDir, "config.local.yaml"), false, overrideConfigSections); err != nil {
+		return nil, err
 	}
 
 	if !hasBaseConfig && hasUserPath {
@@ -449,6 +538,10 @@ func LoadWithOptions(configDir string, opts LoadOptions) (*Config, error) {
 		}
 	}
 
+	v := viper.New()
+	if err := v.MergeConfigMap(cloneConfigMap(settings)); err != nil {
+		return nil, fmt.Errorf("初始化合并配置失败: %w", err)
+	}
 	v.SetEnvPrefix("AGENT")
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 	v.AutomaticEnv()
@@ -457,16 +550,137 @@ func LoadWithOptions(configDir string, opts LoadOptions) (*Config, error) {
 	if err := v.Unmarshal(&cfg); err != nil {
 		return nil, fmt.Errorf("解析配置失败: %w", err)
 	}
+	restoreMCPMapKeys(&cfg, settings)
 
 	cfg.applyExplicitEnvOverrides()
 	cfg.decryptDPAPISecrets()
 	cfg.expandEnv()
-	cfg.applyLegacyLLM()
 
 	if err := validate(&cfg); err != nil {
 		return nil, fmt.Errorf("配置校验失败: %w", err)
 	}
 	return &cfg, nil
+}
+
+// mergeYAMLConfigFile 将单个 YAML 文件按调用顺序合并到目标配置。
+// allowedTopLevel 约束文件职责边界；local/用户配置可覆盖所有正式配置域。
+func mergeYAMLConfigFile(target map[string]any, path string, required bool, allowedTopLevel []string) (bool, error) {
+	path = filepath.Clean(path)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			if required {
+				return false, fmt.Errorf("缺少必需配置文件 %s", path)
+			}
+			return false, nil
+		}
+		return false, fmt.Errorf("读取配置文件 %s 失败: %w", path, err)
+	}
+	settings := map[string]any{}
+	if err := yaml.Unmarshal(data, &settings); err != nil {
+		return false, fmt.Errorf("解析配置文件 %s 失败: %w", path, err)
+	}
+
+	if len(allowedTopLevel) > 0 {
+		allowed := make(map[string]struct{}, len(allowedTopLevel))
+		for _, key := range allowedTopLevel {
+			allowed[key] = struct{}{}
+		}
+		for key := range settings {
+			if _, ok := allowed[key]; !ok {
+				return false, fmt.Errorf("配置文件 %s 不允许顶层配置 %q", path, key)
+			}
+		}
+	}
+	mergeConfigMap(target, settings)
+	return true, nil
+}
+
+// restoreMCPMapKeys 恢复 Viper 为大小写不敏感查找而折叠的 MCP server 与环境变量键。
+func restoreMCPMapKeys(cfg *Config, settings map[string]any) {
+	mcpSettings, ok := settings["mcp"].(map[string]any)
+	if !ok {
+		return
+	}
+	serverSettings, ok := mcpSettings["servers"].(map[string]any)
+	if !ok {
+		return
+	}
+	restored := make(map[string]MCPServerConfig, len(serverSettings))
+	for name, raw := range serverSettings {
+		server, ok := cfg.MCP.Servers[name]
+		if !ok {
+			server = cfg.MCP.Servers[strings.ToLower(name)]
+		}
+		rawServer, _ := raw.(map[string]any)
+		server.Env = stringMap(rawServer["env"], server.Env)
+		server.Headers = stringMap(rawServer["headers"], server.Headers)
+		server.EnvHeaders = stringMap(rawServer["env_headers"], server.EnvHeaders)
+		restored[name] = server
+	}
+	cfg.MCP.Servers = restored
+}
+
+func stringMap(raw any, fallback map[string]string) map[string]string {
+	values, ok := raw.(map[string]any)
+	if !ok {
+		return fallback
+	}
+	out := make(map[string]string, len(values))
+	for key, value := range values {
+		if text, ok := value.(string); ok {
+			out[key] = text
+			continue
+		}
+		out[key] = fmt.Sprint(value)
+	}
+	return out
+}
+
+// mergeConfigMap 采用“map 递归合并、标量与列表整体覆盖”的确定性规则合并高优先级配置。
+func mergeConfigMap(target, override map[string]any) {
+	for key, value := range override {
+		if unresolvedEnvPlaceholder(value) {
+			continue
+		}
+		overrideMap, overrideIsMap := value.(map[string]any)
+		currentMap, currentIsMap := target[key].(map[string]any)
+		if overrideIsMap && currentIsMap {
+			mergeConfigMap(currentMap, overrideMap)
+			continue
+		}
+		target[key] = value
+	}
+}
+
+func unresolvedEnvPlaceholder(value any) bool {
+	text, ok := value.(string)
+	if !ok || len(text) < 4 || !strings.HasPrefix(text, "${") || !strings.HasSuffix(text, "}") {
+		return false
+	}
+	name := text[2 : len(text)-1]
+	if strings.TrimSpace(name) == "" || strings.ContainsAny(name, "${}") {
+		return false
+	}
+	_, exists := os.LookupEnv(name)
+	return !exists
+}
+
+func cloneConfigMap(source map[string]any) map[string]any {
+	cloned := make(map[string]any, len(source))
+	for key, value := range source {
+		switch typed := value.(type) {
+		case map[string]any:
+			cloned[key] = cloneConfigMap(typed)
+		case []any:
+			items := make([]any, len(typed))
+			copy(items, typed)
+			cloned[key] = items
+		default:
+			cloned[key] = value
+		}
+	}
+	return cloned
 }
 
 func ensureProductUserConfig(configPath string) error {
@@ -591,11 +805,6 @@ func (c *Config) decryptDPAPISecrets() {
 	decryptField(&c.Web.SerpAPIKey)
 	decryptField(&c.Sandbox.APIKey)
 
-	// Decrypt Legacy key fields
-	decryptField(&c.LLM.LegacyAPIKey)
-	decryptField(&c.LLM.LegacyArkAPIKey)
-	decryptField(&c.LLM.LegacyArkAccessKey)
-	decryptField(&c.LLM.LegacyArkSecretKey)
 }
 
 // ResolveRoute 根据用途路由解析模型；未知用途回退 chat/default。
@@ -624,29 +833,41 @@ func (c LLMConfig) ResolveModel(alias string) (*ResolvedLLMConfig, error) {
 	if timeout == 0 {
 		timeout = c.Timeout
 	}
+	contextWindow := model.ContextWindow
+	if contextWindow <= 0 {
+		if isTestEnv() {
+			contextWindow = 128000
+		} else {
+			return nil, fmt.Errorf("配置文件中的 llm.models.%s 缺少必填字段 'context_window'（或该值非正整数）。为了保证上下文预算裁剪和防止溢出机制的安全运行，必须在配置中显式指定该模型所支持的最大上下文窗口（例如：context_window: 128000）", alias)
+		}
+	}
+
 	return &ResolvedLLMConfig{
-		Alias:          alias,
-		ProviderName:   model.Provider,
-		ProviderKind:   inferProviderKind(model.Provider, provider.Type),
-		BaseURL:        provider.BaseURL,
-		APIVersion:     provider.APIVersion,
-		ByAzure:        provider.ByAzure,
-		Headers:        provider.Headers,
-		AuthType:       defaultString(provider.Auth.Type, "api_key"),
-		APIKey:         provider.Auth.APIKey,
-		AccessKey:      provider.Auth.AccessKey,
-		SecretKey:      provider.Auth.SecretKey,
-		Model:          model.Model,
-		Strategy:       model.Strategy,
-		Timeout:        timeout,
-		Temperature:    model.Temperature,
-		TopP:           model.TopP,
-		MaxTokens:      model.MaxTokens,
-		ToolChoice:     model.ToolChoice,
-		ResponseFormat: model.ResponseFormat,
-		SupportsTools:  model.SupportsTools,
-		Tags:           model.Tags,
-		Metadata:       model.Metadata,
+		Alias:                 alias,
+		ProviderName:          model.Provider,
+		ProviderKind:          inferProviderKind(model.Provider, provider.Type),
+		BaseURL:               provider.BaseURL,
+		APIVersion:            provider.APIVersion,
+		ByAzure:               provider.ByAzure,
+		Headers:               provider.Headers,
+		AuthType:              defaultString(provider.Auth.Type, "api_key"),
+		APIKey:                provider.Auth.APIKey,
+		AccessKey:             provider.Auth.AccessKey,
+		SecretKey:             provider.Auth.SecretKey,
+		Model:                 model.Model,
+		Strategy:              model.Strategy,
+		Timeout:               timeout,
+		Temperature:           model.Temperature,
+		TopP:                  model.TopP,
+		MaxTokens:             model.MaxTokens,
+		ToolChoice:            model.ToolChoice,
+		ResponseFormat:        model.ResponseFormat,
+		SupportsTools:         model.SupportsTools,
+		Tags:                  model.Tags,
+		Metadata:              model.Metadata,
+		ContextWindow:         contextWindow,
+		EffectiveContextRatio: model.EffectiveContextRatio,
+		OutputReserveTokens:   model.OutputReserveTokens,
 	}, nil
 }
 
@@ -662,12 +883,6 @@ func (c *Config) expandEnv() {
 		}
 		c.LLM.Providers[name] = provider
 	}
-	c.LLM.LegacyAPIKey = os.ExpandEnv(c.LLM.LegacyAPIKey)
-	c.LLM.LegacyBaseURL = os.ExpandEnv(c.LLM.LegacyBaseURL)
-	c.LLM.LegacyAPIVersion = os.ExpandEnv(c.LLM.LegacyAPIVersion)
-	c.LLM.LegacyArkAPIKey = os.ExpandEnv(c.LLM.LegacyArkAPIKey)
-	c.LLM.LegacyArkAccessKey = os.ExpandEnv(c.LLM.LegacyArkAccessKey)
-	c.LLM.LegacyArkSecretKey = os.ExpandEnv(c.LLM.LegacyArkSecretKey)
 	c.Web.BraveAPIKey = os.ExpandEnv(c.Web.BraveAPIKey)
 	c.Web.SearXNGBaseURL = os.ExpandEnv(c.Web.SearXNGBaseURL)
 	c.Web.TavilyAPIKey = os.ExpandEnv(c.Web.TavilyAPIKey)
@@ -682,59 +897,21 @@ func (c *Config) expandEnv() {
 	for i := range c.Skills.Sources {
 		c.Skills.Sources[i].Path = os.ExpandEnv(c.Skills.Sources[i].Path)
 	}
-}
-
-func (c *Config) applyLegacyLLM() {
-	if c.LLM.LegacyProvider != "" && len(c.LLM.Providers) == 0 {
-		providerName := c.LLM.LegacyProvider
-		c.LLM.Providers = map[string]LLMProviderConfig{
-			providerName: {
-				BaseURL:    c.LLM.LegacyBaseURL,
-				ByAzure:    c.LLM.LegacyByAzure,
-				APIVersion: c.LLM.LegacyAPIVersion,
-				Auth: LLMAuthConfig{
-					Type:      "api_key",
-					APIKey:    firstNonEmpty(c.LLM.LegacyAPIKey, c.LLM.LegacyArkAPIKey),
-					AccessKey: c.LLM.LegacyArkAccessKey,
-					SecretKey: c.LLM.LegacyArkSecretKey,
-				},
-			},
+	for name, server := range c.MCP.Servers {
+		server.Command = os.ExpandEnv(server.Command)
+		server.Cwd = os.ExpandEnv(server.Cwd)
+		server.URL = os.ExpandEnv(server.URL)
+		for i, arg := range server.Args {
+			server.Args[i] = os.ExpandEnv(arg)
 		}
-		c.LLM.Models = map[string]LLMModelConfig{
-			"default": {Provider: providerName, Model: c.LLM.LegacyModel, Strategy: "balanced"},
+		for key, value := range server.Env {
+			server.Env[key] = os.ExpandEnv(value)
 		}
-		c.LLM.Router.Chat = "default"
+		for key, value := range server.Headers {
+			server.Headers[key] = os.ExpandEnv(value)
+		}
+		c.MCP.Servers[name] = server
 	}
-
-	chatAlias := firstNonEmpty(c.LLM.Router.Chat, c.LLM.Router.Default, c.LLM.Router.Fallback, "default")
-	chatModel, ok := c.LLM.Models[chatAlias]
-	if !ok {
-		return
-	}
-	provider := c.LLM.Providers[chatModel.Provider]
-	if c.LLM.LegacyAPIKey != "" && provider.Auth.APIKey == "" {
-		provider.Auth.Type = defaultString(provider.Auth.Type, "api_key")
-		provider.Auth.APIKey = c.LLM.LegacyAPIKey
-	}
-	if c.LLM.LegacyBaseURL != "" && provider.BaseURL == "" {
-		provider.BaseURL = c.LLM.LegacyBaseURL
-	}
-	if c.LLM.LegacyByAzure {
-		provider.ByAzure = true
-	}
-	if c.LLM.LegacyAPIVersion != "" && provider.APIVersion == "" {
-		provider.APIVersion = c.LLM.LegacyAPIVersion
-	}
-	if c.LLM.LegacyArkAPIKey != "" && provider.Auth.APIKey == "" {
-		provider.Auth.APIKey = c.LLM.LegacyArkAPIKey
-	}
-	if c.LLM.LegacyArkAccessKey != "" && provider.Auth.AccessKey == "" {
-		provider.Auth.AccessKey = c.LLM.LegacyArkAccessKey
-	}
-	if c.LLM.LegacyArkSecretKey != "" && provider.Auth.SecretKey == "" {
-		provider.Auth.SecretKey = c.LLM.LegacyArkSecretKey
-	}
-	c.LLM.Providers[chatModel.Provider] = provider
 }
 
 func validate(cfg *Config) error {
@@ -746,6 +923,7 @@ func validate(cfg *Config) error {
 	applySandboxDefaults(&cfg.Sandbox)
 	applyPolicyDefaults(&cfg.Policy)
 	applyLogDefaults(&cfg.Log)
+	applyMCPDefaults(&cfg.MCP)
 	if err := validatePolicyConfig(cfg.Policy); err != nil {
 		return err
 	}
@@ -753,6 +931,9 @@ func validate(cfg *Config) error {
 		return err
 	}
 	if err := validateLogConfig(cfg.Log); err != nil {
+		return err
+	}
+	if err := validateMCPConfig(cfg.MCP); err != nil {
 		return err
 	}
 	if len(cfg.LLM.Providers) == 0 {
@@ -1014,6 +1195,84 @@ func defaultFileOps(cfg *PolicyFileOperations, read, list, walk, write, edit, de
 	}
 }
 
+func applyMCPDefaults(cfg *MCPConfig) {
+	if cfg == nil {
+		return
+	}
+	mode := strings.ToLower(strings.TrimSpace(cfg.ConnectMode))
+	if mode == "" {
+		cfg.ConnectMode = "background"
+	} else {
+		cfg.ConnectMode = mode
+	}
+	if cfg.ConnectBatchSize <= 0 {
+		cfg.ConnectBatchSize = 3
+	}
+	if cfg.DefaultStartupTimeout <= 0 {
+		cfg.DefaultStartupTimeout = 30 * time.Second
+	}
+	if cfg.DefaultToolTimeout <= 0 {
+		cfg.DefaultToolTimeout = 300 * time.Second
+	}
+	if cfg.Servers == nil {
+		cfg.Servers = map[string]MCPServerConfig{}
+	}
+}
+
+func validateMCPConfig(cfg MCPConfig) error {
+	if !cfg.Enabled {
+		return nil
+	}
+	switch strings.ToLower(strings.TrimSpace(cfg.ConnectMode)) {
+	case "", "background", "eager":
+	default:
+		return fmt.Errorf("mcp.connect_mode 仅支持 background 或 eager")
+	}
+	if cfg.ConnectBatchSize > 50 {
+		return fmt.Errorf("mcp.connect_batch_size 不能超过 50")
+	}
+	for name, server := range cfg.Servers {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return fmt.Errorf("mcp.servers 存在空名称")
+		}
+		typ := strings.ToLower(strings.TrimSpace(server.Type))
+		if typ == "" {
+			typ = "stdio"
+		}
+		switch typ {
+		case "stdio":
+			if strings.TrimSpace(server.Command) == "" {
+				return fmt.Errorf("mcp.servers.%s: stdio 需要 command", name)
+			}
+		case "streamable_http":
+			if strings.TrimSpace(server.URL) == "" {
+				return fmt.Errorf("mcp.servers.%s: streamable_http 需要 url", name)
+			}
+		default:
+			return fmt.Errorf("mcp.servers.%s: type 必须是 stdio 或 streamable_http", name)
+		}
+		if strings.TrimSpace(server.BearerToken) != "" {
+			return fmt.Errorf("mcp.servers.%s: 禁止 inline bearer_token，请使用 bearer_token_env 或 credential_ref", name)
+		}
+		for hk, hv := range server.Headers {
+			key := strings.ToLower(strings.TrimSpace(hk))
+			val := strings.TrimSpace(hv)
+			if key == "authorization" || strings.HasPrefix(strings.ToLower(val), "bearer ") {
+				return fmt.Errorf("mcp.servers.%s: headers 禁止放置 Authorization/Bearer 明文，请使用 bearer_token_env 或 env_headers", name)
+			}
+		}
+		if exp := strings.TrimSpace(server.Exposure); exp != "" {
+			switch exp {
+			case "direct", "deferred", "hidden":
+			default:
+				return fmt.Errorf("mcp.servers.%s: exposure 必须是 direct、deferred 或 hidden", name)
+			}
+		}
+	}
+	return nil
+}
+
 func validateSandboxConfig(cfg SandboxConfig) error {
 	switch strings.ToLower(strings.TrimSpace(cfg.Mode)) {
 	case "local_host", "local_platform_sandbox", "docker_sandbox", "remote_sandbox":
@@ -1132,4 +1391,13 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func isTestEnv() bool {
+	for _, arg := range os.Args {
+		if strings.HasPrefix(arg, "-test.") || strings.Contains(arg, "test.v") {
+			return true
+		}
+	}
+	return false
 }

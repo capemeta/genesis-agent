@@ -1,5 +1,6 @@
 # ── 配置密钥（禁止提交）──────────────────────────────────
 configs/config.local.yaml
+configs/hooks.local.yaml
 configs/sandbox.local.yaml
 configs/.env
 start.local.bat

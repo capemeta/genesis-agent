@@ -5,9 +5,13 @@ package eino
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
+	"time"
 
 	einoModel "github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
@@ -52,11 +56,13 @@ func (a *adapter) Generate(ctx context.Context, messages []*domain.Message, tool
 	// Step 3：调用 eino 生成回复
 	resp, err := boundModel.Generate(ctx, schemaMessages)
 	if err != nil {
+		logLLMCall(a.modelName, messages, tools, nil, err)
 		return nil, fmt.Errorf("llm/eino: Generate 调用失败: %w", err)
 	}
 
-	// Step 4：eino schema.Message → domain.Message
-	return schemaToDomain(resp), nil
+	respMsg := schemaToDomain(resp)
+	logLLMCall(a.modelName, messages, tools, respMsg, nil)
+	return respMsg, nil
 }
 
 // StreamGenerate 实现 llm.ChatModel 接口
@@ -143,8 +149,54 @@ func (a *adapter) StreamGenerate(ctx context.Context, messages []*domain.Message
 	}
 
 	if finalMsg == nil {
-		return nil, fmt.Errorf("llm/eino: Stream 返回空流")
+		err := fmt.Errorf("llm/eino: Stream 返回空流")
+		logLLMCall(a.modelName, messages, tools, nil, err)
+		return nil, err
 	}
 
-	return schemaToDomain(finalMsg), nil
+	respMsg := schemaToDomain(finalMsg)
+	logLLMCall(a.modelName, messages, tools, respMsg, nil)
+	return respMsg, nil
+}
+
+type llmCallLog struct {
+	Timestamp string            `json:"timestamp"`
+	Model     string            `json:"model"`
+	Messages  []*domain.Message `json:"messages"`
+	Tools     []*tool.Info      `json:"tools"`
+	Response  *domain.Message   `json:"response"`
+	Error     string            `json:"error,omitempty"`
+}
+
+func logLLMCall(modelName string, messages []*domain.Message, tools []*tool.Info, response *domain.Message, err error) {
+	logDir := filepath.Join(".", ".genesis", "logs")
+	_ = os.MkdirAll(logDir, 0755)
+	logFile := filepath.Join(logDir, "llm_raw_debug.jsonl")
+
+	errMsg := ""
+	if err != nil {
+		errMsg = err.Error()
+	}
+
+	call := llmCallLog{
+		Timestamp: time.Now().Format(time.RFC3339Nano),
+		Model:     modelName,
+		Messages:  messages,
+		Tools:     tools,
+		Response:  response,
+		Error:     errMsg,
+	}
+
+	data, errMarshal := json.Marshal(call)
+	if errMarshal != nil {
+		return
+	}
+
+	f, errOpen := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if errOpen != nil {
+		return
+	}
+	defer f.Close()
+
+	_, _ = f.Write(append(data, '\n'))
 }

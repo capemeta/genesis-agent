@@ -4,16 +4,18 @@ import (
 	"net/http"
 
 	"genesis-agent/internal/app"
+	mcpstack "genesis-agent/internal/capabilities/mcp/stack"
 	"genesis-agent/products/enterprise/internal/interfaces/http/handler"
 )
 
 // newRouter 创建路由器并注册所有 API 路由
 // 使用标准库 http.ServeMux，避免引入不必要的第三方路由框架
 // 后期如需要路径参数、中间件等高级特性，可替换为 chi 或 gin
-func newRouter(svc app.AgentService) http.Handler {
+func newRouter(svc app.AgentService, mcp *mcpstack.Stack) http.Handler {
 	mux := http.NewServeMux()
 	h := handler.NewAgentHandler(svc)
 	secrets := handler.NewSecretsHandler(svc)
+	mcpHandler := handler.NewMCPHandler(mcp)
 
 	// ── 健康检查 ──────────────────────────────────────────────
 	mux.HandleFunc("GET /health", handleHealth)
@@ -27,6 +29,11 @@ func newRouter(svc app.AgentService) http.Handler {
 	mux.HandleFunc("POST /v1/runs/stream", h.RunStream)
 	mux.HandleFunc("GET /v1/tools", h.ListTools)
 	mux.HandleFunc("GET /v1/resources/{id}", h.GetResource)
+
+	// ── MCP 管理 API（只读 + refresh；Run 内调用仍走 Tool Gateway）──
+	mux.HandleFunc("GET /v1/mcp/servers", mcpHandler.ListServers)
+	mux.HandleFunc("GET /v1/mcp/servers/{name}", mcpHandler.GetServer)
+	mux.HandleFunc("POST /v1/mcp/servers/{name}/refresh", mcpHandler.RefreshServer)
 
 	// ── 密钥与业务连接 API ─────────────────────────────────────
 	// 密钥接口只返回元数据，不回显 secret 明文。

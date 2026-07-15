@@ -39,14 +39,45 @@ func (mockAgentService) ClearSession(context.Context, string) error { return nil
 func (mockAgentService) ListSessionMessages(context.Context, string) ([]*domain.Message, error) {
 	return nil, nil
 }
-func (mockAgentService) NewSession() *domain.Session {
-	return &domain.Session{ID: "sess-test"}
+func (mockAgentService) CreateSession(context.Context, app.SessionScope) (*domain.Session, error) {
+	return &domain.Session{ID: "sess-test"}, nil
 }
-func (mockAgentService) ListTools() []*tool.Info          { return nil }
-func (mockAgentService) Config() *config.Config           { return nil }
-func (mockAgentService) DefaultAgent() *domain.Agent      { return nil }
-func (mockAgentService) Credentials() credential.Service  { return nil }
-func (mockAgentService) Connections() connection.Service  { return nil }
+func (mockAgentService) ResumeSession(context.Context, string, app.SessionScope) (*domain.Session, error) {
+	return &domain.Session{ID: "sess-test"}, nil
+}
+func (mockAgentService) ContinueSession(context.Context, app.SessionScope) (*domain.Session, error) {
+	return &domain.Session{ID: "sess-test"}, nil
+}
+func (mockAgentService) ListSessions(context.Context, app.SessionScope, int) ([]*domain.Session, error) {
+	return nil, nil
+}
+func (mockAgentService) ForkSession(context.Context, string, string, app.SessionScope) (*domain.Session, error) {
+	return nil, nil
+}
+func (mockAgentService) ReplaySession(context.Context, string, string, app.SessionScope) ([]*domain.Message, error) {
+	return nil, nil
+}
+func (mockAgentService) ListTools() []*tool.Info                                          { return nil }
+func (mockAgentService) Config() *config.Config                                           { return nil }
+func (mockAgentService) DefaultAgent() *domain.Agent                                      { return nil }
+func (mockAgentService) Credentials() credential.Service                                  { return nil }
+func (mockAgentService) Connections() connection.Service                                  { return nil }
+func (mockAgentService) SaveLongTermMemory(context.Context, string, string, string) error { return nil }
+func (mockAgentService) ListLongTermMemories(context.Context, app.SessionScope, domain.MemoryQuery) ([]*domain.LongTermEntry, error) {
+	return nil, nil
+}
+func (mockAgentService) SaveLongTermMemoryEntry(context.Context, app.SessionScope, *domain.LongTermEntry) error {
+	return nil
+}
+func (mockAgentService) DeleteLongTermMemories(context.Context, app.SessionScope, []string) error {
+	return nil
+}
+func (mockAgentService) GetUserProfile(context.Context, app.SessionScope) (*domain.UserProfile, error) {
+	return nil, nil
+}
+func (mockAgentService) SaveUserProfile(context.Context, app.SessionScope, *domain.UserProfile) error {
+	return nil
+}
 
 func TestRunStreamSSE(t *testing.T) {
 	svc := mockAgentService{

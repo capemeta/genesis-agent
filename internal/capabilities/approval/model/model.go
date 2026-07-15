@@ -15,6 +15,8 @@ const (
 	ActionMCPCall           Action = "mcp.call"
 	ActionSkillLoad         Action = "skill.load"
 	ActionSkillResourceRead Action = "skill.resource.read"
+	ActionSkillInstall      Action = "skill.install"
+	ActionSubAgentDelegate  Action = "subagent.delegate"
 )
 
 // Resource 描述动作作用的资源。

@@ -126,7 +126,7 @@ MCP 让 Agent 能连接**外部工具服务器**（filesystem、browser、databa
 
 需要澄清一个关键关系，避免误解 `RuntimeAdapter` 的角色：
 
-- `capability.RuntimeAdapter` 的方法签名基于 `CapabilityIndexRecord`（marketplace 安装态能力）。**它只覆盖“通过 marketplace 安装的 MCP package”这一种来源**，不覆盖 `config.yaml` / 项目文件里直接声明的 server（后者没有 `CapabilityIndexRecord`）。
+- `capability.RuntimeAdapter` 的方法签名基于 `CapabilityIndexRecord`（marketplace 安装态能力）。**它只覆盖“通过 marketplace 安装的 MCP package”这一种来源**，不覆盖 `mcp.yaml` / 项目文件里直接声明的 server（后者没有 `CapabilityIndexRecord`）。
 - 因此**连接生命周期的唯一驱动者是 `mcp.Manager`**，输入是 `Catalog` 合并后的 `[]McpServerDefinition`。
 - MCP 的 `RuntimeAdapter` 实现只是 **Catalog 的一个 `DefinitionSource`**：当 marketplace 安装/启停一个 MCP package 时，它把该 package 投影成 `McpServerDefinition` 并触发 `Manager.Sync`（增量）。它**不自己持有连接逻辑**。
 
@@ -361,7 +361,7 @@ func (t *mcpTool) Execute(ctx context.Context, params string) (string, error) {
 
 | 维度 | CLI | Desktop | Enterprise（HTTP API） |
 |---|---|---|---|
-| 配置来源 | `config.yaml` + 用户级 + 项目 `.genesis/mcp` + marketplace | 同 CLI（+ 桌面 UI 管理） | 平台配置 + 租户级 DB（Phase 2.5）+ marketplace |
+| 配置来源 | 用户级 → `mcp.yaml` → `config.local.yaml` → `.genesis/mcp.yaml` → marketplace | 同 CLI（+ 桌面 UI 管理） | 平台配置 + 租户级 DB（Phase 2.5）+ marketplace |
 | 默认 Scope（server 级） | 宽松：允许 stdio 本地 server（filesystem/browser 等） | 宽松（含桌面自动化类） | **收紧**：默认禁止本地文件/进程类 stdio server；数据库类需 approval |
 | stdio server | 允许（本机进程） | 允许 | 默认禁止（无本机工作区）；如需则走 sandbox transport |
 | streamable-http server | 允许 | 允许 | 允许（企业内部 MCP 服务为主） |
@@ -407,14 +407,17 @@ type MCPConfig struct {
 
 ```text
 1. 内置/平台默认 server
-2. config.yaml mcp.servers
-3. 用户级 ~/.genesis-agent/<product>/config.yaml
-4. 项目级 .genesis/mcp（project 来源，需预连接审批）
-5. marketplace 已安装 MCP package（capability 索引）
-6. 运行时/会话级覆盖（CLI flag / API 请求）
+2. 用户级 ~/.genesis-agent/<product>/config.yaml
+3. configs/mcp.yaml 中的项目共享 mcp.servers
+4. configs/config.local.yaml 中的项目本地覆盖
+5. 项目级 .genesis/mcp.yaml（project 来源，需预连接审批）
+6. marketplace 已安装 MCP package（capability 索引）
+7. 运行时/会话级覆盖（CLI flag / API 请求）
 ```
 
 冲突消解：记录被覆盖来源到审计（借鉴 codex catalog）；project 来源标记 `Origin=project` 触发审批。
+
+这里的 `.genesis/mcp.yaml` 与 marketplace 属于 MCP Catalog 的独立 server 来源，不属于通用配置文件层；通用 MCP 字段内部仍严格遵循“用户级 < `mcp.yaml` < `config.local.yaml`”。
 
 ### 7.3 配置示例
 
@@ -437,6 +440,8 @@ mcp:
       approval_mode: approve
       disabled_tools: ["drop_table"]
 ```
+
+stdio server 的 `env` 是“传给 MCP 子进程的环境变量表”。其中的 `${ENV_NAME}` 在 Genesis 配置加载时从当前进程环境展开；例如 `MYSQL_PASS: ${MYSQL_PASS}` 会将宿主进程的 `MYSQL_PASS` 传给 MySQL MCP Server。它不自动加载 `.env`，可由 PowerShell/CMD 启动命令、`start.local.bat`、服务管理器、容器或 CI 的 Secret 注入提供。密钥不得写成 `env` 中的明文；详细注入方式见 `docs/密钥与连接管理设计.md` 的 §4.6.2。
 
 ---
 
@@ -847,7 +852,7 @@ D:\workspace\go\go-project\codex\codex-rs\core\src\guardian\approval_request.rs
 
 ### 12.4 官方依赖
 
-- `github.com/modelcontextprotocol/go-sdk/mcp`（v1.7.0+，支持 2026-07-28 spec；`mcp.NewClient` / `mcp.CommandTransport`(stdio) / `mcp.StreamableClientTransport`(HTTP) / `mcp.Client.Connect` / `session.CallTool`）。**建议锁定到当时最新稳定版**。
+- `github.com/modelcontextprotocol/go-sdk/mcp`（当前固定 `v1.6.1`，即当前可用最新稳定版；`v1.7.0` 仅有预发布标签，不作为生产依赖；`mcp.NewClient` / `mcp.CommandTransport`(stdio) / `mcp.StreamableClientTransport`(HTTP) / `mcp.Client.Connect` / `session.CallTool`）。后续规范升级时应确认兼容性后再升级至新的稳定版。
   - 文档：https://pkg.go.dev/github.com/modelcontextprotocol/go-sdk/mcp
   - 设计：https://github.com/modelcontextprotocol/go-sdk/blob/main/design/design.md
 
@@ -987,19 +992,33 @@ POST /v1/runs → ReAct loop → registry.Execute(mcp__server__tool)
 
 ---
 
-## 17. 当前实现差距（开发起点）
+## 17. 当前实现状态（对照表）
 
-| 层级 | 状态 | 下一步 |
+| 层级 | 状态 | 说明 |
 |---|---|---|
-| `internal/capabilities/mcp/` | **不存在** | M1：contract/model/transport/manager |
-| go-sdk 依赖 | **未引入** | `go get github.com/modelcontextprotocol/go-sdk` |
-| `tool.Registry.Unregister` | **不存在** | M2 前置小改动 |
-| `platform/config` MCPConfig | **不存在** | M3 |
-| MCP RuntimeAdapter | **未注册** | M2，参考 `tool/adapter/capability/adapter.go` |
-| CLI `mcp` 子命令 | **不存在** | M3/M4，参考 Kode `commands/mcp/*` |
-| Enterprise `/v1/mcp/*` | **不存在** | M3/M5 |
-| Desktop | **产品未实现** | 先完成 CLI 路径，Desktop 复用同一内核 + Wails UI |
-| `ActionMCPCall` 治理接线 | **仅常量** | M4 Authorizer + policy `mcp://` matcher |
+| `internal/capabilities/mcp/` | **已落地** | contract/model/transport/manager/catalog/gateway/tooladapter/stack |
+| go-sdk 依赖 | **已引入** | `github.com/modelcontextprotocol/go-sdk` |
+| `tool.Registry.Unregister` | **已落地** | Tool Gateway 支持动态撤下 |
+| `platform/config` MCPConfig | **已落地** | YAML DTO + 明文 token 禁止 |
+| MCP RuntimeAdapter | **已注册** | 与 marketplace `AdapterRegistry` 共享，Install/SetEnabled 可热同步 |
+| Project DefinitionSource | **已落地** | `.genesis/mcp(.yaml/.yml/.json)`，Precedence=40 |
+| ApprovalStore（文件） | **已落地** | `~/.genesis-agent/{cli,desktop,enterprise}/mcp-approvals.json`（DB 仍属 Phase 2.5） |
+| Project 审批热撤销 | **已落地** | 每次 Sync 重新读取审批决定；reject 会关闭既有 session 并撤下 tool 投影，后台 Dial 在提交前再次校验最新定义 |
+| CapabilityScope 适用范围 | **已落地（fail-closed）** | 统一检查 channel、tenant、project、agent、user、role、environment；受限维度缺失运行时值时拒绝 |
+| OnEvent → Audit/Trace | **已落地** | `adapter/observability.Listener` |
+| policy `mcp://` / `mcp__*` matcher | **已落地** | `policy/matcher/mcp` |
+| CLI `mcp` 子命令 | **已落地** | `list/get/approve/reject/refresh` |
+| Enterprise `/v1/mcp/*` | **已落地（管理面）** | GET servers、GET detail、POST refresh；tool call 调试 API 未做 |
+| Desktop | **内核可装配** | `products/desktop/bootstrap` 复用 MCP stack；Wails UI 仍待实现 |
+| `ActionMCPCall` 治理接线 | **已落地** | Authorizer + policy matcher + ChainAuthorizer |
+| `mcp_search` 动态提升 | **已落地** | 通过 MCP tool 的受锁 `ExposureUpdater` 更新，不再修改共享 `Info` 指针 |
+| go-sdk 稳定版对齐 | **已完成** | `go.mod` 固定 `v1.6.1`；文档已修正此前不存在的 `v1.7.0` 稳定版要求 |
+
+**本次明确延期**：Enterprise 管理 API 补全（`tools/call`、`resources/read`、detail 的 resources/auth）以及 Run SSE MCP 生命周期事件；两项均尚未实现。
+
+**持续不在本轮范围**：DB 持久化、OAuth、elicitation、M6 MCP Server 角色。
+
+**运行时身份接线边界**：MCP Stack 已支持注入 project/agent/user/role 上下文。当前 CLI/Desktop/Enterprise bootstrap 仅提供固定 channel/environment/tenant；因此配置了 project/agent/user/role 限制但产品未传入相应身份时会安全禁用，而不是越权放行。Enterprise 请求级身份接线应与多租户/RBAC Phase 2.5 一并完成。
 
 ---
 
@@ -1029,4 +1048,18 @@ POST /v1/runs → ReAct loop → registry.Execute(mcp__server__tool)
 **残留风险（非阻塞）**：deferred 检索工具形态、OAuth、elicitation、enterprise DB 持久化 — 已在 §14 列出。
 
 **审查结论**：设计可进入 M1 实现。
+
+### 第 3 轮审查与修复（2026-07-15）
+
+**从第一性原理**：MCP 的连接、投影和调用必须始终服从同一份当前治理决策；范围或审批被收紧后，既有连接不能继续越权工作；动态暴露状态不能造成并发数据竞争；文档依赖版本必须对应实际可发布版本。
+
+- [x] project server 在 `reject → refresh` 后会关闭现有 session 并撤下投影；后台连接提交结果前会校验最新定义，避免撤销与 Dial 并发时重新变为 ready。
+- [x] scope 判断收敛为 MCP 域唯一匹配器，覆盖 channel、tenant、project、agent、user、role、environment，任何受限维度缺失或不匹配均拒绝。
+- [x] `mcp_search` 改为调用 MCP tool 的受锁 `ExposureUpdater`，`GetInfo` 返回快照，消除共享 traits 的直接写入。
+- [x] go-sdk 版本要求已与可用稳定版本对齐：当前稳定版为 `v1.6.1`，`v1.7.0` 尚无稳定标签。
+- [x] 已新增 project 审批热撤销、全维度 scope、deferred tool 提升的回归测试；MCP/Tool 相关包测试通过。
+
+**延期项（经确认）**：Enterprise 管理 API 补全与 Run SSE MCP 生命周期事件。本轮不修改。
+
+**验证限制**：Windows 环境未安装 `gcc`，`go test -race` 无法启动；常规 Go 测试作为本轮自动化验证，后续 CI 应启用 race detector。
 

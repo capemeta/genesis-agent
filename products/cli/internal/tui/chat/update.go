@@ -2,13 +2,17 @@ package chat
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
-	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/textarea"
 	tea "github.com/charmbracelet/bubbletea"
 
+	"genesis-agent/internal/app"
 	approvalmodel "genesis-agent/internal/capabilities/approval/model"
+	"genesis-agent/internal/domain"
 	"genesis-agent/internal/runtime/progress"
 	approval "genesis-agent/products/cli/internal/approval"
 )
@@ -24,12 +28,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case approval.ApprovalRequiredMsg:
 		m.activeApproval = &msg
 		m.approvalFocus = true
-		m.textinput.Blur()
+		m.textarea.Blur()
 		m.refreshViewportContent()
 		m.viewport.GotoBottom()
 		return m, nil
 
 	// ── 终端窗口尺寸变化（初次加载和调整窗口大小时触发）──────
+	case clearToastMsg:
+		// 定时清除 toast
+		if time.Now().After(m.toastExpiresAt) {
+			m.toast = ""
+		}
+		return m, nil
+
 	case tea.WindowSizeMsg:
 		return m.handleWindowSize(msg)
 
@@ -49,7 +60,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				m.activeApproval = nil
 				m.approvalFocus = false
-				m.textinput.Focus()
+				m.textarea.Focus()
 				m.refreshViewportContent()
 				m.viewport.GotoBottom()
 				return m, nil
@@ -66,7 +77,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				m.activeApproval = nil
 				m.approvalFocus = false
-				m.textinput.Focus()
+				m.textarea.Focus()
 				m.refreshViewportContent()
 				m.viewport.GotoBottom()
 				return m, nil
@@ -83,7 +94,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				m.activeApproval = nil
 				m.approvalFocus = false
-				m.textinput.Focus()
+				m.textarea.Focus()
 				m.refreshViewportContent()
 				m.viewport.GotoBottom()
 				return m, nil
@@ -100,7 +111,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				m.activeApproval = nil
 				m.approvalFocus = false
-				m.textinput.Focus()
+				m.textarea.Focus()
 				m.refreshViewportContent()
 				m.viewport.GotoBottom()
 				return m, nil
@@ -108,26 +119,163 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
+		if m.helpOverlay {
+			switch strings.ToLower(msg.String()) {
+			case "esc", "?":
+				return m.closeHelpOverlay(), nil
+			}
+			if msg.Type != tea.KeyCtrlC && msg.Type != tea.KeyCtrlD {
+				return m, nil
+			}
+		}
+
+		if m.selectMode {
+			switch strings.ToLower(msg.String()) {
+			case "ctrl+d":
+				m.cancelFn()
+				return m, tea.Quit
+			case "j", "down":
+				return m.moveSelection(1), nil
+			case "k", "up":
+				return m.moveSelection(-1), nil
+			case "v":
+				m.selectAnchor = m.selectCursor
+				m.refreshViewportContent()
+				return m, nil
+			case "y":
+				return m.copySelection()
+			case "esc":
+				return m.exitSelectMode(), nil
+			}
+			if msg.Type != tea.KeyCtrlC && msg.Type != tea.KeyCtrlD {
+				return m, nil
+			}
+		}
+
 		switch msg.Type {
 
 		case tea.KeyCtrlC:
-			// 取消正在执行的 LLM 请求，然后退出程序
+			if m.loading {
+				// 推理中：取消本轮，不退出程序
+				m = m.cancelCurrentRound()
+				return m.showToast("已取消本轮推理")
+			}
+			// 空闲态：二次确认退出
+			now := time.Now()
+			if m.ctrlCLastAt != nil && now.Sub(*m.ctrlCLastAt) < time.Second {
+				m.cancelFn()
+				return m, tea.Quit
+			}
+			m.ctrlCLastAt = &now
+			return m.showToast("再按一次退出，或输入 /quit")
+
+		case tea.KeyCtrlD:
 			m.cancelFn()
 			return m, tea.Quit
 
 		case tea.KeyEsc:
-			// 清空输入框（不退出）
-			m.textinput.SetValue("")
+			if m.commandMenuOpen {
+				m.commandMenuOpen = false
+				m.commandMenuQuery = ""
+				m.viewport.Height = m.viewportHeight()
+				return m, nil
+			}
+			if m.loading {
+				// 推理态：取消本轮（不退出）
+				m = m.cancelCurrentRound()
+				return m.showToast("已取消本轮推理")
+			}
+			// 空闲态：清空输入框
+			m.textarea.Reset()
+			m.historyIdx = -1
 			return m, nil
 
+		case tea.KeyCtrlY:
+			// 复制最近一条 Agent 回答到系统剪贴板
+			return m.copyLastAssistant()
+
+		case tea.KeyTab:
+			if m.commandMenuOpen {
+				m = m.applyCommandMenuSelection()
+				return m, nil
+			}
+			if !m.loading && strings.HasPrefix(strings.TrimSpace(m.textarea.Value()), "/") {
+				m = m.completeSlashCommand()
+				return m, nil
+			}
+
+		case tea.KeyUp:
+			if m.commandMenuOpen {
+				return m.moveCommandMenu(-1), nil
+			}
+			if m.loading {
+				return m, nil
+			}
+			// 在输入为空或已在历史浏览态时，向上浏览历史
+			if m.textarea.Value() == "" || m.historyIdx != -1 {
+				if len(m.history) == 0 {
+					return m, nil
+				}
+				if m.historyIdx == -1 {
+					m.tempInput = m.textarea.Value()
+					m.historyIdx = len(m.history) - 1
+				} else if m.historyIdx > 0 {
+					m.historyIdx--
+				}
+				m.textarea.SetValue(m.history[m.historyIdx])
+				m.textarea.CursorEnd()
+				return m, nil
+			}
+
+		case tea.KeyDown:
+			if m.commandMenuOpen {
+				return m.moveCommandMenu(1), nil
+			}
+			if m.loading {
+				return m, nil
+			}
+			// 向下浏览历史或返回草稿
+			if m.historyIdx != -1 {
+				m.historyIdx++
+				if m.historyIdx >= len(m.history) {
+					m.historyIdx = -1
+					m.textarea.SetValue(m.tempInput)
+				} else {
+					m.textarea.SetValue(m.history[m.historyIdx])
+				}
+				m.textarea.CursorEnd()
+				return m, nil
+			}
+
 		case tea.KeyEnter:
+			if m.commandMenuOpen && msg.String() != "shift+enter" && msg.String() != "alt+enter" {
+				m = m.applyCommandMenuSelection()
+				return m, nil
+			}
+			if msg.String() == "shift+enter" || msg.String() == "alt+enter" {
+				m.textarea.InsertString("\n")
+				return m, nil
+			}
 			// 等待 Agent 响应期间忽略新的发送请求
 			if m.loading {
 				return m, nil
 			}
-			input := strings.TrimSpace(m.textinput.Value())
+			input := strings.TrimSpace(m.textarea.Value())
 			if input == "" {
 				return m, nil
+			}
+			m.textarea.Reset()
+
+			// 保存至输入历史
+			m.history = append(m.history, input)
+			m.historyIdx = -1
+			m.tempInput = ""
+
+			if strings.HasPrefix(input, "#记住") {
+				return m.handleRememberCmd(strings.TrimPrefix(input, "#记住"))
+			}
+			if strings.HasPrefix(input, "#remember") {
+				return m.handleRememberCmd(strings.TrimPrefix(input, "#remember"))
 			}
 			// 斜杠命令（/clear、/help 等）
 			if strings.HasPrefix(input, "/") {
@@ -135,6 +283,33 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			// 发送消息给 Agent
 			return m.sendMessage(input)
+
+		default:
+			if msg.String() == "y" && (!m.textarea.Focused() || m.historyIdx != -1) {
+				return m.copyLastAssistant()
+			}
+			if msg.String() == "v" && !m.loading && strings.TrimSpace(m.textarea.Value()) == "" {
+				return m.enterSelectMode()
+			}
+			if msg.String() == "?" && !m.loading && strings.TrimSpace(m.textarea.Value()) == "" {
+				return m.showHelpOverlay()
+			}
+			// o 键：展开/折叠运行过程日志（Composer 输入为空且非加载时生效）
+			if msg.String() == "o" && !m.loading {
+				if strings.TrimSpace(m.textarea.Value()) == "" {
+					m.progressExpanded = !m.progressExpanded
+					m.refreshViewportContent()
+					return m, nil
+				}
+			}
+			// p 键：展开/折叠计划卡片（仅 Composer 输入为空且非加载时生效）
+			if msg.String() == "p" && m.currentPlan != nil && !m.loading {
+				if strings.TrimSpace(m.textarea.Value()) == "" {
+					m.planExpanded = !m.planExpanded
+					m.refreshViewportContent()
+					return m, nil
+				}
+			}
 		}
 
 	// ── Agent 推理成功完成 ──────────────────────────────────────
@@ -145,10 +320,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.progressCh = nil
 		m.activeApproval = nil
 		m.approvalFocus = false
-		m.textinput.Focus()
+		m.textarea.Focus()
 		run := msg.result.Run
-		if summary := m.progressSummaryMessage(); summary != "" {
-			m.messages = append(m.messages, uiMessage{role: "system", content: summary})
+		if len(m.progressLog) > 0 {
+			logCopy := make([]string, len(m.progressLog))
+			copy(logCopy, m.progressLog)
+			m.messages = append(m.messages, uiMessage{
+				role:            "system",
+				isProgress:      true,
+				progressLog:     logCopy,
+				activityTokens:  run.TotalTokens,
+				activityElapsed: msg.result.Elapsed,
+				activityOutcome: "完成",
+			})
 		}
 		found := false
 		for i := len(m.messages) - 1; i >= 0; i-- {
@@ -180,20 +364,31 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refreshViewportContent()
 		m.viewport.GotoBottom()
 		// 恢复光标闪烁（推理期间被 spinner tick 替代）
-		return m, textinput.Blink
+		return m, textarea.Blink
 
 	// ── Agent 推理失败 ─────────────────────────────────────────
 	case runErrorMsg:
+		if msg.err.Error() == "操作已取消" {
+			return m, nil
+		}
 		m.loading = false
 		m.err = msg.err
 		m.currentStatus = ""
 		m.progressCh = nil
 		m.activeApproval = nil
 		m.approvalFocus = false
-		m.textinput.Focus()
+		m.textarea.Focus()
 		errContent := "❌ 错误: " + msg.err.Error()
-		if summary := m.progressSummaryMessage(); summary != "" {
-			m.messages = append(m.messages, uiMessage{role: "system", content: summary})
+		if len(m.progressLog) > 0 {
+			logCopy := make([]string, len(m.progressLog))
+			copy(logCopy, m.progressLog)
+			m.messages = append(m.messages, uiMessage{
+				role:            "system",
+				isProgress:      true,
+				progressLog:     logCopy,
+				activityElapsed: time.Since(m.runStartedAt),
+				activityOutcome: "失败",
+			})
 		}
 		m.messages = append(m.messages, uiMessage{
 			role:    "system",
@@ -201,16 +396,32 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		})
 		m.refreshViewportContent()
 		m.viewport.GotoBottom()
-		return m, textinput.Blink
+		return m, textarea.Blink
 
 	case progressMsg:
 		if !m.loading {
 			return m, nil
 		}
 		m.applyProgress(msg.event)
-		m.refreshViewportContent()
-		m.viewport.GotoBottom()
+		now := time.Now()
+		if m.lastProgressRenderAt.IsZero() || now.Sub(m.lastProgressRenderAt) >= progressRenderInterval {
+			m.refreshViewportContent()
+			m.viewport.GotoBottom()
+			m.lastProgressRenderAt = now
+			m.progressDirty = false
+		} else {
+			m.progressDirty = true
+			cmds = append(cmds, flushProgressAfter(progressRenderInterval-now.Sub(m.lastProgressRenderAt)))
+		}
 		cmds = append(cmds, waitProgress(m.progressCh))
+
+	case flushProgressMsg:
+		if m.loading && m.progressDirty {
+			m.refreshViewportContent()
+			m.viewport.GotoBottom()
+			m.lastProgressRenderAt = time.Now()
+			m.progressDirty = false
+		}
 	}
 
 	// ── 转发事件给子组件 ────────────────────────────────────────
@@ -228,11 +439,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	m.viewport, vpCmd = m.viewport.Update(msg)
 	cmds = append(cmds, vpCmd)
 
-	// TextInput 在非加载时接收按键（加载时禁用防止误操作）
+	// Textarea 在非加载时接收按键（加载时禁用防止误操作）
 	if !m.loading {
-		var tiCmd tea.Cmd
-		m.textinput, tiCmd = m.textinput.Update(msg)
-		cmds = append(cmds, tiCmd)
+		var taCmd tea.Cmd
+		m.textarea, taCmd = m.textarea.Update(msg)
+		cmds = append(cmds, taCmd)
+		if key, ok := msg.(tea.KeyMsg); ok && key.Type != tea.KeyTab {
+			m.commandSuggestionIndex = -1
+			m.commandSuggestionPrefix = ""
+		}
+		m.syncCommandMenu()
 	}
 
 	return m, tea.Batch(cmds...)
@@ -252,7 +468,7 @@ func (m Model) handleWindowSize(msg tea.WindowSizeMsg) (tea.Model, tea.Cmd) {
 	if inputWidth < 10 {
 		inputWidth = 10
 	}
-	m.textinput.Width = inputWidth
+	m.textarea.SetWidth(inputWidth)
 
 	if !m.ready {
 		// 首次收到窗口尺寸：初始化完成；有历史则 ForUI 水合，否则欢迎语
@@ -260,7 +476,7 @@ func (m Model) handleWindowSize(msg tea.WindowSizeMsg) (tea.Model, tea.Cmd) {
 		m.hydrateFromSession()
 		m.refreshViewportContent()
 		m.viewport.GotoBottom()
-		return m, textinput.Blink
+		return m, textarea.Blink
 	}
 
 	// 后续 resize：重新渲染消息（宽度可能变化，需要重新换行）
@@ -273,13 +489,16 @@ func (m Model) sendMessage(input string) (tea.Model, tea.Cmd) {
 	// 添加用户消息到历史
 	m.messages = append(m.messages, uiMessage{role: "user", content: input})
 	// 清空输入框
-	m.textinput.SetValue("")
+	m.textarea.Reset()
 	// 进入加载状态
 	m.loading = true
 	m.err = nil
 	m.currentStatus = "准备运行 Agent"
 	m.progressLog = nil
-		m.progressCh = make(chan progressMsg, 256)
+	m.progressDirty = false
+	m.lastProgressRenderAt = time.Time{}
+	m.runStartedAt = time.Now()
+	m.progressCh = make(chan progressMsg, 256)
 	// 更新消息区并滚动到底部
 	m.refreshViewportContent()
 	m.viewport.GotoBottom()
@@ -293,6 +512,22 @@ func (m Model) sendMessage(input string) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) applyProgress(event progress.Event) {
+
+	// 处理计划事件：完整 Plan JSON 快照，直接替换 currentPlan
+	if event.Kind == progress.KindPlan {
+		if event.Detail != "" {
+			var plan domain.Plan
+			if err := json.Unmarshal([]byte(event.Detail), &plan); err == nil {
+				m.currentPlan = &plan
+				// 新建计划时自动展开；更新/tick 时保持当前展开状态
+				if event.BlockType == "create" || event.BlockType == "hydrate" {
+					m.planExpanded = true
+				}
+			}
+		}
+		return // 计划事件不写入 progressLog、不更新 status bar
+	}
+
 	if isLiveAssistantBlock(event.BlockType) {
 		m.applyLiveAssistantBlock(event)
 		return
@@ -534,10 +769,18 @@ func shouldLogProgress(event progress.Event) bool {
 // handleSlashCmd 处理 / 开头的斜杠命令
 func (m Model) handleSlashCmd(input string) (tea.Model, tea.Cmd) {
 	// 清空输入框
-	m.textinput.SetValue("")
+	m.textarea.Reset()
+	m.commandMenuOpen = false
+	m.commandMenuQuery = ""
+	m.viewport.Height = m.viewportHeight()
 
-	// 提取命令名称（去掉 /，转小写，去空格）
-	cmdName := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(input, "/")))
+	trimmed := strings.TrimSpace(strings.TrimPrefix(input, "/"))
+	parts := strings.SplitN(trimmed, " ", 2)
+	cmdName := strings.ToLower(parts[0])
+	cmdArg := ""
+	if len(parts) > 1 {
+		cmdArg = parts[1]
+	}
 
 	switch cmdName {
 	case "quit", "exit", "q":
@@ -550,6 +793,8 @@ func (m Model) handleSlashCmd(input string) (tea.Model, tea.Cmd) {
 		// 清空 UI 消息列表
 		m.messages = nil
 		m.err = nil
+		m.currentPlan = nil
+		m.planExpanded = false
 		// 显示确认消息
 		m.messages = append(m.messages, uiMessage{
 			role:    "system",
@@ -559,14 +804,72 @@ func (m Model) handleSlashCmd(input string) (tea.Model, tea.Cmd) {
 		m.viewport.GotoBottom()
 		return m, nil
 
-	case "help", "?", "h":
-		m.messages = append(m.messages, uiMessage{
-			role:    "system",
-			content: helpText,
-		})
+	case "resume":
+		if m.loading {
+			return m.showToast("当前推理尚未结束")
+		}
+		sessionID := strings.TrimSpace(cmdArg)
+		scope := m.currentSessionScope()
+		var session *domain.Session
+		var err error
+		if sessionID == "" {
+			session, err = m.svc.ContinueSession(context.Background(), scope)
+		} else {
+			session, err = m.svc.ResumeSession(context.Background(), sessionID, scope)
+		}
+		if err != nil {
+			m.messages = append(m.messages, uiMessage{role: "system", content: "恢复会话失败: " + err.Error()})
+			m.refreshViewportContent()
+			m.viewport.GotoBottom()
+			return m, nil
+		}
+		m.session = session
+		m.err = nil
+		m.progressLog = nil
+		m.progressExpanded = false
+		m.hydrateFromSession()
 		m.refreshViewportContent()
 		m.viewport.GotoBottom()
 		return m, nil
+
+	case "sessions":
+		sessions, err := m.svc.ListSessions(context.Background(), m.currentSessionScope(), 10)
+		if err != nil {
+			m.messages = append(m.messages, uiMessage{role: "system", content: "加载会话列表失败: " + err.Error()})
+		} else if len(sessions) == 0 {
+			m.messages = append(m.messages, uiMessage{role: "system", content: "没有可恢复的历史会话。"})
+		} else {
+			var lines []string
+			for _, session := range sessions {
+				title := strings.TrimSpace(session.Title)
+				if title == "" {
+					title = "未命名会话"
+				}
+				lines = append(lines, fmt.Sprintf("%s  %s", session.ID, title))
+			}
+			m.messages = append(m.messages, uiMessage{role: "system", content: "最近会话:\n" + strings.Join(lines, "\n")})
+		}
+		m.refreshViewportContent()
+		m.viewport.GotoBottom()
+		return m, nil
+
+	case "help", "?", "h":
+		return m.showHelpOverlay()
+
+	case "remember", "记住":
+		return m.handleRememberCmd(cmdArg)
+
+	case "copy":
+		arg := strings.ToLower(strings.TrimSpace(cmdArg))
+		switch arg {
+		case "user":
+			return m.copyLastUser()
+		case "all":
+			return m.copyAllTranscript()
+		default:
+			// 默认复制最近的一条 Agent 回答 (assistant 消息)
+			return m.copyLastAssistant()
+		}
 
 	default:
 		m.messages = append(m.messages, uiMessage{
@@ -577,4 +880,59 @@ func (m Model) handleSlashCmd(input string) (tea.Model, tea.Cmd) {
 		m.viewport.GotoBottom()
 		return m, nil
 	}
+}
+
+func (m Model) currentSessionScope() app.SessionScope {
+	if m.session == nil {
+		return app.SessionScope{}
+	}
+	return app.SessionScope{
+		TenantID: m.session.TenantID,
+		UserID:   m.session.UserID,
+		AgentID:  m.session.AgentID,
+		AppID:    m.session.AppID,
+	}
+}
+
+// handleRememberCmd 处理用户主动沉淀长期记忆的指令
+func (m Model) handleRememberCmd(content string) (tea.Model, tea.Cmd) {
+	// 清空输入框
+	m.textarea.Reset()
+
+	content = strings.TrimSpace(content)
+	if content == "" {
+		m.messages = append(m.messages, uiMessage{
+			role:    "system",
+			content: "⚠️ 记忆内容不能为空。示例: #记住 数据库连接首选 PostgreSQL",
+		})
+		m.refreshViewportContent()
+		m.viewport.GotoBottom()
+		return m, nil
+	}
+
+	userID := m.session.UserID
+	if userID == "" {
+		userID = "user"
+	}
+	tenantID := m.session.TenantID
+	if tenantID == "" {
+		tenantID = "dev"
+	}
+
+	err := m.svc.SaveLongTermMemory(context.Background(), tenantID, userID, content)
+	if err != nil {
+		m.messages = append(m.messages, uiMessage{
+			role:    "system",
+			content: "❌ 保存长期记忆失败: " + err.Error(),
+		})
+	} else {
+		m.messages = append(m.messages, uiMessage{
+			role:    "system",
+			content: "🟢 已为您记牢：“" + content + "”。后续对话启动时将自适应召回该偏好参考。",
+		})
+	}
+
+	m.refreshViewportContent()
+	m.viewport.GotoBottom()
+	return m, nil
 }

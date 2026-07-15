@@ -2,10 +2,13 @@ package chat
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
-	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -14,25 +17,27 @@ import (
 	"genesis-agent/internal/domain"
 	"genesis-agent/internal/runtime/progress"
 	approval "genesis-agent/products/cli/internal/approval"
+	"genesis-agent/products/cli/internal/tui/clipboard"
 	"genesis-agent/products/cli/internal/tui/styles"
 )
 
 // 固定 UI 元素占用行数
 // 注意：各行数需与 View() 中的实际渲染保持一致
 const (
-	headerLines = 2 // 标题行（1）+ 分隔线（1）
-	footerLines = 2 // 状态栏（1）+ 帮助栏（1）
-	inputLines  = 3 // 上边框（1）+ 内容（1）+ 下边框（1）
-	minViewport = 5 // 消息区最小可用行数
+	headerLines            = 2                      // 标题行（1）+ 分隔线（1）
+	footerLines            = 2                      // 状态栏（1）+ 帮助栏（1）
+	inputLines             = 6                      // 上边框（1）+ 内容/textarea（3）+ 字数（1）+ 下边框（1）
+	minViewport            = 5                      // 消息区最小可用行数
+	progressRenderInterval = 125 * time.Millisecond // 最多 8Hz 刷新进度区
 )
 
 // Model 是 Bubble Tea 的核心状态机
 // 实现 tea.Model 接口：Init() / Update() / View()
 type Model struct {
 	// ── Bubble Tea 组件 ────────────────────────────────────────
-	viewport  viewport.Model  // 可滚动消息历史区
-	textinput textinput.Model // 单行文本输入框
-	spinner   spinner.Model   // 等待时的加载动画
+	viewport viewport.Model // 可滚动消息历史区
+	textarea textarea.Model // 多行文本输入框
+	spinner  spinner.Model  // 等待时的加载动画
 
 	// ── 运行时依赖（构造函数注入）────────────────────────────
 	ctx      context.Context    // 携带取消信号的上下文
@@ -41,12 +46,16 @@ type Model struct {
 	session  *domain.Session    // 当前对话会话
 
 	// ── 对话状态 ──────────────────────────────────────────────
-	messages      []uiMessage      // 当前会话所有消息（用于 View 渲染）
-	loading       bool             // 是否正在等待 Agent 推理响应
-	err           error            // 最近一次错误（nil 表示无错误）
-	progressCh    chan progressMsg // 当前 run 的进度事件通道
-	currentStatus string           // 状态栏当前展示文本
-	progressLog   []string         // 最近的过程摘要，独立于最终回答
+	messages             []uiMessage      // 当前会话所有消息（用于 View 渲染）
+	loading              bool             // 是否正在等待 Agent 推理响应
+	err                  error            // 最近一次错误（nil 表示无错误）
+	progressCh           chan progressMsg // 当前 run 的进度事件通道
+	currentStatus        string           // 状态栏当前展示文本
+	progressLog          []string         // 最近的过程摘要，独立于最终回答
+	progressExpanded     bool             // 运行过程日志是否展开（o 键切换）
+	progressDirty        bool             // 有尚未绘制的进度更新
+	lastProgressRenderAt time.Time        // 最近一次进度区重绘时刻
+	runStartedAt         time.Time        // 当前轮次开始时间，用于失败摘要
 
 	// ── 布局状态 ──────────────────────────────────────────────
 	width  int  // 当前终端宽度（通过 WindowSizeMsg 更新）
@@ -56,6 +65,35 @@ type Model struct {
 	// ── 审批流状态 ────────────────────────────────────────────
 	activeApproval *approval.ApprovalRequiredMsg // 当前等待人工确认的审批请求
 	approvalFocus  bool                          // 当前是否为审批输入拦截状态
+
+	// ── 计划状态 ──────────────────────────────────────────────
+	currentPlan  *domain.Plan // 当前活跃计划（nil 表示无计划）
+	planExpanded bool         // 计划卡片是否展开（true=展开，false=折叠为单行摘要）
+
+	// ── Toast 状态 ────────────────────────────────────────────
+	toast          string    // 短时提示文本（空则不显示）
+	toastExpiresAt time.Time // toast 过期时间
+
+	// ── Ctrl+C 状态 ─────────────────────────────────────────
+	parentCtx   context.Context // 根 context（不被 cancelFn 取消，重建子 ctx 时使用）
+	ctrlCLastAt *time.Time      // 空闲态首次按下 Ctrl+C 的时刻（用于二次确认退出）
+
+	// ── 输入历史 ──────────────────────────────────────────────
+	history    []string // 用户已发送输入历史
+	historyIdx int      // 当前历史索引，-1 表示未处于浏览态
+	tempInput  string   // 浏览前暂存的草稿输入
+
+	// ── Phase 3 交互增强 ───────────────────────────────────────
+	selectMode   bool // 消息级选择模式
+	selectAnchor int  // 选择起点；-1 表示尚未标记
+	selectCursor int  // 当前选择光标，对应 selectableMessageIndexes 的下标
+	helpOverlay  bool // 快捷键与命令帮助覆盖层
+
+	commandSuggestionIndex  int    // Tab 循环补全当前候选下标；-1 表示未激活
+	commandSuggestionPrefix string // 本轮补全的初始前缀，保证 Tab 能循环候选
+	commandMenuOpen         bool   // / 命令选择菜单是否展示
+	commandMenuIndex        int    // 菜单中当前高亮项
+	commandMenuQuery        string // 打开菜单时的查询文本
 }
 
 // NewModel 创建 TUI 对话界面 Model（Bubble Tea 入口）
@@ -65,19 +103,27 @@ func NewModel(
 	svc app.AgentService,
 	session *domain.Session,
 ) Model {
+	// 保留根 context，取消后重建可取消子 context 时需要
+	parentCtx := ctx
 	// 创建可取消的子上下文，用于 Ctrl+C 时取消正在执行的 LLM 请求
-	ctx, cancelFn := context.WithCancel(ctx)
+	ctx, cancelFn := context.WithCancel(parentCtx)
 
-	// 配置文本输入框
-	ti := textinput.New()
-	ti.Placeholder = "输入消息... (Enter 发送 | /help 查看命令 | Ctrl+C 退出)"
-	ti.CharLimit = 2000
-	ti.Focus()
-	ti.PromptStyle = lipgloss.NewStyle().
-		Foreground(styles.ColorPrimary).
-		Bold(true)
-	ti.TextStyle = lipgloss.NewStyle().
-		Foreground(styles.ColorWhite)
+	// 配置多行文本输入框
+	ta := textarea.New()
+	ta.Placeholder = "输入消息... (Enter 发送 | Shift+Enter/Ctrl+J 换行 | Ctrl+Y 复制)"
+	ta.CharLimit = 4000
+	ta.SetHeight(3) // 默认高度 3 行
+	ta.Focus()
+	ta.Prompt = "" // 不加前导字符，使其更像现代聊天输入框
+
+	// 配置样式
+	ta.FocusedStyle.Base = lipgloss.NewStyle()
+	ta.FocusedStyle.Placeholder = lipgloss.NewStyle().Foreground(styles.ColorGray)
+	ta.FocusedStyle.Text = lipgloss.NewStyle().Foreground(styles.ColorWhite)
+
+	ta.BlurredStyle.Base = lipgloss.NewStyle()
+	ta.BlurredStyle.Placeholder = lipgloss.NewStyle().Foreground(styles.ColorDarkGray)
+	ta.BlurredStyle.Text = lipgloss.NewStyle().Foreground(styles.ColorGray)
 
 	// 配置加载动画
 	s := spinner.New()
@@ -89,13 +135,17 @@ func NewModel(
 	vp.SetContent("")
 
 	return Model{
-		ctx:       ctx,
-		cancelFn:  cancelFn,
-		svc:       svc,
-		session:   session,
-		viewport:  vp,
-		textinput: ti,
-		spinner:   s,
+		parentCtx:              parentCtx,
+		ctx:                    ctx,
+		cancelFn:               cancelFn,
+		svc:                    svc,
+		session:                session,
+		viewport:               vp,
+		textarea:               ta,
+		spinner:                s,
+		historyIdx:             -1, // 初始化为未浏览历史状态
+		selectAnchor:           -1,
+		commandSuggestionIndex: -1,
 	}
 }
 
@@ -103,6 +153,8 @@ func NewModel(
 // 本轮运行中的进度条仍由 progress 事件驱动；水合只负责历史/恢复场景。
 func (m *Model) hydrateFromSession() {
 	m.messages = nil
+	m.currentPlan = nil
+	m.planExpanded = false
 	if m.svc == nil || m.session == nil || m.session.ID == "" {
 		m.messages = append(m.messages, welcomeMsg(m.modelName(), m.shortSessionID()))
 		return
@@ -124,16 +176,21 @@ func (m *Model) hydrateFromSession() {
 	if len(m.messages) == 0 {
 		m.messages = append(m.messages, welcomeMsg(m.modelName(), m.shortSessionID()))
 	}
+	// 从消息历史中恢复计划状态（取最后一条 plan_snapshot）
+	m.currentPlan = loadPlanFromMessages(hist)
+	if m.currentPlan != nil {
+		m.planExpanded = true // 恢复后默认展开，让用户直观看到当前进度
+	}
 }
 
 // Init 返回 Bubble Tea 初始化命令（启动光标闪烁）
 func (m Model) Init() tea.Cmd {
-	return textinput.Blink
+	return textarea.Blink
 }
 
 // viewportHeight 计算消息区可用行数（总高度减去所有固定 UI 元素）
 func (m Model) viewportHeight() int {
-	h := m.height - headerLines - footerLines - inputLines
+	h := m.height - headerLines - footerLines - inputLines - m.commandMenuHeight()
 	if h < minViewport {
 		return minViewport
 	}
@@ -144,23 +201,41 @@ func (m Model) viewportHeight() int {
 // 在每次 messages 变化后调用
 func (m *Model) refreshViewportContent() {
 	msgs := m.messages
-	if m.loading && (len(m.progressLog) > 0 || m.activeApproval != nil) {
-		tempMsgs := make([]uiMessage, len(m.messages)+1)
-		copy(tempMsgs, m.messages)
+
+	// 收集加载期间的附加系统消息（进度/审批/计划）
+	var extraMsgs []uiMessage
+	if m.loading {
 		if m.activeApproval != nil {
-			tempMsgs[len(m.messages)] = uiMessage{
+			extraMsgs = append(extraMsgs, uiMessage{
 				role:    "system",
 				content: m.renderApprovalCard(),
-			}
-		} else {
-			tempMsgs[len(m.messages)] = uiMessage{
-				role:    "system",
-				content: m.progressSummaryMessage(),
-			}
+			})
+		} else if len(m.progressLog) > 0 {
+			extraMsgs = append(extraMsgs, uiMessage{
+				role:            "system",
+				isProgress:      true,
+				progressLog:     m.progressLog,
+				activityOutcome: "进行中",
+			})
 		}
+	}
+
+	// 计划卡片：加载中或空闲时只要有活跃计划就持续显示
+	if m.currentPlan != nil {
+		extraMsgs = append(extraMsgs, uiMessage{
+			role:    "system",
+			content: m.renderPlanCard(),
+		})
+	}
+
+	if len(extraMsgs) > 0 {
+		tempMsgs := make([]uiMessage, len(m.messages)+len(extraMsgs))
+		copy(tempMsgs, m.messages)
+		copy(tempMsgs[len(m.messages):], extraMsgs)
 		msgs = tempMsgs
 	}
-	m.viewport.SetContent(renderMessages(msgs, m.width))
+
+	m.viewport.SetContent(renderMessages(msgs, m.width, m.progressExpanded, m.selectMode, m.selectAnchor, m.selectCursor))
 }
 
 func (m *Model) renderApprovalCard() string {
@@ -205,7 +280,473 @@ func (m *Model) renderApprovalCard() string {
 	return borderStyle.Render(content)
 }
 
+// renderPlanCard 渲染当前活跃计划的 TUI 卡片
+// 样式：蓝色圆角边框 + 进度条 + 条目列表（✓绿/▶黄/☐灰）
+func (m *Model) renderPlanCard() string {
+	if m.currentPlan == nil {
+		return ""
+	}
+	p := m.currentPlan
+	contentWidth := m.width - 8 // 边框(2) + padding(4) + margin(2)
+	if contentWidth < 20 {
+		contentWidth = 20
+	}
+
+	// 折叠模式：只显示一行摘要
+	if !m.planExpanded {
+		done := p.DoneCount()
+		total := p.TotalCount()
+		summary := fmt.Sprintf("📋 %s  %s  %d/%d · [p] 展开",
+			p.Title,
+			styles.ProgressBar(p.ProgressPct(), 10),
+			done, total,
+		)
+		return styles.PlanBorder.Width(m.width - 4).Render(
+			styles.PlanTitle.Render(summary),
+		)
+	}
+
+	// 展开模式：完整卡片
+	var sb strings.Builder
+
+	// 标题行
+	titleLine := fmt.Sprintf("📋 %s  (v%d)", p.Title, p.Version)
+	sb.WriteString(styles.PlanTitle.Render(titleLine))
+	sb.WriteString("\n")
+
+	// 进度行
+	pct := p.ProgressPct()
+	progressLine := fmt.Sprintf("%s  %d/%d (%d%%)",
+		styles.ProgressBar(pct, 20),
+		p.DoneCount(), p.TotalCount(), pct,
+	)
+	sb.WriteString(styles.PlanProgressBar.Render(progressLine))
+	sb.WriteString("\n")
+
+	if p.Summary != "" {
+		sb.WriteString(styles.PlanHint.Render(p.Summary))
+		sb.WriteString("\n")
+	}
+	sb.WriteString("\n")
+
+	// 条目列表
+	for _, item := range p.Items {
+		var icon, text string
+		switch item.Status {
+		case domain.PlanItemDone:
+			icon = styles.PlanItemDone.Render("✓")
+			text = styles.PlanItemDone.Render(item.Text)
+			if item.Note != "" {
+				text += styles.PlanHint.Render(" (" + item.Note + ")")
+			}
+		case domain.PlanItemDoing:
+			icon = styles.PlanItemDoing.Render("▶")
+			text = styles.PlanItemDoing.Render(item.Text)
+		case domain.PlanItemFailed:
+			icon = styles.PlanItemFailed.Render("✗")
+			text = styles.PlanItemFailed.Render(item.Text)
+			if item.Note != "" {
+				text += styles.PlanHint.Render(" (" + item.Note + ")")
+			}
+		case domain.PlanItemSkipped:
+			icon = styles.PlanItemPending.Render("-")
+			text = styles.PlanItemPending.Render(item.Text)
+		default: // pending
+			icon = styles.PlanItemPending.Render("☐")
+			text = item.Text
+		}
+		sb.WriteString(fmt.Sprintf("  %s  %s\n", icon, text))
+	}
+
+	// 底部提示
+	sb.WriteString("\n")
+	hint := "[p] 折叠"
+	if p.IsCompleted() {
+		hint = "✓ 全部完成  " + hint
+	}
+	sb.WriteString(styles.PlanHint.Render(hint))
+
+	return styles.PlanBorder.Width(m.width - 4).Render(sb.String())
+}
+
+// loadPlanFromMessages 从消息列表中找最后一条 plan_snapshot 恢复计划
+func loadPlanFromMessages(msgs []*domain.Message) *domain.Plan {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Kind == domain.MessageKindPlanSnapshot && msgs[i].Content != "" {
+			var plan domain.Plan
+			if err := json.Unmarshal([]byte(msgs[i].Content), &plan); err == nil {
+				return &plan
+			}
+		}
+	}
+	return nil
+}
+
+// ── Toast 辅助 ────────────────────────────────────────────────
+
+// showToast 显示一条短时提示（2 秒后自动清除）并返回清除 Cmd。
+func (m Model) showToast(text string) (tea.Model, tea.Cmd) {
+	m.toast = text
+	m.toastExpiresAt = time.Now().Add(2 * time.Second)
+	m.refreshViewportContent()
+	return m, clearToastAfter(2 * time.Second)
+}
+
+// clearToastAfter 在 d 时间后发出 clearToastMsg，由 Update 清除 toast。
+func clearToastAfter(d time.Duration) tea.Cmd {
+	return func() tea.Msg {
+		time.Sleep(d)
+		return clearToastMsg{}
+	}
+}
+
+// ── 中断辅助 ─────────────────────────────────────────────────
+
+// cancelCurrentRound 取消当前推理轮次：
+// 调用 cancelFn 终止进行中的 LLM 请求，然后重建可取消子 context，
+// 恢复为 Idle 态（不退出程序）。
+func (m Model) cancelCurrentRound() Model {
+	m.cancelFn()
+	ctx, cancelFn := context.WithCancel(m.parentCtx)
+	m.ctx = ctx
+	m.cancelFn = cancelFn
+	m.loading = false
+	m.currentStatus = ""
+	m.progressCh = nil
+	m.activeApproval = nil
+	m.approvalFocus = false
+	m.textarea.Focus()
+	return m
+}
+
+// ── 复制辅助 ─────────────────────────────────────────────────
+
+// copyLastAssistant 复制最近一条 assistant 消息到系统剪贴板。
+func (m Model) copyLastAssistant() (tea.Model, tea.Cmd) {
+	text, ok := m.lastMessageContent("assistant")
+	if !ok {
+		return m.showToast("暂无可复制的回答")
+	}
+	if err := clipboard.Write(text); err != nil {
+		return m.showCopyFailureToast(err)
+	}
+	return m.showToast("✓ 已复制到剪贴板")
+}
+
+// copyLastUser 复制最近一条 user 消息到系统剪贴板。
+func (m Model) copyLastUser() (tea.Model, tea.Cmd) {
+	text, ok := m.lastMessageContent("user")
+	if !ok {
+		return m.showToast("暂无可复制的用户消息")
+	}
+	if err := clipboard.Write(text); err != nil {
+		return m.showCopyFailureToast(err)
+	}
+	return m.showToast("✓ 已复制用户消息")
+}
+
+func (m Model) lastMessageContent(role string) (string, bool) {
+	for i := len(m.messages) - 1; i >= 0; i-- {
+		if m.messages[i].role == role {
+			text := strings.TrimSpace(m.messages[i].content)
+			if text == "" {
+				continue
+			}
+			return text, true
+		}
+	}
+	return "", false
+}
+
+// copyAllTranscript 复制全部可见 transcript（纯文本，去掉 ANSI 样式）。
+func (m Model) copyAllTranscript() (tea.Model, tea.Cmd) {
+	if len(m.messages) == 0 {
+		return m.showToast("对话为空")
+	}
+	var sb strings.Builder
+	for _, msg := range m.messages {
+		if msg.role == "system" {
+			continue // 跳过内部 system 消息（进度/审批/计划）
+		}
+		prefix := "你"
+		if msg.role == "assistant" {
+			prefix = "Agent"
+		}
+		sb.WriteString(prefix)
+		sb.WriteString(": ")
+		sb.WriteString(strings.TrimSpace(msg.content))
+		sb.WriteString("\n\n")
+	}
+	text := strings.TrimSpace(sb.String())
+	if text == "" {
+		return m.showToast("对话为空")
+	}
+	if err := clipboard.Write(text); err != nil {
+		return m.showCopyFailureToast(err)
+	}
+	return m.showToast(fmt.Sprintf("✓ 已复制全部对话（%d 条消息）", len(m.messages)))
+}
+
+func (m Model) showCopyFailureToast(err error) (tea.Model, tea.Cmd) {
+	return m.showToast("复制失败: " + err.Error() + "；可输入 /copy 重试或检查终端环境")
+}
+
+// selectableMessageIndexes 返回可在选择模式中复制的用户和 Agent 消息。
+func (m Model) selectableMessageIndexes() []int {
+	indexes := make([]int, 0, len(m.messages))
+	for i, msg := range m.messages {
+		if msg.role == "user" || msg.role == "assistant" {
+			indexes = append(indexes, i)
+		}
+	}
+	return indexes
+}
+
+func (m Model) enterSelectMode() (tea.Model, tea.Cmd) {
+	indexes := m.selectableMessageIndexes()
+	if len(indexes) == 0 {
+		return m.showToast("暂无可选择的消息")
+	}
+	m.selectMode = true
+	m.selectCursor = len(indexes) - 1
+	m.selectAnchor = m.selectCursor
+	m.textarea.Blur()
+	m.refreshViewportContent()
+	return m, nil
+}
+
+func (m Model) exitSelectMode() Model {
+	m.selectMode = false
+	m.selectAnchor = -1
+	m.commandSuggestionIndex = -1
+	m.commandSuggestionPrefix = ""
+	m.textarea.Focus()
+	m.refreshViewportContent()
+	return m
+}
+
+func (m Model) showHelpOverlay() (tea.Model, tea.Cmd) {
+	m.helpOverlay = true
+	m.textarea.Blur()
+	return m, nil
+}
+
+func (m Model) closeHelpOverlay() Model {
+	m.helpOverlay = false
+	m.textarea.Focus()
+	return m
+}
+
+func (m Model) moveSelection(delta int) Model {
+	indexes := m.selectableMessageIndexes()
+	if len(indexes) == 0 {
+		return m
+	}
+	m.selectCursor += delta
+	if m.selectCursor < 0 {
+		m.selectCursor = 0
+	}
+	if m.selectCursor >= len(indexes) {
+		m.selectCursor = len(indexes) - 1
+	}
+	m.refreshViewportContent()
+	return m
+}
+
+func (m Model) copySelection() (tea.Model, tea.Cmd) {
+	indexes := m.selectableMessageIndexes()
+	if len(indexes) == 0 || m.selectCursor < 0 || m.selectCursor >= len(indexes) {
+		return m.showToast("暂无可复制的选择内容")
+	}
+	start, end := m.selectAnchor, m.selectCursor
+	if start < 0 {
+		start = end
+	}
+	if start > end {
+		start, end = end, start
+	}
+	var content strings.Builder
+	for i := start; i <= end; i++ {
+		msg := m.messages[indexes[i]]
+		prefix := "你"
+		if msg.role == "assistant" {
+			prefix = "Agent"
+		}
+		fmt.Fprintf(&content, "%s: %s\n\n", prefix, strings.TrimSpace(msg.content))
+	}
+	text := strings.TrimSpace(content.String())
+	if err := clipboard.Write(text); err != nil {
+		return m.showCopyFailureToast(err)
+	}
+	m = m.exitSelectMode()
+	return m.showToast("已复制选择的消息")
+}
+
+type slashCommand struct {
+	value       string
+	description string
+}
+
+var slashCommands = []slashCommand{
+	{value: "/clear", description: "清空当前会话"},
+	{value: "/copy", description: "复制最近回答"},
+	{value: "/copy all", description: "复制全部对话"},
+	{value: "/copy user", description: "复制最近输入"},
+	{value: "/exit", description: "退出 TUI"},
+	{value: "/help", description: "打开帮助"},
+	{value: "/quit", description: "退出 TUI"},
+	{value: "/remember", description: "保存长期记忆"},
+	{value: "/resume", description: "恢复指定会话"},
+}
+
+func (m Model) completeSlashCommand() Model {
+	input := strings.TrimSpace(m.textarea.Value())
+	if !strings.HasPrefix(input, "/") {
+		m.commandSuggestionIndex = -1
+		m.commandSuggestionPrefix = ""
+		return m
+	}
+	prefix := input
+	if m.commandSuggestionIndex >= 0 && m.commandSuggestionPrefix != "" {
+		prefix = m.commandSuggestionPrefix
+	} else {
+		m.commandSuggestionPrefix = input
+	}
+	candidates := matchingSlashCommands(prefix)
+	if len(candidates) == 0 {
+		m.commandSuggestionIndex = -1
+		m.commandSuggestionPrefix = ""
+		return m
+	}
+	m.commandSuggestionIndex = (m.commandSuggestionIndex + 1) % len(candidates)
+	completion := candidates[m.commandSuggestionIndex].value
+	if completion == "/copy" || completion == "/remember" || completion == "/resume" {
+		completion += " "
+	}
+	m.textarea.SetValue(completion)
+	m.textarea.CursorEnd()
+	return m
+}
+
+func matchingSlashCommands(query string) []slashCommand {
+	query = strings.ToLower(strings.TrimSpace(query))
+	if !strings.HasPrefix(query, "/") {
+		return nil
+	}
+	commands := make([]slashCommand, 0, len(slashCommands))
+	for _, command := range slashCommands {
+		if strings.HasPrefix(command.value, query) {
+			commands = append(commands, command)
+		}
+	}
+	return commands
+}
+
+func (m *Model) syncCommandMenu() {
+	query := strings.TrimSpace(m.textarea.Value())
+	commands := matchingSlashCommands(query)
+	if len(commands) == 0 || m.loading || m.helpOverlay || m.selectMode {
+		m.commandMenuOpen = false
+		m.commandMenuIndex = 0
+		m.commandMenuQuery = ""
+		m.viewport.Height = m.viewportHeight()
+		return
+	}
+	if !m.commandMenuOpen || m.commandMenuQuery != query {
+		m.commandMenuIndex = 0
+	}
+	m.commandMenuOpen = true
+	m.commandMenuQuery = query
+	if m.commandMenuIndex >= len(commands) {
+		m.commandMenuIndex = len(commands) - 1
+	}
+	m.viewport.Height = m.viewportHeight()
+}
+
+func (m Model) commandMenuCommands() []slashCommand {
+	if !m.commandMenuOpen {
+		return nil
+	}
+	return matchingSlashCommands(m.commandMenuQuery)
+}
+
+func (m Model) commandMenuHeight() int {
+	commands := m.commandMenuCommands()
+	if len(commands) == 0 {
+		return 0
+	}
+	visible := len(commands)
+	if visible > 5 {
+		visible = 5
+	}
+	return visible + 1
+}
+
+func (m Model) moveCommandMenu(delta int) Model {
+	commands := m.commandMenuCommands()
+	if len(commands) == 0 {
+		return m
+	}
+	m.commandMenuIndex = (m.commandMenuIndex + delta + len(commands)) % len(commands)
+	return m
+}
+
+func (m Model) applyCommandMenuSelection() Model {
+	commands := m.commandMenuCommands()
+	if len(commands) == 0 {
+		return m
+	}
+	selection := commands[m.commandMenuIndex].value
+	if selection == "/copy" || selection == "/remember" || selection == "/resume" {
+		selection += " "
+	}
+	m.textarea.SetValue(selection)
+	m.textarea.CursorEnd()
+	m.commandMenuOpen = false
+	m.commandMenuQuery = ""
+	m.viewport.Height = m.viewportHeight()
+	return m
+}
+
+func (m Model) sandboxLabel() string {
+	if m.svc == nil || m.svc.Config() == nil {
+		return "sandbox:unknown"
+	}
+	cfg := m.svc.Config().Sandbox
+	if !cfg.Enabled || cfg.DefaultExecution == "disabled" {
+		return "sandbox:off"
+	}
+	if cfg.Mode != "" {
+		return "sandbox:" + cfg.Mode
+	}
+	return "sandbox:on"
+}
+
+// contextUsageLabel 根据当前可见 transcript 和模型窗口估算上下文占用。
+// 该值用于交互提示，不作为计费或截断决策依据。
+func (m Model) contextUsageLabel() string {
+	if m.svc == nil || m.svc.Config() == nil {
+		return ""
+	}
+	resolved, err := m.svc.Config().LLM.ResolveRoute("chat")
+	if err != nil || resolved.ContextWindow <= 0 {
+		return ""
+	}
+	chars := 0
+	for _, message := range m.messages {
+		chars += len([]rune(message.content))
+	}
+	// 对中英文混合文本采用保守近似：每 2 个字符约为 1 token。
+	estimatedTokens := (chars + 1) / 2
+	pct := estimatedTokens * 100 / resolved.ContextWindow
+	if pct > 100 {
+		pct = 100
+	}
+	return fmt.Sprintf("ctx~%d%%", pct)
+}
+
 func waitProgress(ch <-chan progressMsg) tea.Cmd {
+
 	return func() tea.Msg {
 		if ch == nil {
 			return nil
@@ -216,6 +757,12 @@ func waitProgress(ch <-chan progressMsg) tea.Cmd {
 		}
 		return msg
 	}
+}
+
+func flushProgressAfter(delay time.Duration) tea.Cmd {
+	return tea.Tick(delay, func(time.Time) tea.Msg {
+		return flushProgressMsg{}
+	})
 }
 
 // runAgentCmd 构造一个 Bubble Tea Cmd，在后台 goroutine 中执行 Agent 推理
@@ -238,6 +785,7 @@ func (m Model) runAgentCmd(input string, progressCh chan<- progressMsg) tea.Cmd 
 		result, err := m.svc.RunOnce(m.ctx, app.RunRequest{
 			SessionID:  m.session.ID,
 			TenantID:   m.session.TenantID,
+			UserID:     m.session.UserID,
 			Input:      input,
 			OnProgress: emit,
 		})
@@ -255,6 +803,9 @@ func (m Model) runAgentCmd(input string, progressCh chan<- progressMsg) tea.Cmd 
 
 // modelName 返回当前 LLM 模型名（用于标题栏显示）
 func (m Model) modelName() string {
+	if m.svc == nil {
+		return "unknown"
+	}
 	if agent := m.svc.DefaultAgent(); agent != nil && agent.DefaultModel != "" {
 		return agent.DefaultModel
 	}
@@ -268,6 +819,9 @@ func (m Model) modelName() string {
 
 // shortSessionID 返回截短的会话 ID（避免标题栏过长）
 func (m Model) shortSessionID() string {
+	if m.session == nil {
+		return "unknown"
+	}
 	if len(m.session.ID) > 22 {
 		return m.session.ID[:22] + "…"
 	}
@@ -276,17 +830,36 @@ func (m Model) shortSessionID() string {
 
 // helpText /help 命令显示的帮助内容
 const helpText = `可用命令（以 / 开头）:
-  /clear   清空当前会话历史，开始新对话
-  /help    显示此帮助
-  /quit    退出程序
+  /remember <内容>  让智能体主动记住个人偏好或代码知识
+  /clear            清空当前会话历史，开始新对话
+  /copy             复制最近一次 Agent 的最终回答到剪贴板
+  /copy user        复制最近一次用户消息到剪贴板
+  /copy all         复制整段可见对话（纯文本格式）到剪贴板
+  /resume [ID]      恢复指定会话；省略 ID 时恢复最近会话
+  /sessions         列出最近会话
+  /help             显示此帮助
+  /quit             退出程序
+
+直接输入以下前缀也可让智能体记住内容：
+  #记住 <内容>      示例: #记住 数据库连接首选 PostgreSQL
+  #remember <内容>
 
 快捷键:
   Enter    发送消息
-  Esc      清空输入框
-  Ctrl+C   退出程序
+  Esc      推理中取消本轮 / 空闲时清空输入框
+  Ctrl+C   推理中取消本轮 / 空闲时按两次退出
+  Ctrl+D   退出程序
+  Ctrl+Y   复制最近一次 Agent 回答到系统剪贴板
+  /        自动显示命令菜单；↑/↓ 选择，Enter 使用
+  Tab      补全当前斜杠命令
+  v        输入为空时进入消息选择模式
+  j / k    选择模式中移动消息
+  y        选择模式中复制消息
+  p        展开/折叠计划卡片（输入区域为空时生效）
   ↑ / ↓    滚动消息历史（一行）
   PgUp     向上翻页
-  PgDn     向下翻页`
+  PgDn     向下翻页
+  鼠标滚轮 滚动消息；终端原生拖选请按住 Shift（若终端支持）`
 
 // welcomeMsg 首次进入对话时显示的欢迎消息
 func welcomeMsg(modelName, sessionID string) uiMessage {

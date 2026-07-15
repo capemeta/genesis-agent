@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	contract "genesis-agent/internal/capabilities/memory/contract"
 	"genesis-agent/internal/domain"
 	"genesis-agent/internal/platform/logger"
 	"genesis-agent/internal/runtime"
@@ -13,18 +14,29 @@ type memStore struct {
 	msgs []*domain.Message
 }
 
-func (m *memStore) AppendMessages(_ context.Context, _ string, messages []*domain.Message) error {
+func (m *memStore) Append(_ context.Context, _ contract.SessionRef, messages []*domain.Message) error {
 	m.msgs = append(m.msgs, messages...)
 	return nil
 }
 
-func (m *memStore) GetHistory(context.Context, string) ([]*domain.Message, error) {
-	return append([]*domain.Message(nil), m.msgs...), nil
+func (m *memStore) GetRecent(_ context.Context, _ contract.SessionRef, _ contract.RecentOptions) (contract.RecentResult, error) {
+	return contract.RecentResult{
+		Messages:  append([]*domain.Message(nil), m.msgs...),
+		Truncated: false,
+	}, nil
 }
 
-func (m *memStore) ClearHistory(context.Context, string) error {
+func (m *memStore) Clear(_ context.Context, _ contract.SessionRef) error {
 	m.msgs = nil
 	return nil
+}
+
+func (m *memStore) Summarize(_ context.Context, _ contract.SessionRef, _ contract.SummarizeOptions) (contract.SummaryResult, error) {
+	return contract.SummaryResult{}, nil
+}
+
+func (m *memStore) GetSummary(_ context.Context, _ contract.SessionRef) (*domain.SessionSummary, error) {
+	return nil, nil
 }
 
 func TestPersistRunSessionMessagesSavesFullChain(t *testing.T) {

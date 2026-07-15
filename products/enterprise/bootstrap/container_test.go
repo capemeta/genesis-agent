@@ -16,7 +16,7 @@ func TestEnterpriseContainerWiresSkillTools(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 最小可校验配置；日志落到临时目录，避免与开发机 .genesis/logs 文件锁冲突。
-	cfg := []byte(`llm:
+	llmCfg := []byte(`llm:
   timeout: 30s
   providers:
     test:
@@ -31,12 +31,16 @@ func TestEnterpriseContainerWiresSkillTools(t *testing.T) {
       model: test-model
   router:
     default: fast
-log:
+`)
+	cfg := []byte(`log:
   level: info
   format: text
   dir: logs
 `)
 	if err := os.WriteFile(filepath.Join(configDir, "config.yaml"), cfg, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "llm.yaml"), llmCfg, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	c := enterprisebootstrap.NewContainer(&configDir, true)

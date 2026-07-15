@@ -3,11 +3,14 @@ package skill
 
 import (
 	"fmt"
-	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 
+	capcontract "genesis-agent/internal/capabilities/capability/contract"
+	marketpolicy "genesis-agent/internal/capabilities/package/marketplace/policy"
 	marketservice "genesis-agent/internal/capabilities/package/marketplace/service"
+	platformconfig "genesis-agent/internal/platform/config"
 	"genesis-agent/shared/local/skillmarket"
 )
 
@@ -48,22 +51,55 @@ func DefaultPaths() (Paths, error) {
 	}, nil
 }
 
+// MarketplaceOptions 控制 marketplace 与 runtime adapter 的共享。
+type MarketplaceOptions struct {
+	Adapters     capcontract.RuntimeAdapterRegistry
+	Install      platformconfig.SkillsInstallConfig
+	ConfigDir    string // 可选；空则不从磁盘重载，仅用 Install 字段
+	SkipLoadCfg  bool   // 测试用：跳过 LoadWithOptions
+}
+
 func NewMarketplaceService() (*marketservice.Service, Paths, error) {
+	return NewMarketplaceServiceWith(MarketplaceOptions{})
+}
+
+// NewMarketplaceServiceWith 创建 marketplace 服务；Adapters 非空时可与 MCP/Tool RuntimeAdapter 热更新闭环。
+func NewMarketplaceServiceWith(opts MarketplaceOptions) (*marketservice.Service, Paths, error) {
 	paths, err := DefaultPaths()
 	if err != nil {
 		return nil, Paths{}, err
 	}
+	installCfg := opts.Install
+	if !opts.SkipLoadCfg {
+		configDir := strings.TrimSpace(opts.ConfigDir)
+		if configDir == "" {
+			if _, err := os.Stat("configs"); err == nil {
+				configDir = "configs"
+			} else {
+				configDir = paths.ConfigHome
+			}
+		}
+		if cfg, err := platformconfig.LoadWithOptions(configDir, platformconfig.LoadOptions{Product: "cli"}); err == nil && cfg != nil {
+			installCfg = cfg.Skills.Install
+		}
+	}
+	hosts := installCfg.EffectiveAllowedHosts()
 	svc, err := marketservice.New(marketservice.Options{
 		Registry:     skillmarket.NewRegistryStore(paths.MarketplaceFile),
 		Installs:     skillmarket.NewInstallStore(paths.InstallFile),
 		Capabilities: skillmarket.NewCapabilityIndexStore(paths.CapabilityIndexFile),
-		Parser:       skillmarket.NewParser(),
-		Fetcher:      skillmarket.NewFetcher(paths.CacheDir, http.DefaultClient),
+		Parser:       skillmarket.NewParserWithHosts(hosts),
+		Fetcher:      skillmarket.NewFetcherWithHosts(paths.CacheDir, nil, hosts),
 		Installer: skillmarket.NewInstaller(skillmarket.InstallerOptions{
 			UserInstalledDir:    paths.UserInstalledDir,
 			ProjectInstalledDir: paths.ProjectInstalledDir,
 			ProjectPath:         paths.Workspace,
 		}),
+		Policy: marketpolicy.AllowHosts{
+			Hosts:      hosts,
+			AllowLocal: installCfg.EffectiveAllowLocal(),
+		},
+		Adapters: opts.Adapters,
 	})
 	if err != nil {
 		return nil, Paths{}, err

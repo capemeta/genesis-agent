@@ -15,6 +15,7 @@ type ArgvCommand struct {
 	Argv           []string
 	Cwd            string
 	Env            map[string]string
+	Stdin          []byte
 	DisplayCommand string
 	Shell          execmodel.ShellKind
 }
@@ -31,7 +32,7 @@ func (r *Runner) RunArgv(ctx context.Context, command ArgvCommand, opts execcont
 	if display == "" {
 		display = strings.Join(command.Argv, " ")
 	}
-	return r.runArgv(ctx, command.Argv, execResultMeta{Command: display, Cwd: command.Cwd, Shell: command.Shell, Env: command.Env}, opts)
+	return r.runArgv(ctx, command.Argv, execResultMeta{Command: display, Cwd: command.Cwd, Shell: command.Shell, Env: command.Env, Stdin: command.Stdin}, opts)
 }
 
 func newCommandContext(ctx context.Context, argv []string) *exec.Cmd {

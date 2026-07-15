@@ -14,12 +14,13 @@ import (
 type ErrorCode string
 
 const (
-	ErrCodeInvalidInput       ErrorCode = "invalid_input"
-	ErrCodePermissionDenied   ErrorCode = "permission_denied"
-	ErrCodeTimeout            ErrorCode = "timeout"
-	ErrCodeOutputLimit        ErrorCode = "output_limit"
-	ErrCodeRunnerFailed       ErrorCode = "runner_failed"
-	ErrCodeSandboxUnavailable ErrorCode = "sandbox_unavailable"
+	ErrCodeInvalidInput             ErrorCode = "invalid_input"
+	ErrCodePermissionDenied         ErrorCode = "permission_denied"
+	ErrCodeTimeout                  ErrorCode = "timeout"
+	ErrCodeOutputLimit              ErrorCode = "output_limit"
+	ErrCodeRunnerFailed             ErrorCode = "runner_failed"
+	ErrCodeSandboxUnavailable       ErrorCode = "sandbox_unavailable"
+	ErrCodeSandboxPolicyUnsupported ErrorCode = "sandbox_policy_unsupported"
 )
 
 // Error 携带稳定 code，方便工具输出和后续 HTTP/审计映射。

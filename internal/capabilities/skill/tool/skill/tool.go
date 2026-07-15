@@ -9,6 +9,8 @@ import (
 
 	approvalcontract "genesis-agent/internal/capabilities/approval/contract"
 	approvalmodel "genesis-agent/internal/capabilities/approval/model"
+	hookcontract "genesis-agent/internal/capabilities/hook/contract"
+	hookmodel "genesis-agent/internal/capabilities/hook/model"
 	skillcontract "genesis-agent/internal/capabilities/skill/contract"
 	"genesis-agent/internal/capabilities/skill/model"
 	tool "genesis-agent/internal/capabilities/tool/contract"
@@ -140,6 +142,18 @@ func (t *Tool) load(ctx context.Context, in input, modelCall bool, invocation st
 	if err != nil {
 		return "", err
 	}
+	if modelCall {
+		if dispatcher := hookcontract.FromContext(ctx); dispatcher != nil {
+			result, hookErr := dispatcher.Dispatch(ctx, hookmodel.Event{Name: hookmodel.EventPreSkillUse, MatchKey: meta.QualifiedName, Payload: map[string]any{"skill_name": meta.QualifiedName, "invocation": invocation}})
+			if hookErr != nil {
+				return "", fmt.Errorf("执行 PreSkillUse Hook 失败: %w", hookErr)
+			}
+			hookcontract.AppendAdditionalContext(ctx, result.AdditionalContext...)
+			if result.Blocked {
+				return "", fmt.Errorf("Skill %q 被 Hook 阻断: %s", meta.QualifiedName, result.BlockReason)
+			}
+		}
+	}
 	if defaultContext(meta.Context) == model.ContextModeFork {
 		// fork 语义预留给后续规范化 subagent 运行时：独立上下文、收窄工具/Skill/MCP、结果回传主线程。
 		// 当前不实现半吊子子 Run，避免与后续多 Agent / 子 Agent 设计冲突。
@@ -155,6 +169,15 @@ func (t *Tool) load(ctx context.Context, in input, modelCall bool, invocation st
 	injection, err := t.deps.Service.Load(ctx, skillcontract.LoadRequest{ResolveRequest: resolveReq, Args: in.Args})
 	if err != nil {
 		return "", err
+	}
+	if modelCall {
+		if dispatcher := hookcontract.FromContext(ctx); dispatcher != nil {
+			result, hookErr := dispatcher.Dispatch(ctx, hookmodel.Event{Name: hookmodel.EventPostSkillUse, MatchKey: injection.Skill.QualifiedName, Payload: map[string]any{"skill_name": injection.Skill.QualifiedName, "invocation": invocation, "injected": true}})
+			if hookErr != nil {
+				return "", fmt.Errorf("执行 PostSkillUse Hook 失败: %w", hookErr)
+			}
+			hookcontract.AppendAdditionalContext(ctx, result.AdditionalContext...)
+		}
 	}
 	// Content 仍放入 JSON 供 runtime parseSkillInjection；react_loop 会改为短 ToolResult + 单份 system injection。
 	return toJSON(output{

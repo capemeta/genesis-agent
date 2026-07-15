@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"genesis-agent/internal/app"
+	mcpstack "genesis-agent/internal/capabilities/mcp/stack"
 	"genesis-agent/products/enterprise/internal/interfaces/http/handler"
 )
 
@@ -38,17 +39,24 @@ func DefaultServerConfig() ServerConfig {
 type Server struct {
 	cfg    ServerConfig
 	svc    app.AgentService
+	mcp    *mcpstack.Stack
 	httpSv *http.Server
 }
 
 // NewServer 创建 HTTP API 服务器
 func NewServer(svc app.AgentService, cfg ServerConfig) *Server {
+	return NewServerWithMCP(svc, nil, cfg)
+}
+
+// NewServerWithMCP 创建带 MCP 管理面的 HTTP API 服务器。
+func NewServerWithMCP(svc app.AgentService, mcp *mcpstack.Stack, cfg ServerConfig) *Server {
 	s := &Server{
 		cfg: cfg,
 		svc: svc,
+		mcp: mcp,
 	}
 
-	mux := newRouter(svc)
+	mux := newRouter(svc, mcp)
 	s.httpSv = &http.Server{
 		Addr:         fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
 		Handler:      mux,

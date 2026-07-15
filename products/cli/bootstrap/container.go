@@ -3,9 +3,11 @@ package bootstrap
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 
@@ -18,6 +20,7 @@ import (
 	auditmemory "genesis-agent/internal/capabilities/audit/adapter/memory"
 	auditcontract "genesis-agent/internal/capabilities/audit/contract"
 	capcontract "genesis-agent/internal/capabilities/capability/contract"
+	capservice "genesis-agent/internal/capabilities/capability/service"
 	execsandbox "genesis-agent/internal/capabilities/execution/adapter/sandbox"
 	execcontract "genesis-agent/internal/capabilities/execution/contract"
 	execservice "genesis-agent/internal/capabilities/execution/service"
@@ -34,6 +37,10 @@ import (
 	"genesis-agent/internal/capabilities/filesystem/tool/toolkit"
 	walkdir "genesis-agent/internal/capabilities/filesystem/tool/walk_dir"
 	writefile "genesis-agent/internal/capabilities/filesystem/tool/write_file"
+	mcpstore "genesis-agent/internal/capabilities/mcp/adapter/store"
+	"genesis-agent/internal/capabilities/mcp/contract"
+	"genesis-agent/internal/capabilities/mcp/model"
+	mcpstack "genesis-agent/internal/capabilities/mcp/stack"
 	policyapproval "genesis-agent/internal/capabilities/policy/adapter/approval"
 	policyconfig "genesis-agent/internal/capabilities/policy/adapter/config"
 	profilemodel "genesis-agent/internal/capabilities/profile/model"
@@ -48,6 +55,7 @@ import (
 	scriptworkspace "genesis-agent/internal/capabilities/skill/script/workspace"
 	skillservice "genesis-agent/internal/capabilities/skill/service"
 	installskilldeps "genesis-agent/internal/capabilities/skill/tool/install_skill_dependencies"
+	installskillfromsource "genesis-agent/internal/capabilities/skill/tool/install_skill_from_source"
 	listskillresources "genesis-agent/internal/capabilities/skill/tool/list_skill_resources"
 	readskillresource "genesis-agent/internal/capabilities/skill/tool/read_skill_resource"
 	runskillcommand "genesis-agent/internal/capabilities/skill/tool/run_skill_command"
@@ -73,6 +81,7 @@ import (
 	localfs "genesis-agent/shared/local/filesystem"
 	localresolver "genesis-agent/shared/local/pathresolver"
 	localplan "genesis-agent/shared/local/plan"
+	windowssandbox "genesis-agent/shared/local/sandbox/windows"
 	localskill "genesis-agent/shared/local/skill"
 
 	httpfetcher "genesis-agent/internal/capabilities/web/adapter/fetch/http"
@@ -95,10 +104,12 @@ type Container struct {
 	sandbox       clisandbox.Config
 	workspaceRoot string
 
-	once    sync.Once
-	initErr error
-	bundle  *shared.RuntimeBundle
-	logging *logger.RuntimeLogging
+	once     sync.Once
+	initErr  error
+	bundle   *shared.RuntimeBundle
+	logging  *logger.RuntimeLogging
+	mcpStack *mcpstack.Stack
+	mcpStore contract.ApprovalStore
 }
 
 type productRuntime struct {
@@ -111,16 +122,30 @@ type productRuntime struct {
 	skillNameMatcher     react.SkillNameMatcher
 	skillMentionSelector react.SkillMentionSelector
 	skillExplicitLoader  react.SkillExplicitLoader
+	capabilityRegistry   capcontract.Registry
+	adapterRegistry      capcontract.RuntimeAdapterRegistry
+	approvalService      approvalcontract.Service
+	hookExecutionRunner  execcontract.ExecutionRunner
+	config               *platformconfig.Config
+	workspaceRoot        string
 }
 
 // Execute 执行 CLI 产品命令树。
 func Execute(ctx context.Context) error {
-	return command.ExecuteWithFactory(func(runCtx context.Context, opts command.ServiceOptions) (app.AgentService, error) {
-		if runCtx == nil {
-			runCtx = ctx
-		}
-		return NewServiceWithOptions(runCtx, opts)
-	})
+	return command.ExecuteWithFactories(
+		func(runCtx context.Context, opts command.ServiceOptions) (app.AgentService, error) {
+			if runCtx == nil {
+				runCtx = ctx
+			}
+			return NewServiceWithOptions(runCtx, opts)
+		},
+		func(runCtx context.Context, opts command.ServiceOptions) (command.MCPAdmin, error) {
+			if runCtx == nil {
+				runCtx = ctx
+			}
+			return OpenMCPAdmin(runCtx, opts)
+		},
+	)
 }
 
 // NewContainer 创建 CLI 产品容器。
@@ -174,30 +199,65 @@ func (c *Container) Init(ctx context.Context) error {
 			return
 		}
 		c.bundle, c.initErr = shared.BuildAgentService(ctx, shared.BuildOptions{
-			Product:              "cli",
-			ConfigDir:            configDir,
-			Quiet:                c.quiet,
-			RouteName:            "chat",
-			DefaultAgentID:       "default-agent",
-			DefaultAgentName:     "Genesis Agent",
-			Profile:              prof,
-			AdditionalTools:      runtime.tools,
-			PromptInjectors:      runtime.promptInjectors,
-			Logger:               runtime.logger,
-			AuditSink:            runtime.auditSink,
-			UsageSink:            runtime.usageSink,
-			Web:                  webOpts,
-			PlanRepository:       planRepo,
-			SkillNameMatcher:     runtime.skillNameMatcher,
-			SkillMentionSelector: runtime.skillMentionSelector,
-			SkillExplicitLoader:  runtime.skillExplicitLoader,
+			Product:               "cli",
+			ConfigDir:             configDir,
+			Quiet:                 c.quiet,
+			RouteName:             "chat",
+			DefaultAgentID:        "default-agent",
+			DefaultAgentName:      "Genesis Agent",
+			Profile:               prof,
+			AdditionalTools:       runtime.tools,
+			PromptInjectors:       runtime.promptInjectors,
+			Logger:                runtime.logger,
+			AuditSink:             runtime.auditSink,
+			UsageSink:             runtime.usageSink,
+			Web:                   webOpts,
+			PlanRepository:        planRepo,
+			SkillNameMatcher:      runtime.skillNameMatcher,
+			SkillMentionSelector:  runtime.skillMentionSelector,
+			SkillExplicitLoader:   runtime.skillExplicitLoader,
+			SubAgentMaxConcurrent: 3,
+			SubAgentApproval:      runtime.approvalService,
+			HookExecutionRunner:   runtime.hookExecutionRunner,
+			HookApproval:          runtime.approvalService,
 		})
 		if c.initErr != nil {
 			_ = c.logging.Close()
 			c.logging = nil
+			return
 		}
+		mcpStack, mcpStore, err := attachMCPStack(ctx, c.bundle, runtime, profilemodel.ChannelCLI, profilemodel.EnvironmentLocal)
+		if err != nil {
+			_ = c.logging.Close()
+			c.logging = nil
+			c.bundle = nil
+			c.initErr = err
+			return
+		}
+		c.mcpStack = mcpStack
+		c.mcpStore = mcpStore
 	})
 	return c.initErr
+}
+
+// Close 释放 MCP 连接与运行日志。
+func (c *Container) Close() error {
+	var first error
+	if c.mcpStack != nil {
+		if err := c.mcpStack.Close(context.Background()); err != nil {
+			first = err
+		}
+		c.mcpStack = nil
+	}
+	if c.logging != nil {
+		if err := c.logging.Close(); err != nil {
+			if first == nil {
+				first = err
+			}
+		}
+		c.logging = nil
+	}
+	return first
 }
 
 func isSandboxOverride(cfg clisandbox.Config) bool {
@@ -217,6 +277,12 @@ func (c *Container) Service() app.AgentService {
 	return c.bundle.AgentService
 }
 
+// MCPStack 返回已装配的 MCP 栈（可能为 nil 或空栈）。
+func (c *Container) MCPStack() *mcpstack.Stack { return c.mcpStack }
+
+// MCPApprovalStore 返回 project MCP 预连接审批存储。
+func (c *Container) MCPApprovalStore() contract.ApprovalStore { return c.mcpStore }
+
 func NewService(ctx context.Context, configDirRef *string, quiet bool) (app.AgentService, error) {
 	return NewServiceWithOptions(ctx, command.ServiceOptions{ConfigDirRef: configDirRef, Quiet: quiet})
 }
@@ -227,6 +293,49 @@ func NewServiceWithOptions(ctx context.Context, opts command.ServiceOptions) (ap
 		return nil, err
 	}
 	return c.Service(), nil
+}
+
+// OpenMCPAdmin 初始化 CLI 容器并返回 MCP 管理面句柄（list/approve/refresh）。
+func OpenMCPAdmin(ctx context.Context, opts command.ServiceOptions) (command.MCPAdmin, error) {
+	c := &Container{configDirRef: opts.ConfigDirRef, quiet: opts.Quiet, sandbox: opts.Sandbox, workspaceRoot: workspaceRootOrDot(opts.WorkspaceRoot)}
+	if err := c.Init(ctx); err != nil {
+		return nil, err
+	}
+	return &mcpAdmin{c: c}, nil
+}
+
+type mcpAdmin struct{ c *Container }
+
+func (a *mcpAdmin) Close() error {
+	if a == nil || a.c == nil {
+		return nil
+	}
+	return a.c.Close()
+}
+
+func (a *mcpAdmin) Enabled() bool {
+	return a != nil && a.c != nil && a.c.mcpStack != nil && a.c.mcpStack.Manager != nil
+}
+
+func (a *mcpAdmin) States() []model.ServerState {
+	if !a.Enabled() {
+		return nil
+	}
+	return a.c.mcpStack.Manager.States()
+}
+
+func (a *mcpAdmin) Refresh(ctx context.Context) error {
+	if !a.Enabled() {
+		return fmt.Errorf("MCP 未启用或未装配")
+	}
+	return a.c.mcpStack.Refresh(ctx)
+}
+
+func (a *mcpAdmin) ApprovalStore() contract.ApprovalStore {
+	if a == nil || a.c == nil {
+		return nil
+	}
+	return a.c.mcpStore
 }
 
 func buildProductRuntime(ctx context.Context, configDir string, cfg *platformconfig.Config, quiet bool, sandboxCfg clisandbox.Config, prof profilemodel.Profile, workspaceRoot string) (productRuntime, logger.Logger, error) {
@@ -271,11 +380,17 @@ func buildProductRuntime(ctx context.Context, configDir string, cfg *platformcon
 		return productRuntime{}, nil, err
 	}
 	tools := productTools
-	capabilityRegistry, _, err := cliskill.NewMarketplaceService()
+	adapterRegistry := capservice.NewAdapterRegistry()
+	marketSvc, _, err := cliskill.NewMarketplaceServiceWith(cliskill.MarketplaceOptions{
+		Adapters:  adapterRegistry,
+		ConfigDir: configDir,
+		Install:   cfg.Skills.Install,
+	})
 	if err != nil {
 		_ = runtimeLogging.Close()
 		return productRuntime{}, nil, err
 	}
+	capabilityRegistry := marketSvc
 	capabilityTools, err := buildCapabilityTools(ctx, capabilityRegistry)
 	if err != nil {
 		_ = runtimeLogging.Close()
@@ -354,13 +469,22 @@ func buildProductRuntime(ctx context.Context, configDir string, cfg *platformcon
 		_ = runtimeLogging.Close()
 		return productRuntime{}, nil, err
 	}
-	tools = append(tools, skillGateway, listResources, readResource, searchResources, runSkillCommand, installDeps)
+	installFromSource, err := installskillfromsource.New(installskillfromsource.Deps{
+		Installer: marketSvc,
+		Approval:  baseApprovalSvc,
+		Product:   "cli",
+	})
+	if err != nil {
+		_ = runtimeLogging.Close()
+		return productRuntime{}, nil, err
+	}
+	tools = append(tools, skillGateway, listResources, readResource, searchResources, runSkillCommand, installDeps, installFromSource)
 	skillMatcher := &skillcollision.Matcher{Service: skillSvc, CatalogRequest: catalogReq}
 	skillMentions := &react.MentionSelector{Service: skillSvc, CatalogRequest: catalogReq}
 	// system 仅短硬规则；完整 catalog 挂在 Skill 工具 DescriptionFunc。
 	injector := promptbuilder.ContextInjectorFunc(func(ctx context.Context, req promptbuilder.BuildRequest) (promptbuilder.Fragment, error) {
 		var b strings.Builder
-		b.WriteString("Skills 是任务流程包，不是可执行工具。加载技能必须调用 Skill(skill=...)；禁止把 office-ppt 等技能名当作独立工具调用。用户输入中的 $skill 或 skill:// 引用会在回合开始自动注入。可用技能列表见 Skill 工具描述中的 <available_skills>。若 run_skill_command 返回 failure_kind=dependency_missing：调用 install_skill_dependencies（须审批，仅装 runtime 白名单包）后，用相同参数再跑命令（安装成功会清零重复失败计数）；sandbox_violation 勿当成缺包。收到 failure_kind=repeated_failure：禁止再次提交相同调用，必须改参或改策略。收到 failure_kind=no_progress：必须总结阻塞或询问用户，禁止继续空转。")
+		b.WriteString("Skills 是任务流程包，不是可执行工具。加载技能必须调用 Skill(skill=...)；禁止把 office-ppt 等技能名当作独立工具调用。用户输入中的 $skill 或 skill:// 引用会在回合开始自动注入。可用技能列表见 Skill 工具描述中的 <available_skills>。用户给出 Skill 的 GitHub/URL 地址要求安装时：调用 install_skill_from_source（须审批），禁止 run_command/curl/git clone 旁路。若 run_skill_command 返回 failure_kind=dependency_missing：调用 install_skill_dependencies（须审批，仅装 runtime 白名单包）后，用相同参数再跑命令（安装成功会清零重复失败计数）；sandbox_violation 勿当成缺包。收到 failure_kind=repeated_failure：禁止再次提交相同调用，必须改参或改策略。收到 failure_kind=no_progress：必须总结阻塞或询问用户，禁止继续空转。")
 		b.WriteString("\n\nRun 文件落点：中间脚本/临时文件用 write_file(\"$WORK_DIR/...\")；最终交付进 $OUTPUT_DIR；禁止写到仓库根目录。")
 		if req.Run != nil && strings.TrimSpace(req.Run.ID) != "" {
 			if ws, err := scriptworkspace.PrepareLocalTask(workspaceRoot, req.Run.ID); err == nil {
@@ -389,7 +513,60 @@ func buildProductRuntime(ctx context.Context, configDir string, cfg *platformcon
 		skillNameMatcher:     skillMatcher,
 		skillMentionSelector: skillMentions,
 		skillExplicitLoader:  explicitLoader,
+		capabilityRegistry:   capabilityRegistry,
+		adapterRegistry:      adapterRegistry,
+		approvalService:      baseApprovalSvc,
+		hookExecutionRunner:  execStack.Runner,
+		config:               cfg,
+		workspaceRoot:        workspaceRoot,
 	}, log, nil
+}
+
+func attachMCPStack(ctx context.Context, bundle *shared.RuntimeBundle, runtime productRuntime, channel profilemodel.ChannelType, env profilemodel.RuntimeEnvironment) (*mcpstack.Stack, contract.ApprovalStore, error) {
+	store, err := openCLIApprovalStore()
+	if err != nil {
+		return nil, nil, err
+	}
+	if bundle == nil || bundle.ToolGateway == nil || runtime.config == nil || !runtime.config.MCP.Enabled {
+		return nil, store, nil
+	}
+	mcpStack, err := mcpstack.Build(ctx, mcpstack.Options{
+		Config:             runtime.config,
+		CapabilityIndex:    runtime.capabilityRegistry,
+		ToolRegistry:       bundle.ToolGateway,
+		ApprovalService:    runtime.approvalService,
+		CredentialSvc:      bundle.Credentials,
+		ApprovalStore:      store,
+		AdapterRegistry:    runtime.adapterRegistry,
+		ExistingAuthorizer: bundle.ToolGateway.Authorizer(),
+		Channel:            channel,
+		Environment:        env,
+		TenantID:           "dev",
+		Workspace:          runtime.workspaceRoot,
+		FailOnRequired:     false,
+		AuditSink:          runtime.auditSink,
+		Tracer:             bundle.Tracer,
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("初始化 MCP 栈失败: %w", err)
+	}
+	if mcpStack != nil && mcpStack.Authorizer != nil {
+		bundle.ToolGateway.SetAuthorizer(mcpStack.Authorizer)
+	}
+	return mcpStack, store, nil
+}
+
+func openCLIApprovalStore() (contract.ApprovalStore, error) {
+	home, err := os.UserHomeDir()
+	if err != nil || strings.TrimSpace(home) == "" {
+		return nil, fmt.Errorf("无法定位用户主目录以创建 mcp approvals")
+	}
+	path := filepath.Join(home, ".genesis-agent", "cli", "mcp-approvals.json")
+	store, err := mcpstore.NewFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("初始化 mcp approval store 失败: %w", err)
+	}
+	return store, nil
 }
 
 func buildCapabilityTools(ctx context.Context, registry capcontract.Registry) ([]toolcontract.Tool, error) {
@@ -438,7 +615,7 @@ func buildProductTools(sandboxCfg clisandbox.Config, baseApprovalSvc approvalcon
 		tools = append(tools, t)
 	}
 	directRunner := localexec.NewRunner()
-	sandboxRunner, sessionClient, fileClient, workspaceRef, err := buildSandboxStack(directRunner, sandboxCfg)
+	sandboxRunner, sessionClient, fileClient, workspaceRef, err := buildSandboxStack(directRunner, sandboxCfg, log)
 	if err != nil {
 		return nil, productExecStack{}, err
 	}
@@ -481,7 +658,7 @@ func buildProductTools(sandboxCfg clisandbox.Config, baseApprovalSvc approvalcon
 	}, nil
 }
 
-func buildSandboxStack(directRunner *localexec.Runner, sandboxCfg clisandbox.Config) (execcontract.SandboxRunner, sandboxcontract.SessionClient, sandboxcontract.FileSystemClient, sandboxcontract.WorkspaceRef, error) {
+func buildSandboxStack(directRunner *localexec.Runner, sandboxCfg clisandbox.Config, log logger.Logger) (execcontract.SandboxRunner, sandboxcontract.SessionClient, sandboxcontract.FileSystemClient, sandboxcontract.WorkspaceRef, error) {
 	switch sandboxCfg.Mode {
 	case clisandbox.ModeDockerSandbox, clisandbox.ModeRemoteSandbox:
 		client, err := sandboxhttp.New(sandboxhttp.Config{
@@ -503,6 +680,74 @@ func buildSandboxStack(directRunner *localexec.Runner, sandboxCfg clisandbox.Con
 		}
 		return runner, client, client, workspaceRef, nil
 	case clisandbox.ModePlatform:
+		if runtime.GOOS == "windows" {
+			if !windowssandbox.IsWindowsNetworkSetupReady() {
+				if windowssandbox.IsElevated() {
+					// 当前已是管理员权限，直接初始化
+					fmt.Printf("检测到在管理员特权终端运行且网络沙箱未就绪，自动开始初始化网络沙箱配置...\n")
+					log.Info("检测到在管理员特权终端运行且网络沙箱未就绪，自动开始初始化网络沙箱配置...")
+					if err := windowssandbox.RunWindowsSetupWithFlags(true); err != nil {
+						fmt.Printf("自动配置网络沙箱失败: %v\n", err)
+						log.Error("自动配置网络沙箱失败", "error", err)
+					} else {
+						log.Info("自动配置网络沙箱成功")
+					}
+				} else {
+					// 非管理员权限：用 Win32 ShellExecuteExW 静默提权
+					// 注意：如果在 go test 运行环境中，直接跳过 UAC 提权以避免测试进程挂起等待 UAC 交互。
+					if flag.Lookup("test.v") != nil {
+						fmt.Printf("检测到处于测试环境，跳过自动 UAC 提权。\n")
+						log.Warn("检测到处于测试环境，跳过自动 UAC 提权以避免挂起。")
+					} else {
+						fmt.Printf("检测到网络沙箱未就绪且当前处于非管理员终端，尝试自动请求管理员权限进行网络沙箱初始化...\n")
+						log.Info("检测到网络沙箱未就绪且当前处于非管理员终端，尝试自动请求管理员权限进行网络沙箱初始化...")
+						cwd, _ := os.Getwd()
+
+						// 获取真实用户的沙箱配置目录，传给提权子进程以确保写入正确位置
+						localAppData := os.Getenv("LOCALAPPDATA")
+						var sandboxConfigDir string
+						if localAppData != "" {
+							sandboxConfigDir = filepath.Join(localAppData, "genesis-agent", "sandbox")
+						} else {
+							home, _ := os.UserHomeDir()
+							sandboxConfigDir = filepath.Join(home, ".genesis-agent", "sandbox")
+						}
+
+						// 构建提权子进程的程序路径和参数
+						// 开发模式（go run）与生产模式（编译后的 exe）分别处理
+						var exeFile string
+						var args []string
+						if strings.Contains(os.Args[0], "main") || strings.Contains(os.Args[0], "go-build") {
+							exeFile = "go"
+							args = []string{"run", "cmd/genesis-cli/main.go", "sandbox", "windows-setup", "--network", "--appdata", sandboxConfigDir}
+						} else {
+							exeFile = os.Args[0]
+							args = []string{"sandbox", "windows-setup", "--network", "--appdata", sandboxConfigDir}
+						}
+
+						// 调用 Win32 ShellExecuteExW 进行 UAC 提权（SW_HIDE 静默后台运行）
+						if err := windowssandbox.RunElevatedWindowsSetup(exeFile, args, cwd); err != nil {
+							fmt.Printf("自动请求管理员权限失败: %v\n请手动右键管理员运行 start.bat，或运行：genesis-cli.exe sandbox windows-setup --network\n", err)
+							log.Error("自动请求管理员权限失败", "error", err)
+						} else {
+							if windowssandbox.IsWindowsNetworkSetupReady() {
+								log.Info("通过管理员提权自动配置网络沙箱成功")
+								fmt.Printf("自动配置网络沙箱成功！\n")
+								windowssandbox.ClearElevationResult(cwd)
+							} else {
+								result, _ := windowssandbox.ReadElevationResult(cwd)
+								errStr := "未知错误，子进程未写入任何异常信息。"
+								if result != nil && result.Error != "" {
+									errStr = result.Error
+								}
+								log.Warn("管理员提权已结束，但网络沙箱仍未就绪", "error", errStr)
+								fmt.Printf("管理员提权已结束，但网络沙箱仍未就绪。\n错误输出:\n%s\n", errStr)
+							}
+						}
+					}
+				}
+			}
+		}
 		runner, err := localexec.NewSandboxRunner(directRunner, localexec.SandboxRunnerOptions{})
 		if err != nil {
 			return nil, nil, nil, sandboxcontract.WorkspaceRef{}, err

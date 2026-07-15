@@ -37,20 +37,20 @@ var (
 
 // HeaderBar 标题栏主区域（程序名）
 var HeaderBar = lipgloss.NewStyle().
-	Background(ColorPrimary).
-	Foreground(ColorWhite).
+	Foreground(ColorPrimary).
 	Bold(true).
-	Padding(0, 2)
+	Padding(0, 1)
 
 // HeaderBarSub 标题栏次要信息区（模型名、策略名等）
 var HeaderBarSub = lipgloss.NewStyle().
-	Background(ColorSecondary).
-	Foreground(lipgloss.Color("#C4B5FD")).
-	Padding(0, 2)
+	Foreground(ColorGray).
+	Padding(0, 1)
 
-// HeaderBarFill 标题栏右侧填充（保持满宽背景色）
-var HeaderBarFill = lipgloss.NewStyle().
-	Background(ColorPrimary)
+// HeaderChip 顶栏紧凑状态标签。
+var HeaderChip = lipgloss.NewStyle().
+	Foreground(ColorAccent).
+	Background(lipgloss.Color("#1F2937")).
+	Padding(0, 1)
 
 // ── 消息气泡 ─────────────────────────────────────────────────
 
@@ -59,10 +59,9 @@ var UserLabel = lipgloss.NewStyle().
 	Foreground(ColorBlue).
 	Bold(true)
 
-// UserBubble 用户消息内容区
+// UserBubble 用户消息内容区（无背景气泡，扁平化）
 var UserBubble = lipgloss.NewStyle().
 	Foreground(ColorWhite).
-	Background(ColorBlue).
 	Padding(0, 1).
 	MarginBottom(1)
 
@@ -83,6 +82,28 @@ var SystemMsg = lipgloss.NewStyle().
 	Italic(true).
 	Padding(0, 1)
 
+// HelpOverlay 让帮助在固定 transcript 区内展示，不改变整体布局高度。
+var HelpOverlay = lipgloss.NewStyle().
+	Foreground(ColorGray).
+	Border(lipgloss.RoundedBorder()).
+	BorderForeground(ColorDarkGray).
+	Padding(1, 2)
+
+// CommandMenu 样式用于 Composer 上方的斜杠命令选择菜单。
+var CommandMenuCommand = lipgloss.NewStyle().
+	Foreground(ColorWhite).
+	Bold(true)
+
+var CommandMenuDescription = lipgloss.NewStyle().
+	Foreground(ColorGray)
+
+var CommandMenuSelected = lipgloss.NewStyle().
+	Foreground(ColorAccent).
+	Bold(true)
+
+var CommandMenuHint = lipgloss.NewStyle().
+	Foreground(ColorDarkGray)
+
 // MetaInfo 消息元信息（步骤数、token 消耗、耗时）
 var MetaInfo = lipgloss.NewStyle().
 	Foreground(ColorDarkGray).
@@ -99,6 +120,11 @@ var StatusError = lipgloss.NewStyle().
 	Foreground(ColorRed).
 	Bold(true)
 
+// StatusToast 提示状态文字（Toast，如复制成功）
+var StatusToast = lipgloss.NewStyle().
+	Foreground(ColorGreen).
+	Bold(true)
+
 // HelpBar 帮助栏普通文字
 var HelpBar = lipgloss.NewStyle().
 	Foreground(ColorGray)
@@ -107,6 +133,14 @@ var HelpBar = lipgloss.NewStyle().
 var HelpKey = lipgloss.NewStyle().
 	Foreground(ColorAccent).
 	Bold(true)
+
+// SelectionCursor 和 SelectionRange 区分选择模式的当前光标与已选范围。
+var SelectionCursor = lipgloss.NewStyle().
+	Foreground(ColorYellow).
+	Bold(true)
+
+var SelectionRange = lipgloss.NewStyle().
+	Foreground(ColorAccent)
 
 // ── 输入框 ───────────────────────────────────────────────────
 
@@ -131,4 +165,61 @@ func Divider(width int) string {
 	}
 	line := strings.Repeat("─", width)
 	return lipgloss.NewStyle().Foreground(ColorDarkGray).Render(line)
+}
+
+// ── 计划卡片 ─────────────────────────────────────────────
+
+// PlanBorder 计划卡片圆角边框（蓝色，与审批卡黄色区分）
+var PlanBorder = lipgloss.NewStyle().
+	Border(lipgloss.RoundedBorder()).
+	BorderForeground(ColorBlue).
+	Padding(0, 2)
+
+// PlanTitle 计划标题样式
+var PlanTitle = lipgloss.NewStyle().
+	Foreground(ColorBlue).
+	Bold(true)
+
+// PlanProgressBar 进度条文字样式
+var PlanProgressBar = lipgloss.NewStyle().
+	Foreground(ColorGray)
+
+// PlanItemDone 已完成条目样式（绿色）
+var PlanItemDone = lipgloss.NewStyle().
+	Foreground(ColorGreen)
+
+// PlanItemDoing 进行中条目样式（黄色加粗）
+var PlanItemDoing = lipgloss.NewStyle().
+	Foreground(ColorYellow).
+	Bold(true)
+
+// PlanItemPending 待开始条目样式（深灰）
+var PlanItemPending = lipgloss.NewStyle().
+	Foreground(ColorDarkGray)
+
+// PlanItemFailed 失败条目样式（红色）
+var PlanItemFailed = lipgloss.NewStyle().
+	Foreground(ColorRed)
+
+// PlanHint 计划卡片底部提示文字
+var PlanHint = lipgloss.NewStyle().
+	Foreground(ColorDarkGray).
+	Italic(true)
+
+// ProgressBar 生成文字进度条
+// filled: "█"，empty: "░"，width: 进度条字符宽度
+func ProgressBar(pct, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	filled := width * pct / 100
+	if filled > width {
+		filled = width
+	}
+	bar := strings.Repeat("█", filled) + strings.Repeat("░", width-filled)
+	color := ColorGreen
+	if pct < 100 {
+		color = ColorBlue
+	}
+	return lipgloss.NewStyle().Foreground(color).Render(bar)
 }

@@ -17,6 +17,14 @@ const (
 	KindSandbox Kind = "sandbox"
 	KindFile    Kind = "file"
 	KindSystem  Kind = "system"
+	// KindHook 表示 Hook handler 的运行状态。
+	KindHook Kind = "hook"
+	// KindSubAgent 表示父 Run 时间线中的子智能体生命周期事件。
+	KindSubAgent Kind = "subagent"
+	// KindPlan 规划技能计划事件。
+	// BlockType: "create"（新建）/ "tick"（勾选条目）/ "update"（整体更新）/ "hydrate"（会话恢复）
+	// Detail: Plan JSON 完整快照（非 delta，接收方直接替换本地状态）
+	KindPlan Kind = "plan"
 )
 
 // Phase 描述一个动作的生命周期。

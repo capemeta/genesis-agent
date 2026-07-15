@@ -98,7 +98,8 @@ type countingFailRegistry struct {
 	calls  atomic.Int64
 }
 
-func (f *countingFailRegistry) Register(tool.Tool) {}
+func (f *countingFailRegistry) Register(tool.Tool)   {}
+func (f *countingFailRegistry) Unregister(string)    {}
 func (f *countingFailRegistry) Get(string) tool.Tool {
 	return nil
 }

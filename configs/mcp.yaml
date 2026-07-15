@@ -1,0 +1,24 @@
+# MCP Client（默认关闭；启用后从 servers 与 marketplace mcp-package 合并连接）
+# connect_mode: background=启动不阻塞（推荐）| eager=阻塞等到连接结束
+mcp:
+  enabled: false
+  connect_mode: background
+  connect_batch_size: 3
+  default_startup_timeout: 30s
+  default_tool_timeout: 300s
+  servers:
+    mcp_server_mysql:
+      type: stdio
+      command: npx
+      args:
+        - "-y"
+        - "@benborla29/mcp-server-mysql"
+      env:
+        MYSQL_HOST: "127.0.0.1"
+        MYSQL_PORT: "3308"
+        MYSQL_USER: "root"
+        MYSQL_PASS: admin
+        MYSQL_DB: "test_db"
+        ALLOW_INSERT_OPERATION: "true"
+        ALLOW_UPDATE_OPERATION: "true"
+        ALLOW_DELETE_OPERATION: "true"

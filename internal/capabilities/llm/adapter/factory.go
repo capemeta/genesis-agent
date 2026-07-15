@@ -24,13 +24,16 @@ func NewChatModelByConfig(ctx context.Context, cfg *config.ResolvedLLMConfig) (l
 	switch cfg.ProviderKind {
 	case "openai":
 		return eino.New(ctx, &eino.Config{
-			Provider:   eino.ProviderOpenAI,
-			Model:      cfg.Model,
-			APIKey:     cfg.APIKey,
-			BaseURL:    cfg.BaseURL,
-			Timeout:    cfg.Timeout,
-			ByAzure:    cfg.ByAzure,
-			APIVersion: cfg.APIVersion,
+			Provider:    eino.ProviderOpenAI,
+			Model:       cfg.Model,
+			APIKey:      cfg.APIKey,
+			BaseURL:     cfg.BaseURL,
+			Timeout:     cfg.Timeout,
+			MaxTokens:   cfg.MaxTokens,
+			Temperature: cfg.Temperature,
+			TopP:        cfg.TopP,
+			ByAzure:     cfg.ByAzure,
+			APIVersion:  cfg.APIVersion,
 		})
 	case "ark":
 		return eino.New(ctx, &eino.Config{
@@ -41,13 +44,19 @@ func NewChatModelByConfig(ctx context.Context, cfg *config.ResolvedLLMConfig) (l
 			ArkSecretKey: cfg.SecretKey,
 			BaseURL:      cfg.BaseURL,
 			Timeout:      cfg.Timeout,
+			MaxTokens:    cfg.MaxTokens,
+			Temperature:  cfg.Temperature,
+			TopP:         cfg.TopP,
 		})
 	case "ollama":
 		return eino.New(ctx, &eino.Config{
-			Provider: eino.ProviderOllama,
-			Model:    cfg.Model,
-			BaseURL:  cfg.BaseURL,
-			Timeout:  cfg.Timeout,
+			Provider:    eino.ProviderOllama,
+			Model:       cfg.Model,
+			BaseURL:     cfg.BaseURL,
+			Timeout:     cfg.Timeout,
+			MaxTokens:   cfg.MaxTokens,
+			Temperature: cfg.Temperature,
+			TopP:        cfg.TopP,
 		})
 	case "anthropic":
 		return nil, fmt.Errorf("llm adapter: provider=%q 已支持配置，但当前尚未接入 Anthropic/Claude 模型适配器", cfg.ProviderName)

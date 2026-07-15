@@ -17,10 +17,15 @@ import (
 	auditfile "genesis-agent/internal/capabilities/audit/adapter/file"
 	auditmemory "genesis-agent/internal/capabilities/audit/adapter/memory"
 	auditcontract "genesis-agent/internal/capabilities/audit/contract"
+	capcontract "genesis-agent/internal/capabilities/capability/contract"
+	capservice "genesis-agent/internal/capabilities/capability/service"
 	execsandbox "genesis-agent/internal/capabilities/execution/adapter/sandbox"
 	execcontract "genesis-agent/internal/capabilities/execution/contract"
 	execmodel "genesis-agent/internal/capabilities/execution/model"
 	execservice "genesis-agent/internal/capabilities/execution/service"
+	mcpstore "genesis-agent/internal/capabilities/mcp/adapter/store"
+	"genesis-agent/internal/capabilities/mcp/contract"
+	mcpstack "genesis-agent/internal/capabilities/mcp/stack"
 	policyapproval "genesis-agent/internal/capabilities/policy/adapter/approval"
 	policyconfig "genesis-agent/internal/capabilities/policy/adapter/config"
 	profilemodel "genesis-agent/internal/capabilities/profile/model"
@@ -32,20 +37,49 @@ import (
 	platformconfig "genesis-agent/internal/platform/config"
 	"genesis-agent/internal/platform/logger"
 	promptbuilder "genesis-agent/internal/runtime/prompt"
+	enterprisemcp "genesis-agent/products/enterprise/internal/mcp"
 	"genesis-agent/products/enterprise/internal/profile"
 	localexec "genesis-agent/shared/local/execution"
+	"genesis-agent/shared/local/skillmarket"
 	"genesis-agent/shared/skillstack"
 )
+
+func loadEnterpriseCapabilityIndex(adapters capcontract.RuntimeAdapterRegistry) (capcontract.Registry, error) {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return nil, fmt.Errorf("无法定位用户主目录")
+	}
+	indexFile := filepath.Join(home, ".genesis-agent", "enterprise", "capability-index.json")
+	return capservice.NewRegistry(capservice.Options{
+		Store:    skillmarket.NewCapabilityIndexStore(indexFile),
+		Adapters: adapters,
+	})
+}
+
+func openEnterpriseApprovalStore() (contract.ApprovalStore, error) {
+	home, err := os.UserHomeDir()
+	if err != nil || strings.TrimSpace(home) == "" {
+		return nil, fmt.Errorf("无法定位用户主目录以创建 mcp approvals")
+	}
+	// Phase 2.5 前用文件存储；DB/OAuth 不在本轮范围。
+	path := filepath.Join(home, ".genesis-agent", "enterprise", "mcp-approvals.json")
+	store, err := mcpstore.NewFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return store, nil
+}
 
 // Container 是 Enterprise 产品的装配容器。
 type Container struct {
 	configDirRef *string
 	quiet        bool
 
-	once    sync.Once
-	initErr error
-	bundle  *shared.RuntimeBundle
-	logging *logger.RuntimeLogging
+	once     sync.Once
+	initErr  error
+	bundle   *shared.RuntimeBundle
+	logging  *logger.RuntimeLogging
+	mcpStack *mcpstack.Stack
 }
 
 // NewContainer 创建 Enterprise 产品容器。
@@ -130,25 +164,81 @@ func (c *Container) Init(ctx context.Context) error {
 			injectors = append(injectors, skillStack.PromptInjector)
 		}
 		c.bundle, c.initErr = shared.BuildAgentService(ctx, shared.BuildOptions{
-			Product:              "enterprise",
-			ConfigDir:            configDir,
-			Quiet:                c.quiet,
-			RouteName:            "chat",
-			DefaultAgentID:       "enterprise-default-agent",
-			DefaultAgentName:     "Genesis Enterprise Agent",
-			Profile:              prof,
-			AdditionalTools:      skillStack.Tools,
-			PromptInjectors:      injectors,
-			Logger:               runtimeLogging.AgentLogger,
-			AuditSink:            auditSink,
-			UsageSink:            usageSink,
-			SkillNameMatcher:     skillStack.SkillNameMatcher,
-			SkillMentionSelector: skillStack.SkillMentionSelector,
-			SkillExplicitLoader:  skillStack.SkillExplicitLoader,
+			Product:               "enterprise",
+			ConfigDir:             configDir,
+			Quiet:                 c.quiet,
+			RouteName:             "chat",
+			DefaultAgentID:        "enterprise-default-agent",
+			DefaultAgentName:      "Genesis Enterprise Agent",
+			Profile:               prof,
+			AdditionalTools:       skillStack.Tools,
+			PromptInjectors:       injectors,
+			Logger:                runtimeLogging.AgentLogger,
+			AuditSink:             auditSink,
+			UsageSink:             usageSink,
+			SkillNameMatcher:      skillStack.SkillNameMatcher,
+			SkillMentionSelector:  skillStack.SkillMentionSelector,
+			SkillExplicitLoader:   skillStack.SkillExplicitLoader,
+			SubAgentMaxConcurrent: 3,
+			SubAgentApproval:      approvalSvc,
+			HookApproval:          approvalSvc,
 		})
 		if c.initErr != nil {
 			_ = runtimeLogging.Close()
 			c.logging = nil
+			return
+		}
+		if cfg.MCP.Enabled && c.bundle != nil && c.bundle.ToolGateway != nil {
+			adapterReg := capservice.NewAdapterRegistry()
+			capIndex, err := loadEnterpriseCapabilityIndex(adapterReg)
+			if err != nil {
+				_ = runtimeLogging.Close()
+				c.logging = nil
+				c.bundle = nil
+				c.initErr = fmt.Errorf("初始化Enterprise capability index失败: %w", err)
+				return
+			}
+			store, err := openEnterpriseApprovalStore()
+			if err != nil {
+				_ = runtimeLogging.Close()
+				c.logging = nil
+				c.bundle = nil
+				c.initErr = fmt.Errorf("初始化Enterprise MCP approval store失败: %w", err)
+				return
+			}
+			workspace := "."
+			if wd, err := os.Getwd(); err == nil && strings.TrimSpace(wd) != "" {
+				workspace = wd
+			}
+			mcpStack, err := mcpstack.Build(ctx, mcpstack.Options{
+				Config:             cfg,
+				CapabilityIndex:    capIndex,
+				ToolRegistry:       c.bundle.ToolGateway,
+				ApprovalService:    approvalSvc,
+				CredentialSvc:      c.bundle.Credentials,
+				ApprovalStore:      store,
+				AdapterRegistry:    adapterReg,
+				ExistingAuthorizer: c.bundle.ToolGateway.Authorizer(),
+				Requirements:       enterprisemcp.StdioDenyFilter{},
+				Channel:            profilemodel.ChannelEnterprise,
+				Environment:        profilemodel.EnvironmentServer,
+				TenantID:           "dev",
+				Workspace:          workspace,
+				FailOnRequired:     true,
+				AuditSink:          auditSink,
+				Tracer:             c.bundle.Tracer,
+			})
+			if err != nil {
+				_ = runtimeLogging.Close()
+				c.logging = nil
+				c.bundle = nil
+				c.initErr = fmt.Errorf("初始化Enterprise MCP栈失败: %w", err)
+				return
+			}
+			if mcpStack != nil && mcpStack.Authorizer != nil {
+				c.bundle.ToolGateway.SetAuthorizer(mcpStack.Authorizer)
+			}
+			c.mcpStack = mcpStack
 		}
 	})
 	return c.initErr
@@ -162,14 +252,28 @@ func (c *Container) Service() app.AgentService {
 	return c.bundle.AgentService
 }
 
-// Close 释放运行日志等资源。
+// MCPStack 返回已装配的 MCP 栈（可能为 nil）。
+func (c *Container) MCPStack() *mcpstack.Stack { return c.mcpStack }
+
+// Close 释放 MCP 连接与运行日志等资源。
 func (c *Container) Close() error {
-	if c == nil || c.logging == nil {
+	if c == nil {
 		return nil
 	}
-	err := c.logging.Close()
-	c.logging = nil
-	return err
+	var first error
+	if c.mcpStack != nil {
+		if err := c.mcpStack.Close(context.Background()); err != nil {
+			first = err
+		}
+		c.mcpStack = nil
+	}
+	if c.logging != nil {
+		if err := c.logging.Close(); err != nil && first == nil {
+			first = err
+		}
+		c.logging = nil
+	}
+	return first
 }
 
 // NewService 构建 Enterprise 产品 AgentService，保持与 CLI bootstrap 一致的接口形态。

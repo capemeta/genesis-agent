@@ -18,6 +18,7 @@ import (
 	platformconfig "genesis-agent/internal/platform/config"
 	"genesis-agent/internal/platform/logger"
 	clisandbox "genesis-agent/products/cli/internal/sandbox"
+	windowssandbox "genesis-agent/shared/local/sandbox/windows"
 )
 
 func TestRunCommandDefaultSandboxDisabled(t *testing.T) {
@@ -141,8 +142,8 @@ func TestRunCommandRequiredSandboxFailsClosedOnUnsupportedWindowsPolicy(t *testi
 	}
 	tool := mustRunCommandTool(t, cfg)
 	_, err = tool.Execute(context.Background(), runCommandParams)
-	if code := execcontract.CodeOf(err); code != execcontract.ErrCodeSandboxUnavailable {
-		t.Fatalf("CodeOf(err) = %s, want %s (%v)", code, execcontract.ErrCodeSandboxUnavailable, err)
+	if code := execcontract.CodeOf(err); code != execcontract.ErrCodeSandboxPolicyUnsupported {
+		t.Fatalf("CodeOf(err) = %s, want %s (%v)", code, execcontract.ErrCodeSandboxPolicyUnsupported, err)
 	}
 }
 
@@ -240,10 +241,19 @@ type runCommandResult struct {
 
 func mustRunCommandTool(t *testing.T, cfg clisandbox.Config) toolcontract.Tool {
 	t.Helper()
+	if runtime.GOOS == "windows" {
+		windowssandbox.SetSandboxDirOverride(t.TempDir())
+		t.Cleanup(func() {
+			windowssandbox.SetSandboxDirOverride("")
+		})
+	}
 	workspace := newTestWorkspace(t, "sandbox-behavior-*")
 	approvalSvc, err := buildBaseApprovalService(true, platformconfig.PolicyConfig{}, logger.NewNop(), nil)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if cfg.Execution != execmodel.SandboxDisabled && cfg.Mode == "" {
+		cfg.Mode = clisandbox.ModePlatform
 	}
 	tools, _, err := buildProductTools(cfg, approvalSvc, logger.NewNop(), workspace)
 	if err != nil {

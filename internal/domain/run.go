@@ -37,8 +37,9 @@ type Run struct {
 
 // StartRunRequest 启动一次Run的请求参数
 type StartRunRequest struct {
-	SessionID string
-	TenantID  string
-	UserInput string
-	Agent     *Agent
+	SessionID       string
+	TenantID        string
+	UserInput       string
+	Agent           *Agent
+	ContextStrategy string // 新增：本次会话的上下文预算策略（如 default/rag/coding）
 }

@@ -305,7 +305,7 @@ func (s *Service) Run(ctx context.Context, req scriptcontract.RunRequest) (*scri
 		} else {
 			result, produced, workDir, staged, artifacts, warnings, err = s.runLocal(ctx, meta, runID, req, timeout, sandbox)
 		}
-		degraded := detectDegradedFromWarnings(warnings)
+		degraded := result != nil && result.Environment == execmodel.EnvironmentLocal && sandbox.Mode != execmodel.SandboxDisabled
 		executionBackend := resolveExecutionBackend(sandbox, intendedRemote, degraded)
 		includeMap := s.shouldIncludePathMap(formatPathContextKey(runID, meta.Name), executionBackend, degraded)
 		attachExecutionPathContext(out, executionBackend, degraded, includeMap, runID, sanitize(string(meta.PackageID)))
@@ -340,6 +340,9 @@ func (s *Service) Run(ctx context.Context, req scriptcontract.RunRequest) (*scri
 		out.ExitCode = result.ExitCode
 		out.Stdout = result.Stdout
 		out.Stderr = result.Stderr
+		if len(result.Warnings) > 0 {
+			out.Warnings = append(out.Warnings, result.Warnings...)
+		}
 		out.OK = result.ExitCode == 0 && !result.TimedOut && len(result.SandboxViolations) == 0
 		out.Error = ""
 		out.FailureKind = ""

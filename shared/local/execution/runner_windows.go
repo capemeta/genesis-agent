@@ -28,5 +28,5 @@ func (r *Runner) RunArgvProcessConstrained(ctx context.Context, command ArgvComm
 		}
 		return cmd, afterStart, cleanup, nil
 	}
-	return r.runArgvWithFactory(ctx, command.Argv, execResultMeta{Command: display, Cwd: command.Cwd, Shell: command.Shell, Env: command.Env}, opts, factory)
+	return r.runArgvWithFactory(ctx, command.Argv, execResultMeta{Command: display, Cwd: command.Cwd, Shell: command.Shell, Env: command.Env, Stdin: command.Stdin}, opts, factory)
 }

@@ -21,12 +21,18 @@ func DefaultProfile() profilemodel.Profile {
 				"run_skill_command",
 				"install_skill_dependencies",
 				"Skill",
+				"Task",
+				"TaskOutput",
+				"TaskStop",
 				"list_skill_resources",
 				"read_skill_resource",
 				"search_skill_resources",
+				"list_mcp_resources",
+				"read_mcp_resource",
+				"mcp_search",
+				"mcp__*",
 			},
 		},
 		Skills: profilemodel.SkillSet{AllowImplicit: true},
 	}
 }
-

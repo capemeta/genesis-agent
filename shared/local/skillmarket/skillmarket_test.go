@@ -1,12 +1,18 @@
 package skillmarket
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
-	capmodel "genesis-agent/internal/capabilities/capability/model"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	capmodel "genesis-agent/internal/capabilities/capability/model"
 	marketcontract "genesis-agent/internal/capabilities/package/marketplace/contract"
 	marketmodel "genesis-agent/internal/capabilities/package/marketplace/model"
 	marketservice "genesis-agent/internal/capabilities/package/marketplace/service"
@@ -180,6 +186,105 @@ func TestServiceInstallPersistsSourceProvenanceAndCapabilityIndex(t *testing.T) 
 		if capability.Enabled {
 			t.Fatalf("capability should be disabled: %+v", capabilities)
 		}
+	}
+}
+
+func TestDownloadURLZipByContentType(t *testing.T) {
+	// 模拟 openskills 类下载站：URL 无 .zip 后缀，但 Content-Type 为 application/zip。
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	w, err := zw.Create("frontend-design/SKILL.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(w, "---\nname: frontend-design\ndescription: demo\n---\n\n# Demo\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/zip")
+		_, _ = w.Write(buf.Bytes())
+	}))
+	t.Cleanup(srv.Close)
+
+	fetcher := NewFetcher(t.TempDir(), srv.Client())
+	tempDir := t.TempDir()
+	if err := fetcher.downloadURL(context.Background(), srv.URL+"/api/download?slug=frontend-design", tempDir); err != nil {
+		t.Fatal(err)
+	}
+	skillPath := filepath.Join(tempDir, "SKILL.md")
+	if _, err := os.Stat(skillPath); err != nil {
+		t.Fatalf("expected extracted SKILL.md: %v", err)
+	}
+}
+
+func TestFetcherAllowsGitHubCodeloadRedirect(t *testing.T) {
+	req, err := http.NewRequest(http.MethodGet, "https://codeload.github.com/org/repo/zip/main", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	viaReq, err := http.NewRequest(http.MethodGet, "https://github.com/org/repo/archive/main.zip", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	check := makeRedirectChecker([]string{"github.com"})
+	if err := check(req, []*http.Request{viaReq}); err != nil {
+		t.Fatalf("codeload redirect should be allowed: %v", err)
+	}
+}
+
+func TestFetcherRejectsCrossHostRedirect(t *testing.T) {
+	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "https://evil.example/pack.zip", http.StatusFound)
+	}))
+	t.Cleanup(good.Close)
+
+	fetcher := NewFetcherWithHosts(t.TempDir(), nil, []string{"github.com"})
+	err := fetcher.downloadURL(context.Background(), good.URL+"/api/download", t.TempDir())
+	if err == nil {
+		t.Fatal("expected cross-host redirect to be rejected")
+	}
+	if !strings.Contains(err.Error(), "跨主机重定向") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestFetcherAllowsSameHostRedirect(t *testing.T) {
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	w, err := zw.Create("demo/SKILL.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(w, "---\nname: demo\ndescription: demo\n---\n\n# Demo\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	mux := http.NewServeMux()
+	var base string
+	mux.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, base+"/files/pack.zip", http.StatusFound)
+	})
+	mux.HandleFunc("/files/pack.zip", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/zip")
+		_, _ = w.Write(buf.Bytes())
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	base = srv.URL
+
+	fetcher := NewFetcher(t.TempDir(), nil)
+	tempDir := t.TempDir()
+	if err := fetcher.downloadURL(context.Background(), srv.URL+"/api/download", tempDir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(tempDir, "SKILL.md")); err != nil {
+		t.Fatalf("expected extracted SKILL.md: %v", err)
 	}
 }
 

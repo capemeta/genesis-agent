@@ -23,7 +23,10 @@ type Service struct {
 	parser       marketcontract.SourceParser
 	fetcher      marketcontract.Fetcher
 	installer    marketcontract.Installer
+	policy       marketcontract.AllowedSourcePolicy
+	reloader     marketcontract.CatalogReloader
 	capRegistry  *capservice.Registry
+	adapters     capcontract.RuntimeAdapterRegistry
 	now          func() time.Time
 }
 
@@ -34,6 +37,8 @@ type Options struct {
 	Parser       marketcontract.SourceParser
 	Fetcher      marketcontract.Fetcher
 	Installer    marketcontract.Installer
+	Policy       marketcontract.AllowedSourcePolicy
+	Reloader     marketcontract.CatalogReloader
 	Adapters     capcontract.RuntimeAdapterRegistry
 	Now          func() time.Time
 }
@@ -64,7 +69,19 @@ func New(opts Options) (*Service, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Service{registry: opts.Registry, installs: opts.Installs, capabilities: opts.Capabilities, capRegistry: capRegistry, parser: opts.Parser, fetcher: opts.Fetcher, installer: opts.Installer, now: opts.Now}, nil
+	return &Service{
+		registry:     opts.Registry,
+		installs:     opts.Installs,
+		capabilities: opts.Capabilities,
+		capRegistry:  capRegistry,
+		adapters:     opts.Adapters,
+		parser:       opts.Parser,
+		fetcher:      opts.Fetcher,
+		installer:    opts.Installer,
+		policy:       opts.Policy,
+		reloader:     opts.Reloader,
+		now:          opts.Now,
+	}, nil
 }
 
 func (s *Service) AddMarketplace(ctx context.Context, input string) (marketmodel.MarketplaceRecord, error) {
@@ -263,6 +280,12 @@ func (s *Service) install(ctx context.Context, spec string, scope marketmodel.In
 		_ = s.installer.Uninstall(ctx, install)
 		return marketmodel.InstallRecord{}, err
 	}
+	if err := s.notifyAdapters(ctx, install.Capabilities, true); err != nil {
+		_ = s.capabilities.DeletePackage(ctx, install.Spec)
+		_, _, _ = s.installs.Delete(ctx, install.Spec)
+		_ = s.installer.Uninstall(ctx, install)
+		return marketmodel.InstallRecord{}, err
+	}
 	return install, nil
 }
 
@@ -404,6 +427,7 @@ func (s *Service) Uninstall(ctx context.Context, spec string) error {
 	if !ok {
 		return fmt.Errorf("package %q 未安装", spec)
 	}
+	caps := append([]capmodel.CapabilityIndexRecord(nil), record.Capabilities...)
 	if err := s.installer.Uninstall(ctx, record); err != nil {
 		return err
 	}
@@ -412,6 +436,29 @@ func (s *Service) Uninstall(ctx context.Context, spec string) error {
 	}
 	if err := s.capabilities.DeletePackage(ctx, record.Spec); err != nil {
 		return err
+	}
+	_ = s.notifyAdapters(ctx, caps, false)
+	return nil
+}
+
+func (s *Service) notifyAdapters(ctx context.Context, caps []capmodel.CapabilityIndexRecord, register bool) error {
+	if s == nil || s.adapters == nil || len(caps) == 0 {
+		return nil
+	}
+	for _, cap := range caps {
+		adapter, ok := s.adapters.AdapterFor(cap.Type)
+		if !ok || adapter == nil {
+			continue
+		}
+		var err error
+		if register {
+			err = adapter.Register(ctx, cap)
+		} else {
+			err = adapter.Unregister(ctx, cap)
+		}
+		if err != nil {
+			return fmt.Errorf("runtime adapter(%s) 同步失败: %w", cap.Type, err)
+		}
 	}
 	return nil
 }

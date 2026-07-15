@@ -50,6 +50,7 @@ func NewAgentHandler(svc app.AgentService) *AgentHandler {
 // RunRequest POST /v1/runs 请求体
 type RunRequest struct {
 	SessionID string                    `json:"session_id"` // 可选：指定会话 ID，否则自动创建新会话
+	UserID    string                    `json:"user_id"`    // 开发期身份占位；生产环境应由认证中间件注入
 	Input     string                    `json:"input"`      // 必填：用户输入内容
 	Sandbox   *execmodel.SandboxProfile `json:"sandbox,omitempty"`
 }
@@ -96,16 +97,28 @@ func (h *AgentHandler) Run(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	userID := strings.TrimSpace(req.UserID)
+	if userID == "" {
+		userID = "user"
+	}
 	// 创建或使用已有会话
 	sessionID := req.SessionID
 	if sessionID == "" {
-		session := h.svc.NewSession()
+		session, err := h.svc.CreateSession(r.Context(), app.SessionScope{TenantID: "dev", UserID: userID})
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("创建会话失败: %v", err))
+			return
+		}
 		sessionID = session.ID
+	} else if _, err := h.svc.ResumeSession(r.Context(), sessionID, app.SessionScope{TenantID: "dev", UserID: userID}); err != nil {
+		writeError(w, http.StatusNotFound, fmt.Sprintf("会话不可恢复: %v", err))
+		return
 	}
 
 	result, err := h.svc.RunOnce(r.Context(), app.RunRequest{
 		SessionID: sessionID,
 		TenantID:  "dev", // Phase 1A 硬编码租户，Phase 1B 从 JWT 解析
+		UserID:    userID,
 		Input:     req.Input,
 		Sandbox:   req.Sandbox,
 	})
@@ -136,11 +149,22 @@ func (h *AgentHandler) RunStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	userID := strings.TrimSpace(req.UserID)
+	if userID == "" {
+		userID = "user"
+	}
 	// 创建或使用已有会话
 	sessionID := req.SessionID
 	if sessionID == "" {
-		session := h.svc.NewSession()
+		session, err := h.svc.CreateSession(r.Context(), app.SessionScope{TenantID: "dev", UserID: userID})
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("创建会话失败: %v", err))
+			return
+		}
 		sessionID = session.ID
+	} else if _, err := h.svc.ResumeSession(r.Context(), sessionID, app.SessionScope{TenantID: "dev", UserID: userID}); err != nil {
+		writeError(w, http.StatusNotFound, fmt.Sprintf("会话不可恢复: %v", err))
+		return
 	}
 	tenantID := "dev" // Phase 1A 硬编码租户，Phase 1B 从 JWT 解析
 
@@ -173,6 +197,7 @@ func (h *AgentHandler) RunStream(w http.ResponseWriter, r *http.Request) {
 		res, err := h.svc.RunOnce(r.Context(), app.RunRequest{
 			SessionID: sessionID,
 			TenantID:  tenantID,
+			UserID:    userID,
 			Input:     req.Input,
 			Sandbox:   req.Sandbox,
 			OnProgress: func(event progress.Event) {
@@ -189,11 +214,31 @@ func (h *AgentHandler) RunStream(w http.ResponseWriter, r *http.Request) {
 	timer := time.NewTimer(15 * time.Second)
 	defer timer.Stop()
 
+	var runRes *runResult
+
 	for {
 		select {
 		case event, ok := <-progressCh:
 			if !ok {
 				progressCh = nil
+				if runRes != nil {
+					if runRes.err != nil && !hasSentTerminalEvent {
+						seq++
+						errData := map[string]interface{}{
+							"seq":        seq,
+							"run_id":     "",
+							"session_id": sessionID,
+							"tenant_id":  tenantID,
+							"ts":         time.Now().Format(time.RFC3339Nano),
+							"error_code": "SYSTEM_ERROR",
+							"error_type": "fatal",
+							"message":    runRes.err.Error(),
+							"retriable":  false,
+						}
+						_ = writeSSE(w, flusher, seq, "run.failed", errData)
+					}
+					return
+				}
 				continue
 			}
 
@@ -231,22 +276,26 @@ func (h *AgentHandler) RunStream(w http.ResponseWriter, r *http.Request) {
 			timer.Reset(15 * time.Second)
 
 		case res := <-resultCh:
-			if res.err != nil && !hasSentTerminalEvent {
-				seq++
-				errData := map[string]interface{}{
-					"seq":        seq,
-					"run_id":     "",
-					"session_id": sessionID,
-					"tenant_id":  tenantID,
-					"ts":         time.Now().Format(time.RFC3339Nano),
-					"error_code": "SYSTEM_ERROR",
-					"error_type": "fatal",
-					"message":    res.err.Error(),
-					"retriable":  false,
+			runRes = &res
+			resultCh = nil
+			if progressCh == nil {
+				if runRes.err != nil && !hasSentTerminalEvent {
+					seq++
+					errData := map[string]interface{}{
+						"seq":        seq,
+						"run_id":     "",
+						"session_id": sessionID,
+						"tenant_id":  tenantID,
+						"ts":         time.Now().Format(time.RFC3339Nano),
+						"error_code": "SYSTEM_ERROR",
+						"error_type": "fatal",
+						"message":    runRes.err.Error(),
+						"retriable":  false,
+					}
+					_ = writeSSE(w, flusher, seq, "run.failed", errData)
 				}
-				_ = writeSSE(w, flusher, seq, "run.failed", errData)
+				return
 			}
-			return
 
 		case <-r.Context().Done():
 			// 客户端断开连接

@@ -12,6 +12,7 @@ const (
 type RuntimePolicy struct {
 	MaxIterations int   // 最大迭代次数，防止无限循环
 	MaxTokens     int64 // Token预算上限（0=不限制）
+	MaxToolCalls  int   // 工具调用总数上限（0=不限制）
 	TimeoutSec    int   // 超时秒数（0=不限制）
 
 	// MaxConsecutiveFail 任意工具连续失败上限（不要求同 args）；0=关闭。

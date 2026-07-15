@@ -47,11 +47,11 @@ func (t ToolTraits) Normalize() ToolTraits {
 // Info 工具元信息，描述工具的能力和参数要求。
 // LLM通过这些信息决定何时以及如何调用工具。
 type Info struct {
-	Name            string                              // 工具名称（唯一标识符；原语 snake_case，元工具可如 Skill）
-	Description     string                              // 静态描述；若 DescriptionFunc 成功则被覆盖
+	Name            string                                // 工具名称（唯一标识符；原语 snake_case，元工具可如 Skill）
+	Description     string                                // 静态描述；若 DescriptionFunc 成功则被覆盖
 	DescriptionFunc func(context.Context) (string, error) // 可选动态描述（如 Skill catalog）
-	Parameters      *ParameterSchema                    // 工具参数 Schema（type=object）
-	Traits          ToolTraits                          // 工具治理元数据
+	Parameters      *ParameterSchema                      // 工具参数 Schema（type=object）
+	Traits          ToolTraits                            // 工具治理元数据
 }
 
 // ResolveDescription 解析工具描述：优先 DescriptionFunc，失败或空则回退静态 Description。
@@ -123,7 +123,14 @@ func DefaultTraits(name string) ToolTraits {
 		return ToolTraits{Exposure: ToolExposureDirect, ReadOnly: true, ConcurrencySafe: true, NeedsPermission: true}
 	case "run_command", "run_skill_command", "http_request":
 		return ToolTraits{Exposure: ToolExposureDirect, ReadOnly: false, ConcurrencySafe: false, NeedsPermission: true}
+	case "list_mcp_resources", "read_mcp_resource":
+		return ToolTraits{Exposure: ToolExposureDirect, ReadOnly: true, ConcurrencySafe: true, NeedsPermission: true}
+	case "mcp_search":
+		return ToolTraits{Exposure: ToolExposureDirect, ReadOnly: false, ConcurrencySafe: true, NeedsPermission: true}
 	default:
+		if strings.HasPrefix(name, "mcp__") {
+			return ToolTraits{Exposure: ToolExposureDirect, ReadOnly: false, ConcurrencySafe: false, NeedsPermission: true}
+		}
 		return ToolTraits{Exposure: ToolExposureDirect, ReadOnly: false, ConcurrencySafe: false}
 	}
 }
@@ -137,10 +144,18 @@ type Tool interface {
 	Execute(ctx context.Context, params string) (string, error)
 }
 
+// ExposureUpdater 支持安全地变更工具对 LLM 的暴露策略。
+// 动态工具可选实现，调用方不得直接修改 GetInfo 返回值。
+type ExposureUpdater interface {
+	SetExposure(exposure ToolExposure)
+}
+
 // Registry 工具注册表接口
 type Registry interface {
 	// Register 注册一个工具，若名称重复则覆盖
 	Register(t Tool)
+	// Unregister 按名称移除工具；不存在时为 no-op
+	Unregister(name string)
 	// Get 按名称获取工具，返回 nil 表示未找到
 	Get(name string) Tool
 	// Execute 执行指定工具，若工具不存在返回错误
@@ -152,4 +167,3 @@ type Registry interface {
 	// Names 返回所有已注册工具的名称列表
 	Names() []string
 }
-

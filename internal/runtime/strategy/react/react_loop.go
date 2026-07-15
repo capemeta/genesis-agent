@@ -13,6 +13,8 @@ import (
 	"strings"
 	"time"
 
+	hookcontract "genesis-agent/internal/capabilities/hook/contract"
+	hookmodel "genesis-agent/internal/capabilities/hook/model"
 	"genesis-agent/internal/capabilities/llm/contract"
 	"genesis-agent/internal/capabilities/memory/contract"
 	skillcollision "genesis-agent/internal/capabilities/skill/collision"
@@ -23,6 +25,7 @@ import (
 	"genesis-agent/internal/platform/contextutil"
 	"genesis-agent/internal/platform/logger"
 	"genesis-agent/internal/runtime"
+	runtimecontext "genesis-agent/internal/runtime/context"
 	"genesis-agent/internal/runtime/progress"
 	"genesis-agent/internal/runtime/prompt"
 	"genesis-agent/internal/runtime/repeatguard"
@@ -38,7 +41,7 @@ type SkillNameMatcher interface {
 type ReactLoopEngine struct {
 	llm                       llm.ChatModel
 	registry                  tool.Registry
-	memory                    memory.ShortTermStore
+	memory                    memory.ShortTermMemory
 	prompt                    prompt.Builder
 	logger                    logger.Logger
 	tracer                    trace.Tracer
@@ -46,10 +49,52 @@ type ReactLoopEngine struct {
 	skillMentionSelector      SkillMentionSelector
 	skillExplicitLoader       SkillExplicitLoader
 	autoRewriteSkillCollision *bool // nil 表示默认开启
+
+	// 新增：上下文窗口规划与 Token 估算
+	estimator             runtimecontext.TokenEstimator
+	planner               *runtimecontext.ContextBudgetPlanner
+	contextWindow         int
+	maxTokens             int
+	effectiveContextRatio float64
+	outputReserveTokens   int
+	compactor             runtimecontext.Compactor
+
+	// 新增：长期记忆与用户画像
+	ltm              memory.LongTermMemory
+	userProfileStore memory.UserProfileStore
 }
 
 // EngineOption 可选依赖。
 type EngineOption func(*ReactLoopEngine)
+
+// WithLongTermMemory 注入长期记忆存储后端
+func WithLongTermMemory(ltm memory.LongTermMemory) EngineOption {
+	return func(e *ReactLoopEngine) {
+		e.ltm = ltm
+	}
+}
+
+// WithUserProfileStore 注入用户画像存储后端
+func WithUserProfileStore(ups memory.UserProfileStore) EngineOption {
+	return func(e *ReactLoopEngine) {
+		e.userProfileStore = ups
+	}
+}
+
+// WithCompactor 注入两级压缩编排器。
+func WithCompactor(compactor runtimecontext.Compactor) EngineOption {
+	return func(e *ReactLoopEngine) {
+		e.compactor = compactor
+	}
+}
+
+// WithContextBudgetConfig 注入模型上下文预算配置。
+func WithContextBudgetConfig(effectiveRatio float64, outputReserveTokens int) EngineOption {
+	return func(e *ReactLoopEngine) {
+		e.effectiveContextRatio = effectiveRatio
+		e.outputReserveTokens = outputReserveTokens
+	}
+}
 
 // WithSkillNameMatcher 注入 Skill/Tool 名碰撞检测。
 func WithSkillNameMatcher(matcher SkillNameMatcher) EngineOption {
@@ -62,19 +107,28 @@ func WithSkillNameMatcher(matcher SkillNameMatcher) EngineOption {
 func NewReactLoopEngine(
 	llmClient llm.ChatModel,
 	registry tool.Registry,
-	store memory.ShortTermStore,
+	store memory.ShortTermMemory,
 	promptBuilder prompt.Builder,
 	log logger.Logger,
 	tracer trace.Tracer,
+	estimator runtimecontext.TokenEstimator,
+	planner *runtimecontext.ContextBudgetPlanner,
+	contextWindow int,
+	maxTokens int,
 	opts ...EngineOption,
 ) *ReactLoopEngine {
 	e := &ReactLoopEngine{
-		llm:      llmClient,
-		registry: registry,
-		memory:   store,
-		prompt:   promptBuilder,
-		logger:   log,
-		tracer:   tracer,
+		llm:                   llmClient,
+		registry:              registry,
+		memory:                store,
+		prompt:                promptBuilder,
+		logger:                log,
+		tracer:                tracer,
+		estimator:             estimator,
+		planner:               planner,
+		contextWindow:         contextWindow,
+		maxTokens:             maxTokens,
+		effectiveContextRatio: 0.92,
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -158,33 +212,159 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 		maxIter = 50
 	}
 
+	if dispatcher := hookcontract.FromContext(ctx); dispatcher != nil {
+		result, err := dispatcher.Dispatch(ctx, hookmodel.Event{Name: hookmodel.EventUserPromptSubmit, Payload: map[string]any{"user_prompt": req.UserInput}})
+		if err != nil {
+			return fmt.Errorf("执行 UserPromptSubmit Hook 失败: %w", err)
+		}
+		hookcontract.AppendAdditionalContext(ctx, result.AdditionalContext...)
+		if result.Blocked {
+			return fmt.Errorf("用户输入被 Hook 阻断: %s", result.BlockReason)
+		}
+	}
+
 	// ── 步骤1: 获取工具定义（tool.Info，与外部框架无关）─────────
 	toolInfos := e.getToolInfos(agent)
 	activeToolNames := namesOfToolInfos(toolInfos)
 
-	// ── 步骤2: 构建初始消息列表 ───────────────────────────────
-	// System消息（注入提示词 + 当前时间）
+	// ── 步骤2: 构建初始消息列表与弹性预算装配 ──────────────────
+	// System消息（Persona System Prompt）
 	systemPrompt, err := e.prompt.BuildSystem(ctx, prompt.BuildRequest{Agent: agent, Run: rc.Run})
 	if err != nil {
 		return err
 	}
-	rc.Messages = append(rc.Messages, domain.NewSystemMessage(systemPrompt))
+	systemTokens := e.estimator.Estimate(ctx, systemPrompt, req.Agent.DefaultModel)
 
-	// 加载Session历史对话
-	history, err := e.memory.GetHistory(ctx, req.SessionID)
+	// 工具定义 DTO 的 Schema Token 估算
+	toolsTokens := 0
+	for _, t := range toolInfos {
+		if t != nil {
+			toolsTokens += e.estimator.Estimate(ctx, t.Name, req.Agent.DefaultModel)
+			toolsTokens += e.estimator.Estimate(ctx, tool.ResolveDescription(ctx, t), req.Agent.DefaultModel)
+			if t.Parameters != nil {
+				if data, mErr := json.Marshal(t.Parameters); mErr == nil {
+					toolsTokens += e.estimator.Estimate(ctx, string(data), req.Agent.DefaultModel)
+				}
+			}
+		}
+	}
+
+	// 当前轮输入 Token 估算
+	userTokens := e.estimator.Estimate(ctx, req.UserInput, req.Agent.DefaultModel)
+
+	// 弹性段预算规划 (Clamp + Reflow)
+	ref := memory.SessionRef{SessionID: req.SessionID, TenantID: req.TenantID}
+	if sessionRef, ok := memory.SessionRefFromCtx(ctx); ok {
+		ref = sessionRef
+	}
+	var historySummary *domain.SessionSummary
+	actualSummaryTokens := 0
+	if e.memory != nil {
+		if summary, sErr := e.memory.GetSummary(ctx, ref); sErr == nil && summary != nil {
+			historySummary = summary
+			actualSummaryTokens = summary.TokensCount
+		}
+	}
+
+	// ── 跨会话长期记忆与画像前置检索 ──────────────────
+	var up *domain.UserProfile
+	var ltmEntries []*domain.LongTermEntry
+	actualLTMTokens := 0
+
+	if e.ltm != nil {
+		sessionRef, ok := memory.SessionRefFromCtx(ctx)
+		if !ok {
+			sessionRef = ref
+			sessionRef.TenantID = req.TenantID
+		}
+
+		profileOptIn := true
+		if e.userProfileStore != nil && sessionRef.UserID != "" {
+			if loadedUp, upErr := e.userProfileStore.Get(ctx, sessionRef.TenantID, sessionRef.UserID); upErr == nil && loadedUp != nil {
+				up = loadedUp
+				profileOptIn = up.Builtin.MemoryOptIn
+			}
+		}
+
+		if profileOptIn {
+			var scopes []domain.MemoryScope
+			if sessionRef.UserID != "" {
+				scopes = append(scopes, domain.MemoryScope{Type: domain.MemoryScopeUser, ID: sessionRef.UserID})
+			}
+			scopes = append(scopes, domain.MemoryScope{Type: domain.MemoryScopeWorkspace, ID: req.SessionID})
+
+			mQuery := domain.MemoryQuery{
+				Query:  req.UserInput,
+				Scopes: scopes,
+				TopK:   5,
+				SortBy: domain.MemorySortByComposite,
+			}
+
+			if entries, ltmErr := e.ltm.Search(ctx, sessionRef, mQuery); ltmErr == nil {
+				ltmEntries = entries
+				for _, entry := range entries {
+					if entry != nil {
+						actualLTMTokens += e.estimator.Estimate(ctx, "- "+entry.Content, req.Agent.DefaultModel)
+					}
+				}
+			} else {
+				log.Warn("检索长期记忆失败", "error", ltmErr)
+			}
+		}
+	}
+
+	planOpt := runtimecontext.PlanOptions{
+		ContextWindow:         e.contextWindow,
+		EffectiveContextRatio: e.effectiveContextRatio,
+		MaxTokens:             e.maxTokens,
+		OutputReserveTokens:   e.outputReserveTokens,
+		Strategy:              req.ContextStrategy,
+		StableSystemTokens:    systemTokens,
+		ToolsSchemaTokens:     toolsTokens,
+		CurrentUserTokens:     userTokens,
+		ActualSummaryTokens:   actualSummaryTokens,
+		ActualLTMTokens:       actualLTMTokens,
+	}
+
+	budget, inputBudget, planErr := e.planner.Plan(ctx, planOpt)
+	if planErr != nil {
+		log.Error("Planner 预算分配失败，执行安全退化兜底", "error", planErr)
+		budget = runtimecontext.DistributableBudget{
+			History: 4096, // 退化安全值
+		}
+		inputBudget = int(float64(e.contextWindow)*e.effectiveContextRatio) - e.outputReserveTokens
+	}
+
+	// 拉取适量历史消息
+	recentOpt := memory.RecentOptions{
+		MaxTokens: budget.History,
+		Model:     req.Agent.DefaultModel,
+	}
+	res, err := e.memory.GetRecent(ctx, ref, recentOpt)
 	if err != nil {
 		log.Warn("加载历史记录失败，将从空历史开始", "error", err)
 	}
-	for _, m := range history {
-		if m != nil {
-			m.EnsureKind()
-		}
-	}
+	history := res.Messages
 	historyLen := len(history)
-	rc.Messages = append(rc.Messages, history...)
 
-	// 本轮用户输入
-	rc.Messages = append(rc.Messages, domain.NewUserMessage(req.UserInput))
+	// 精密组装 messages (system -> history -> working_obs -> user)
+	assembler := runtimecontext.NewDefaultContextAssembler(e.estimator)
+	assemblerOpt := runtimecontext.AssemblerOptions{
+		Budget:             budget,
+		MaxInputTokens:     inputBudget,
+		Model:              req.Agent.DefaultModel,
+		SystemPrompt:       systemPrompt,
+		UserProfile:        up,
+		LongTermMemories:   ltmEntries,
+		HistorySummary:     historySummary,
+		HistoryMessages:    history,
+		CurrentUserMessage: domain.NewUserMessage(req.UserInput),
+	}
+
+	rc.Messages, err = assembler.Assemble(ctx, assemblerOpt)
+	if err != nil {
+		return fmt.Errorf("assemble context messages failed: %w", err)
+	}
 
 	// mention 自动注入（在首轮 LLM 前；走 Skill 网关，含 Approval / 去重 / 收窄）
 	e.injectMentionedSkills(ctx, rc, req.UserInput, &activeToolNames, &toolInfos, log)
@@ -197,7 +377,11 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 	log.Info("准备执行Loop", "max_iterations", maxIter, "tools", strings.Join(toolNames, ","))
 
 	// ── 步骤3: 主循环 ─────────────────────────────────────────
+	stopBlocks := 0
 	for rc.Iteration = 0; rc.Iteration < maxIter; rc.Iteration++ {
+		if additions := hookcontract.DrainAdditionalContext(ctx); len(additions) > 0 {
+			rc.Messages = append(rc.Messages, domain.NewSystemMessage(strings.Join(additions, "\n")))
+		}
 		iterLog := log.With("iteration", rc.Iteration)
 		if rc.RepeatGuard != nil {
 			rc.RepeatGuard.BeginIteration()
@@ -288,6 +472,32 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 			})
 		}
 
+		// 两级压缩编排接线
+		if e.compactor != nil {
+			// 1. L1 Micro-Compact 大工具结果就地外置卸载
+			microRes, err := e.compactor.MaybeMicroCompact(ctx, rc)
+			if err != nil {
+				iterLog.Warn("L1 Micro Compact 失败", "err", err)
+			} else if microRes.Triggered {
+				iterLog.Info("L1 Micro Compact 成功触发", "saved_tokens", microRes.TokensSaved)
+			}
+
+			// 在压缩前，先记下本 Run 产生的增量消息数 N
+			deltaCount := len(rc.Messages) - historyLen
+
+			autoRes, err := e.compactor.MaybeAutoCompact(ctx, rc, ref)
+			if err != nil {
+				iterLog.Warn("L2 Auto Compact 失败", "err", err)
+			} else if autoRes.Triggered {
+				iterLog.Info("L2 Auto Compact 成功触发", "saved_tokens", autoRes.TokensSaved, "summary_id", autoRes.SummaryID)
+				// 自适应调整 historyLen，防止增量历史截断指针在重构后越界
+				historyLen = len(rc.Messages) - deltaCount
+				if historyLen < 0 {
+					historyLen = 0
+				}
+			}
+		}
+
 		// ForModel：完整链送给 LLM（含 skill_injection / tool）；UI 另走 ForUI，禁止双写存储
 		llmResp, err := e.llm.StreamGenerate(ctx, transcript.ProjectForModel(rc.Messages), toolInfos, onDelta)
 		if err != nil {
@@ -309,6 +519,15 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 			return fmt.Errorf("第%d轮LLM调用失败: %w", rc.Iteration, err)
 		}
 		iterLog.Debug("LLM响应", "tool_calls", len(llmResp.ToolCalls), "content_len", len(llmResp.Content))
+		usage := domain.TokenUsage{CompletionTokens: int64(e.estimator.Estimate(ctx, llmResp.Content, req.Agent.DefaultModel))}
+		if payload, marshalErr := json.Marshal(llmResp.ToolCalls); marshalErr == nil {
+			usage.CompletionTokens += int64(e.estimator.Estimate(ctx, string(payload), req.Agent.DefaultModel))
+		}
+		usage.TotalTokens = usage.CompletionTokens
+		rc.AddTokens(usage)
+		if limit := req.Agent.RuntimePolicy.MaxTokens; limit > 0 && rc.TokenUsed > limit {
+			return fmt.Errorf("budget exceeded: tokens (used=%d, max=%d)", rc.TokenUsed, limit)
+		}
 
 		progress.Emit(ctx, progress.Event{
 			Kind:       progress.KindLLM,
@@ -340,6 +559,10 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 
 		// ── 分支判断 ─────────────────────────────────────────
 		if len(llmResp.ToolCalls) > 0 {
+			if limit := req.Agent.RuntimePolicy.MaxToolCalls; limit > 0 && rc.ToolCalls+len(llmResp.ToolCalls) > limit {
+				return fmt.Errorf("budget exceeded: tool_calls (used=%d, requested=%d, max=%d)", rc.ToolCalls, len(llmResp.ToolCalls), limit)
+			}
+			rc.ToolCalls += len(llmResp.ToolCalls)
 
 			// ── 路径A: 执行工具调用 ──────────────────────────
 			step.ActionType = domain.ActionTypeToolCall
@@ -380,6 +603,26 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 				_ = rc.RepeatGuard.EndIteration(rc.Iteration, true)
 			}
 
+			if dispatcher := hookcontract.FromContext(ctx); dispatcher != nil {
+				result, hookErr := dispatcher.Dispatch(ctx, hookmodel.Event{Name: hookmodel.EventStop, Payload: map[string]any{"final_answer": llmResp.Content, "iterations": rc.Iteration + 1, "stop_active": stopBlocks > 0}})
+				if hookErr != nil {
+					return fmt.Errorf("执行 Stop Hook 失败: %w", hookErr)
+				}
+				hookcontract.AppendAdditionalContext(ctx, result.AdditionalContext...)
+				if result.Blocked {
+					stopBlocks++
+					if stopBlocks > 5 {
+						return fmt.Errorf("Stop Hook 连续阻断超过 5 次: %s", result.BlockReason)
+					}
+					rc.Messages = append(rc.Messages, domain.NewSystemMessage("Stop Hook 要求继续处理："+result.BlockReason))
+					now := time.Now()
+					step.Status = domain.StepStatusCompleted
+					step.FinishedAt = &now
+					rc.AddStep(step)
+					e.tracer.EndSpan(ctx, stepSpan, nil)
+					continue
+				}
+			}
 			rc.Run.FinalAnswer = llmResp.Content
 			rc.Run.Status = domain.RunStatusCompleted
 			applySkillFollowIncomplete(rc, iterLog)
@@ -813,7 +1056,11 @@ func (e *ReactLoopEngine) persistRunSessionMessages(ctx context.Context, session
 	if len(toSave) == 0 {
 		return
 	}
-	if err := e.memory.AppendMessages(ctx, sessionID, toSave); err != nil {
+	ref := memory.SessionRef{SessionID: sessionID}
+	if sessionRef, ok := memory.SessionRefFromCtx(ctx); ok {
+		ref = sessionRef
+	}
+	if err := e.memory.Append(ctx, ref, toSave); err != nil {
 		log.Warn("保存对话历史失败", "error", err, "message_count", len(toSave))
 		return
 	}

@@ -3,13 +3,18 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
 	"time"
 
+	approvalcontract "genesis-agent/internal/capabilities/approval/contract"
+	approvalmodel "genesis-agent/internal/capabilities/approval/model"
 	auditcontract "genesis-agent/internal/capabilities/audit/contract"
 	auditmodel "genesis-agent/internal/capabilities/audit/model"
+	hookcontract "genesis-agent/internal/capabilities/hook/contract"
+	hookmodel "genesis-agent/internal/capabilities/hook/model"
 	profilemodel "genesis-agent/internal/capabilities/profile/model"
 	tool "genesis-agent/internal/capabilities/tool/contract"
 	"genesis-agent/internal/capabilities/tool/scheduler"
@@ -65,6 +70,7 @@ type Options struct {
 	AuditSink  auditcontract.Sink
 	UsageSink  usagecontract.Sink
 	Authorizer Authorizer
+	Approval   approvalcontract.Service
 }
 
 // Gateway 在工具注册表外层执行可见性过滤、调度、追踪和审计。
@@ -77,6 +83,7 @@ type Gateway struct {
 	auditSink auditcontract.Sink
 	usageSink usagecontract.Sink
 	authz     Authorizer
+	approval  approvalcontract.Service
 }
 
 // New 创建工具网关。
@@ -89,12 +96,32 @@ func New(registry tool.Registry, tools profilemodel.ToolSet, options ...Options)
 		g.auditSink = options[0].AuditSink
 		g.usageSink = options[0].UsageSink
 		g.authz = options[0].Authorizer
+		g.approval = options[0].Approval
 	}
 	return g
 }
 
+// Authorizer 返回当前执行前授权器（可能为 nil）。
+func (g *Gateway) Authorizer() Authorizer {
+	if g == nil {
+		return nil
+	}
+	return g.authz
+}
+
+// SetAuthorizer 注入或替换执行前授权器（供产品 bootstrap 在 MCP 栈装配后接线）。
+func (g *Gateway) SetAuthorizer(authz Authorizer) {
+	if g == nil {
+		return
+	}
+	g.authz = authz
+}
+
 // Register 透传工具注册。产品 bootstrap 仍应优先注册后再创建 Gateway。
 func (g *Gateway) Register(t tool.Tool) { g.registry.Register(t) }
+
+// Unregister 透传工具注销（供 MCP listChanged / 断连动态撤下工具）。
+func (g *Gateway) Unregister(name string) { g.registry.Unregister(name) }
 
 // Get 按名称获取已允许的工具。
 func (g *Gateway) Get(name string) tool.Tool {
@@ -153,6 +180,38 @@ func (g *Gateway) Execute(ctx context.Context, name, params string) (result stri
 		g.record(ctx, event)
 	}()
 
+	if dispatcher := hookcontract.FromContext(ctx); dispatcher != nil {
+		pre, dispatchErr := dispatcher.Dispatch(ctx, hookmodel.Event{Name: hookmodel.EventPreToolUse, MatchKey: name, Payload: map[string]any{
+			"tool_name": name, "tool_input": decodeToolParams(params),
+		}})
+		if dispatchErr != nil {
+			return "", fmt.Errorf("执行 PreToolUse Hook 失败: %w", dispatchErr)
+		}
+		hookcontract.AppendAdditionalContext(ctx, pre.AdditionalContext...)
+		if pre.Blocked {
+			return "", fmt.Errorf("工具 [%s] 被 Hook 阻断: %s", name, pre.BlockReason)
+		}
+		if pre.NeedApproval {
+			if g.approval == nil {
+				return "", fmt.Errorf("工具 [%s] 的 Hook 请求人工审批，但当前 Gateway 未配置审批服务", name)
+			}
+			decision, approvalErr := g.approval.Authorize(ctx, approvalmodel.Request{ToolName: name, Action: approvalmodel.ActionCommandExec, Resource: approvalmodel.Resource{Type: "tool", URI: name, Display: name}, Reason: "Hook 请求人工审批", Risk: approvalmodel.RiskMedium, SuggestedScopes: []approvalmodel.GrantScope{approvalmodel.GrantScopeOnce, approvalmodel.GrantScopeSession}})
+			if approvalErr != nil {
+				return "", fmt.Errorf("执行 Hook 审批失败: %w", approvalErr)
+			}
+			if decision.Type != approvalmodel.DecisionApproved && decision.Type != approvalmodel.DecisionApprovedForScope {
+				return "", fmt.Errorf("工具 [%s] 的 Hook 审批被拒绝: %s", name, decision.Reason)
+			}
+		}
+		if len(pre.UpdatedInput) > 0 {
+			updated, marshalErr := json.Marshal(mergeToolParams(params, pre.UpdatedInput))
+			if marshalErr != nil {
+				return "", fmt.Errorf("序列化 Hook 改写后的工具参数失败: %w", marshalErr)
+			}
+			params = string(updated)
+		}
+	}
+
 	if g.authz != nil {
 		decision, authErr := g.authz.AuthorizeTool(ctx, AuthorizationRequest{ToolName: name, Params: params, Info: info, Traits: traits})
 		if authErr != nil {
@@ -172,7 +231,33 @@ func (g *Gateway) Execute(ctx context.Context, name, params string) (result stri
 		return "", err
 	}
 	defer release()
-	return t.Execute(ctx, params)
+	result, executeErr := t.Execute(ctx, params)
+	if dispatcher := hookcontract.FromContext(ctx); dispatcher != nil {
+		post, dispatchErr := dispatcher.Dispatch(ctx, hookmodel.Event{Name: hookmodel.EventPostToolUse, MatchKey: name, Payload: map[string]any{
+			"tool_name": name, "tool_input": decodeToolParams(params), "tool_result": result,
+			"success": executeErr == nil, "duration_ms": time.Since(started).Milliseconds(),
+		}})
+		_ = dispatchErr // PostToolUse 是通知型事件，必须 fail-open。
+		hookcontract.AppendAdditionalContext(ctx, post.AdditionalContext...)
+	}
+	return result, executeErr
+}
+
+func decodeToolParams(params string) any {
+	var value any
+	if err := json.Unmarshal([]byte(params), &value); err == nil {
+		return value
+	}
+	return params
+}
+
+func mergeToolParams(params string, updates map[string]any) map[string]any {
+	merged := make(map[string]any, len(updates))
+	_ = json.Unmarshal([]byte(params), &merged)
+	for key, value := range updates {
+		merged[key] = value
+	}
+	return merged
 }
 
 // ListInfos 返回当前 Profile 可见的工具列表（动态描述已解析）。
@@ -328,8 +413,9 @@ func auditMetadata(event AuditEvent, enriched map[string]string) map[string]stri
 }
 
 func isVisible(info *tool.Info) bool {
+	// deferred 不进 LLM schema，需经检索工具提升后改为 direct（对齐 MCP deferred exposure）。
 	traits := tool.TraitsOf(info)
-	return traits.Exposure == tool.ToolExposureDirect || traits.Exposure == tool.ToolExposureDeferred
+	return traits.Exposure == tool.ToolExposureDirect
 }
 
 func isExecutable(info *tool.Info) bool {
@@ -359,7 +445,8 @@ func matchesAny(patterns []string, name string) bool {
 		if pattern == "*" || pattern == name {
 			return true
 		}
-		if strings.HasSuffix(pattern, ".*") {
+		// 支持 prefix.* 与 prefix*（如 mcp__*、mcp__filesystem__*）。
+		if strings.HasSuffix(pattern, "*") {
 			prefix := strings.TrimSuffix(pattern, "*")
 			if strings.HasPrefix(name, prefix) {
 				return true

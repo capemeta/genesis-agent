@@ -96,7 +96,8 @@ func (f *fakeSkillMatcher) Match(context.Context, string) (string, bool, error) 
 
 type emptyRegistry struct{}
 
-func (emptyRegistry) Register(tool.Tool) {}
+func (emptyRegistry) Register(tool.Tool)   {}
+func (emptyRegistry) Unregister(string)    {}
 func (emptyRegistry) Get(string) tool.Tool {
 	return nil
 }

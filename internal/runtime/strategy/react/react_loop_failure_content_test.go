@@ -55,7 +55,8 @@ type failingJSONRegistry struct {
 	err    error
 }
 
-func (f failingJSONRegistry) Register(tool.Tool) {}
+func (f failingJSONRegistry) Register(tool.Tool)   {}
+func (f failingJSONRegistry) Unregister(string)    {}
 func (f failingJSONRegistry) Get(string) tool.Tool {
 	return nil
 }

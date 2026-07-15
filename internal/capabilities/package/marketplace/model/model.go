@@ -37,6 +37,7 @@ const (
 // MarketplaceSource 是可刷新、可审计的分发来源描述。
 type MarketplaceSource struct {
 	Type    SourceType        `json:"type"`
+	Host    string            `json:"host,omitempty"` // github 兼容主机，空则 github.com
 	Repo    string            `json:"repo,omitempty"`
 	URL     string            `json:"url,omitempty"`
 	Path    string            `json:"path,omitempty"`
@@ -234,7 +235,11 @@ func SourceAddress(source MarketplaceSource) string {
 		if source.Repo == "" {
 			return ""
 		}
-		address := "https://github.com/" + source.Repo
+		host := strings.TrimSpace(source.Host)
+		if host == "" {
+			host = "github.com"
+		}
+		address := "https://" + host + "/" + source.Repo
 		if source.Ref != "" {
 			address += "@" + source.Ref
 		}
@@ -254,7 +259,11 @@ func SourceAddress(source MarketplaceSource) string {
 func SourceDomain(source MarketplaceSource) string {
 	switch source.Type {
 	case SourceTypeGitHub:
-		return "github.com"
+		host := strings.TrimSpace(source.Host)
+		if host == "" {
+			return "github.com"
+		}
+		return strings.ToLower(host)
 	case SourceTypeGit, SourceTypeURL:
 		if parsed, err := url.Parse(source.URL); err == nil {
 			return strings.ToLower(parsed.Hostname())

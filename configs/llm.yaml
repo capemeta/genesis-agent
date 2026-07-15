@@ -1,0 +1,156 @@
+# LLM 独立默认配置。密钥请通过 config.local.yaml 或环境变量覆盖。
+llm:
+  # 全局默认请求超时；Provider 可单独覆盖
+  timeout: 60s
+
+  # Provider 层：endpoint 与认证只配置一次
+  providers:
+    qwen:
+      type: openai
+      base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+      timeout: 60s
+      auth:
+        type: api_key
+        api_key: ${QWEN_API_KEY}
+
+    openai:
+      type: openai
+      base_url: https://api.openai.com/v1
+      timeout: 60s
+      auth:
+        type: api_key
+        api_key: ${OPENAI_API_KEY}
+
+    deepseek:
+      type: openai
+      base_url: https://api.deepseek.com/v1
+      timeout: 60s
+      auth:
+        type: api_key
+        api_key: ${DEEPSEEK_API_KEY}
+
+    claude:
+      type: anthropic
+      base_url: https://api.anthropic.com
+      timeout: 60s
+      auth:
+        type: api_key
+        api_key: ${CLAUDE_API_KEY}
+
+    ollama:
+      type: ollama
+      base_url: http://localhost:11434
+      timeout: 120s
+      auth:
+        type: none
+
+    ark:
+      type: ark
+      base_url: ""
+      timeout: 60s
+      auth:
+        type: api_key
+        api_key: ${ARK_API_KEY}
+        access_key: ${ARK_ACCESS_KEY}
+        secret_key: ${ARK_SECRET_KEY}
+
+    azure_openai:
+      type: openai
+      base_url: ${AZURE_OPENAI_BASE_URL}
+      api_version: ${AZURE_OPENAI_API_VERSION}
+      by_azure: true
+      timeout: 60s
+      auth:
+        type: api_key
+        api_key: ${AZURE_OPENAI_API_KEY}
+
+  # Model Pool：业务只选择模型别名，不重复写 endpoint/key
+  # 输入预算 = (总窗口 * 0.92) - output_reserve_tokens
+  #   实际可用的 = 总窗口 * 0.92 ，预留一些缓冲
+  #   output_reserve_tokens 专门用来计算的，与 max_tokens独立出来好点
+  models:
+    fast:
+      provider: qwen
+      model: qwen-turbo
+      strategy: low_cost
+      timeout: 45s
+      temperature: 0.2
+      max_tokens: 2048
+      tool_choice: auto
+      supports_tools: true
+      # 必填：上下文管理配置（必须显式指定以保证预算裁剪和防溢出机制的运行）
+      context_window: 128000
+      effective_context_ratio: 0.92
+      output_reserve_tokens: 2048
+      tags: [fast, cheap, tool_call]
+
+    default:
+      provider: qwen
+      model: deepseek-v4-flash
+      strategy: balanced
+      timeout: 90s
+      temperature: 0.4
+      max_tokens: 4096
+      tool_choice: auto
+      supports_tools: true
+      # 必填：上下文管理配置（必须显式指定以保证预算裁剪和防溢出机制的运行）
+      context_window: 128000
+      effective_context_ratio: 0.92
+      output_reserve_tokens: 4096
+      tags: [chat, default]
+
+    reasoning:
+      provider: qwen
+      model: deepseek-v4-flash
+      strategy: high_quality
+      timeout: 180s
+      temperature: 0.2
+      max_tokens: 8192
+      tool_choice: auto
+      supports_tools: true
+      # 必填：上下文管理配置（必须显式指定以保证预算裁剪和防溢出机制的运行）
+      context_window: 128000
+      effective_context_ratio: 0.92
+      output_reserve_tokens: 8192
+      tags: [planning, reasoning]
+
+    coder:
+      provider: qwen
+      model: deepseek-v4-flash
+      strategy: code_quality
+      timeout: 240s
+      temperature: 0.1
+      max_tokens: 8192
+      tool_choice: auto
+      supports_tools: true
+      # 必填：上下文管理配置（必须显式指定以保证预算裁剪和防溢出机制的运行）
+      context_window: 128000
+      effective_context_ratio: 0.92
+      output_reserve_tokens: 8192
+      tags: [coding]
+
+    local:
+      provider: ollama
+      model: qwen2.5:7b
+      strategy: local_private
+      timeout: 300s
+      temperature: 0.3
+      max_tokens: 4096
+      supports_tools: false
+      # 必填：上下文管理配置（必须显式指定以保证预算裁剪和防溢出机制的运行）
+      context_window: 32768
+      effective_context_ratio: 0.92
+      output_reserve_tokens: 4096
+      tags: [local, offline]
+
+  # 路由规则：不同任务选择不同模型别名
+  router:
+    default: default
+    fallback: default
+    tool_call: fast
+    chat: default
+    coding: coder
+    planning: reasoning
+    summarization: fast
+    embedding: default
+    vision: default

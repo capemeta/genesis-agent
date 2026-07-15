@@ -40,7 +40,7 @@ start.bat skill install document-skills@anthropic-agent-skills
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
-| `--config, -c <dir>` | `configs` | 配置目录，包含 `config.yaml` 和可选 `config.local.yaml`。 |
+| `--config, -c <dir>` | `configs` | 配置目录，包含 `config.yaml`、`llm.yaml`，以及可选的 `mcp.yaml`、`hooks.yaml`、`config.local.yaml`；当前默认值相对进程工作目录。 |
 | `--sandbox <mode>` | `disabled` | 命令执行沙箱策略：`disabled`、`optional`、`required`。 |
 | `--help, -h` | 无 | 显示帮助。 |
 
@@ -50,6 +50,8 @@ start.bat skill install document-skills@anthropic-agent-skills
 start.bat --config configs chat
 start.bat --sandbox required run "执行测试"
 ```
+
+`start.bat` 会先切换到脚本所在目录，因此源码开发期的默认 `configs` 会解析为仓库同级目录。直接运行已打包的 `genesis-cli.exe` 时，当前实现仍以启动时工作目录为准；需要通过 `--config <目录>` 显式指定。安装包自动按 exe 同级 `configs/` 定位属于既定发行目标，尚待加载器实现，详见 `docs/产品分发架构设计.md` 的“安装包配置分发契约”。
 
 ## 四、基础命令
 

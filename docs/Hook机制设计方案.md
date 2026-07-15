@@ -1,10 +1,24 @@
 # Hook 机制设计方案
 
-> 状态：设计稿（Phase 1B）
+> 状态：Phase 1 已落地，治理增强与后续事件持续推进
 > 适用范围：`genesis-agent` Runtime 内核、Tool/Skill 网关、Approval 与观测体系
 > 关联文档：`docs/agent loop设计.md`（SkillHook / Runtime Middleware 目标）、`docs/项目目录与边界说明.md`（目录与依赖边界）、`docs/文件系统设计方案.md`（Gateway Authorizer）、`docs/子智能体设计.md`（Subagent 生命周期）、`docs/superpowers/specs/2026-07-09-skill-tool-protocol-boundary-design.md`（Skill/Tool 边界）
 
 本方案定义 genesis-agent 的通用 Hook（钩子）机制：在 Agent 运行生命周期的关键点，允许用户/企业通过**外部命令**或**内置 Go 处理器**观测、注入上下文、改写工具输入、放行或阻断执行，而无需修改内核代码。
+
+## 实施状态（2026-07-15）
+
+| 范围 | 状态 | 已落地内容 / 说明 |
+|---|:---:|---|
+| P1：内核骨架 | 已完成 | `hook/model`、`hook/contract`、context dispatcher、并发安全 additionalContext 队列、`progress.KindHook` 已落地。 |
+| P2：command / builtin handler | 已完成 | `execution.Command.Stdin` 已透传到本地执行器；command handler 支持 stdin JSON、stdout decision、exit `0/1/2`、超时；builtin registry 已提供。 |
+| P3：Gateway | 已完成 | `PreToolUse`/`PostToolUse` 已接入统一 Gateway，支持阻断、参数改写、上下文追加与 `ask` 到 Approval Service 的桥接；每个 handler 都进入 Hook 专用 audit/trace。 |
+| P4：Run / ReAct | 部分完成 | `RunStart`/`RunComplete` 已上提 `app.RunOnce`；ReAct 已接入 `UserPromptSubmit`、`Stop`，Stop 最多重入 5 次；additionalContext 在下一次 LLM 推理前注入 system message。仍需补充端到端生命周期测试。 |
+| P5：Skill | 已完成 | 仅 model 调用 `Skill(...)` 触发 `PreSkillUse`/`PostSkillUse`；显式/mention 路径保持不拦截。 |
+| P6：治理与产品装配 | 已完成 | 已实现稳定 handler key + `state` 覆盖、`trusted_hash` 命令定义指纹校验、统一 scope 过滤、默认 git/secret builtin guards、managed-only 与三产品装配。 |
+| P7：后续能力 | 部分完成 | `PreCompact` 在上下文变更前接入，可阻断本次压缩；`SubagentStart` 在并发槽预留前接入，可阻断启动；`SubagentStop` 在终态后通知。已提供产品无关的有效 Hook 查询服务、`genesis-cli hook list [--json]` 与用户/项目/local 跨来源优先级。仍待 Enterprise managed+sandbox command hook、prompt handler、Desktop/Enterprise 管理界面与 plugin HookSource。 |
+
+当前验证：Hook 单元测试、Gateway、ReAct、app、三个产品 bootstrap 和 `go test ./internal/...` 通过。`check_product_isolation.ps1` 仍因工作区已有 Enterprise 对 `shared/local/*` 的依赖失败，非 Hook 本次新增依赖；该既有边界问题需单独清理后重新启用脚本绿灯要求。
 
 ---
 
@@ -18,7 +32,7 @@
    - `RunStart` / `UserPromptSubmit` / `Stop` / `RunComplete` → `ReactLoopEngine`（`react_loop.go`），通过 context 注入 `hook.Dispatcher`（对齐 `progress.Sink` / `ApprovalGrantedHook` 模式）。
    - `PreSkillUse` / `PostSkillUse` → Skill 网关工具与 `run_skill_command` 服务。
    - `PermissionRequest` 语义与 `approval.Service` 串联（deny 短路）。
-5. **配置**采用 YAML（与项目 viper 体系一致），多层 merge + per-hook `enabled` / `trusted_hash` 治理，支持企业 `managed-only`。
+5. **配置**采用独立 `hooks.yaml`（不再嵌入通用 `config.yaml`），多层追加 merge + per-hook `enabled` / `trusted_hash` 治理，支持企业 `managed-only`。
 6. **观测**复用现有 `progress.Sink` / `audit.Sink` / `usage.Sink` / `trace.Tracer`，Hook 运行态可推送 UI。
 7. **产品形态统一内核、差异只在 bootstrap 注入**（§6.5）：CLI/Desktop 走宿主机执行；**Enterprise 禁止宿主任意 command hook**，只允许 builtin 或 managed+sandbox，默认 `allow_managed_only=true`；Hook 纳入统一能力适用范围（scope）过滤。
 
@@ -294,7 +308,7 @@ internal/capabilities/hook/
 
 ```text
 products/<product>/bootstrap
-  -> hook/service.NewDispatcher(loader.Load(cfg.Hooks, scope), runner, sinks...)  // 详见 §6.5.5
+  -> hook/service.NewDispatcher(config.LoadHookConfig(...), runner, sinks...)  // 详见 §6.5.5
   -> app.RunOnce 时 hook.WithDispatcher(ctx, dispatcher)   // 类比 progress.WithSink
 internal/runtime & Gateway & Skill service
   -> hook/contract.FromContext(ctx).Dispatch(...)
@@ -452,12 +466,13 @@ Dispatcher/loader 提供 `execution` 与 `allow_managed_only` 开关即可覆盖
 # CLI / Desktop（shared/local host runner）
 products/<cli|desktop>/bootstrap:
   runner := localexec.NewHostCommandRunner(...)          // shared/local/execution
-  disp   := hooksvc.NewDispatcher(hookloader.Load(cfg.Hooks, scope), runner, sinks...)
+  hooks  := config.LoadHookConfig(configDir, product)
+  disp   := hooksvc.NewDispatcher(hooks, runner, sinks...)
   // RunOnce 时 hook.WithDispatcher(ctx, disp)  ← 与 progress.WithSink 同处（internal/app）
 
 # Enterprise（sandbox runner，managed-only）
 products/enterprise/bootstrap:
-  cfg.Hooks.Execution = "sandbox"; cfg.Hooks.AllowManagedOnly = true
+  hooks := config.LoadHookConfig(configDir, "enterprise") // 仅 managed 来源，默认 sandbox + managed-only
   runner := sandboxexec.NewSandboxCommandRunner(sandboxClient)   // 经 SandboxRunner
   disp   := hooksvc.NewDispatcher(hookloader.LoadManaged(policy, tenantScope), runner, centralSinks...)
 ```
@@ -529,25 +544,24 @@ gateway.Execute(ctx, name, params):
 
 ## 8. 配置设计（YAML）
 
-### 8.1 配置位置与优先级（复用 viper 多层，`config.go:3-8`）
+### 8.1 配置位置与优先级（统一多层语义）
 
-1. `configs/config.yaml`（默认，提交版本库，通常空/示例）
-2. `configs/config.local.yaml`（本地覆盖）
-3. `~/.genesis-agent/<product>/config.yaml`（用户级）
-4. 企业 managed：`requirements`（`allow_managed_only=true` 时忽略上面三层的 hooks）
-5. `AGENT_` 环境变量（仅开关类，如 `AGENT_HOOKS_ENABLED`）
+1. `~/.genesis-agent/<product>/hooks.yaml`（跨项目用户级）
+2. `configs/hooks.yaml`（项目共享，提交版本库，通常空/示例）
+3. `.genesis/hooks.yaml`（工作区项目级，仅 CLI/Desktop）
+4. `configs/hooks.local.yaml`（项目本地覆盖，已 gitignore）
+5. 企业 managed：`requirements`（`allow_managed_only=true` 时忽略本机来源）
 
-多层 hooks **追加合并**（对齐 Kode，非覆盖）；`enabled`/`trusted_hash` 就近覆盖。
+多层 hooks 按上述低到高顺序**追加合并**（对齐 Kode，非覆盖）；事件执行顺序保持来源顺序，`enabled`/`trusted_hash` 和其他标量由后层覆盖。
 
-### 8.2 配置结构（新增顶层 `hooks:`，映射 `config.Config`）
+### 8.2 配置结构（独立 `hooks.yaml`）
 
 ```yaml
-hooks:
-  enabled: true                 # 全局开关（对齐 Kode disableAllHooks 反义）
-  execution: host               # host | sandbox（Enterprise bootstrap 覆盖为 sandbox，见 §6.4/§6.5）
-  allow_managed_only: false     # 企业：仅 managed hooks 生效
-  default_timeout: 30s          # command handler 默认超时
-  events:
+enabled: true                 # 全局开关（对齐 Kode disableAllHooks 反义）
+execution: host               # host | sandbox（Enterprise 固定 sandbox）
+allow_managed_only: false     # 企业：仅 managed hooks 生效
+default_timeout: 30s          # command handler 默认超时
+events:
     PreToolUse:
       - matcher: "run_command|run_skill_command"   # 精确/别名；支持 glob 与 /regex/
         handlers:
@@ -707,7 +721,7 @@ ReactLoopEngine.runToolCall
 | **P4：接入 Engine** | RunStart/RunComplete 上提到 `app.RunOnce`；UserPromptSubmit/Stop（重入≤5）接 `react_loop`；additionalContext 注入队列（并发安全） | ReAct 集成测试 |
 | **P5：Skill + 审批桥接** | PreSkillUse（仅 model 调用）/PostSkillUse；ask/deny 桥接 `approval.Service` | Skill/审批集成测试 |
 | **P6：治理 + 产品装配** | trust hash（内容指纹）、全局/单条禁用、managed-only、内置守卫（git/secret）；CLI/Desktop 注入宿主 runner；**Enterprise 暂按「command 禁用、仅 builtin + 观测」装配**（决策 F）+ managed-only + tenant scope（§6.5）；纳入统一能力适用范围过滤 | 治理测试 + `check_product_isolation.ps1` |
-| **P7（后续）** | **Enterprise command hook（managed + sandbox，决策 F）**；prompt handler；PreCompact/Subagent 事件；`hooks/list` 管理契约与 UI；plugin HookSource | — |
+| **P7（后续）** | **Enterprise command hook（managed + sandbox，决策 F）**；prompt handler；Desktop/Enterprise 管理界面；plugin HookSource | — |
 
 > **P2 前置（阻塞）**：需先与 execution owner 落地 `Command.Stdin` 契约扩展（§6.4 / 决策 A）；未落地前 P2 先仅实现 builtin handler，command handler 待契约就绪。
 
