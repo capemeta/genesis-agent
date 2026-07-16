@@ -5,19 +5,27 @@ import (
 
 	"genesis-agent/internal/app"
 	mcpstack "genesis-agent/internal/capabilities/mcp/stack"
+	multicontract "genesis-agent/internal/runtime/multiagent/contract"
 	"genesis-agent/products/enterprise/internal/interfaces/http/handler"
 )
 
 // newRouter 创建路由器并注册所有 API 路由
 // 使用标准库 http.ServeMux，避免引入不必要的第三方路由框架
 // 后期如需要路径参数、中间件等高级特性，可替换为 chi 或 gin
-func newRouter(svc app.AgentService, mcp *mcpstack.Stack) http.Handler {
+func newRouter(svc app.AgentService, mcp *mcpstack.Stack, readers ...multicontract.ProjectionReader) http.Handler {
+	var projection multicontract.ProjectionReader
+	if len(readers) > 0 {
+		projection = readers[0]
+	}
+	return newRouterWithProjectionTenant(svc, mcp, projection, "")
+}
+
+func newRouterWithProjectionTenant(svc app.AgentService, mcp *mcpstack.Stack, projection multicontract.ProjectionReader, tenantID string) http.Handler {
 	mux := http.NewServeMux()
 	h := handler.NewAgentHandler(svc)
 	secrets := handler.NewSecretsHandler(svc)
 	mcpHandler := handler.NewMCPHandler(mcp)
-
-	// ── 健康检查 ──────────────────────────────────────────────
+	subagentProjection := handler.NewSubAgentProjectionHandlerForTenant(projection, tenantID)
 	mux.HandleFunc("GET /health", handleHealth)
 	mux.HandleFunc("GET /readiness", handleHealth)
 
@@ -34,6 +42,7 @@ func newRouter(svc app.AgentService, mcp *mcpstack.Stack) http.Handler {
 	mux.HandleFunc("GET /v1/mcp/servers", mcpHandler.ListServers)
 	mux.HandleFunc("GET /v1/mcp/servers/{name}", mcpHandler.GetServer)
 	mux.HandleFunc("POST /v1/mcp/servers/{name}/refresh", mcpHandler.RefreshServer)
+	mux.HandleFunc("GET /v1/subagents/events", subagentProjection.List)
 
 	// ── 密钥与业务连接 API ─────────────────────────────────────
 	// 密钥接口只返回元数据，不回显 secret 明文。

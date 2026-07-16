@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -21,11 +22,64 @@ type frontmatter struct {
 	Tools           []string `yaml:"tools"`
 	DisallowedTools []string `yaml:"disallowed_tools"`
 	MaxTurns        int      `yaml:"max_turns"`
+	MaxDepth        int      `yaml:"max_depth"`
+	MaxTokens       int64    `yaml:"max_tokens"`
+	MaxToolCalls    int      `yaml:"max_tool_calls"`
+	ForkContext     *bool    `yaml:"fork_context"`
+	ExecutionMode   string   `yaml:"execution_mode"`
+	TimeoutSeconds  int      `yaml:"timeout_seconds"`
 }
 
 // LoadProjectDefinitions 只读加载工作区 .genesis/agents 下的 Markdown 定义。
 func LoadProjectDefinitions(workspace string) ([]model.Definition, error) {
 	dir := filepath.Join(workspace, ".genesis", "agents")
+	return loadDefinitionsDirectory(dir)
+}
+
+// LoadLocalDefinitions 按 user → 工作区祖先（由远到近）合并本地只读 Definition。
+// 同名定义由后加载的更具体目录覆盖，保持与产品无关的可预测优先级。
+func LoadLocalDefinitions(workspace, home string) ([]model.Definition, error) {
+	workspace = filepath.Clean(workspace)
+	directories := make([]string, 0)
+	if strings.TrimSpace(home) != "" {
+		directories = append(directories, filepath.Join(home, ".genesis", "agents"))
+	}
+	ancestors := make([]string, 0)
+	for current := workspace; ; current = filepath.Dir(current) {
+		ancestors = append(ancestors, filepath.Join(current, ".genesis", "agents"))
+		parent := filepath.Dir(current)
+		if parent == current {
+			break
+		}
+	}
+	for i := len(ancestors) - 1; i >= 0; i-- {
+		directories = append(directories, ancestors[i])
+	}
+	merged := make(map[string]model.Definition)
+	seen := make(map[string]struct{})
+	for _, dir := range directories {
+		dir = filepath.Clean(dir)
+		if _, ok := seen[dir]; ok {
+			continue
+		}
+		seen[dir] = struct{}{}
+		definitions, err := loadDefinitionsDirectory(dir)
+		if err != nil {
+			return nil, err
+		}
+		for _, definition := range definitions {
+			merged[definition.Name] = definition
+		}
+	}
+	definitions := make([]model.Definition, 0, len(merged))
+	for _, definition := range merged {
+		definitions = append(definitions, definition)
+	}
+	sort.Slice(definitions, func(i, j int) bool { return definitions[i].Name < definitions[j].Name })
+	return definitions, nil
+}
+
+func loadDefinitionsDirectory(dir string) ([]model.Definition, error) {
 	entries, err := os.ReadDir(dir)
 	if os.IsNotExist(err) {
 		return nil, nil
@@ -38,13 +92,14 @@ func LoadProjectDefinitions(workspace string) ([]model.Definition, error) {
 		if entry.IsDir() || !strings.EqualFold(filepath.Ext(entry.Name()), ".md") {
 			continue
 		}
-		content, readErr := os.ReadFile(filepath.Join(dir, entry.Name()))
+		path := filepath.Join(dir, entry.Name())
+		content, readErr := os.ReadFile(path)
 		if readErr != nil {
 			return nil, fmt.Errorf("读取 Agent 定义 %s 失败: %w", entry.Name(), readErr)
 		}
 		definition, parseErr := ParseDefinition(string(content))
 		if parseErr != nil {
-			return nil, fmt.Errorf("Agent 定义 %s 无效: %w", entry.Name(), parseErr)
+			return nil, fmt.Errorf("Agent 定义 %s 无效: %w", path, parseErr)
 		}
 		definitions = append(definitions, definition)
 	}
@@ -59,7 +114,9 @@ func ParseDefinition(content string) (model.Definition, error) {
 		return model.Definition{}, fmt.Errorf("frontmatter 必须以 --- 包裹")
 	}
 	var meta frontmatter
-	if err := yaml.Unmarshal([]byte(parts[1]), &meta); err != nil {
+	decoder := yaml.NewDecoder(bytes.NewBufferString(parts[1]))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&meta); err != nil {
 		return model.Definition{}, fmt.Errorf("解析 frontmatter 失败: %w", err)
 	}
 	meta.Name, meta.Description = strings.TrimSpace(meta.Name), strings.TrimSpace(meta.Description)
@@ -88,7 +145,26 @@ func ParseDefinition(content string) (model.Definition, error) {
 	if meta.MaxTurns < 0 {
 		return model.Definition{}, fmt.Errorf("max_turns 不能小于 0")
 	}
-	return model.Definition{Name: meta.Name, Description: meta.Description, WhenToUse: meta.Description, SystemPrompt: body, Tools: tools, MaxTurns: meta.MaxTurns}, nil
+	if meta.MaxDepth < 0 || meta.MaxDepth > 2 {
+		return model.Definition{}, fmt.Errorf("max_depth 必须为 0、1 或 2")
+	}
+	if meta.MaxTokens < 0 {
+		return model.Definition{}, fmt.Errorf("max_tokens 不能小于 0")
+	}
+	if meta.MaxToolCalls < 0 {
+		return model.Definition{}, fmt.Errorf("max_tool_calls 不能小于 0")
+	}
+	mode := model.ExecutionModeSync
+	if raw := strings.TrimSpace(meta.ExecutionMode); raw != "" {
+		mode = model.ExecutionMode(raw)
+		if mode != model.ExecutionModeSync && mode != model.ExecutionModeAsync {
+			return model.Definition{}, fmt.Errorf("execution_mode 必须为 sync 或 async")
+		}
+	}
+	if meta.TimeoutSeconds < 0 {
+		return model.Definition{}, fmt.Errorf("timeout_seconds 不能小于 0")
+	}
+	return model.Definition{Name: meta.Name, Description: meta.Description, WhenToUse: meta.Description, SystemPrompt: body, Tools: tools, MaxTurns: meta.MaxTurns, MaxDepth: meta.MaxDepth, MaxTokens: meta.MaxTokens, MaxToolCalls: meta.MaxToolCalls, ForkContext: meta.ForkContext, ExecutionMode: mode, TimeoutSec: meta.TimeoutSeconds}, nil
 }
 func toSet(values []string) map[string]bool {
 	out := map[string]bool{}

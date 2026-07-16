@@ -22,7 +22,7 @@ const (
 	metaPathMapNote      = "path_map_note"
 	metaBackendLegacy    = "backend"
 
-	pathMapNoteText = "脚本内用环境变量；inputs/write_file 仍只用 $WORK_DIR/... ，禁止把 path_map 右侧路径写入 tool JSON"
+	pathMapNoteText = "脚本内使用环境变量；inputs 和中间脚本用 $WORK_DIR/...，write_file 写最终文本交付物用 $OUTPUT_DIR/...；禁止把 path_map 右侧路径写入 tool JSON，command 中也禁止写逻辑前缀"
 )
 
 type pathHintState struct {

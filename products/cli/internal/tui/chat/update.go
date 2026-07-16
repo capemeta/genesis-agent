@@ -194,6 +194,33 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// 复制最近一条 Agent 回答到系统剪贴板
 			return m.copyLastAssistant()
 
+		case tea.KeyCtrlP:
+			// Ctrl+P/N 专用于输入历史，避免与消息区滚动争抢方向键。
+			if !m.loading && len(m.history) > 0 {
+				if m.historyIdx == -1 {
+					m.tempInput = m.textarea.Value()
+					m.historyIdx = len(m.history) - 1
+				} else if m.historyIdx > 0 {
+					m.historyIdx--
+				}
+				m.textarea.SetValue(m.history[m.historyIdx])
+				m.textarea.CursorEnd()
+				return m, nil
+			}
+
+		case tea.KeyCtrlN:
+			if !m.loading && m.historyIdx != -1 {
+				m.historyIdx++
+				if m.historyIdx >= len(m.history) {
+					m.historyIdx = -1
+					m.textarea.SetValue(m.tempInput)
+				} else {
+					m.textarea.SetValue(m.history[m.historyIdx])
+				}
+				m.textarea.CursorEnd()
+				return m, nil
+			}
+
 		case tea.KeyTab:
 			if m.commandMenuOpen {
 				m = m.applyCommandMenuSelection()
@@ -209,21 +236,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m.moveCommandMenu(-1), nil
 			}
 			if m.loading {
+				m.viewport.LineUp(1)
 				return m, nil
 			}
-			// 在输入为空或已在历史浏览态时，向上浏览历史
-			if m.textarea.Value() == "" || m.historyIdx != -1 {
-				if len(m.history) == 0 {
-					return m, nil
-				}
-				if m.historyIdx == -1 {
-					m.tempInput = m.textarea.Value()
-					m.historyIdx = len(m.history) - 1
-				} else if m.historyIdx > 0 {
-					m.historyIdx--
-				}
-				m.textarea.SetValue(m.history[m.historyIdx])
-				m.textarea.CursorEnd()
+			// Composer 为空时，方向键按界面提示滚动消息区。
+			// 输入历史改用 Ctrl+P/N，不再让「↑」看起来失效。
+			if m.textarea.Value() == "" && m.historyIdx == -1 {
+				m.viewport.LineUp(1)
 				return m, nil
 			}
 
@@ -232,25 +251,26 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m.moveCommandMenu(1), nil
 			}
 			if m.loading {
+				m.viewport.LineDown(1)
 				return m, nil
 			}
-			// 向下浏览历史或返回草稿
-			if m.historyIdx != -1 {
-				m.historyIdx++
-				if m.historyIdx >= len(m.history) {
-					m.historyIdx = -1
-					m.textarea.SetValue(m.tempInput)
-				} else {
-					m.textarea.SetValue(m.history[m.historyIdx])
-				}
-				m.textarea.CursorEnd()
+			if m.textarea.Value() == "" && m.historyIdx == -1 {
+				m.viewport.LineDown(1)
 				return m, nil
 			}
 
 		case tea.KeyEnter:
 			if m.commandMenuOpen && msg.String() != "shift+enter" && msg.String() != "alt+enter" {
-				m = m.applyCommandMenuSelection()
-				return m, nil
+				commands := m.commandMenuCommands()
+				input := strings.TrimSpace(m.textarea.Value())
+				if len(commands) == 0 || commands[m.commandMenuIndex].value != input {
+					m = m.applyCommandMenuSelection()
+					return m, nil
+				}
+				// 已输入完整命令时，Enter 应直接执行，不再停留在“使用候选”。
+				m.commandMenuOpen = false
+				m.commandMenuQuery = ""
+				m.viewport.Height = m.viewportHeight()
 			}
 			if msg.String() == "shift+enter" || msg.String() == "alt+enter" {
 				m.textarea.InsertString("\n")
@@ -294,8 +314,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if msg.String() == "?" && !m.loading && strings.TrimSpace(m.textarea.Value()) == "" {
 				return m.showHelpOverlay()
 			}
-			// o 键：展开/折叠运行过程日志（Composer 输入为空且非加载时生效）
-			if msg.String() == "o" && !m.loading {
+			// o 键：展开/折叠运行过程日志；加载期间输入框已禁用，仍允许控制视图。
+			if msg.String() == "o" {
 				if strings.TrimSpace(m.textarea.Value()) == "" {
 					m.progressExpanded = !m.progressExpanded
 					m.refreshViewportContent()
@@ -314,6 +334,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	// ── Agent 推理成功完成 ──────────────────────────────────────
 	case runCompleteMsg:
+		followTail := m.viewport.AtBottom()
 		m.loading = false
 		m.err = nil
 		m.currentStatus = ""
@@ -362,7 +383,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			})
 		}
 		m.refreshViewportContent()
-		m.viewport.GotoBottom()
+		if followTail {
+			m.viewport.GotoBottom()
+		}
 		// 恢复光标闪烁（推理期间被 spinner tick 替代）
 		return m, textarea.Blink
 
@@ -371,6 +394,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err.Error() == "操作已取消" {
 			return m, nil
 		}
+		followTail := m.viewport.AtBottom()
 		m.loading = false
 		m.err = msg.err
 		m.currentStatus = ""
@@ -395,7 +419,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			content: errContent,
 		})
 		m.refreshViewportContent()
-		m.viewport.GotoBottom()
+		if followTail {
+			m.viewport.GotoBottom()
+		}
 		return m, textarea.Blink
 
 	case progressMsg:
@@ -405,8 +431,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.applyProgress(msg.event)
 		now := time.Now()
 		if m.lastProgressRenderAt.IsZero() || now.Sub(m.lastProgressRenderAt) >= progressRenderInterval {
+			followTail := m.viewport.AtBottom()
 			m.refreshViewportContent()
-			m.viewport.GotoBottom()
+			if followTail {
+				m.viewport.GotoBottom()
+			}
 			m.lastProgressRenderAt = now
 			m.progressDirty = false
 		} else {
@@ -417,8 +446,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case flushProgressMsg:
 		if m.loading && m.progressDirty {
+			followTail := m.viewport.AtBottom()
 			m.refreshViewportContent()
-			m.viewport.GotoBottom()
+			if followTail {
+				m.viewport.GotoBottom()
+			}
 			m.lastProgressRenderAt = time.Now()
 			m.progressDirty = false
 		}
@@ -433,8 +465,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, spinCmd)
 	}
 
-	// Viewport 处理滚动相关事件（↑↓、PgUp/PgDn）
-	// 未启用鼠标捕获，以便终端原生拖选复制；滚轮滚动不可用。
+	// Viewport 处理翻页键。空输入时的↑/↓已在上方显式处理。
 	var vpCmd tea.Cmd
 	m.viewport, vpCmd = m.viewport.Update(msg)
 	cmds = append(cmds, vpCmd)
@@ -456,15 +487,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // handleWindowSize 处理终端窗口大小变化事件
 func (m Model) handleWindowSize(msg tea.WindowSizeMsg) (tea.Model, tea.Cmd) {
-	m.width = msg.Width
+	// Windows 终端与 Lip Gloss 对 CJK、符号和中英文混排的显示宽度可能存在偏差。
+	// 只保留 1 列时，渲染器认为未满行，但终端可能已经物理换行并滚屏，旧帧便会形成重影。
+	// 固定预留多列安全区，任何应用内容都不接近终端自动换行边界。
+	m.width = msg.Width - rightEdgeSafetyColumns
+	if m.width < 1 {
+		m.width = 1
+	}
 	m.height = msg.Height
 
 	// 更新 viewport 尺寸
-	m.viewport.Width = msg.Width
+	m.viewport.Width = m.width
 	m.viewport.Height = m.viewportHeight()
 
 	// 更新输入框宽度（减去圆角边框 2 + 内边距 2）
-	inputWidth := msg.Width - 4
+	inputWidth := m.width - 4
 	if inputWidth < 10 {
 		inputWidth = 10
 	}
@@ -495,6 +532,7 @@ func (m Model) sendMessage(input string) (tea.Model, tea.Cmd) {
 	m.err = nil
 	m.currentStatus = "准备运行 Agent"
 	m.progressLog = nil
+	m.progressCallIDs = nil
 	m.progressDirty = false
 	m.lastProgressRenderAt = time.Time{}
 	m.runStartedAt = time.Now()
@@ -547,7 +585,21 @@ func (m *Model) applyProgress(event progress.Event) {
 		if n := len(m.progressLog); n > 0 && m.progressLog[n-1] == summary {
 			return
 		}
-		m.progressLog = append(m.progressLog, summary)
+		// 如果有 CallID，则尝试原位替换该工具调用的最新执行进度
+		replaced := false
+		if event.CallID != "" {
+			for i, cid := range m.progressCallIDs {
+				if cid == event.CallID {
+					m.progressLog[i] = summary
+					replaced = true
+					break
+				}
+			}
+		}
+		if !replaced {
+			m.progressLog = append(m.progressLog, summary)
+			m.progressCallIDs = append(m.progressCallIDs, event.CallID)
+		}
 	}
 }
 
@@ -572,7 +624,6 @@ func (m *Model) applyLiveAssistantBlock(event progress.Event) {
 	case progress.PhaseStart:
 		idx := m.ensureAssistantMessage()
 		if event.BlockType == "final_answer" {
-			// 保留中间思考，再接最终回答；无思考时从空开始。
 			if strings.TrimSpace(m.messages[idx].content) != "" {
 				m.messages[idx].content = strings.TrimRight(m.messages[idx].content, "\n") + "\n\n—— 最终回答 ——\n\n"
 			} else {
@@ -580,7 +631,6 @@ func (m *Model) applyLiveAssistantBlock(event progress.Event) {
 			}
 			return
 		}
-		// 新一轮中间思考：与上一轮之间留空行，避免粘连。
 		if strings.TrimSpace(m.messages[idx].content) != "" {
 			m.messages[idx].content = strings.TrimRight(m.messages[idx].content, "\n") + "\n\n"
 		}
@@ -826,6 +876,7 @@ func (m Model) handleSlashCmd(input string) (tea.Model, tea.Cmd) {
 		m.session = session
 		m.err = nil
 		m.progressLog = nil
+		m.progressCallIDs = nil
 		m.progressExpanded = false
 		m.hydrateFromSession()
 		m.refreshViewportContent()

@@ -31,6 +31,7 @@ const (
 // Deps 是 run_command 工具依赖。
 type Deps struct {
 	Runner         execcontract.ExecutionRunner
+	Shells         execcontract.ShellCapabilityProvider
 	SessionManager execcontract.InteractiveSessionRunner // 注入会话管理器端口（可选，向后兼容）
 	Resolver       fscontract.PathResolver
 	Approval       approvalcontract.Service
@@ -81,16 +82,28 @@ func New(deps Deps) (tool.Tool, error) {
 }
 
 func (t *Tool) GetInfo() *tool.Info {
+	shellSchema := &tool.ParameterSchema{
+		Type:        "string",
+		Description: "要使用的Shell；默认使用environment_context中已探测的default_shell。command只填写脚本正文，不要重复嵌套Shell启动命令。",
+		Enum:        []string{string(execmodel.ShellAuto)},
+	}
+	if capabilities := t.shellCapabilities(context.Background()); len(capabilities.Supported) > 0 {
+		for _, shell := range capabilities.Supported {
+			if shell.Kind != "" {
+				shellSchema.Enum = append(shellSchema.Enum, string(shell.Kind))
+			}
+		}
+	}
 	return &tool.Info{
 		Name:        "run_command",
-		Description: "在当前 workspace 内或经审批目录下执行平台 shell 命令。支持按产品注入本地或沙箱 runner，并限制超时和输出大小。支持后台异步运行与 PTY 交互会话。",
+		Description: "在当前 workspace 内或经审批目录下执行平台Shell命令。仅用于运行程序、构建、测试或结构化文件工具无法表达的操作；列目录、遍历、查找、搜索和读取文件应优先使用list_dir、walk_dir、glob、grep、read_file。command只填写脚本正文，不要嵌套Shell启动命令。支持后台异步运行与PTY交互会话。",
 		Parameters: &tool.ParameterSchema{
 			Type: "object",
 			Properties: map[string]*tool.ParameterSchema{
 				"command":          {Type: "string", Description: "要执行的命令"},
 				"cwd":              {Type: "string", Description: "工作目录，默认当前 workspace"},
 				"env":              {Type: "object", Description: "额外环境变量；配置后需要审批"},
-				"shell":            {Type: "string", Description: "shell类型：auto/system/bash/sh/zsh/powershell/cmd，默认auto；具体支持取决于产品runner"},
+				"shell":            shellSchema,
 				"timeout_ms":       {Type: "integer", Description: "超时时间，默认30000，最大600000"},
 				"max_output_bytes": {Type: "integer", Description: "stdout和stderr分别输出上限，默认131072，最大4194304"},
 				"background":       {Type: "boolean", Description: "是否在后台异步运行，默认false"},
@@ -110,7 +123,7 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 	if in.Command == "" {
 		return "", execcontract.NewError(execcontract.ErrCodeInvalidInput, fmt.Errorf("command不能为空"))
 	}
-	shell, err := parseShell(in.Shell)
+	shell, err := t.resolveShell(in.Shell)
 	if err != nil {
 		return "", err
 	}
@@ -135,7 +148,7 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 		Background: in.Background,
 		UsePTY:     in.UsePTY,
 	}
-	cls := policy.Classify(cmd.Command)
+	cls := policy.ClassifyCommand(cmd)
 	if len(cmd.Env) > 0 && !cls.Critical {
 		cls.Dangerous = true
 		if cls.Reason == "read-only command" {
@@ -189,9 +202,12 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 		// 异步后台运行模式：直接返回会话 ID 句柄，不阻塞 Agent
 		if in.Background {
 			res := map[string]any{
-				"session_id": sessionID,
-				"status":     "running",
-				"message":    "命令已在后台异步启动，可使用 write_stdin 工具与会话订阅工具交互与查看进度",
+				"ok":             true,
+				"tool_status":    "success",
+				"process_status": "running",
+				"session_id":     sessionID,
+				"status":         "running",
+				"message":        "命令已在后台异步启动，可使用 write_stdin 工具与会话订阅工具交互与查看进度",
 			}
 			data, _ := json.MarshalIndent(res, "", "  ")
 			return string(data), nil
@@ -211,7 +227,7 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 				ExitCode:    0,
 				Environment: execmodel.EnvironmentLocal,
 			}
-			return toJSON(res)
+			return commandResultJSON(res)
 		}
 
 		// 同步 PTY 交互模式：订阅日志并同步等待会话运行结束
@@ -261,7 +277,7 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 						ExitCode:    0,
 						Environment: execmodel.EnvironmentLocal,
 					}
-					return toJSON(res)
+					return commandResultJSON(res)
 				}
 
 				if time.Now().After(deadline) {
@@ -277,7 +293,37 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return toJSON(result)
+	return commandResultJSON(result)
+}
+
+func (t *Tool) shellCapabilities(ctx context.Context) execmodel.ShellCapabilities {
+	if t == nil || t.deps.Shells == nil {
+		return execmodel.ShellCapabilities{}
+	}
+	return t.deps.Shells.ShellCapabilities(ctx)
+}
+
+func (t *Tool) resolveShell(raw string) (execmodel.ShellKind, error) {
+	shell, err := parseShell(raw)
+	if err != nil {
+		return "", err
+	}
+	capabilities := t.shellCapabilities(context.Background())
+	if shell == execmodel.ShellAuto || shell == execmodel.ShellSystem {
+		if capabilities.Default.Kind != "" {
+			return capabilities.Default.Kind, nil
+		}
+		return execmodel.ShellAuto, nil
+	}
+	if len(capabilities.Supported) == 0 {
+		return "", execcontract.NewError(execcontract.ErrCodeInvalidInput, fmt.Errorf("当前执行环境未声明支持shell: %s；请省略shell或使用auto", shell))
+	}
+	for _, supported := range capabilities.Supported {
+		if supported.Kind == shell {
+			return shell, nil
+		}
+	}
+	return "", execcontract.NewError(execcontract.ErrCodeInvalidInput, fmt.Errorf("当前执行环境不支持shell: %s", shell))
 }
 
 func sandboxProfile(ctx context.Context, profile execmodel.SandboxProfile) execmodel.SandboxProfile {
@@ -360,4 +406,44 @@ func toJSON(v any) (string, error) {
 		return "", fmt.Errorf("序列化工具结果失败: %w", err)
 	}
 	return string(data), nil
+}
+
+type commandResultOutput struct {
+	*execmodel.Result
+	OK                   bool           `json:"ok"`
+	ToolStatus           string         `json:"tool_status"`
+	ProcessStatus        string         `json:"process_status"`
+	CommandSucceeded     bool           `json:"command_succeeded"`
+	FailureKind          string         `json:"failure_kind,omitempty"`
+	SuggestedAction      string         `json:"suggested_action,omitempty"`
+	SuggestedTool        map[string]any `json:"suggested_tool,omitempty"`
+	OperationFingerprint string         `json:"operation_fingerprint,omitempty"`
+}
+
+func commandResultJSON(result *execmodel.Result) (string, error) {
+	if result == nil {
+		return "", fmt.Errorf("命令结果不能为空")
+	}
+	succeeded := result.ExitCode == 0 && !result.TimedOut
+	out := commandResultOutput{
+		Result:           result,
+		OK:               succeeded,
+		ToolStatus:       "success",
+		ProcessStatus:    "exited",
+		CommandSucceeded: succeeded,
+	}
+	if result.TimedOut {
+		out.ProcessStatus = "timed_out"
+		out.FailureKind = "timeout"
+	} else if result.ExitCode != 0 {
+		out.FailureKind = "command_exit_nonzero"
+	}
+	if !succeeded {
+		if hint := policy.RecoveryHint(execmodel.Command{Command: result.Command, Shell: result.Shell}); hint != nil {
+			out.SuggestedAction = hint.Action
+			out.OperationFingerprint = hint.OperationFingerprint
+			out.SuggestedTool = map[string]any{"name": hint.Tool, "reason": hint.Reason}
+		}
+	}
+	return toJSON(out)
 }

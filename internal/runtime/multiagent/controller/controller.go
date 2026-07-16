@@ -3,6 +3,8 @@ package controller
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"strings"
 	"sync"
@@ -15,32 +17,42 @@ import (
 	"genesis-agent/internal/platform/contextutil"
 	"genesis-agent/internal/platform/logger"
 	"genesis-agent/internal/runtime"
+	"genesis-agent/internal/runtime/multiagent/contextsnapshot"
 	"genesis-agent/internal/runtime/multiagent/contract"
 	"genesis-agent/internal/runtime/multiagent/model"
+	"genesis-agent/internal/runtime/multiagent/projection"
+	"genesis-agent/internal/runtime/multiagent/result"
 	"genesis-agent/internal/runtime/progress"
 )
 
 // Controller 是内存 Store 驱动的 Phase 1 控制器。持久化 Store 以后通过同一端口替换。
 type Controller struct {
-	engine  runtime.RunEngine
-	limiter contract.SlotLimiter
-	logger  logger.Logger
+	engine    runtime.RunEngine
+	limiter   contract.SlotLimiter
+	logger    logger.Logger
+	reducer   result.Reducer
+	projector result.Projector
+	store     contract.InstanceStore
+	proj      contract.ProjectionSink
 
 	mu        sync.RWMutex
 	instances map[string]*entry
 	nextID    uint64
+	idPrefix  string
 }
 
 type entry struct {
 	instance  model.Instance
+	request   contract.SpawnRequest
 	cancel    context.CancelFunc
 	slot      contract.SlotToken
 	done      chan struct{}
 	parentCtx context.Context
+	manifest  *result.ManifestRegistry
 }
 
 // New 创建控制器。
-func New(engine runtime.RunEngine, limiter contract.SlotLimiter, log logger.Logger) (*Controller, error) {
+func New(engine runtime.RunEngine, limiter contract.SlotLimiter, log logger.Logger, options ...Option) (*Controller, error) {
 	if engine == nil {
 		return nil, fmt.Errorf("subagent RunEngine不能为空")
 	}
@@ -50,29 +62,72 @@ func New(engine runtime.RunEngine, limiter contract.SlotLimiter, log logger.Logg
 	if log == nil {
 		log = logger.NewNop()
 	}
-	return &Controller{engine: engine, limiter: limiter, logger: log, instances: make(map[string]*entry)}, nil
+	controller := &Controller{engine: engine, limiter: limiter, logger: log, reducer: result.NewReducer(), projector: result.NewProjector(nil), store: newMemoryStore(), proj: projection.NewNopSink(), instances: make(map[string]*entry), idPrefix: newIDPrefix()}
+	for _, option := range options {
+		option(controller)
+	}
+	return controller, nil
+}
+
+// WithInstanceStore 注入产品级实例 Store。
+func WithInstanceStore(store contract.InstanceStore) Option {
+	return func(controller *Controller) {
+		if store != nil {
+			controller.store = store
+		}
+	}
+}
+
+// Option 扩展 Controller 的产品无关依赖。
+type Option func(*Controller)
+
+// WithResultPipeline 注入可测试的终态归约与交付投影。
+func WithResultPipeline(reducer result.Reducer, projector result.Projector) Option {
+	return func(controller *Controller) {
+		controller.reducer = reducer
+		controller.projector = projector
+	}
+}
+
+// WithProjectionSink 注入三端产品投影事件消费者。
+func WithProjectionSink(sink contract.ProjectionSink) Option {
+	return func(controller *Controller) {
+		if sink != nil {
+			controller.proj = sink
+		}
+	}
 }
 
 // Spawn 预留并发槽后异步启动独立子 Run；调用方可立即 Wait。
-func (c *Controller) Spawn(ctx context.Context, req contract.SpawnRequest) (result model.Instance, err error) {
+func (c *Controller) Spawn(ctx context.Context, req contract.SpawnRequest) (model.Instance, error) {
+	var empty model.Instance
 	if req.Agent == nil {
-		return result, fmt.Errorf("subagent Agent不能为空")
+		return empty, fmt.Errorf("subagent Agent不能为空")
 	}
 	if strings.TrimSpace(req.Prompt) == "" {
-		return result, fmt.Errorf("subagent prompt不能为空")
+		return empty, fmt.Errorf("subagent prompt不能为空")
 	}
-	if req.Depth > 1 {
-		return result, fmt.Errorf("agent depth limit reached: max=1；本层不可再委派，请自行完成")
+	if req.Depth <= 0 {
+		req.Depth = 1
+	}
+	if req.MaxDepth <= 0 {
+		req.MaxDepth = 1
+	}
+	if req.MaxDepth > 2 {
+		return empty, fmt.Errorf("agent max_depth limit reached: hard max=2")
+	}
+	if req.Depth > req.MaxDepth {
+		return empty, fmt.Errorf("agent depth limit reached: max=%d；本层不可再委派，请自行完成", req.MaxDepth)
 	}
 	if strings.TrimSpace(req.SessionID) == "" {
 		req.SessionID = strings.TrimSpace(req.ParentRunID)
 	}
 	if err := dispatchSubagentStart(ctx, req); err != nil {
-		return result, err
+		return empty, err
 	}
 	token, err := c.limiter.Reserve(ctx, req.SessionID, req.Depth)
 	if err != nil {
-		return result, err
+		return empty, err
 	}
 	committed := false
 	defer func() {
@@ -81,19 +136,27 @@ func (c *Controller) Spawn(ctx context.Context, req contract.SpawnRequest) (resu
 		}
 	}()
 
-	agentID := fmt.Sprintf("agent-%d", atomic.AddUint64(&c.nextID, 1))
+	agentID := fmt.Sprintf("agent-%s-%d", c.idPrefix, atomic.AddUint64(&c.nextID, 1))
+	childBase := contextsnapshot.WithoutParentSnapshot(ctx)
 	var childCtx context.Context
 	var cancel context.CancelFunc
 	if req.Timeout > 0 {
-		childCtx, cancel = context.WithTimeout(ctx, req.Timeout)
+		childCtx, cancel = context.WithTimeout(childBase, req.Timeout)
 	} else {
-		childCtx, cancel = context.WithCancel(ctx)
+		childCtx, cancel = context.WithCancel(childBase)
 	}
 	childCtx = progress.WithSink(childCtx, func(progress.Event) {})
+	manifest := result.NewManifestRegistry()
+	childCtx = result.WithManifestRegistry(childCtx, manifest)
+	childCtx = contract.WithDelegationDepth(childCtx, req.Depth)
+	childCtx = contract.WithMaxDelegationDepth(childCtx, req.MaxDepth)
+	childCtx = contract.WithDelegationReadOnly(childCtx, req.ReadOnly)
+	childCtx = contract.WithDelegationTools(childCtx, toolNames(req.Agent.Tools))
+	childCtx = contract.WithTreeBudget(childCtx, req.Budget)
 	childCtx = contextutil.WithSessionID(childCtx, req.SessionID)
 	childCtx = contextutil.WithTenantID(childCtx, req.TenantID)
-	instance := model.Instance{AgentID: agentID, ParentRunID: req.ParentRunID, SessionID: req.SessionID, Depth: req.Depth, SubagentType: req.SubagentType, Status: model.StatusRunning, CreatedAt: time.Now()}
-	e := &entry{instance: instance, cancel: cancel, slot: token, done: make(chan struct{}), parentCtx: ctx}
+	instance := model.Instance{AgentID: agentID, ParentRunID: req.ParentRunID, SessionID: req.SessionID, TenantID: req.TenantID, Depth: req.Depth, SubagentType: req.SubagentType, Status: model.StatusRunning, CreatedAt: time.Now()}
+	e := &entry{instance: instance, request: req, cancel: cancel, slot: token, done: make(chan struct{}), parentCtx: ctx, manifest: manifest}
 	c.mu.Lock()
 	c.instances[agentID] = e
 	c.mu.Unlock()
@@ -102,13 +165,72 @@ func (c *Controller) Spawn(ctx context.Context, req contract.SpawnRequest) (resu
 		delete(c.instances, agentID)
 		c.mu.Unlock()
 		cancel()
-		return result, err
+		return instance, err
+	}
+	if err := c.store.Save(ctx, contract.StoredInstance{Instance: instance, Request: req}); err != nil {
+		c.mu.Lock()
+		delete(c.instances, agentID)
+		c.mu.Unlock()
+		cancel()
+		return empty, fmt.Errorf("保存 subagent 实例失败: %w", err)
 	}
 	committed = true
 	c.emit(ctx, progress.PhaseStart, instance, "启动子智能体")
+	c.emitProjection(ctx, model.ProjectionEventSpawned, instance)
 	c.logger.Info("subagent spawn start", "run_id", req.ParentRunID, "session_id", req.SessionID, "agent_id", agentID, "agent", req.Agent.Name)
 	go c.run(childCtx, req, e)
 	return instance, nil
+}
+
+func toolNames(tools []domain.ToolRef) []string {
+	names := make([]string, 0, len(tools))
+	for _, tool := range tools {
+		names = append(names, tool.Name)
+	}
+	return names
+}
+
+func newIDPrefix() string {
+	var bytes [8]byte
+	if _, err := rand.Read(bytes[:]); err == nil {
+		return hex.EncodeToString(bytes[:])
+	}
+	return fmt.Sprintf("%d", time.Now().UnixNano())
+}
+
+// Resume 基于同一 Agent 定义启动新的 follow-up 子 Run。
+// 当前内存实现只继承已过滤的终态结果，不重放工具轨迹或完整 transcript。
+func (c *Controller) Resume(ctx context.Context, agentID, prompt string) (model.Instance, error) {
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" {
+		return model.Instance{}, fmt.Errorf("resume prompt不能为空")
+	}
+	e, err := c.entry(agentID)
+	var previous model.Instance
+	var request contract.SpawnRequest
+	if err != nil {
+		stored, storeErr := c.store.Get(ctx, agentID)
+		if storeErr != nil {
+			return model.Instance{}, err
+		}
+		previous, request = stored.Instance, stored.Request
+	} else {
+		c.mu.RLock()
+		previous, request = e.instance, e.request
+		c.mu.RUnlock()
+	}
+	if previous.Result == nil {
+		return model.Instance{}, fmt.Errorf("subagent %q 尚未结束，不能 resume", agentID)
+	}
+	request.Prompt = followupPrompt(previous.Result, prompt)
+	return c.Spawn(ctx, request)
+}
+
+func followupPrompt(previous *model.TaskResult, prompt string) string {
+	if previous == nil || strings.TrimSpace(previous.Summary) == "" {
+		return prompt
+	}
+	return "上一轮已过滤结果摘要（仅供只读参考）：\n" + previous.Summary + "\n\n后续任务：\n" + prompt
 }
 
 func (c *Controller) run(ctx context.Context, req contract.SpawnRequest, e *entry) {
@@ -124,25 +246,51 @@ func (c *Controller) run(ctx context.Context, req contract.SpawnRequest, e *entr
 }
 
 func (c *Controller) finish(ctx context.Context, e *entry, run *domain.Run, err error) {
-	c.mu.Lock()
+	c.mu.RLock()
+	instance := e.instance
+	c.mu.RUnlock()
 	if run != nil {
-		e.instance.ChildRunID = run.ID
-		e.instance.Summary = truncate(run.FinalAnswer, 4000)
+		instance.ChildRunID = run.ID
 	}
 	if err != nil {
-		e.instance.Error = err.Error()
+		instance.Error = err.Error()
 		if ctx.Err() != nil {
-			e.instance.Status = model.StatusCancelled
+			instance.Status = model.StatusCancelled
 		} else {
-			e.instance.Status = model.StatusFailed
+			instance.Status = model.StatusFailed
 		}
+	} else if run != nil && run.Status == domain.RunStatusCancelled {
+		instance.Status = model.StatusCancelled
+	} else if run != nil && run.Status == domain.RunStatusFailed {
+		instance.Status = model.StatusFailed
 	} else {
-		e.instance.Status = model.StatusCompleted
+		instance.Status = model.StatusCompleted
+	}
+	manifest, findings := e.manifest.Snapshot()
+	resultCtx := context.WithoutCancel(e.parentCtx)
+	record := c.reducer.Reduce(resultCtx, result.TerminalCandidate{
+		AgentID:      instance.AgentID,
+		SubagentType: instance.SubagentType,
+		Run:          run,
+		Err:          err,
+		Cancelled:    instance.Status == model.StatusCancelled,
+		Manifest:     manifest,
+		Findings:     findings,
+	})
+	projected := c.projector.Project(resultCtx, record)
+	instance.Result = &projected
+	instance.Summary = projected.Summary
+	if projected.Error != nil {
+		instance.Error = projected.Error.Message
 	}
 	now := time.Now()
-	e.instance.FinishedAt = &now
-	instance := e.instance
+	instance.FinishedAt = &now
+	c.mu.Lock()
+	e.instance = instance
 	c.mu.Unlock()
+	if err := c.store.Save(resultCtx, contract.StoredInstance{Instance: instance, Request: e.request}); err != nil {
+		c.logger.Error("保存 subagent 终态失败", "agent_id", instance.AgentID, "error", err)
+	}
 	_ = c.limiter.Release(e.slot)
 	phase := progress.PhaseComplete
 	summary := "子智能体完成"
@@ -150,6 +298,11 @@ func (c *Controller) finish(ctx context.Context, e *entry, run *domain.Run, err 
 		phase, summary = progress.PhaseError, "子智能体未完成"
 	}
 	c.emit(e.parentCtx, phase, instance, summary)
+	eventType := model.ProjectionEventCompleted
+	if instance.Status == model.StatusCancelled {
+		eventType = model.ProjectionEventStopped
+	}
+	c.emitProjection(resultCtx, eventType, instance)
 	c.dispatchSubagentStop(e.parentCtx, instance)
 	c.logger.Info("subagent finished", "run_id", instance.ParentRunID, "session_id", instance.SessionID, "agent_id", instance.AgentID, "status", instance.Status, "error", instance.Error)
 	close(e.done)
@@ -218,20 +371,31 @@ func (c *Controller) Wait(ctx context.Context, agentID string) (model.Instance, 
 }
 
 // Stop 取消运行中的实例；终态由运行协程统一写入。
-func (c *Controller) Stop(_ context.Context, agentID string) error {
+func (c *Controller) Stop(ctx context.Context, agentID string) error {
 	e, err := c.entry(agentID)
 	if err != nil {
-		return err
+		stored, storeErr := c.store.Get(ctx, agentID)
+		if storeErr != nil {
+			return err
+		}
+		if stored.Instance.Status != model.StatusRunning {
+			return nil
+		}
+		return fmt.Errorf("subagent %q 正在其他进程运行，当前进程不能直接取消；请在持有该任务的进程执行 TaskStop", agentID)
 	}
 	e.cancel()
 	return nil
 }
 
 // Get 返回实例快照，不等待其到达终态。
-func (c *Controller) Get(_ context.Context, agentID string) (model.Instance, error) {
+func (c *Controller) Get(ctx context.Context, agentID string) (model.Instance, error) {
 	e, err := c.entry(agentID)
 	if err != nil {
-		return model.Instance{}, err
+		stored, storeErr := c.store.Get(ctx, agentID)
+		if storeErr != nil {
+			return model.Instance{}, err
+		}
+		return stored.Instance, nil
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -262,10 +426,29 @@ func (c *Controller) emit(ctx context.Context, phase progress.Phase, instance mo
 	progress.Emit(ctx, progress.Event{Kind: progress.KindSubAgent, Phase: phase, RunID: instance.ParentRunID, Component: "subagent", Name: "Task", Summary: summary, Metadata: metadata})
 }
 
-func truncate(value string, limit int) string {
-	value = strings.TrimSpace(value)
-	if len(value) <= limit {
-		return value
+func (c *Controller) emitProjection(ctx context.Context, eventType model.ProjectionEventType, instance model.Instance) {
+	if c.proj == nil {
+		return
 	}
-	return value[:limit] + "..."
+	metadata := map[string]string{
+		"subagent_type": instance.SubagentType,
+	}
+	resultID := ""
+	if instance.Result != nil {
+		resultID = instance.Result.ResultID
+	}
+	if err := c.proj.EmitProjection(ctx, model.ProjectionEvent{
+		Type:        eventType,
+		TenantID:    instance.TenantID,
+		SessionID:   instance.SessionID,
+		ParentRunID: instance.ParentRunID,
+		AgentID:     instance.AgentID,
+		ChildRunID:  instance.ChildRunID,
+		Status:      instance.Status,
+		ResultID:    resultID,
+		OccurredAt:  time.Now(),
+		Metadata:    metadata,
+	}); err != nil {
+		c.logger.Warn("投影 subagent 事件失败", "agent_id", instance.AgentID, "event", string(eventType), "error", err)
+	}
 }

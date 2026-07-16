@@ -118,6 +118,8 @@ func extractArtifacts(toolName string, payload map[string]any) []string {
 func inferFailureKindFromError(msg string) string {
 	lower := strings.ToLower(msg)
 	switch {
+	case strings.Contains(lower, "unexpected eof"), strings.Contains(lower, "unexpected end of json input"), strings.Contains(lower, "unterminated string"):
+		return "tool_arguments_truncated"
 	case strings.Contains(lower, "path_contract") || strings.Contains(lower, "execution_path_contract"):
 		return "path_contract_violation"
 	case strings.Contains(lower, "dependency") || strings.Contains(lower, "cannot find module") || strings.Contains(lower, "modulenotfound"):

@@ -9,6 +9,7 @@ import (
 	"genesis-agent/internal/app"
 	"genesis-agent/internal/domain"
 	cliapproval "genesis-agent/products/cli/internal/approval"
+	clitui "genesis-agent/products/cli/internal/tui"
 	"genesis-agent/products/cli/internal/tui/chat"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/spf13/cobra"
@@ -39,7 +40,7 @@ func newChatCmd(configDirRef *string, sandboxModeRef *string, factory ServiceFac
   Esc        推理中取消本轮 / 空闲时清空输入框
   ↑ / ↓      滚动消息历史
   PgUp/PgDn  快速翻页
-  鼠标拖选   终端原生拖选（需按住 Shift，若终端支持）
+  鼠标拖选   终端原生选取文本并复制
 
 内置命令（以 / 开头）:
   /clear     清空当前会话历史，开始新对话
@@ -73,14 +74,15 @@ func newChatCmd(configDirRef *string, sandboxModeRef *string, factory ServiceFac
 
 			// 构建 Bubble Tea 初始 Model
 			m := chat.NewModel(ctx, svc, session)
+			restoreConsoleOutput := clitui.PrepareConsoleOutput()
+			defer restoreConsoleOutput()
 
 			// 启动 TUI 程序
 			// WithAltScreen: 使用备用屏幕，退出后恢复原始终端内容。
-			// 捕获鼠标以支持消息区滚轮；需要终端原生拖选时可按住 Shift。
+			// 默认不启用鼠标捕获，让 Windows Console / Terminal 直接处理拖选复制。
 			p := tea.NewProgram(
 				m,
 				tea.WithAltScreen(),
-				tea.WithMouseCellMotion(),
 			)
 
 			// 绑定全局 TUI 审批器对应的 program 实例

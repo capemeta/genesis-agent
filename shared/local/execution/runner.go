@@ -29,6 +29,14 @@ type Runner struct{}
 // NewRunner 创建本地命令 runner。
 func NewRunner() *Runner { return &Runner{} }
 
+// ShellCapabilities 返回本地主机真实探测到的 Shell 能力。
+func (r *Runner) ShellCapabilities(ctx context.Context) execmodel.ShellCapabilities {
+	if err := ctx.Err(); err != nil {
+		return execmodel.ShellCapabilities{}
+	}
+	return detectedShellCapabilities()
+}
+
 // Run 执行命令并收集 stdout/stderr。
 func (r *Runner) Run(ctx context.Context, command execmodel.Command, opts execcontract.RunOptions) (*execmodel.Result, error) {
 	if err := ctx.Err(); err != nil {
@@ -147,8 +155,8 @@ func (r *Runner) runArgvWithFactory(ctx context.Context, argv []string, meta exe
 }
 func normalizeShell(shell execmodel.ShellKind) execmodel.ShellKind {
 	if shell == "" || shell == execmodel.ShellAuto || shell == execmodel.ShellSystem {
-		if runtime.GOOS == "windows" {
-			return execmodel.ShellCmd
+		if detected := detectedShellCapabilities().Default.Kind; detected != "" {
+			return detected
 		}
 		if runtime.GOOS == "darwin" {
 			return execmodel.ShellZsh

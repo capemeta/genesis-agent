@@ -21,7 +21,7 @@ var commandLogicalPrefixes = []string{
 	"$SKILL_DIR",
 }
 
-// isExecutionPlaneAbsoluteInput 判断是否为远程/容器执行面绝对路径，不可作为宿主机 stage 源。
+// isExecutionPlaneAbsoluteInput 判断是否为远程/容器执行面绝对路径，不可作为控制面 stage 源。
 func isExecutionPlaneAbsoluteInput(raw string) bool {
 	normalized := strings.ReplaceAll(strings.TrimSpace(raw), "\\", "/")
 	if normalized == "" {

@@ -254,3 +254,42 @@ func TestStageInputsStillRejectsOutsideWorkspace(t *testing.T) {
 		t.Fatalf("err=%v", err)
 	}
 }
+
+func TestStageInputsAllowsUserProvidedHostAbsoluteFile(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "workspace")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ws := execmodel.ExecutionWorkspace{
+		InputDir:  filepath.Join(root, "input"),
+		OutputDir: filepath.Join(root, "output"),
+		WorkDir:   filepath.Join(root, "work"),
+		TmpDir:    filepath.Join(root, "tmp"),
+	}
+	for _, d := range []string{ws.InputDir, ws.OutputDir, ws.WorkDir, ws.TmpDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	skillDir := filepath.Join(ws.WorkDir, "skills", "office-pdf")
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	hostFile := filepath.Join(parent, "user-provided.pdf")
+	if err := os.WriteFile(hostFile, []byte("pdf"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	staged, err := stageInputs(root, ws, skillDir, []string{hostFile})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(staged) != 1 || staged[0] != "user-provided.pdf" {
+		t.Fatalf("staged=%v", staged)
+	}
+	data, err := os.ReadFile(filepath.Join(skillDir, "user-provided.pdf"))
+	if err != nil || string(data) != "pdf" {
+		t.Fatalf("staged data=%q err=%v", data, err)
+	}
+}

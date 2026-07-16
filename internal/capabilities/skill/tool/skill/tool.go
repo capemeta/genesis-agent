@@ -31,8 +31,13 @@ type Deps struct {
 
 // Tool 是 Skill 网关。
 type Tool struct {
-	deps Deps
+	deps     Deps
+	forkTask tool.Tool
 }
+
+// SetForkTask 由共享 bootstrap 在 Task 创建后注入唯一委派网关。
+// Skill 不直接依赖 Controller 或具体运行策略。
+func (t *Tool) SetForkTask(task tool.Tool) { t.forkTask = task }
 
 type input struct {
 	Skill    string `json:"skill,omitempty"`
@@ -154,17 +159,15 @@ func (t *Tool) load(ctx context.Context, in input, modelCall bool, invocation st
 			}
 		}
 	}
-	if defaultContext(meta.Context) == model.ContextModeFork {
-		// fork 语义预留给后续规范化 subagent 运行时：独立上下文、收窄工具/Skill/MCP、结果回传主线程。
-		// 当前不实现半吊子子 Run，避免与后续多 Agent / 子 Agent 设计冲突。
-		return "", fmt.Errorf("skill %q 声明 context=fork；规范化 subagent 运行时尚未启用，请改用 context=inline", meta.QualifiedName)
-	}
 	depReport, err := t.checkDependencies(ctx, meta, invocation)
 	if err != nil {
 		return "", err
 	}
 	if err := t.authorize(ctx, meta, depReport, invocation); err != nil {
 		return "", err
+	}
+	if defaultContext(meta.Context) == model.ContextModeFork {
+		return t.fork(ctx, meta, resolveReq, in.Args)
 	}
 	injection, err := t.deps.Service.Load(ctx, skillcontract.LoadRequest{ResolveRequest: resolveReq, Args: in.Args})
 	if err != nil {
@@ -195,6 +198,38 @@ func (t *Tool) load(ctx context.Context, in input, modelCall bool, invocation st
 		MaxThinkingTokens: injection.Skill.MaxThinkingTokens,
 		Dependencies:      depReport.Outputs,
 	})
+}
+
+func (t *Tool) fork(ctx context.Context, meta model.Metadata, resolveReq skillcontract.ResolveRequest, args string) (string, error) {
+	if t.forkTask == nil {
+		return "", fmt.Errorf("skill %q 声明 context=fork，但 Task 委派网关未注入", meta.QualifiedName)
+	}
+	// fork 的参数由委派信封统一追加，避免 Skill.Load 与 Task.prompt 双重注入。
+	injection, err := t.deps.Service.Load(ctx, skillcontract.LoadRequest{ResolveRequest: resolveReq})
+	if err != nil {
+		return "", err
+	}
+	agent := strings.TrimSpace(meta.Agent)
+	if agent == "" {
+		agent = "general-purpose"
+	}
+	prompt := strings.TrimSpace(injection.Contents)
+	if prompt == "" {
+		return "", fmt.Errorf("skill %q 的 fork 内容为空", meta.QualifiedName)
+	}
+	if strings.TrimSpace(args) != "" {
+		prompt += "\n\n任务参数：\n" + strings.TrimSpace(args)
+	}
+	payload, err := json.Marshal(map[string]any{
+		"subagent_type": agent,
+		"description":   "执行 Skill " + meta.QualifiedName,
+		"prompt":        prompt,
+		"allowed_tools": cloneStrings(meta.AllowedTools),
+	})
+	if err != nil {
+		return "", fmt.Errorf("编码 Skill fork 委派失败: %w", err)
+	}
+	return t.forkTask.Execute(ctx, string(payload))
 }
 
 type dependencyReport struct {

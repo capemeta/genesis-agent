@@ -1,6 +1,6 @@
 # CLI TUI 体验重构设计
 
-> 状态：实现完成，待 Windows 真实终端手工验收  
+> 状态：核心能力已实现，Windows 真实终端交互整改中
 > 日期：2026-07-13  
 > 范围：`products/cli` 交互式 `chat` TUI（Bubble Tea + Lip Gloss）  
 > 目标：在 Cursor 内置终端 / bat(cmd) 双击启动等 Windows 常见环境下，达到接近 Claude Code / Codex 的可读性、可控性与「拿走内容」体验  
@@ -21,7 +21,7 @@
 
 | 标准 | 说明 |
 | --- | --- |
-| 复制可达 | 不依赖鼠标拖选，也能稳定把最近一条 Agent 回答写入系统剪贴板，并有明确反馈 |
+| 复制可达 | 鼠标不被应用捕获，可使用终端原生拖选；也能用 `Ctrl+Y` 稳定把最近一条 Agent 回答写入系统剪贴板 |
 | 中断语义正确 | Ctrl+C 取消本轮推理，不退出程序；退出有独立明确入口 |
 | 主回答优先 | 工具/技能/sandbox 过程默认折叠，不淹没最终回答 |
 | 输入可预期 | 多行编辑、发送/换行分离、输入历史、斜杠命令可发现 |
@@ -29,7 +29,7 @@
 
 ### 1.3 非目标（本设计不做）
 
-- 不为拖选而退出 Alt Screen，或维护 Plain/TUI 双渲染主路径
+- 不为拖选而维护 Plain/TUI 双渲染主路径；保留 Alt Screen，但默认不捕获鼠标
 - 第一版不做像素级应用内鼠标圈选
 - 不引入侧栏、多会话分屏、WebView 混合 UI
 - 不改动 Run Engine / progress 协议语义（仅优化 CLI 呈现）
@@ -73,6 +73,7 @@
 3. **过程不抢戏**：运行过程默认折叠为一行摘要（步数 / tokens / 耗时 / 成败）；`o` 或点击等价快捷键展开。
 4. **反馈可见**：复制成功、取消本轮、审批结果等用短时 toast（约 2s），不永久污染 transcript。
 5. **帮助情境化**：footer 文案随模式变化（空闲 / 推理 / 审批），避免永远同一串快捷键。
+6. **Windows 帧边界**：布局宽度固定预留最右侧 4 列，吸收 Windows 终端与渲染库对 CJK、符号及中英文混排的宽度估算偏差，禁止应用内容接近自动换行边界；Windows Console 启动时启用 `DISABLE_NEWLINE_AUTO_RETURN`，退出时恢复原模式，避免逐帧滚屏留下重影。
 
 ### 3.3 组件映射（实现边界）
 
@@ -92,8 +93,8 @@
 
 ### 4.1 原则
 
-> 用户要的是「拿走内容」，不是「在 TUI 里画出高亮」。  
-> **主路径 = 应用写入系统剪贴板**；终端原生拖选仅作增强说明，不作为成功标准。
+> 用户要的是「拿走内容」，不是被迫先学习 TUI 特有操作。
+> **主路径 = 终端原生拖选 + `Ctrl+Y` 一键复制回答**；应用内消息选择模式仅作键盘补充。
 
 ### 4.2 优先级
 
@@ -103,13 +104,13 @@
 | **P0** | 结果反馈 | 成功/失败 toast |
 | **P0** | 可发现性 | Composer 底栏与 `/help` 常驻提示 |
 | **P1** | 扩展复制 | `/copy last\|user\|all`；路径类内容可选择去装饰后复制 |
-| **P1** | 滚轮滚动 | 启用鼠标滚轮；帮助注明「终端拖选需按住 Shift（若终端支持）」 |
+| **P1** | 终端原生选取 | 默认不捕获鼠标；消息区滚动使用 `↑/↓` 与 `PgUp/PgDn` |
 | **P2** | 应用内选择模式 | `v` 进入，`j/k` 移动，起止标记，`y` 复制，`Esc` 退出 |
 
 ### 4.3 鼠标策略
 
-- **默认启用** `tea.WithMouseCellMotion()`，用于滚轮滚动消息区。
-- **不承诺** Cursor/cmd 下普通拖选可用；帮助文案明确主路径是 `Ctrl+Y`。
+- **默认不启用** `tea.WithMouseCellMotion()`，避免 xterm 鼠标跟踪拦截 Windows cmd / Cursor 终端的原生拖选。
+- 主路径同时提供终端拖选和 `Ctrl+Y`；消息区滚动使用键盘，不以牺牲复制换取滚轮。
 - Spinner / 进度刷新 **降频**（例如状态栏 8–10 Hz 上限，内容区按事件合并），降低闪烁与无效重绘。
 
 ### 4.4 复制内容规则
@@ -117,6 +118,7 @@
 1. `Ctrl+Y` / 默认 `/copy`：复制最近一条 **assistant** 消息的可见正文（含已展示的思考与「最终回答」分段，与用户屏幕一致）。
 2. 若无 assistant 消息：toast 提示无可复制内容，不报错退出。
 3. 剪贴板写入失败（权限/环境）：toast 显示失败原因摘要，并建议 `/copy` 重试或检查终端环境。
+4. 剪贴板后端按环境降级：本地优先原生剪贴板；WSL 失败后尝试 Windows PowerShell；SSH 会话或本地后端不可用时使用 OSC 52（含 tmux passthrough）。
 
 ---
 
@@ -242,7 +244,7 @@ Toast 为正交短时状态，不改变 Mode。
 
 ### Phase 3 — 增强（已完成）
 
-1. 鼠标滚轮 + Shift 拖选说明  
+1. 终端原生拖选（默认不捕获鼠标）
 2. `/copy` 子命令  
 3. 上下文占用 chip（当前为基于 transcript 的 `ctx~` 近似值；后续可替换为 provider usage）  
 4. 应用内选择模式（P2）  
@@ -256,15 +258,15 @@ Toast 为正交短时状态，不改变 Mode。
 
 - Update 层单测：无 assistant 时复制 toast、斜杠命令菜单与补全、选择模式、帮助覆盖层、完成 activity 摘要。
 - 快捷键：Running 下 Ctrl+C 触发 cancel 且不 `tea.Quit`；`/quit` 与 Ctrl+D 退出。
-- 布局：WindowSize 变化后 viewport 高度计算正确；窄终端标题栏不超宽。
+- 布局：WindowSize 变化后完整 `View()` 不超过终端高宽；命令菜单开/关都不得增加额外空行或遗留旧帧；任何行都不得占用终端最右一列。
 
 ### 9.2 手工验收矩阵
 
 | 环境 | 复制 | 取消本轮 | 多行输入 | 审批 |
 | --- | --- | --- | --- | --- |
-| Cursor 内置终端 | Ctrl+Y 成功 | Ctrl+C | Shift+Enter | Y/N |
-| bat / cmd 窗口 | Ctrl+Y 成功 | Ctrl+C | Shift+Enter | Y/N |
-| Windows Terminal（可选） | 同上；Shift 拖选仅作观察 | 同上 | 同上 | 同上 |
+| Cursor 内置终端 | 原生拖选 + Ctrl+Y | Ctrl+C | Shift+Enter | Y/N |
+| bat / cmd 窗口 | 原生拖选 + Ctrl+Y | Ctrl+C | Shift+Enter | Y/N |
+| Windows Terminal（可选） | 原生拖选 + Ctrl+Y | 同上 | 同上 | 同上 |
 
 ---
 
@@ -277,7 +279,7 @@ Toast 为正交短时状态，不改变 Mode。
 | 范围 | 较完整体验升级（对标 Claude Code / Codex） |
 | 路线 | B 体验导向重构 |
 | 布局基线 | 体验细节加强版（§1b） |
-| 复制体系 | 应用内剪贴板为主；拖选不承诺 |
+| 复制体系 | 终端原生拖选与应用内剪贴板并列为主路径；默认不捕获鼠标 |
 
 ---
 
@@ -291,7 +293,7 @@ Toast 为正交短时状态，不改变 Mode。
 
 ## 十二、参考
 
-- 现实现：`products/cli/internal/command/chat_cmd.go`（Alt Screen + 鼠标滚轮捕获）  
+- 现实现：`products/cli/internal/command/chat_cmd.go`（Alt Screen，默认不捕获鼠标）
 - 进度展示契约：`docs/运行进度事件与前端展示契约.md`  
 - 目录边界：`docs/项目目录与边界说明.md`（产品 TUI 仅在 `products/cli`）  
 - 头脑风暴稿：`.superpowers/brainstorm/30496-1783949541/content/`（本地，不入库）

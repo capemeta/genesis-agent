@@ -58,7 +58,7 @@ func newRootCmd(parent context.Context) *cobra.Command {
 				cfg.Port = port
 			}
 
-			server := transporthttp.NewServerWithMCP(c.Service(), c.MCPStack(), cfg)
+			server := transporthttp.NewServerWithMCPAndProjectionForTenant(c.Service(), c.MCPStack(), c.SubAgentProjectionReader(), "dev", cfg)
 
 			fmt.Printf("Genesis Agent Enterprise HTTP API 已启动: %s\n", server.Addr())
 			fmt.Println("按 Ctrl+C 优雅停止服务...")

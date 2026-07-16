@@ -155,6 +155,13 @@ func TestSystemFSIncludesOfficeSkills(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	skillDoc, err := source.Read(context.Background(), contract.ReadRequest{PackageID: "office-ppt", Resource: "office-ppt/SKILL.md"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(skillDoc.Content), "8,000 characters") || !strings.Contains(string(skillDoc.Content), "Do not print the script") {
+		t.Fatal("office-ppt must constrain large script transfer to file-editing tools")
+	}
 	var hasFill, hasForms, hasCJK bool
 	for _, resource := range pdfResources.Resources {
 		if resource.Resource == "office-pdf/scripts/fill_fillable_fields.py" && resource.Text {

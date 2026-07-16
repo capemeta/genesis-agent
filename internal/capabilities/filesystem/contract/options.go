@@ -1,6 +1,8 @@
 // Package contract 定义文件系统能力的端口接口。
 package contract
 
+import "genesis-agent/internal/capabilities/filesystem/model"
+
 // ResolveOptions 控制路径解析行为。
 type ResolveOptions struct {
 	Operation            string
@@ -26,6 +28,8 @@ type WriteOptions struct {
 // ListOptions 控制目录枚举。
 type ListOptions struct {
 	MaxEntries int
+	// EntryType 是 Genesis Agent 本地端口语义；远程 adapter 必须自行适配，不能直接扩张 genesis-sandbox 线协议。
+	EntryType model.EntryType `json:"-"`
 }
 
 // WalkOptions 控制 bounded walk。

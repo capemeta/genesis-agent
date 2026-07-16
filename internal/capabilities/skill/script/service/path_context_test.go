@@ -72,6 +72,9 @@ func TestAttachExecutionPathContextIncludesMapOnChange(t *testing.T) {
 	if out.Metadata[metaPathMapNote] == "" {
 		t.Fatal("missing path_map_note")
 	}
+	if note := out.Metadata[metaPathMapNote]; !strings.Contains(note, "$WORK_DIR") || !strings.Contains(note, "$OUTPUT_DIR") || !strings.Contains(note, "最终文本交付物") {
+		t.Fatalf("path_map_note must distinguish intermediate and final files: %q", note)
+	}
 
 	include2 := s.shouldIncludePathMap(key, executionBackendRemoteSandbox, false)
 	if include2 {

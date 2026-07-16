@@ -23,6 +23,7 @@ import (
 	capservice "genesis-agent/internal/capabilities/capability/service"
 	execsandbox "genesis-agent/internal/capabilities/execution/adapter/sandbox"
 	execcontract "genesis-agent/internal/capabilities/execution/contract"
+	execmodel "genesis-agent/internal/capabilities/execution/model"
 	execservice "genesis-agent/internal/capabilities/execution/service"
 	runcommand "genesis-agent/internal/capabilities/execution/tool/run_command"
 	writestdin "genesis-agent/internal/capabilities/execution/tool/write_stdin"
@@ -69,6 +70,9 @@ import (
 	usagecontract "genesis-agent/internal/capabilities/usage/contract"
 	platformconfig "genesis-agent/internal/platform/config"
 	"genesis-agent/internal/platform/logger"
+	multicontract "genesis-agent/internal/runtime/multiagent/contract"
+	multiagentmodel "genesis-agent/internal/runtime/multiagent/model"
+	multiprojection "genesis-agent/internal/runtime/multiagent/projection"
 	promptbuilder "genesis-agent/internal/runtime/prompt"
 	"genesis-agent/internal/runtime/strategy/react"
 	cliapproval "genesis-agent/products/cli/internal/approval"
@@ -76,6 +80,7 @@ import (
 	"genesis-agent/products/cli/internal/profile"
 	clisandbox "genesis-agent/products/cli/internal/sandbox"
 	cliskill "genesis-agent/products/cli/internal/skill"
+	clisubagent "genesis-agent/products/cli/internal/subagent"
 	"genesis-agent/products/cli/internal/tui"
 	localexec "genesis-agent/shared/local/execution"
 	localfs "genesis-agent/shared/local/filesystem"
@@ -198,28 +203,49 @@ func (c *Container) Init(ctx context.Context) error {
 			c.initErr = fmt.Errorf("初始化CLI Plan本地存储失败: %w", err)
 			return
 		}
+		subAgentStore, err := clisubagent.NewFileStore(runtime.workspaceRoot)
+		if err != nil {
+			_ = c.logging.Close()
+			c.logging = nil
+			c.initErr = err
+			return
+		}
+		subAgentResources, err := clisubagent.NewWorkspaceResources(runtime.workspaceRoot)
+		if err != nil {
+			_ = c.logging.Close()
+			c.logging = nil
+			c.initErr = err
+			return
+		}
 		c.bundle, c.initErr = shared.BuildAgentService(ctx, shared.BuildOptions{
-			Product:               "cli",
-			ConfigDir:             configDir,
-			Quiet:                 c.quiet,
-			RouteName:             "chat",
-			DefaultAgentID:        "default-agent",
-			DefaultAgentName:      "Genesis Agent",
-			Profile:               prof,
-			AdditionalTools:       runtime.tools,
-			PromptInjectors:       runtime.promptInjectors,
-			Logger:                runtime.logger,
-			AuditSink:             runtime.auditSink,
-			UsageSink:             runtime.usageSink,
-			Web:                   webOpts,
-			PlanRepository:        planRepo,
-			SkillNameMatcher:      runtime.skillNameMatcher,
-			SkillMentionSelector:  runtime.skillMentionSelector,
-			SkillExplicitLoader:   runtime.skillExplicitLoader,
-			SubAgentMaxConcurrent: 3,
-			SubAgentApproval:      runtime.approvalService,
-			HookExecutionRunner:   runtime.hookExecutionRunner,
-			HookApproval:          runtime.approvalService,
+			Product:                        "cli",
+			ConfigDir:                      configDir,
+			Quiet:                          c.quiet,
+			RouteName:                      "chat",
+			DefaultAgentID:                 "default-agent",
+			DefaultAgentName:               "Genesis Agent",
+			Profile:                        prof,
+			AdditionalTools:                runtime.tools,
+			PromptInjectors:                runtime.promptInjectors,
+			Logger:                         runtime.logger,
+			AuditSink:                      runtime.auditSink,
+			UsageSink:                      runtime.usageSink,
+			Web:                            webOpts,
+			PlanRepository:                 planRepo,
+			SkillNameMatcher:               runtime.skillNameMatcher,
+			SkillMentionSelector:           runtime.skillMentionSelector,
+			SkillExplicitLoader:            runtime.skillExplicitLoader,
+			SubAgentMaxConcurrent:          3,
+			SubAgentStore:                  subAgentStore,
+			SubAgentDelivery:               subAgentStore,
+			SubAgentProjection:             multiprojection.NewMemorySink(multiagentmodel.ProjectionChannelCLI),
+			SubAgentIncludeUserDefinitions: true,
+			SubAgentEvidence:               subAgentResources,
+			SubAgentResources:              subAgentResources,
+			SubAgentCapabilityRegistry:     runtime.capabilityRegistry,
+			SubAgentApproval:               runtime.approvalService,
+			HookExecutionRunner:            runtime.hookExecutionRunner,
+			HookApproval:                   runtime.approvalService,
 		})
 		if c.initErr != nil {
 			_ = c.logging.Close()
@@ -282,6 +308,15 @@ func (c *Container) MCPStack() *mcpstack.Stack { return c.mcpStack }
 
 // MCPApprovalStore 返回 project MCP 预连接审批存储。
 func (c *Container) MCPApprovalStore() contract.ApprovalStore { return c.mcpStore }
+
+// SubAgentProjectionReader 为 CLI 摘要展示提供安全的控制面事件查询。
+func (c *Container) SubAgentProjectionReader() multicontract.ProjectionReader {
+	if c == nil || c.bundle == nil {
+		return nil
+	}
+	reader, _ := c.bundle.SubAgentProjection.(multicontract.ProjectionReader)
+	return reader
+}
 
 func NewService(ctx context.Context, configDirRef *string, quiet bool) (app.AgentService, error) {
 	return NewServiceWithOptions(ctx, command.ServiceOptions{ConfigDirRef: configDirRef, Quiet: quiet})
@@ -379,6 +414,7 @@ func buildProductRuntime(ctx context.Context, configDir string, cfg *platformcon
 		_ = runtimeLogging.Close()
 		return productRuntime{}, nil, err
 	}
+	environmentInjector := promptbuilder.NewEnvironmentContextInjector(cliEnvironmentContext(ctx, workspaceRoot, sandboxCfg.ExecutionProfile(), execStack.Shells))
 	tools := productTools
 	adapterRegistry := capservice.NewAdapterRegistry()
 	marketSvc, _, err := cliskill.NewMarketplaceServiceWith(cliskill.MarketplaceOptions{
@@ -484,7 +520,7 @@ func buildProductRuntime(ctx context.Context, configDir string, cfg *platformcon
 	// system 仅短硬规则；完整 catalog 挂在 Skill 工具 DescriptionFunc。
 	injector := promptbuilder.ContextInjectorFunc(func(ctx context.Context, req promptbuilder.BuildRequest) (promptbuilder.Fragment, error) {
 		var b strings.Builder
-		b.WriteString("Skills 是任务流程包，不是可执行工具。加载技能必须调用 Skill(skill=...)；禁止把 office-ppt 等技能名当作独立工具调用。用户输入中的 $skill 或 skill:// 引用会在回合开始自动注入。可用技能列表见 Skill 工具描述中的 <available_skills>。用户给出 Skill 的 GitHub/URL 地址要求安装时：调用 install_skill_from_source（须审批），禁止 run_command/curl/git clone 旁路。若 run_skill_command 返回 failure_kind=dependency_missing：调用 install_skill_dependencies（须审批，仅装 runtime 白名单包）后，用相同参数再跑命令（安装成功会清零重复失败计数）；sandbox_violation 勿当成缺包。收到 failure_kind=repeated_failure：禁止再次提交相同调用，必须改参或改策略。收到 failure_kind=no_progress：必须总结阻塞或询问用户，禁止继续空转。")
+		b.WriteString("Skills 是任务流程包，不是可执行工具。加载技能必须调用 Skill(skill=...)；禁止把 office-ppt 等技能名当作独立工具调用。用户输入中的 $skill 或 skill:// 引用会在回合开始自动注入。用户指定的宿主机文件应直接作为 run_skill_command.inputs，由运行时在审批后 stage，禁止 run_command / Copy-Item 手动搬运。可用技能列表见 Skill 工具描述中的 <available_skills>。用户给出 Skill 的 GitHub/URL 地址要求安装时：调用 install_skill_from_source（须审批），禁止 run_command/curl/git clone 旁路。若 run_skill_command 返回 failure_kind=dependency_missing：调用 install_skill_dependencies（须审批，仅装 runtime 白名单包）后，用相同参数再跑命令（安装成功会清零重复失败计数）；sandbox_violation 勿当成缺包。收到 failure_kind=repeated_failure：禁止再次提交相同调用，必须改参或改策略。收到 failure_kind=no_progress：必须总结阻塞或询问用户，禁止继续空转。")
 		b.WriteString("\n\nRun 文件落点：中间脚本/临时文件用 write_file(\"$WORK_DIR/...\")；最终交付进 $OUTPUT_DIR；禁止写到仓库根目录。")
 		if req.Run != nil && strings.TrimSpace(req.Run.ID) != "" {
 			if ws, err := scriptworkspace.PrepareLocalTask(workspaceRoot, req.Run.ID); err == nil {
@@ -505,7 +541,7 @@ func buildProductRuntime(ctx context.Context, configDir string, cfg *platformcon
 	})
 	return productRuntime{
 		tools:                tools,
-		promptInjectors:      []promptbuilder.ContextInjector{injector},
+		promptInjectors:      []promptbuilder.ContextInjector{environmentInjector, injector},
 		logger:               log,
 		logging:              runtimeLogging,
 		auditSink:            auditSink,
@@ -592,6 +628,7 @@ func buildBaseApprovalService(quiet bool, policyCfg platformconfig.PolicyConfig,
 // productExecStack 是 CLI 执行栈，供 run_command 与 run_skill_command 复用。
 type productExecStack struct {
 	Runner        execcontract.ExecutionRunner
+	Shells        execcontract.ShellCapabilityProvider
 	SessionClient sandboxcontract.SessionClient
 	FileClient    sandboxcontract.FileSystemClient
 	WorkspaceRef  sandboxcontract.WorkspaceRef
@@ -615,6 +652,11 @@ func buildProductTools(sandboxCfg clisandbox.Config, baseApprovalSvc approvalcon
 		tools = append(tools, t)
 	}
 	directRunner := localexec.NewRunner()
+	var shellProvider execcontract.ShellCapabilityProvider = directRunner
+	if sandboxCfg.Mode == clisandbox.ModeDockerSandbox || sandboxCfg.Mode == clisandbox.ModeRemoteSandbox {
+		// 远程 sandbox 的 OS/Shell 不能从宿主机推断；服务端未返回能力前仅向模型暴露 auto。
+		shellProvider = nil
+	}
 	sandboxRunner, sessionClient, fileClient, workspaceRef, err := buildSandboxStack(directRunner, sandboxCfg, log)
 	if err != nil {
 		return nil, productExecStack{}, err
@@ -628,6 +670,7 @@ func buildProductTools(sandboxCfg clisandbox.Config, baseApprovalSvc approvalcon
 
 	runCommand, err := runcommand.New(runcommand.Deps{
 		Runner:         executionRunner,
+		Shells:         shellProvider,
 		SessionManager: sessionManager,
 		Resolver:       resolver,
 		Approval:       approvalSvc,
@@ -652,10 +695,37 @@ func buildProductTools(sandboxCfg clisandbox.Config, baseApprovalSvc approvalcon
 
 	return tools, productExecStack{
 		Runner:        executionRunner,
+		Shells:        shellProvider,
 		SessionClient: sessionClient,
 		FileClient:    fileClient,
 		WorkspaceRef:  workspaceRef,
 	}, nil
+}
+
+func cliEnvironmentContext(ctx context.Context, cwd string, sandbox execmodel.SandboxProfile, shells execcontract.ShellCapabilityProvider) promptbuilder.EnvironmentContext {
+	environment := promptbuilder.EnvironmentContext{
+		OS:               runtime.GOOS,
+		Cwd:              cwd,
+		SandboxMode:      string(sandbox.Mode),
+		SandboxProvider:  sandbox.Provider,
+		ExternalApproval: true,
+	}
+	if shells == nil {
+		if sandbox.Provider == clisandbox.ProviderGenesisSandbox {
+			environment.OS = ""
+			environment.Cwd = "/workspace"
+		}
+		return environment
+	}
+	capabilities := shells.ShellCapabilities(ctx)
+	environment.DefaultShell = string(capabilities.Default.Kind)
+	environment.DefaultShellPath = capabilities.Default.Path
+	for _, shell := range capabilities.Supported {
+		if shell.Kind != "" {
+			environment.SupportedShells = append(environment.SupportedShells, string(shell.Kind))
+		}
+	}
+	return environment
 }
 
 func buildSandboxStack(directRunner *localexec.Runner, sandboxCfg clisandbox.Config, log logger.Logger) (execcontract.SandboxRunner, sandboxcontract.SessionClient, sandboxcontract.FileSystemClient, sandboxcontract.WorkspaceRef, error) {

@@ -8,6 +8,14 @@ import (
 	"genesis-agent/internal/domain"
 )
 
+func TestTruncatedJSONCallsShareStableIdentity(t *testing.T) {
+	first := BuildCallKey("write_file", `{"path":"a.js","content":"first`, PathRoots{}, nil)
+	second := BuildCallKey("write_file", `{"path":"b.js","content":"different`, PathRoots{}, nil)
+	if first.CallKey != second.CallKey {
+		t.Fatalf("truncated calls should share identity: %s != %s", first.CallKey, second.CallKey)
+	}
+}
+
 func TestNormalizeArgsStableAndIgnoresNoise(t *testing.T) {
 	a := `{"b":"  x ","a":1,"request_id":"r1","nonce":"n"}`
 	b := `{"a":1,"b":"x","trace_id":"t"}`
@@ -203,4 +211,3 @@ func TestResetClearsAll(t *testing.T) {
 		t.Fatal("reset should clear blocks")
 	}
 }
-

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 
@@ -36,6 +37,9 @@ import (
 	usagecontract "genesis-agent/internal/capabilities/usage/contract"
 	platformconfig "genesis-agent/internal/platform/config"
 	"genesis-agent/internal/platform/logger"
+	multicontract "genesis-agent/internal/runtime/multiagent/contract"
+	multiagentmodel "genesis-agent/internal/runtime/multiagent/model"
+	multiprojection "genesis-agent/internal/runtime/multiagent/projection"
 	promptbuilder "genesis-agent/internal/runtime/prompt"
 	enterprisemcp "genesis-agent/products/enterprise/internal/mcp"
 	"genesis-agent/products/enterprise/internal/profile"
@@ -122,6 +126,18 @@ func (c *Container) Init(ctx context.Context) error {
 		}
 
 		prof := profile.DefaultProfile()
+		var capabilityRegistry capcontract.Registry
+		var adapterReg *capservice.AdapterRegistry
+		if cfg.MCP.Enabled {
+			adapterReg = capservice.NewAdapterRegistry()
+			capabilityRegistry, err = loadEnterpriseCapabilityIndex(adapterReg)
+			if err != nil {
+				_ = runtimeLogging.Close()
+				c.logging = nil
+				c.initErr = fmt.Errorf("初始化Enterprise capability index失败: %w", err)
+				return
+			}
+		}
 		approvalSvc, err := buildEnterpriseApproval(cfg.Policy, runtimeLogging.AgentLogger, auditSink)
 		if err != nil {
 			_ = runtimeLogging.Close()
@@ -159,29 +175,32 @@ func (c *Container) Init(ctx context.Context) error {
 			return
 		}
 
-		injectors := make([]promptbuilder.ContextInjector, 0, 1)
+		injectors := make([]promptbuilder.ContextInjector, 0, 2)
+		injectors = append(injectors, promptbuilder.NewEnvironmentContextInjector(enterpriseEnvironmentContext(ctx, execStack)))
 		if skillStack.PromptInjector != nil {
 			injectors = append(injectors, skillStack.PromptInjector)
 		}
 		c.bundle, c.initErr = shared.BuildAgentService(ctx, shared.BuildOptions{
-			Product:               "enterprise",
-			ConfigDir:             configDir,
-			Quiet:                 c.quiet,
-			RouteName:             "chat",
-			DefaultAgentID:        "enterprise-default-agent",
-			DefaultAgentName:      "Genesis Enterprise Agent",
-			Profile:               prof,
-			AdditionalTools:       skillStack.Tools,
-			PromptInjectors:       injectors,
-			Logger:                runtimeLogging.AgentLogger,
-			AuditSink:             auditSink,
-			UsageSink:             usageSink,
-			SkillNameMatcher:      skillStack.SkillNameMatcher,
-			SkillMentionSelector:  skillStack.SkillMentionSelector,
-			SkillExplicitLoader:   skillStack.SkillExplicitLoader,
-			SubAgentMaxConcurrent: 3,
-			SubAgentApproval:      approvalSvc,
-			HookApproval:          approvalSvc,
+			Product:                    "enterprise",
+			ConfigDir:                  configDir,
+			Quiet:                      c.quiet,
+			RouteName:                  "chat",
+			DefaultAgentID:             "enterprise-default-agent",
+			DefaultAgentName:           "Genesis Enterprise Agent",
+			Profile:                    prof,
+			AdditionalTools:            skillStack.Tools,
+			PromptInjectors:            injectors,
+			Logger:                     runtimeLogging.AgentLogger,
+			AuditSink:                  auditSink,
+			UsageSink:                  usageSink,
+			SkillNameMatcher:           skillStack.SkillNameMatcher,
+			SkillMentionSelector:       skillStack.SkillMentionSelector,
+			SkillExplicitLoader:        skillStack.SkillExplicitLoader,
+			SubAgentMaxConcurrent:      3,
+			SubAgentProjection:         multiprojection.NewMemorySink(multiagentmodel.ProjectionChannelEnterprise),
+			SubAgentCapabilityRegistry: capabilityRegistry,
+			SubAgentApproval:           approvalSvc,
+			HookApproval:               approvalSvc,
 		})
 		if c.initErr != nil {
 			_ = runtimeLogging.Close()
@@ -189,15 +208,6 @@ func (c *Container) Init(ctx context.Context) error {
 			return
 		}
 		if cfg.MCP.Enabled && c.bundle != nil && c.bundle.ToolGateway != nil {
-			adapterReg := capservice.NewAdapterRegistry()
-			capIndex, err := loadEnterpriseCapabilityIndex(adapterReg)
-			if err != nil {
-				_ = runtimeLogging.Close()
-				c.logging = nil
-				c.bundle = nil
-				c.initErr = fmt.Errorf("初始化Enterprise capability index失败: %w", err)
-				return
-			}
 			store, err := openEnterpriseApprovalStore()
 			if err != nil {
 				_ = runtimeLogging.Close()
@@ -212,7 +222,7 @@ func (c *Container) Init(ctx context.Context) error {
 			}
 			mcpStack, err := mcpstack.Build(ctx, mcpstack.Options{
 				Config:             cfg,
-				CapabilityIndex:    capIndex,
+				CapabilityIndex:    capabilityRegistry,
 				ToolRegistry:       c.bundle.ToolGateway,
 				ApprovalService:    approvalSvc,
 				CredentialSvc:      c.bundle.Credentials,
@@ -254,6 +264,15 @@ func (c *Container) Service() app.AgentService {
 
 // MCPStack 返回已装配的 MCP 栈（可能为 nil）。
 func (c *Container) MCPStack() *mcpstack.Stack { return c.mcpStack }
+
+// SubAgentProjectionReader 返回经归约的子任务控制面投影，供 HTTP 审计面读取。
+func (c *Container) SubAgentProjectionReader() multicontract.ProjectionReader {
+	if c == nil || c.bundle == nil {
+		return nil
+	}
+	reader, _ := c.bundle.SubAgentProjection.(multicontract.ProjectionReader)
+	return reader
+}
 
 // Close 释放 MCP 连接与运行日志等资源。
 func (c *Container) Close() error {
@@ -320,6 +339,7 @@ func buildEnterpriseApproval(policyCfg platformconfig.PolicyConfig, log logger.L
 // 生产 headless ask 审批仍为过渡方案（见 headlessAskApprover 注释）。
 func buildEnterpriseExecStack(cfg platformconfig.SandboxConfig, log logger.Logger) (skillstack.ExecStack, error) {
 	directRunner := localexec.NewRunner()
+	var shellProvider execcontract.ShellCapabilityProvider = directRunner
 	profile := execmodel.SandboxProfile{Mode: execmodel.SandboxDisabled}
 	var sessionClient sandboxcontract.SessionClient
 	var fileClient sandboxcontract.FileSystemClient
@@ -338,6 +358,7 @@ func buildEnterpriseExecStack(cfg platformconfig.SandboxConfig, log logger.Logge
 		mode := strings.ToLower(strings.TrimSpace(cfg.Mode))
 		switch mode {
 		case "docker_sandbox", "remote_sandbox":
+			shellProvider = nil
 			profile.Provider = "genesis-sandbox"
 			profile.WorkspaceID = strings.TrimSpace(cfg.WorkspaceID)
 			if profile.Mode == execmodel.SandboxDisabled {
@@ -382,11 +403,39 @@ func buildEnterpriseExecStack(cfg platformconfig.SandboxConfig, log logger.Logge
 	}
 	return skillstack.ExecStack{
 		Runner:        executionRunner,
+		Shells:        shellProvider,
 		SessionClient: sessionClient,
 		FileClient:    fileClient,
 		WorkspaceRef:  workspaceRef,
 		Sandbox:       profile,
 	}, nil
+}
+
+func enterpriseEnvironmentContext(ctx context.Context, stack skillstack.ExecStack) promptbuilder.EnvironmentContext {
+	cwd, _ := os.Getwd()
+	environment := promptbuilder.EnvironmentContext{
+		OS:               runtime.GOOS,
+		Cwd:              cwd,
+		SandboxMode:      string(stack.Sandbox.Mode),
+		SandboxProvider:  stack.Sandbox.Provider,
+		ExternalApproval: true,
+	}
+	if stack.Shells == nil {
+		if stack.Sandbox.Provider == "genesis-sandbox" {
+			environment.OS = ""
+			environment.Cwd = "/workspace"
+		}
+		return environment
+	}
+	capabilities := stack.Shells.ShellCapabilities(ctx)
+	environment.DefaultShell = string(capabilities.Default.Kind)
+	environment.DefaultShellPath = capabilities.Default.Path
+	for _, shell := range capabilities.Supported {
+		if shell.Kind != "" {
+			environment.SupportedShells = append(environment.SupportedShells, string(shell.Kind))
+		}
+	}
+	return environment
 }
 
 func firstNonEmpty(values ...string) string {

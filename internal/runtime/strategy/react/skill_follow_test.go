@@ -97,6 +97,37 @@ func TestAnnotateSkillFollowWarnsRedeiveryWrite(t *testing.T) {
 	}
 }
 
+func TestAnnotateSkillFollowWarnsFinalTextWrittenToWork(t *testing.T) {
+	rc := runtime.NewRunContext(&domain.Run{ID: "r3"}, &domain.Agent{})
+	out := annotateSkillFollowHints(rc, "write_file",
+		`{"path":"$WORK_DIR/年度总结.md","content":"summary"}`,
+		`{"path":".genesis/runs/r3/work/年度总结.md","size":7}`)
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(out), &obj); err != nil {
+		t.Fatal(err)
+	}
+	if obj["delivery_path_mismatch"] != true {
+		t.Fatalf("expected delivery path warning, got %s", out)
+	}
+	if hint, _ := obj["delivery_path_hint"].(string); !strings.Contains(hint, "$OUTPUT_DIR") {
+		t.Fatalf("expected actionable OUTPUT_DIR hint, got %s", out)
+	}
+
+	script := annotateSkillFollowHints(rc, "write_file",
+		`{"path":"$WORK_DIR/extract_pdf.py","content":"print(1)"}`,
+		`{"path":".genesis/runs/r3/work/extract_pdf.py","size":8}`)
+	if strings.Contains(script, "delivery_path_mismatch") {
+		t.Fatalf("intermediate script should not be treated as a final document: %s", script)
+	}
+
+	delivered := annotateSkillFollowHints(rc, "write_file",
+		`{"path":"$OUTPUT_DIR/年度总结.md","content":"summary"}`,
+		`{"path":".genesis/runs/r3/output/年度总结.md","size":7}`)
+	if strings.Contains(delivered, "delivery_path_mismatch") || strings.Contains(delivered, "delivery_complete") {
+		t.Fatalf("a new OUTPUT_DIR text deliverable should not be warned: %s", delivered)
+	}
+}
+
 func TestAnnotateSkillFollowQAFailed(t *testing.T) {
 	rc := runtime.NewRunContext(&domain.Run{ID: "r1"}, &domain.Agent{})
 	registerSkillInjectionFollow(rc, `## Creating

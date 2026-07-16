@@ -12,6 +12,7 @@ import (
 
 	"genesis-agent/internal/app"
 	mcpstack "genesis-agent/internal/capabilities/mcp/stack"
+	multicontract "genesis-agent/internal/runtime/multiagent/contract"
 	"genesis-agent/products/enterprise/internal/interfaces/http/handler"
 )
 
@@ -37,10 +38,11 @@ func DefaultServerConfig() ServerConfig {
 
 // Server HTTP API 服务器
 type Server struct {
-	cfg    ServerConfig
-	svc    app.AgentService
-	mcp    *mcpstack.Stack
-	httpSv *http.Server
+	cfg        ServerConfig
+	svc        app.AgentService
+	mcp        *mcpstack.Stack
+	projection multicontract.ProjectionReader
+	httpSv     *http.Server
 }
 
 // NewServer 创建 HTTP API 服务器
@@ -50,13 +52,24 @@ func NewServer(svc app.AgentService, cfg ServerConfig) *Server {
 
 // NewServerWithMCP 创建带 MCP 管理面的 HTTP API 服务器。
 func NewServerWithMCP(svc app.AgentService, mcp *mcpstack.Stack, cfg ServerConfig) *Server {
+	return NewServerWithMCPAndProjection(svc, mcp, nil, cfg)
+}
+
+// NewServerWithMCPAndProjection 创建带 MCP 与子任务控制面投影的 HTTP API 服务器。
+func NewServerWithMCPAndProjection(svc app.AgentService, mcp *mcpstack.Stack, projection multicontract.ProjectionReader, cfg ServerConfig) *Server {
+	return NewServerWithMCPAndProjectionForTenant(svc, mcp, projection, "", cfg)
+}
+
+// NewServerWithMCPAndProjectionForTenant 创建受服务端租户范围约束的子任务投影 API。
+func NewServerWithMCPAndProjectionForTenant(svc app.AgentService, mcp *mcpstack.Stack, projection multicontract.ProjectionReader, tenantID string, cfg ServerConfig) *Server {
 	s := &Server{
-		cfg: cfg,
-		svc: svc,
-		mcp: mcp,
+		cfg:        cfg,
+		svc:        svc,
+		mcp:        mcp,
+		projection: projection,
 	}
 
-	mux := newRouter(svc, mcp)
+	mux := newRouterWithProjectionTenant(svc, mcp, projection, tenantID)
 	s.httpSv = &http.Server{
 		Addr:         fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
 		Handler:      mux,

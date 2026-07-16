@@ -46,7 +46,7 @@ func (t *Tool) GetInfo() *tool.Info {
 在当前 Skill 的持久工作目录中按原文执行命令。
 当第三方 SKILL.md 写 python scripts/foo.py、python -m bar、node scripts/foo.js、pdftoppm ... 时，应直接把整条命令放进 command，由运行时负责 materialize skill、准备工作目录、注入环境并选择合适的 sandbox/profile。
 需要执行 JS/Python 时，默认写入 $WORK_DIR 脚本再 python foo.py / node foo.js；禁止 python -c / node -e 多行或长串内联（Windows/远程 shell 引号易失败）。仅极短单行探测可例外。
-inputs 可选，语义是控制面 stage 源：用 $WORK_DIR/... 或工作区相对路径；禁止 /workspace/... 等执行面绝对路径。若提供，会在执行前复制到当前 Skill 工作目录，供命令用相对文件名访问；文件已在工作目录或仅跑包内脚本时请省略。
+inputs 可选，语义是控制面 stage 源：可用 $WORK_DIR/...、工作区相对路径，或用户在本次任务中指定的宿主机绝对文件路径；禁止 /workspace/... 等执行面绝对路径。若提供，会在执行审批后复制到当前 Skill 工作目录，供命令用相对文件名访问；禁止用 run_command / Copy-Item 手动搬运输入文件。文件已在工作目录或仅跑包内脚本时请省略。
 command 写相对文件名或包内 scripts/...；禁止把 $WORK_DIR/$INPUT_DIR/$OUTPUT_DIR/$TMPDIR/$SKILL_DIR 写进 command（本地与远程 sandbox 均不展开）。正确：inputs=["$WORK_DIR/foo.py"] + command="python foo.py"。
 返回 metadata.execution_backend / degraded；首次或环境变化时含 path_map（勿把右侧路径写入 inputs/command）。
 交付物不要用 write_file 伪造 .pptx/.docx/.xlsx/.pdf；应由命令真实生成。
@@ -56,7 +56,7 @@ command 写相对文件名或包内 scripts/...；禁止把 $WORK_DIR/$INPUT_DIR
 			Properties: map[string]*tool.ParameterSchema{
 				"skill":      {Type: "string", Description: "Skill 名称，例如 office-ppt"},
 				"command":    {Type: "string", Description: "在 Skill 工作目录执行的命令，例如 python create_pdfs.py；禁止含 $WORK_DIR；避免多行 python -c / node -e"},
-				"inputs":     {Type: "array", Description: "可选控制面路径：stage 到 Skill 工作目录。用 $WORK_DIR/foo 或工作区相对路径；禁止 /workspace/...；已在 cwd 则省略", Items: &tool.ParameterSchema{Type: "string"}},
+				"inputs":     {Type: "array", Description: "可选控制面 stage 源：$WORK_DIR/foo、工作区相对路径或用户指定的宿主机绝对文件；禁止 /workspace/...。运行时会在审批后 stage 到 Skill 工作目录", Items: &tool.ParameterSchema{Type: "string"}},
 				"timeout_ms": {Type: "integer", Description: "超时毫秒，默认 120000"},
 			},
 			Required: []string{"skill", "command"},

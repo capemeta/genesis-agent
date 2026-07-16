@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	capmodel "genesis-agent/internal/capabilities/capability/model"
+	"io"
 	"path"
 	"strings"
 
@@ -28,6 +29,7 @@ type Tool struct{ deps Deps }
 
 type input struct {
 	Name     string `json:"name,omitempty"`
+	Skill    string `json:"skill,omitempty"`
 	Package  string `json:"package,omitempty"`
 	Resource string `json:"resource"`
 	MaxBytes int    `json:"max_bytes,omitempty"`
@@ -60,6 +62,7 @@ func (t *Tool) GetInfo() *tool.Info {
 			Type: "object",
 			Properties: map[string]*tool.ParameterSchema{
 				"name":      {Type: "string", Description: "Skill 名称或 qualified_name"},
+				"skill":     {Type: "string", Description: "name 的兼容别名；二者同时提供时必须一致"},
 				"package":   {Type: "string", Description: "可选 package id，用于直接定位 skill"},
 				"resource":  {Type: "string", Description: "ResourceID 或短名：office-ppt/design.md 或 design.md"},
 				"max_bytes": {Type: "integer", Description: "最大读取字节数"},
@@ -72,12 +75,24 @@ func (t *Tool) GetInfo() *tool.Info {
 
 func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 	var in input
-	if err := json.Unmarshal([]byte(params), &in); err != nil {
+	decoder := json.NewDecoder(strings.NewReader(params))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&in); err != nil {
 		return "", fmt.Errorf("解析read_skill_resource参数失败: %w", err)
 	}
-	name := strings.TrimSpace(in.Name)
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return "", fmt.Errorf("解析read_skill_resource参数失败: 参数只能包含一个JSON对象")
+	}
+	name, err := normalizeSkillName(in.Name, in.Skill)
+	if err != nil {
+		return "", err
+	}
 	pkg := model.PackageID(strings.TrimSpace(in.Package))
-	resource := model.QualifySkillResource(string(pkg), name, strings.TrimSpace(in.Resource))
+	rawResource := strings.TrimSpace(in.Resource)
+	if name == "" && pkg == "" {
+		name = skillNameFromQualifiedResource(rawResource)
+	}
+	resource := model.QualifySkillResource(string(pkg), name, rawResource)
 	if resource == "" {
 		return "", fmt.Errorf("resource不能为空")
 	}
@@ -101,6 +116,28 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 		return "", err
 	}
 	return string(data), nil
+}
+
+func normalizeSkillName(name, alias string) (string, error) {
+	name = strings.TrimSpace(name)
+	alias = strings.TrimSpace(alias)
+	if name != "" && alias != "" && !strings.EqualFold(name, alias) {
+		return "", fmt.Errorf("name与skill不能指向不同Skill")
+	}
+	if name != "" {
+		return name, nil
+	}
+	return alias, nil
+}
+
+// skillNameFromQualifiedResource 从完整 ResourceID 推导资源所有者。
+// 仅接受至少两段的包内路径，短名仍必须显式提供 name/skill/package。
+func skillNameFromQualifiedResource(resource string) string {
+	normalized := strings.Trim(strings.TrimSpace(strings.ReplaceAll(resource, `\`, "/")), "/")
+	if normalized == "" || !strings.Contains(normalized, "/") {
+		return ""
+	}
+	return strings.SplitN(normalized, "/", 2)[0]
 }
 
 func (t *Tool) ensureIndexed(ctx context.Context, pkg model.PackageID, name string, resource model.ResourceID) error {

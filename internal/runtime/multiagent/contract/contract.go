@@ -15,10 +15,13 @@ type SpawnRequest struct {
 	TenantID     string
 	ParentRunID  string
 	Depth        int
+	MaxDepth     int
+	ReadOnly     bool
 	SubagentType string
 	Prompt       string
 	Agent        *domain.Agent
 	Timeout      time.Duration
+	Budget       *TreeBudget
 }
 
 // SlotToken 是限流器创建的不可透明预留凭据。
@@ -34,6 +37,7 @@ type SlotLimiter interface {
 // Controller 是 Task 工具依赖的最小控制平面。
 type Controller interface {
 	Spawn(ctx context.Context, request SpawnRequest) (model.Instance, error)
+	Resume(ctx context.Context, agentID, prompt string) (model.Instance, error)
 	Wait(ctx context.Context, agentID string) (model.Instance, error)
 	Stop(ctx context.Context, agentID string) error
 	Get(ctx context.Context, agentID string) (model.Instance, error)

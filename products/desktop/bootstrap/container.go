@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 
@@ -26,6 +27,10 @@ import (
 	profilemodel "genesis-agent/internal/capabilities/profile/model"
 	platformconfig "genesis-agent/internal/platform/config"
 	"genesis-agent/internal/platform/logger"
+	multicontract "genesis-agent/internal/runtime/multiagent/contract"
+	multiagentmodel "genesis-agent/internal/runtime/multiagent/model"
+	multiprojection "genesis-agent/internal/runtime/multiagent/projection"
+	promptbuilder "genesis-agent/internal/runtime/prompt"
 	desktopprofile "genesis-agent/products/desktop/internal/profile"
 	localexec "genesis-agent/shared/local/execution"
 	"genesis-agent/shared/local/skillmarket"
@@ -81,7 +86,20 @@ func (c *Container) Init(ctx context.Context) error {
 			return
 		}
 		prof := desktopprofile.DefaultProfile()
-		hookRunner, err := execservice.NewRunner(localexec.NewRunner(), nil, execservice.WithLogger(runtimeLogging.AgentLogger))
+		var capabilityRegistry capcontract.Registry
+		var adapterReg *capservice.AdapterRegistry
+		if cfg.MCP.Enabled {
+			adapterReg = capservice.NewAdapterRegistry()
+			capabilityRegistry, err = loadDesktopCapabilityIndex(adapterReg)
+			if err != nil {
+				_ = runtimeLogging.Close()
+				c.logging = nil
+				c.initErr = fmt.Errorf("初始化 Desktop capability index失败: %w", err)
+				return
+			}
+		}
+		hostRunner := localexec.NewRunner()
+		hookRunner, err := execservice.NewRunner(hostRunner, nil, execservice.WithLogger(runtimeLogging.AgentLogger))
 		if err != nil {
 			_ = runtimeLogging.Close()
 			c.logging = nil
@@ -89,20 +107,42 @@ func (c *Container) Init(ctx context.Context) error {
 			return
 		}
 
+		cwd, _ := os.Getwd()
+		shellCapabilities := hostRunner.ShellCapabilities(ctx)
+		supportedShells := make([]string, 0, len(shellCapabilities.Supported))
+		for _, shell := range shellCapabilities.Supported {
+			if shell.Kind != "" {
+				supportedShells = append(supportedShells, string(shell.Kind))
+			}
+		}
+		environmentInjector := promptbuilder.NewEnvironmentContextInjector(promptbuilder.EnvironmentContext{
+			OS:               runtime.GOOS,
+			Cwd:              cwd,
+			DefaultShell:     string(shellCapabilities.Default.Kind),
+			DefaultShellPath: shellCapabilities.Default.Path,
+			SupportedShells:  supportedShells,
+			SandboxMode:      "disabled",
+			ExternalApproval: true,
+		})
+
 		c.bundle, c.initErr = shared.BuildAgentService(ctx, shared.BuildOptions{
-			Product:               "desktop",
-			ConfigDir:             c.configDir,
-			Quiet:                 c.quiet,
-			RouteName:             "chat",
-			DefaultAgentID:        "desktop-default-agent",
-			DefaultAgentName:      "Genesis Desktop Agent",
-			Profile:               prof,
-			Logger:                runtimeLogging.AgentLogger,
-			AuditSink:             auditSink,
-			SubAgentMaxConcurrent: 4,
-			SubAgentApproval:      approvalSvc,
-			HookExecutionRunner:   hookRunner,
-			HookApproval:          approvalSvc,
+			Product:                        "desktop",
+			ConfigDir:                      c.configDir,
+			Quiet:                          c.quiet,
+			RouteName:                      "chat",
+			DefaultAgentID:                 "desktop-default-agent",
+			DefaultAgentName:               "Genesis Desktop Agent",
+			Profile:                        prof,
+			PromptInjectors:                []promptbuilder.ContextInjector{environmentInjector},
+			Logger:                         runtimeLogging.AgentLogger,
+			AuditSink:                      auditSink,
+			SubAgentMaxConcurrent:          4,
+			SubAgentProjection:             multiprojection.NewMemorySink(multiagentmodel.ProjectionChannelDesktop),
+			SubAgentIncludeUserDefinitions: true,
+			SubAgentCapabilityRegistry:     capabilityRegistry,
+			SubAgentApproval:               approvalSvc,
+			HookExecutionRunner:            hookRunner,
+			HookApproval:                   approvalSvc,
 		})
 		if c.initErr != nil {
 			_ = runtimeLogging.Close()
@@ -110,15 +150,6 @@ func (c *Container) Init(ctx context.Context) error {
 			return
 		}
 		if !cfg.MCP.Enabled || c.bundle == nil || c.bundle.ToolGateway == nil {
-			return
-		}
-		adapterReg := capservice.NewAdapterRegistry()
-		capIndex, err := loadDesktopCapabilityIndex(adapterReg)
-		if err != nil {
-			_ = runtimeLogging.Close()
-			c.logging = nil
-			c.bundle = nil
-			c.initErr = err
 			return
 		}
 		store, err := openDesktopApprovalStore()
@@ -135,7 +166,7 @@ func (c *Container) Init(ctx context.Context) error {
 		}
 		mcpStack, err := mcpstack.Build(ctx, mcpstack.Options{
 			Config:             cfg,
-			CapabilityIndex:    capIndex,
+			CapabilityIndex:    capabilityRegistry,
 			ToolRegistry:       c.bundle.ToolGateway,
 			ApprovalService:    approvalSvc,
 			CredentialSvc:      c.bundle.Credentials,
@@ -180,6 +211,15 @@ func (c *Container) MCPStack() *mcpstack.Stack {
 		return nil
 	}
 	return c.mcpStack
+}
+
+// SubAgentProjectionReader 为未来 Wails ViewModel 提供安全的控制面事件查询。
+func (c *Container) SubAgentProjectionReader() multicontract.ProjectionReader {
+	if c == nil || c.bundle == nil {
+		return nil
+	}
+	reader, _ := c.bundle.SubAgentProjection.(multicontract.ProjectionReader)
+	return reader
 }
 
 // Close 释放资源。

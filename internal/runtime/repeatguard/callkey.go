@@ -11,11 +11,11 @@ import (
 
 // 默认忽略字段：易变身份噪声，不参与 call_key。
 var defaultIgnoreFields = map[string]struct{}{
-	"request_id":         {},
-	"trace_id":           {},
-	"timestamp":          {},
-	"nonce":              {},
-	"client_request_id":  {},
+	"request_id":        {},
+	"trace_id":          {},
+	"timestamp":         {},
+	"nonce":             {},
+	"client_request_id": {},
 }
 
 // PathRoots 用于将绝对路径改写为逻辑前缀，避免同文件不同绝对路径拆成多个 key。
@@ -29,10 +29,10 @@ type PathRoots struct {
 
 // CallIdentity 描述一次工具调用的规范化身份。
 type CallIdentity struct {
-	ToolName   string
-	CallKey    string
-	Canonical  string // 规范化后的 args 摘要（调试/日志）
-	KeyPrefix  string // call_key 前 12 位十六进制
+	ToolName  string
+	CallKey   string
+	Canonical string // 规范化后的 args 摘要（调试/日志）
+	KeyPrefix string // call_key 前 12 位十六进制
 }
 
 // BuildCallKey 计算 call_key = hash(tool + "\0" + canonical_json(normalize(args)))。
@@ -60,6 +60,11 @@ func normalizeArgs(argsJSON string, roots PathRoots, extraIgnore []string) strin
 	}
 	var raw any
 	if err := json.Unmarshal([]byte(trimmed), &raw); err != nil {
+		// 截断的结构化参数通常每次正文都不同，按原文哈希会绕过重复失败保护。
+		// 将同一工具的“不完整 JSON”归为稳定调用族，使 Guard 能及时要求换策略。
+		if isTruncatedJSONError(err) {
+			return "<truncated-json-tool-arguments>"
+		}
 		return trimmed
 	}
 	ignore := mergeIgnore(extraIgnore)
@@ -69,6 +74,16 @@ func normalizeArgs(argsJSON string, roots PathRoots, extraIgnore []string) strin
 		return trimmed
 	}
 	return string(data)
+}
+
+func isTruncatedJSONError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "unexpected end of json input") ||
+		strings.Contains(message, "unexpected eof") ||
+		strings.Contains(message, "unexpected end of input")
 }
 
 func mergeIgnore(extra []string) map[string]struct{} {

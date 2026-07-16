@@ -18,12 +18,14 @@ type Instance struct {
 	AgentID      string
 	ParentRunID  string
 	SessionID    string
+	TenantID     string
 	Depth        int
 	SubagentType string
 	Status       Status
 	Summary      string
 	Error        string
 	ChildRunID   string
+	Result       *TaskResult
 	CreatedAt    time.Time
 	FinishedAt   *time.Time
 }

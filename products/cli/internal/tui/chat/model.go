@@ -28,6 +28,7 @@ const (
 	footerLines            = 2                      // 状态栏（1）+ 帮助栏（1）
 	inputLines             = 6                      // 上边框（1）+ 内容/textarea（3）+ 字数（1）+ 下边框（1）
 	minViewport            = 5                      // 消息区最小可用行数
+	rightEdgeSafetyColumns = 4                      // Windows 对中英文混排宽度估算存在偏差，预留安全列避免物理换行
 	progressRenderInterval = 125 * time.Millisecond // 最多 8Hz 刷新进度区
 )
 
@@ -52,6 +53,7 @@ type Model struct {
 	progressCh           chan progressMsg // 当前 run 的进度事件通道
 	currentStatus        string           // 状态栏当前展示文本
 	progressLog          []string         // 最近的过程摘要，独立于最终回答
+	progressCallIDs      []string         // 运行过程进度 CallID 缓存，用于按 CallID 原位替换
 	progressExpanded     bool             // 运行过程日志是否展开（o 键切换）
 	progressDirty        bool             // 有尚未绘制的进度更新
 	lastProgressRenderAt time.Time        // 最近一次进度区重绘时刻
@@ -113,6 +115,7 @@ func NewModel(
 	ta.Placeholder = "输入消息... (Enter 发送 | Shift+Enter/Ctrl+J 换行 | Ctrl+Y 复制)"
 	ta.CharLimit = 4000
 	ta.SetHeight(3) // 默认高度 3 行
+	ta.ShowLineNumbers = false
 	ta.Focus()
 	ta.Prompt = "" // 不加前导字符，使其更像现代聊天输入框
 
@@ -776,7 +779,7 @@ func (m Model) runAgentCmd(input string, progressCh chan<- progressMsg) tea.Cmd 
 			if progressCh == nil {
 				return
 			}
-			// 必须可靠投递：丢弃 PhaseStart 会导致 final_answer 无法清空，对话区出现段落叠加/重复。
+			// 必须可靠投递：丢弃 PhaseStart 会导致 final_answer 无法分段，对话区出现叠加/重复。
 			select {
 			case progressCh <- progressMsg{event: event}:
 			case <-m.ctx.Done():
@@ -856,10 +859,11 @@ const helpText = `可用命令（以 / 开头）:
   j / k    选择模式中移动消息
   y        选择模式中复制消息
   p        展开/折叠计划卡片（输入区域为空时生效）
-  ↑ / ↓    滚动消息历史（一行）
+  ↑ / ↓    输入为空时滚动消息历史（一行）
   PgUp     向上翻页
   PgDn     向下翻页
-  鼠标滚轮 滚动消息；终端原生拖选请按住 Shift（若终端支持）`
+  Ctrl+P/N 上一条/下一条输入历史
+  鼠标拖选 终端原生选取文本；消息滚动请使用 ↑/↓ 或 PgUp/PgDn`
 
 // welcomeMsg 首次进入对话时显示的欢迎消息
 func welcomeMsg(modelName, sessionID string) uiMessage {

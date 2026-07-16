@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"genesis-agent/products/cli/internal/tui/styles"
 )
@@ -19,14 +20,19 @@ func (m Model) View() string {
 		return "\n  正在初始化界面...\n"
 	}
 
-	return lipgloss.JoinVertical(lipgloss.Left,
+	sections := []string{
 		m.headerView(),
 		m.transcriptView(),
 		m.statusView(),
 		m.helpView(),
-		m.commandMenuView(),
-		m.inputView(),
-	)
+	}
+	// JoinVertical 会为空字符串仍保留一行。命令菜单关闭时必须完全省略，
+	// 否则整帧会比终端多一行，在 Windows cmd 中导致每次重绘都滚屏留下旧帧。
+	if commandMenu := m.commandMenuView(); commandMenu != "" {
+		sections = append(sections, commandMenu)
+	}
+	sections = append(sections, m.inputView())
+	return lipgloss.JoinVertical(lipgloss.Left, sections...)
 }
 
 func (m Model) commandMenuView() string {
@@ -153,14 +159,13 @@ func truncateDisplay(value string, max int) string {
 	if max <= 0 {
 		return ""
 	}
-	runes := []rune(value)
-	if len(runes) <= max {
+	if ansi.StringWidth(value) <= max {
 		return value
 	}
 	if max <= 3 {
-		return string(runes[:max])
+		return ansi.Truncate(value, max, "")
 	}
-	return string(runes[:max-3]) + "..."
+	return ansi.Truncate(value, max, "...")
 }
 
 // helpView 渲染帮助栏（1 行，显示常用快捷键，随状态切换）
@@ -168,8 +173,7 @@ func (m Model) helpView() string {
 	var items []string
 	if m.helpOverlay {
 		items = []string{styles.HelpKey.Render("Esc") + " " + styles.HelpBar.Render("关闭帮助")}
-		bar := "  " + strings.Join(items, styles.HelpBar.Render("   "))
-		return lipgloss.NewStyle().Width(m.width).Render(bar)
+		return m.renderHelpBar(items)
 	}
 
 	if m.loading || m.helpOverlay {
@@ -193,8 +197,9 @@ func (m Model) helpView() string {
 		items = []string{
 			styles.HelpKey.Render("Ctrl+C") + " " + styles.HelpBar.Render("退出"),
 			styles.HelpKey.Render("Ctrl+Y") + " " + styles.HelpBar.Render("复制"),
+			styles.HelpKey.Render("v") + " " + styles.HelpBar.Render("选择消息"),
 			styles.HelpKey.Render("/help") + " " + styles.HelpBar.Render("帮助"),
-			styles.HelpKey.Render("↑↓") + " " + styles.HelpBar.Render("滚动"),
+			styles.HelpKey.Render("↑↓/PgUp/PgDn") + " " + styles.HelpBar.Render("滚动"),
 		}
 		// 有运行过程记录时显示 o 键提示
 		hasProgress := len(m.progressLog) > 0
@@ -231,8 +236,20 @@ func (m Model) helpView() string {
 		}
 	}
 
-	bar := "  " + strings.Join(items, styles.HelpBar.Render("   "))
-	return lipgloss.NewStyle().Width(m.width).Render(bar)
+	return m.renderHelpBar(items)
+}
+
+// renderHelpBar 保证帮助栏始终只占一行，窄终端下优先保留左侧高优先级快捷键。
+func (m Model) renderHelpBar(items []string) string {
+	separator := styles.HelpBar.Render("   ")
+	for len(items) > 0 {
+		bar := "  " + strings.Join(items, separator)
+		if lipgloss.Width(bar) <= m.width {
+			return lipgloss.NewStyle().Width(m.width).Render(bar)
+		}
+		items = items[:len(items)-1]
+	}
+	return lipgloss.NewStyle().Width(m.width).Render("")
 }
 
 // inputView 渲染输入框（上边框 + 内容/textarea + 字数提示 + 下边框）
@@ -252,15 +269,11 @@ func (m Model) inputView() string {
 	length := m.textarea.Length()
 	limit := m.textarea.CharLimit
 	countStr := fmt.Sprintf("%d/%d", length, limit)
-	paddingWidth := contentWidth - len(countStr)
-	if paddingWidth < 0 {
-		paddingWidth = 0
-	}
 	completionHint := "输入 / 显示命令"
 	if strings.HasPrefix(strings.TrimSpace(m.textarea.Value()), "/") {
 		completionHint = "↑/↓ 选择命令"
 	}
-	hintWidth := contentWidth - len(countStr) - len(completionHint) - 1
+	hintWidth := contentWidth - lipgloss.Width(countStr) - lipgloss.Width(completionHint) - 1
 	if hintWidth < 0 {
 		hintWidth = 0
 	}
@@ -358,6 +371,12 @@ func activitySummary(msg uiMessage) string {
 		outcome = "完成"
 	}
 	elapsed := msg.activityElapsed.Round(time.Millisecond)
+	if msg.activityTokens <= 0 {
+		if elapsed <= 0 {
+			return fmt.Sprintf("运行过程（%d 步 · %s）", len(msg.progressLog), outcome)
+		}
+		return fmt.Sprintf("运行过程（%d 步 · %s · %s）", len(msg.progressLog), elapsed, outcome)
+	}
 	if elapsed <= 0 {
 		return fmt.Sprintf("运行过程（%d 步 · %d tokens · %s）", len(msg.progressLog), msg.activityTokens, outcome)
 	}

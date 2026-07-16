@@ -6,11 +6,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"genesis-agent/internal/app"
 	approvalcontract "genesis-agent/internal/capabilities/approval/contract"
 	auditmemory "genesis-agent/internal/capabilities/audit/adapter/memory"
 	auditcontract "genesis-agent/internal/capabilities/audit/contract"
+	capabilitycontract "genesis-agent/internal/capabilities/capability/contract"
 	connectionfile "genesis-agent/internal/capabilities/connection/adapter/file"
 	connectioncontract "genesis-agent/internal/capabilities/connection/contract"
 	connectionservice "genesis-agent/internal/capabilities/connection/service"
@@ -51,7 +53,11 @@ import (
 	loggercontract "genesis-agent/internal/platform/logger"
 	sloglogger "genesis-agent/internal/platform/logger"
 	runtimecontext "genesis-agent/internal/runtime/context"
+	multibackground "genesis-agent/internal/runtime/multiagent/background"
+	"genesis-agent/internal/runtime/multiagent/contextsnapshot"
+	multicontract "genesis-agent/internal/runtime/multiagent/contract"
 	"genesis-agent/internal/runtime/multiagent/controller"
+	multiresult "genesis-agent/internal/runtime/multiagent/result"
 	promptbuilder "genesis-agent/internal/runtime/prompt"
 	"genesis-agent/internal/runtime/strategy/react"
 
@@ -104,6 +110,19 @@ type BuildOptions struct {
 	SubAgentApproval          approvalcontract.Service
 	// SubAgentMaxConcurrent 是根会话内的子智能体并发硬限；产品在 bootstrap 注入默认值。
 	SubAgentMaxConcurrent int
+	SubAgentStore         multicontract.InstanceStore
+	SubAgentDelivery      multicontract.ResultDeliveryStore
+	SubAgentLease         multicontract.LeaseStore
+	SubAgentHeartbeat     multicontract.HeartbeatStore
+	SubAgentCancellation  multicontract.CancellationStore
+	SubAgentProjection    multicontract.ProjectionSink
+	SubAgentEvidence      multiresult.EvidenceValidator
+	SubAgentResources     multiresult.ResourceProjector
+	// SubAgentCapabilityRegistry 提供已安装且启用的 marketplace/plugin 子智能体定义。
+	SubAgentCapabilityRegistry capabilitycontract.Registry
+	// SubAgentIncludeUserDefinitions 仅由允许本机用户自定义 Agent 的产品显式开启。
+	// Enterprise 默认关闭，改由企业策略 Source 注入。
+	SubAgentIncludeUserDefinitions bool
 }
 
 // RuntimeBundle 聚合 shared builder 构建出的运行时依赖。
@@ -116,10 +135,12 @@ type RuntimeBundle struct {
 	MemoryStore  memorycontract.ShortTermMemory
 	AuditSink    auditcontract.Sink
 	UsageSink    usagecontract.Sink
-	DefaultAgent *domain.Agent
-	AgentService app.AgentService
-	Credentials  credentialcontract.Service
-	Connections  connectioncontract.Service
+	// SubAgentProjection 是产品层注入的子智能体投影端口，供 UI/SSE/审计继续接同一事件流。
+	SubAgentProjection multicontract.ProjectionSink
+	DefaultAgent       *domain.Agent
+	AgentService       app.AgentService
+	Credentials        credentialcontract.Service
+	Connections        connectioncontract.Service
 }
 
 // BuildAgentService 构建产品无关的 Agent 运行时服务。
@@ -401,17 +422,65 @@ func BuildAgentService(ctx context.Context, opts BuildOptions) (*RuntimeBundle, 
 	if err != nil {
 		return nil, fmt.Errorf("初始化 subagent 并发槽失败: %w", err)
 	}
-	subagentController, err := controller.New(runEngine, limiter, log)
+	reducer := multiresult.NewReducer()
+	if opts.SubAgentEvidence != nil {
+		reducer.Evidence = opts.SubAgentEvidence
+	}
+	projector := multiresult.NewProjector(opts.SubAgentResources)
+	controllerOptions := []controller.Option{controller.WithResultPipeline(reducer, projector)}
+	if opts.SubAgentStore != nil {
+		controllerOptions = append(controllerOptions, controller.WithInstanceStore(opts.SubAgentStore))
+	}
+	if opts.SubAgentProjection != nil {
+		controllerOptions = append(controllerOptions, controller.WithProjectionSink(opts.SubAgentProjection))
+	}
+	subagentController, err := controller.New(runEngine, limiter, log, controllerOptions...)
 	if err != nil {
 		return nil, fmt.Errorf("初始化 subagent Controller 失败: %w", err)
+	}
+	leaseStore, heartbeatStore, cancellationStore := opts.SubAgentLease, opts.SubAgentHeartbeat, opts.SubAgentCancellation
+	if leaseStore == nil || heartbeatStore == nil || cancellationStore == nil {
+		controlStore := multibackground.NewMemoryControlStore()
+		if leaseStore == nil {
+			leaseStore = controlStore
+		}
+		if heartbeatStore == nil {
+			heartbeatStore = controlStore
+		}
+		if cancellationStore == nil {
+			cancellationStore = controlStore
+		}
+	}
+	subagentBackground, err := multibackground.New(multibackground.Deps{
+		Controller: subagentController,
+		Leases:     leaseStore,
+		Heartbeats: heartbeatStore,
+		Cancels:    cancellationStore,
+		OwnerID:    product + "-worker",
+		Interval:   500 * time.Millisecond,
+		LeaseTTL:   30 * time.Second,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("初始化 subagent 后台管理器失败: %w", err)
 	}
 	workspace, err := os.Getwd()
 	if err != nil {
 		return nil, fmt.Errorf("读取工作区失败: %w", err)
 	}
-	projectDefinitions, err := subagentservice.LoadProjectDefinitions(workspace)
+	userHomeDir := ""
+	if opts.SubAgentIncludeUserDefinitions {
+		userHomeDir, err = os.UserHomeDir()
+		if err != nil {
+			return nil, fmt.Errorf("读取用户目录失败: %w", err)
+		}
+	}
+	projectDefinitions, err := subagentservice.LoadLocalDefinitions(workspace, userHomeDir)
 	if err != nil {
 		return nil, err
+	}
+	capabilityDefinitions, err := subagentservice.LoadCapabilityDefinitions(ctx, opts.SubAgentCapabilityRegistry, product)
+	if err != nil {
+		return nil, fmt.Errorf("加载 marketplace subagent definitions: %w", err)
 	}
 	builtinCatalog := subagentservice.NewBuiltinCatalog()
 	builtinDefinitions := make([]subagentmodel.Definition, 0, len(builtinCatalog.List()))
@@ -420,17 +489,29 @@ func BuildAgentService(ctx context.Context, opts BuildOptions) (*RuntimeBundle, 
 		builtinDefinitions = append(builtinDefinitions, definition)
 	}
 	taskTool, err := subagenttask.New(subagenttask.Deps{
-		Catalog:      subagentservice.NewMergedCatalog(builtinDefinitions, projectDefinitions),
-		Controller:   subagentController,
-		BaseAgent:    defaultAgent,
-		AllowedTools: append([]string(nil), toolSet.Enabled...),
-		Approval:     opts.SubAgentApproval,
+		Catalog:        subagentservice.NewMergedCatalog(builtinDefinitions, capabilityDefinitions, projectDefinitions),
+		Controller:     subagentController,
+		BaseAgent:      defaultAgent,
+		AllowedTools:   append([]string(nil), toolSet.Enabled...),
+		Approval:       opts.SubAgentApproval,
+		SnapshotSource: contextsnapshot.NewPersistentSource(memStore),
+		Background:     subagentBackground,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("初始化 Task 工具失败: %w", err)
 	}
+	if skillGateway, ok := toolGateway.Get("Skill").(interface{ SetForkTask(toolcontract.Tool) }); ok {
+		skillGateway.SetForkTask(taskTool)
+	}
 	toolGateway.Register(taskTool)
-	taskOutputTool, taskStopTool, err := subagentlifecycle.New(subagentController)
+	lifecycleOptions := []subagentlifecycle.Option{}
+	if opts.SubAgentDelivery != nil {
+		lifecycleOptions = append(lifecycleOptions, subagentlifecycle.WithResultDeliveryStore(opts.SubAgentDelivery))
+	}
+	if cancellationStore != nil {
+		lifecycleOptions = append(lifecycleOptions, subagentlifecycle.WithCancellationStore(cancellationStore))
+	}
+	taskOutputTool, taskStopTool, err := subagentlifecycle.New(subagentController, lifecycleOptions...)
 	if err != nil {
 		return nil, fmt.Errorf("初始化 Task 生命周期工具失败: %w", err)
 	}
@@ -449,18 +530,19 @@ func BuildAgentService(ctx context.Context, opts BuildOptions) (*RuntimeBundle, 
 	hookDispatcher := hookservice.NewDispatcherWithOptions(hookConfig, []hookservice.DispatcherOption{hookservice.WithAuditSink(auditSink), hookservice.WithTracer(tracer), hookservice.WithDefaultScope(hookScopeForProduct(product))}, hookRunners...)
 	svc := app.NewAgentService(cfg, runEngine, memStore, fileMem, toolGateway, defaultAgent, credentialSvc, connectionSvc, ltm, userProfileStore, hookDispatcher)
 	return &RuntimeBundle{
-		Config:       cfg,
-		Logger:       log,
-		Tracer:       tracer,
-		ToolGateway:  toolGateway,
-		ToolRegistry: toolGateway,
-		MemoryStore:  memStore,
-		AuditSink:    auditSink,
-		UsageSink:    usageSink,
-		DefaultAgent: defaultAgent,
-		AgentService: svc,
-		Credentials:  credentialSvc,
-		Connections:  connectionSvc,
+		Config:             cfg,
+		Logger:             log,
+		Tracer:             tracer,
+		ToolGateway:        toolGateway,
+		ToolRegistry:       toolGateway,
+		MemoryStore:        memStore,
+		AuditSink:          auditSink,
+		UsageSink:          usageSink,
+		SubAgentProjection: opts.SubAgentProjection,
+		DefaultAgent:       defaultAgent,
+		AgentService:       svc,
+		Credentials:        credentialSvc,
+		Connections:        connectionSvc,
 	}, nil
 }
 

@@ -50,7 +50,14 @@ func ShellArgv(shell execmodel.ShellKind, command string) ([]string, execmodel.S
 	case execmodel.ShellCmd:
 		return []string{windowsShell(), "/d", "/c", command}, shell, nil
 	case execmodel.ShellPowerShell:
-		return nil, shell, execcontract.NewError(execcontract.ErrCodeInvalidInput, fmt.Errorf("当前本地runner未启用PowerShell，请注入专用PowerShell runner"))
+		path := ""
+		if info, ok := findShell(execmodel.ShellPowerShell); ok {
+			path = info.Path
+		}
+		if strings.TrimSpace(path) == "" {
+			return nil, shell, execcontract.NewError(execcontract.ErrCodeInvalidInput, fmt.Errorf("当前环境未检测到PowerShell"))
+		}
+		return []string{path, "-NoProfile", "-Command", command}, shell, nil
 	case execmodel.ShellBash:
 		return []string{"bash", "-lc", command}, shell, nil
 	case execmodel.ShellSh:

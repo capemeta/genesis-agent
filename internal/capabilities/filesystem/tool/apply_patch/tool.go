@@ -30,12 +30,17 @@ func New(deps toolkit.Deps) (tool.Tool, error) {
 
 func (t *Tool) GetInfo() *tool.Info {
 	return &tool.Info{
-		Name:        "apply_patch",
-		Description: "应用 Codex 风格补丁，支持 Add/Delete/Update/Move、多文件和多 hunk 修改。复杂代码修改优先使用本工具。",
+		Name: "apply_patch",
+		Description: "应用 Codex 格式补丁，支持 Add/Delete/Update/Move、多文件和多 hunk 修改。" +
+			"✅ 推荐用 Add File 创建新文件（尤其是大文件/脚本）：patch 字段内容相比 write_file 的 content 字段，" +
+			"不需要对 \\n、\\t 等做额外 JSON 转义（+ 前缀行是逐行写入），token 效率更高，截断风险更低。" +
+			"适合：1) 局部、可审查的代码修改（Update File + hunk）；2) 创建中等到大型新文件（Add File）；" +
+			"3) 删除或重命名文件（Delete/Move）。" +
+			"仍受 max_tokens 限制，超大文件（>15000 字符）需分多次调用，先写骨架再 Update File 追加各段。",
 		Parameters: &tool.ParameterSchema{
 			Type: "object",
 			Properties: map[string]*tool.ParameterSchema{
-				"patch": {Type: "string", Description: "以 *** Begin Patch 开始、*** End Patch 结束的 patch 文本"},
+				"patch": {Type: "string", Description: "以 *** Begin Patch 开始、*** End Patch 结束的 patch 文本；+ 前缀为新增行，- 前缀为删除行，空格前缀为上下文行"},
 			},
 			Required: []string{"patch"},
 		},

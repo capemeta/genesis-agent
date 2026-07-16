@@ -2,6 +2,7 @@ package repeatguard
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"sync"
 
@@ -386,6 +387,15 @@ func (g *Guard) noteArtifactsLocked(paths []string) {
 }
 
 func buildRepeatedFailureJSON(id CallIdentity, st *CallFailureState) string {
+	hint := "平台已拦截相同调用。请更换参数/脚本，或先完成 prior.suggested_action，或向用户说明阻塞原因。禁止再次提交相同调用。"
+	// 针对参数截断给出专项指引：告知 LLM 改变工具选择，而不是微调内容
+	if st.LastFailureKind == "tool_arguments_truncated" {
+		hint = "工具参数 JSON 在 LLM 输出中途被截断（content 内容过大超过 max_tokens），已连续失败 " + fmt.Sprintf("%d", st.ConsecutiveFailures) + " 次。" +
+			"禁止原样重试。必须改变策略：" +
+			"1) 改用 apply_patch 的 Add File 操作写入脚本（+ 前缀行，无需 JSON 转义，截断风险更低）；" +
+			"2) 或将内容拆为骨架+多次 append（首次 write_file 写骨架，后续 append=true+expected_hash 追加）；" +
+			"3) 或缩减单次写入量。"
+	}
 	payload := map[string]any{
 		"ok":               false,
 		"failure_kind":     "repeated_failure",
@@ -399,7 +409,7 @@ func buildRepeatedFailureJSON(id CallIdentity, st *CallFailureState) string {
 			"suggested_action": st.LastSuggestedAction,
 			"error_excerpt":    st.LastErrorExcerpt,
 		},
-		"hint": "平台已拦截相同调用。请更换参数/脚本，或先完成 prior.suggested_action，或向用户说明阻塞原因。禁止再次提交相同调用。",
+		"hint": hint,
 	}
 	data, err := json.Marshal(payload)
 	if err != nil {

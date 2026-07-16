@@ -47,6 +47,26 @@ func TestBackendOverwriteFalse(t *testing.T) {
 	}
 }
 
+func TestBackendListFiltersBeforeApplyingLimit(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(root, "z-dir"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := New().ListDir(context.Background(), resolved(root, ""), fscontract.ListOptions{
+		MaxEntries: 1,
+		EntryType:  model.EntryTypeDir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name != "z-dir" {
+		t.Fatalf("entries = %+v, want z-dir", entries)
+	}
+}
+
 func TestBackendWalkIsBounded(t *testing.T) {
 	root := t.TempDir()
 	for _, name := range []string{"a.txt", "b.txt"} {

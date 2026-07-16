@@ -34,6 +34,7 @@ import (
 // ExecStack 是产品执行栈中与 Skill 脚本相关的子集。
 type ExecStack struct {
 	Runner        execcontract.ExecutionRunner
+	Shells        execcontract.ShellCapabilityProvider
 	SessionClient sandboxcontract.SessionClient
 	FileClient    sandboxcontract.FileSystemClient
 	WorkspaceRef  sandboxcontract.WorkspaceRef
@@ -183,7 +184,7 @@ func BuildEmbedded(opts Options) (*Stack, error) {
 	mentions := &react.MentionSelector{Service: skillSvc, CatalogRequest: catalogReq}
 	injector := promptbuilder.ContextInjectorFunc(func(ctx context.Context, req promptbuilder.BuildRequest) (promptbuilder.Fragment, error) {
 		var b strings.Builder
-		b.WriteString("Skills 是任务流程包，不是可执行工具。加载技能必须调用 Skill(skill=...)；禁止把 office-ppt 等技能名当作独立工具调用。用户输入中的 $skill 或 skill:// 引用会在回合开始自动注入。可用技能列表见 Skill 工具描述中的 <available_skills>。若 run_skill_command 返回 failure_kind=dependency_missing：调用 install_skill_dependencies（须审批，仅装 runtime 白名单包）后，用相同参数再跑命令（安装成功会清零重复失败计数）；sandbox_violation 勿当成缺包。收到 failure_kind=repeated_failure：禁止再次提交相同调用，必须改参或改策略。收到 failure_kind=no_progress：必须总结阻塞或询问用户，禁止继续空转。")
+		b.WriteString("Skills 是任务流程包，不是可执行工具。加载技能必须调用 Skill(skill=...)；禁止把 office-ppt 等技能名当作独立工具调用。用户输入中的 $skill 或 skill:// 引用会在回合开始自动注入。用户指定的宿主机文件应直接作为 run_skill_command.inputs，由运行时在审批后 stage，禁止 run_command / Copy-Item 手动搬运。可用技能列表见 Skill 工具描述中的 <available_skills>。若 run_skill_command 返回 failure_kind=dependency_missing：调用 install_skill_dependencies（须审批，仅装 runtime 白名单包）后，用相同参数再跑命令（安装成功会清零重复失败计数）；sandbox_violation 勿当成缺包。收到 failure_kind=repeated_failure：禁止再次提交相同调用，必须改参或改策略。收到 failure_kind=no_progress：必须总结阻塞或询问用户，禁止继续空转。")
 		b.WriteString("\n\nRun 文件落点：中间脚本/临时文件用 write_file(\"$WORK_DIR/...\")；最终交付进 $OUTPUT_DIR；禁止写到仓库根目录。")
 		if req.Run != nil && strings.TrimSpace(req.Run.ID) != "" && strings.TrimSpace(opts.WorkspaceRoot) != "" {
 			if ws, err := scriptworkspace.PrepareLocalTask(opts.WorkspaceRoot, req.Run.ID); err == nil {

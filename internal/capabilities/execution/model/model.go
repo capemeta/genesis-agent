@@ -16,6 +16,19 @@ const (
 	ShellCmd        ShellKind = "cmd"
 )
 
+// ShellInfo 描述一个已经由产品执行环境验证可用的 Shell。
+type ShellInfo struct {
+	Kind ShellKind `json:"kind"`
+	Path string    `json:"path,omitempty"`
+}
+
+// ShellCapabilities 描述当前执行环境真实可用的 Shell 能力。
+// Default 必须出现在 Supported 中；未知远程环境可以返回零值，由调用方保守使用 auto。
+type ShellCapabilities struct {
+	Default   ShellInfo   `json:"default"`
+	Supported []ShellInfo `json:"supported,omitempty"`
+}
+
 // ExecutionEnvironment 描述命令实际执行环境。
 type ExecutionEnvironment string
 

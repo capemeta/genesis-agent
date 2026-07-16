@@ -2,6 +2,7 @@ package execution
 
 import (
 	"context"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -73,11 +74,46 @@ func TestDecodeCommandOutputPrefersUTF8AndFallsBackGBK(t *testing.T) {
 	}
 }
 
-func TestRunnerRejectsPowerShellWithoutDedicatedRunner(t *testing.T) {
+func TestRunnerPowerShellCapabilityMatchesExecution(t *testing.T) {
 	runner := NewRunner()
-	_, err := runner.Run(context.Background(), execmodel.Command{Command: echoCommand(), Shell: execmodel.ShellPowerShell}, execcontract.RunOptions{Timeout: 30 * time.Second})
-	if code := execcontract.CodeOf(err); code != execcontract.ErrCodeInvalidInput {
-		t.Fatalf("CodeOf(err) = %s, want %s", code, execcontract.ErrCodeInvalidInput)
+	hasPowerShell := false
+	for _, shell := range runner.ShellCapabilities(context.Background()).Supported {
+		if shell.Kind == execmodel.ShellPowerShell {
+			hasPowerShell = true
+			break
+		}
+	}
+	result, err := runner.Run(context.Background(), execmodel.Command{Command: "Write-Output hello", Shell: execmodel.ShellPowerShell}, execcontract.RunOptions{Timeout: 30 * time.Second})
+	if !hasPowerShell {
+		if code := execcontract.CodeOf(err); code != execcontract.ErrCodeInvalidInput {
+			t.Fatalf("CodeOf(err) = %s, want %s", code, execcontract.ErrCodeInvalidInput)
+		}
+		return
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ExitCode != 0 || !strings.Contains(result.Stdout, "hello") {
+		t.Fatalf("result = %+v", result)
+	}
+}
+
+func TestRunnerPowerShellAcceptsTrailingBackslashLiteralPath(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows PowerShell path regression")
+	}
+	runner := NewRunner()
+	if _, ok := findShell(execmodel.ShellPowerShell); !ok {
+		t.Skip("PowerShell is unavailable")
+	}
+	path := filepath.Clean(t.TempDir()) + `\`
+	command := "Get-ChildItem -LiteralPath '" + strings.ReplaceAll(path, "'", "''") + "'"
+	result, err := runner.Run(context.Background(), execmodel.Command{Command: command, Shell: execmodel.ShellPowerShell}, execcontract.RunOptions{Timeout: 30 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ExitCode != 0 {
+		t.Fatalf("exit=%d stderr=%q command=%q", result.ExitCode, result.Stderr, command)
 	}
 }
 func TestRunnerRunEcho(t *testing.T) {
@@ -99,7 +135,13 @@ func TestRunnerRunEcho(t *testing.T) {
 
 func TestRunnerRunExitErrorReturnsResult(t *testing.T) {
 	runner := NewRunner()
-	result, err := runner.Run(context.Background(), execmodel.Command{Command: exitCommand()}, execcontract.RunOptions{Timeout: 30 * time.Second})
+	shell := execmodel.ShellAuto
+	command := exitCommand()
+	if runtime.GOOS == "windows" && runner.ShellCapabilities(context.Background()).Default.Kind == execmodel.ShellPowerShell {
+		command = "exit 7"
+		shell = execmodel.ShellPowerShell
+	}
+	result, err := runner.Run(context.Background(), execmodel.Command{Command: command, Shell: shell}, execcontract.RunOptions{Timeout: 30 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}

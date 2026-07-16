@@ -85,6 +85,12 @@ type ExecutionRunner interface {
 	Run(ctx context.Context, cmd model.Command, opts RunOptions) (*model.Result, error)
 }
 
+// ShellCapabilityProvider 暴露执行环境已经验证可用的 Shell。
+// 工具 Schema 和运行时上下文必须以该能力为准，不能声明 runner 实际不支持的 Shell。
+type ShellCapabilityProvider interface {
+	ShellCapabilities(ctx context.Context) model.ShellCapabilities
+}
+
 // InteractiveSessionRunner 是支持伪终端（PTY）长生命周期交互式终端会话的底层接口。
 type InteractiveSessionRunner interface {
 	// StartSession 启动一个 PTY 交互会话，并指定会话 ID

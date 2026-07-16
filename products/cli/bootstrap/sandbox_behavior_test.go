@@ -15,7 +15,6 @@ import (
 	execcontract "genesis-agent/internal/capabilities/execution/contract"
 	execmodel "genesis-agent/internal/capabilities/execution/model"
 	toolcontract "genesis-agent/internal/capabilities/tool/contract"
-	platformconfig "genesis-agent/internal/platform/config"
 	"genesis-agent/internal/platform/logger"
 	clisandbox "genesis-agent/products/cli/internal/sandbox"
 	windowssandbox "genesis-agent/shared/local/sandbox/windows"
@@ -248,14 +247,10 @@ func mustRunCommandTool(t *testing.T, cfg clisandbox.Config) toolcontract.Tool {
 		})
 	}
 	workspace := newTestWorkspace(t, "sandbox-behavior-*")
-	approvalSvc, err := buildBaseApprovalService(true, platformconfig.PolicyConfig{}, logger.NewNop(), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
 	if cfg.Execution != execmodel.SandboxDisabled && cfg.Mode == "" {
 		cfg.Mode = clisandbox.ModePlatform
 	}
-	tools, _, err := buildProductTools(cfg, approvalSvc, logger.NewNop(), workspace)
+	tools, _, err := buildProductTools(cfg, allowBootstrapApproval{}, logger.NewNop(), workspace)
 	if err != nil {
 		t.Fatal(err)
 	}

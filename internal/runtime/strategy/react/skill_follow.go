@@ -77,10 +77,33 @@ func annotateSkillFollowHints(rc *runtime.RunContext, toolName, args, content st
 		hints["skill_follow"] = "delivery_complete"
 		hints["warning"] = "Do not re-deliver or forge artifacts with write_file; use artifacts[].path from the earlier run_skill_command result."
 	}
+	if name == "write_file" && isLikelyFinalTextWrittenToWork(args) {
+		hints["delivery_path_mismatch"] = true
+		hints["delivery_path_hint"] = "$WORK_DIR is for intermediate scripts/state. If this file is the user-requested final deliverable, write the same content to $OUTPUT_DIR/<name> (or the user's explicit destination) before finishing."
+		hints["warning"] = "Possible delivery path mismatch: a document was written to $WORK_DIR instead of $OUTPUT_DIR."
+	}
 	if len(hints) == 0 {
 		return content
 	}
 	return mergeJSONHints(content, hints)
+}
+
+func isLikelyFinalTextWrittenToWork(args string) bool {
+	writePath := strings.TrimSpace(extractWritePath(args))
+	if writePath == "" {
+		return false
+	}
+	normalized := strings.ToLower(strings.ReplaceAll(writePath, `\`, "/"))
+	if normalized != "$work_dir" && !strings.HasPrefix(normalized, "$work_dir/") &&
+		!strings.HasPrefix(normalized, "${work_dir}/") && !strings.HasPrefix(normalized, "%work_dir%/") {
+		return false
+	}
+	switch path.Ext(normalized) {
+	case ".md", ".markdown", ".txt", ".csv", ".tsv", ".html", ".htm":
+		return true
+	default:
+		return false
+	}
 }
 
 func shouldWarnRedeivery(follow *runtime.SkillFollowState, args, content string) bool {
@@ -92,10 +115,6 @@ func shouldWarnRedeivery(follow *runtime.SkillFollowState, args, content string)
 		return false
 	}
 	lower := strings.ToLower(strings.ReplaceAll(writePath, `\`, `/`))
-	if strings.Contains(lower, "$output_dir") || strings.Contains(lower, "${output_dir}") ||
-		strings.Contains(lower, "%output_dir%") || strings.Contains(lower, "/output/") {
-		return true
-	}
 	base := path.Base(lower)
 	if follow != nil && follow.IsDeliveredName(base) {
 		return true

@@ -111,21 +111,28 @@ func (b *Backend) ListDir(ctx context.Context, path model.ResolvedPath, opts fsc
 	if maxEntries > maxListEntries {
 		return nil, fscontract.NewError(fscontract.ErrCodeInvalidInput, path.DisplayPath, fmt.Errorf("max_entries超过上限%d", maxListEntries))
 	}
+	if !validEntryTypeFilter(opts.EntryType) {
+		return nil, fscontract.NewError(fscontract.ErrCodeInvalidInput, path.DisplayPath, fmt.Errorf("不支持的entry_type: %s", opts.EntryType))
+	}
 	entries, err := os.ReadDir(path.BackendPath)
 	if err != nil {
 		return nil, mapOSError(path.DisplayPath, err)
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
-	if len(entries) > maxEntries {
-		entries = entries[:maxEntries]
-	}
-	out := make([]model.DirEntry, 0, len(entries))
+	out := make([]model.DirEntry, 0, min(maxEntries, len(entries)))
 	for _, entry := range entries {
 		info, err := entry.Info()
 		if err != nil {
 			return nil, mapOSError(entry.Name(), err)
 		}
-		out = append(out, dirEntry(path, entry.Name(), info))
+		item := dirEntry(path, entry.Name(), info)
+		if opts.EntryType != "" && item.Type != opts.EntryType {
+			continue
+		}
+		out = append(out, item)
+		if len(out) == maxEntries {
+			break
+		}
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Type != out[j].Type {
@@ -134,6 +141,15 @@ func (b *Backend) ListDir(ctx context.Context, path model.ResolvedPath, opts fsc
 		return out[i].Name < out[j].Name
 	})
 	return out, nil
+}
+
+func validEntryTypeFilter(entryType model.EntryType) bool {
+	switch entryType {
+	case "", model.EntryTypeDir, model.EntryTypeFile, model.EntryTypeSymlink, model.EntryTypeOther:
+		return true
+	default:
+		return false
+	}
 }
 
 func (b *Backend) Walk(ctx context.Context, path model.ResolvedPath, opts fscontract.WalkOptions) (*model.WalkOutcome, error) {

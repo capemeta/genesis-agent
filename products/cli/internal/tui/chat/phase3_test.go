@@ -63,6 +63,31 @@ func TestSlashCommandMenuInterceptsArrowAndEnter(t *testing.T) {
 	}
 }
 
+func TestExactSlashCommandEnterExecutesImmediately(t *testing.T) {
+	m := NewModel(context.Background(), nil, nil)
+	m.textarea.SetValue("/quit")
+	m.syncCommandMenu()
+
+	model, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	updated := model.(Model)
+	if got := updated.textarea.Value(); got != "" {
+		t.Fatalf("textarea value = %q, want empty after command execution", got)
+	}
+	if cmd == nil {
+		t.Fatal("exact /quit should execute immediately")
+	}
+	if _, ok := cmd().(tea.QuitMsg); !ok {
+		t.Fatalf("command result = %T, want tea.QuitMsg", cmd())
+	}
+}
+
+func TestComposerHidesLineNumbers(t *testing.T) {
+	m := NewModel(context.Background(), nil, nil)
+	if m.textarea.ShowLineNumbers {
+		t.Fatal("chat composer should not show source-editor line numbers")
+	}
+}
+
 func TestSelectModeMovesAcrossConversationMessages(t *testing.T) {
 	m := NewModel(context.Background(), nil, nil)
 	m.messages = []uiMessage{
@@ -149,6 +174,56 @@ func TestWindowSizeCalculatesViewportHeight(t *testing.T) {
 	updated := model.(Model)
 	if got, want := updated.viewport.Height, 30; got != want {
 		t.Fatalf("viewport height = %d, want %d", got, want)
+	}
+}
+
+func TestViewFitsTerminalBounds(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		width       int
+		height      int
+		commandMenu bool
+	}{
+		{name: "default", width: 100, height: 40},
+		{name: "narrow", width: 40, height: 24},
+		{name: "command menu", width: 80, height: 30, commandMenu: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			m := NewModel(context.Background(), nil, nil)
+			model, _ := m.Update(tea.WindowSizeMsg{Width: test.width, Height: test.height})
+			m = model.(Model)
+			if test.commandMenu {
+				m.textarea.SetValue("/")
+				m.syncCommandMenu()
+			}
+			lines := strings.Split(m.View(), "\n")
+			if got := len(lines); got != test.height {
+				t.Fatalf("view height = %d, want exact terminal height = %d", got, test.height)
+			}
+			for index, line := range lines {
+				if got := lipgloss.Width(line); got >= test.width {
+					t.Fatalf("view line %d width = %d, terminal width = %d; rightmost column must stay unused", index, got, test.width)
+				}
+			}
+		})
+	}
+}
+
+func TestViewFitsTerminalBoundsWithLongMixedPath(t *testing.T) {
+	m := NewModel(context.Background(), nil, nil)
+	model, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 32})
+	m = model.(Model)
+	if want := 120 - rightEdgeSafetyColumns; m.width != want {
+		t.Fatalf("layout width = %d, want %d safety-adjusted columns", m.width, want)
+	}
+	longPath := `E:\\开普元\\服务器账号信息\\政务大模型资源\\南方电网\\space\\需求文档\\需梳理资料\\1、各部门年度总结\\3-人资部.pdf`
+	m.messages = []uiMessage{{role: "assistant", content: strings.Repeat("这个PDF文件路径是："+longPath, 4)}}
+	m.refreshViewportContent()
+
+	for index, line := range strings.Split(m.View(), "\n") {
+		if got := lipgloss.Width(line); got > m.width {
+			t.Fatalf("view line %d width = %d, safe layout width = %d", index, got, m.width)
+		}
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	einoModel "github.com/cloudwego/eino/components/model"
@@ -59,6 +60,11 @@ func (a *adapter) Generate(ctx context.Context, messages []*domain.Message, tool
 		logLLMCall(a.modelName, messages, tools, nil, err)
 		return nil, fmt.Errorf("llm/eino: Generate 调用失败: %w", err)
 	}
+	if reason := finishReason(resp); isIncompleteFinishReason(reason) {
+		err = fmt.Errorf("llm/eino: 模型响应不完整: finish_reason=%s", reason)
+		logLLMCall(a.modelName, messages, tools, nil, err)
+		return nil, err
+	}
 
 	respMsg := schemaToDomain(resp)
 	logLLMCall(a.modelName, messages, tools, respMsg, nil)
@@ -103,6 +109,17 @@ func (a *adapter) StreamGenerate(ctx context.Context, messages []*domain.Message
 			}
 			finalMsg = &schema.Message{
 				Role: role,
+			}
+		}
+		if chunk.ResponseMeta != nil {
+			if finalMsg.ResponseMeta == nil {
+				finalMsg.ResponseMeta = &schema.ResponseMeta{}
+			}
+			if chunk.ResponseMeta.FinishReason != "" {
+				finalMsg.ResponseMeta.FinishReason = chunk.ResponseMeta.FinishReason
+			}
+			if chunk.ResponseMeta.Usage != nil {
+				finalMsg.ResponseMeta.Usage = chunk.ResponseMeta.Usage
 			}
 		}
 
@@ -153,6 +170,11 @@ func (a *adapter) StreamGenerate(ctx context.Context, messages []*domain.Message
 		logLLMCall(a.modelName, messages, tools, nil, err)
 		return nil, err
 	}
+	if reason := finishReason(finalMsg); isIncompleteFinishReason(reason) {
+		err := fmt.Errorf("llm/eino: 模型流式响应不完整: finish_reason=%s", reason)
+		logLLMCall(a.modelName, messages, tools, nil, err)
+		return nil, err
+	}
 
 	respMsg := schemaToDomain(finalMsg)
 	logLLMCall(a.modelName, messages, tools, respMsg, nil)
@@ -169,6 +191,11 @@ type llmCallLog struct {
 }
 
 func logLLMCall(modelName string, messages []*domain.Message, tools []*tool.Info, response *domain.Message, err error) {
+	// 原始 LLM 消息可能含用户文档、工具参数和凭据，仅允许显式诊断时落盘。
+	// 常规运行的结构化诊断走 logger/trace，并采用摘要与脱敏字段。
+	if !rawLLMDebugEnabled() {
+		return
+	}
 	logDir := filepath.Join(".", ".genesis", "logs")
 	_ = os.MkdirAll(logDir, 0755)
 	logFile := filepath.Join(logDir, "llm_raw_debug.jsonl")
@@ -199,4 +226,29 @@ func logLLMCall(modelName string, messages []*domain.Message, tools []*tool.Info
 	defer f.Close()
 
 	_, _ = f.Write(append(data, '\n'))
+}
+
+func rawLLMDebugEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("GENESIS_LLM_RAW_DEBUG"))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func finishReason(message *schema.Message) string {
+	if message == nil || message.ResponseMeta == nil {
+		return ""
+	}
+	return strings.TrimSpace(message.ResponseMeta.FinishReason)
+}
+
+func isIncompleteFinishReason(reason string) bool {
+	switch strings.ToLower(strings.TrimSpace(reason)) {
+	case "length", "max_tokens", "max_output_tokens", "max_tokens_exceeded":
+		return true
+	default:
+		return false
+	}
 }

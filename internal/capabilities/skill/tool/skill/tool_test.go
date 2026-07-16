@@ -13,6 +13,7 @@ import (
 	skillcontract "genesis-agent/internal/capabilities/skill/contract"
 	skillmodel "genesis-agent/internal/capabilities/skill/model"
 	skillservice "genesis-agent/internal/capabilities/skill/service"
+	tool "genesis-agent/internal/capabilities/tool/contract"
 	"genesis-agent/internal/platform/logger"
 )
 
@@ -115,7 +116,7 @@ func TestSkillRejectsForkContext(t *testing.T) {
 	meta := skillmodel.Metadata{
 		Name: "forked", QualifiedName: "forked", Description: "Forked", Enabled: true, PromptVisible: true,
 		Authority: skillmodel.Authority{Kind: skillmodel.SourceKindEmbedded, ID: "test"}, PackageID: "forked",
-		MainResource: "forked/SKILL.md", Context: skillmodel.ContextModeFork,
+		MainResource: "forked/SKILL.md", Context: skillmodel.ContextModeFork, AllowedTools: []string{"read_file"},
 	}.Normalize()
 	source := skillmemory.NewSource(meta.Authority, []skillmemory.Skill{{Metadata: meta, Body: "Body"}})
 	svc := skillservice.New([]skillcontract.Source{source}, skillservice.Options{})
@@ -130,6 +131,41 @@ func TestSkillRejectsForkContext(t *testing.T) {
 	_, err = created.Execute(context.Background(), `{"skill":"forked"}`)
 	if err == nil || !strings.Contains(err.Error(), "fork") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+type recordingForkTask struct{ params string }
+
+func (t *recordingForkTask) GetInfo() *tool.Info { return &tool.Info{Name: "Task"} }
+func (t *recordingForkTask) Execute(_ context.Context, params string) (string, error) {
+	t.params = params
+	return `{"status":"completed","agent_id":"agent-1","summary":"done"}`, nil
+}
+
+func TestSkillForkDelegatesThroughTaskGateway(t *testing.T) {
+	meta := skillmodel.Metadata{
+		Name: "forked", QualifiedName: "forked", Description: "Forked", Enabled: true, PromptVisible: true,
+		Authority: skillmodel.Authority{Kind: skillmodel.SourceKindEmbedded, ID: "test"}, PackageID: "forked",
+		MainResource: "forked/SKILL.md", Context: skillmodel.ContextModeFork, AllowedTools: []string{"read_file"},
+	}.Normalize()
+	source := skillmemory.NewSource(meta.Authority, []skillmemory.Skill{{Metadata: meta, Body: "Skill body"}})
+	svc := skillservice.New([]skillcontract.Source{source}, skillservice.Options{})
+	approval, err := approvalservice.New(approvalstatic.NewPolicyEngine(), approvaldeny.NewRequester(), approvalmemory.NewStore(), logger.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := New(Deps{Service: svc, Approval: approval, EnabledTools: []string{"read_file"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway := &recordingForkTask{}
+	created.(*Tool).SetForkTask(gateway)
+	out, err := created.Execute(context.Background(), `{"skill":"forked","args":"inspect config"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, `"agent_id":"agent-1"`) || !strings.Contains(gateway.params, `"subagent_type":"general-purpose"`) || !strings.Contains(gateway.params, `"allowed_tools":["read_file"]`) || !strings.Contains(gateway.params, "Skill body") || strings.Count(gateway.params, "inspect config") != 1 {
+		t.Fatalf("fork was not delegated safely: output=%q params=%q", out, gateway.params)
 	}
 }
 

@@ -96,8 +96,8 @@ func (f *fakeSkillMatcher) Match(context.Context, string) (string, bool, error) 
 
 type emptyRegistry struct{}
 
-func (emptyRegistry) Register(tool.Tool)   {}
-func (emptyRegistry) Unregister(string)    {}
+func (emptyRegistry) Register(tool.Tool) {}
+func (emptyRegistry) Unregister(string)  {}
 func (emptyRegistry) Get(string) tool.Tool {
 	return nil
 }
@@ -173,7 +173,7 @@ func TestApplySkillToolResultInjectsUserMessage(t *testing.T) {
 }
 func TestRenderSkillInjectionAddsRuntimeBridge(t *testing.T) {
 	body := renderSkillInjection(skillInjectionOutput{QualifiedName: "third-party", Content: "Run python scripts/do_work.py"})
-	for _, want := range []string{"<skill_runtime_bridge>", "run_skill_command", "完整 Skill 包", "third-party", "不要用 run_skill_command 执行 npm install", "npm install -g", "dependencies.runtime", "按技能文档示例选择解释器", "不要把 Node 包当成", "须先 Read", "QA Required", "node -e", "python -c", "默认先 write_file", "register_cjk_font", "缺字黑块", "控制面", "/workspace", "execution_backend", "path_map", "写进 command", "inputs=[\"$WORK_DIR/create_pdfs.py\"]", "相对文件名", "极短单行探测"} {
+	for _, want := range []string{"<skill_runtime_bridge>", "run_skill_command", "完整 Skill 包", "third-party", "不要用 run_skill_command 执行 npm install", "npm install -g", "dependencies.runtime", "按技能文档示例选择解释器", "不要把 Node 包当成", "须先 Read", "QA Required", "node -e", "python -c", "默认先 write_file", "当前工具列表提供 apply_patch", "register_cjk_font", "缺字黑块", "控制面", "/workspace", "execution_backend", "path_map", "写进 command", "inputs=[\"$WORK_DIR/create_pdfs.py\"]", "相对文件名", "极短单行探测", "大型 JSON 工具参数被截断", "append=true", "expected_hash", "不要额外编写一次性探测脚本"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("missing %q in %s", want, body)
 		}

@@ -42,13 +42,41 @@ type fakeRunner struct {
 	called bool
 	cmd    execmodel.Command
 	opts   execcontract.RunOptions
+	result *execmodel.Result
+}
+
+type fakeShells struct{}
+
+func (fakeShells) ShellCapabilities(context.Context) execmodel.ShellCapabilities {
+	return execmodel.ShellCapabilities{
+		Default: execmodel.ShellInfo{Kind: execmodel.ShellBash, Path: "bash"},
+		Supported: []execmodel.ShellInfo{
+			{Kind: execmodel.ShellBash, Path: "bash"},
+		},
+	}
 }
 
 func (r *fakeRunner) Run(ctx context.Context, cmd execmodel.Command, opts execcontract.RunOptions) (*execmodel.Result, error) {
 	r.called = true
 	r.cmd = cmd
 	r.opts = opts
+	if r.result != nil {
+		result := *r.result
+		result.Command = cmd.Command
+		result.Cwd = cmd.Cwd
+		result.Shell = cmd.Shell
+		return &result, nil
+	}
 	return &execmodel.Result{Command: cmd.Command, Cwd: cmd.Cwd, Shell: cmd.Shell, ExitCode: 0, Stdout: "ok", DurationMS: 1}, nil
+}
+
+func TestToolInfoOnlyAdvertisesSupportedShells(t *testing.T) {
+	tool := newTestTool(t, &fakeApproval{}, &fakeRunner{}, execmodel.SandboxProfile{})
+	got := tool.GetInfo().Parameters.Properties["shell"].Enum
+	want := []string{"auto", "bash"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("shell enum = %v, want %v", got, want)
+	}
 }
 
 func TestToolExecuteRunsApprovedCommand(t *testing.T) {
@@ -142,10 +170,47 @@ func TestToolExecuteRejectsUnknownShell(t *testing.T) {
 	}
 }
 
+func TestToolExecuteRejectsKnownButUnsupportedShell(t *testing.T) {
+	approval := &fakeApproval{decision: approvalmodel.Decision{Type: approvalmodel.DecisionApproved}}
+	runner := &fakeRunner{}
+	tool := newTestTool(t, approval, runner, execmodel.SandboxProfile{})
+	_, err := tool.Execute(context.Background(), `{"command":"Get-Location","shell":"powershell"}`)
+	if code := execcontract.CodeOf(err); code != execcontract.ErrCodeInvalidInput {
+		t.Fatalf("CodeOf(err) = %s, want %s", code, execcontract.ErrCodeInvalidInput)
+	}
+	if runner.called {
+		t.Fatal("runner called after unsupported shell")
+	}
+}
+
+func TestToolNonZeroExitReturnsStructuredFailureAndRecoveryHint(t *testing.T) {
+	approval := &fakeApproval{decision: approvalmodel.Decision{Type: approvalmodel.DecisionApproved}}
+	runner := &fakeRunner{result: &execmodel.Result{ExitCode: 1, Stderr: "failed"}}
+	tool := newTestTool(t, approval, runner, execmodel.SandboxProfile{})
+	out, err := tool.Execute(context.Background(), `{"command":"ls D:/","shell":"bash"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result struct {
+		OK                   bool           `json:"ok"`
+		FailureKind          string         `json:"failure_kind"`
+		SuggestedAction      string         `json:"suggested_action"`
+		SuggestedTool        map[string]any `json:"suggested_tool"`
+		OperationFingerprint string         `json:"operation_fingerprint"`
+	}
+	if err := json.Unmarshal([]byte(out), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.OK || result.FailureKind != "command_exit_nonzero" || result.SuggestedAction == "" || result.SuggestedTool["name"] != "list_dir" || result.OperationFingerprint != "filesystem.list" {
+		t.Fatalf("result = %+v", result)
+	}
+}
+
 func newTestTool(t *testing.T, approval *fakeApproval, runner *fakeRunner, sandbox execmodel.SandboxProfile) *Tool {
 	t.Helper()
 	tool, err := New(Deps{
 		Runner: runner,
+		Shells: fakeShells{},
 		Resolver: fakeResolver{path: fsmodel.ResolvedPath{
 			DisplayPath:  "C:/workspace",
 			BackendPath:  "C:/workspace",

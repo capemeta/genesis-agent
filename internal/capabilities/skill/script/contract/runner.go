@@ -17,7 +17,7 @@ type RunRequest struct {
 	Catalog       skillcontract.CatalogRequest
 	Skill         string
 	Command       string
-	Inputs        []string // 可选控制面路径（$WORK_DIR/... 或工作区相对）；禁止 /workspace 等执行面绝对路径；将 stage 到 session 工作目录
+	Inputs        []string // 可选控制面 stage 源（$WORK_DIR/...、工作区相对路径或用户提供的宿主机绝对文件）；禁止 /workspace 等执行面绝对路径；将 stage 到 session 工作目录
 	RunID         string
 	TimeoutMS     int64
 	Sandbox       execmodel.SandboxProfile

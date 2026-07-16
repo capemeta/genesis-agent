@@ -35,6 +35,72 @@ func TestClassifyCompoundCommandIsDangerous(t *testing.T) {
 		t.Fatalf("Classify(compound) = %+v, want dangerous", cls)
 	}
 }
+
+func TestClassifyDoesNotTrustExecutableWithReadOnlyPrefix(t *testing.T) {
+	cls := ClassifyCommand(execmodel.Command{Command: "ls-malicious --write", Shell: execmodel.ShellBash})
+	if !cls.Dangerous || cls.ReadOnly {
+		t.Fatalf("ClassifyCommand() = %+v, want dangerous", cls)
+	}
+}
+
+func TestClassifyUnknownShellIsConservative(t *testing.T) {
+	cls := ClassifyCommand(execmodel.Command{Command: "ls", Shell: execmodel.ShellAuto})
+	if !cls.Dangerous || cls.ReadOnly {
+		t.Fatalf("ClassifyCommand() = %+v, want dangerous", cls)
+	}
+}
+
+func TestClassifyGitBranchMutationIsNotReadOnly(t *testing.T) {
+	cls := ClassifyCommand(execmodel.Command{Command: "git branch -D obsolete", Shell: execmodel.ShellPowerShell})
+	if !cls.Dangerous || cls.ReadOnly {
+		t.Fatalf("ClassifyCommand() = %+v, want dangerous", cls)
+	}
+}
+
+func TestClassifyPowerShellReadOnlyPipeline(t *testing.T) {
+	cls := ClassifyCommand(execmodel.Command{
+		Command: "Get-ChildItem -LiteralPath 'D:\\' | Select-Object -ExpandProperty Name",
+		Shell:   execmodel.ShellPowerShell,
+	})
+	if !cls.ReadOnly || cls.Dangerous {
+		t.Fatalf("ClassifyCommand() = %+v, want read-only", cls)
+	}
+}
+
+func TestClassifyPowerShellMutationIsDangerous(t *testing.T) {
+	cls := ClassifyCommand(execmodel.Command{Command: "Remove-Item -Recurse build", Shell: execmodel.ShellPowerShell})
+	if !cls.Dangerous || !cls.Destructive {
+		t.Fatalf("ClassifyCommand() = %+v, want destructive", cls)
+	}
+}
+
+func TestClassifyPowerShellSingleAmpersandIsDangerous(t *testing.T) {
+	cls := ClassifyCommand(execmodel.Command{Command: "Get-Location & Remove-Item build", Shell: execmodel.ShellPowerShell})
+	if !cls.Dangerous || cls.ReadOnly {
+		t.Fatalf("ClassifyCommand() = %+v, want dangerous", cls)
+	}
+}
+
+func TestClassifyMultilineCommandIsDangerous(t *testing.T) {
+	cls := ClassifyCommand(execmodel.Command{Command: "ls\nwhoami", Shell: execmodel.ShellBash})
+	if !cls.Dangerous || cls.ReadOnly {
+		t.Fatalf("ClassifyCommand() = %+v, want dangerous", cls)
+	}
+}
+
+func TestClassifyCmdVariableExpansionIsConservative(t *testing.T) {
+	cls := ClassifyCommand(execmodel.Command{Command: "echo %PATH%", Shell: execmodel.ShellCmd})
+	if !cls.Dangerous || cls.ReadOnly {
+		t.Fatalf("ClassifyCommand() = %+v, want dangerous", cls)
+	}
+}
+
+func TestRecoveryHintForNestedPowerShellDirectoryListing(t *testing.T) {
+	hint := RecoveryHint(execmodel.Command{Command: `powershell -Command "Get-ChildItem D:\\"`, Shell: execmodel.ShellCmd})
+	if hint == nil || hint.Tool != "list_dir" || hint.OperationFingerprint != "filesystem.list" {
+		t.Fatalf("RecoveryHint() = %+v", hint)
+	}
+}
 func TestBuildApprovalRequestForExternalCommand(t *testing.T) {
 	cmd := execmodel.Command{Command: "echo hi", Shell: execmodel.ShellBash}
 	req := BuildApprovalRequest("run_command", cmd, fsmodel.ResolvedPath{

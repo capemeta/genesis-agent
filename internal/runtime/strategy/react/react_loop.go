@@ -8,6 +8,7 @@ package react
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -26,6 +27,9 @@ import (
 	"genesis-agent/internal/platform/logger"
 	"genesis-agent/internal/runtime"
 	runtimecontext "genesis-agent/internal/runtime/context"
+	"genesis-agent/internal/runtime/multiagent/contextsnapshot"
+	"genesis-agent/internal/runtime/multiagent/contract"
+	"genesis-agent/internal/runtime/multiagent/sanitize"
 	"genesis-agent/internal/runtime/progress"
 	"genesis-agent/internal/runtime/prompt"
 	"genesis-agent/internal/runtime/repeatguard"
@@ -169,6 +173,7 @@ func (e *ReactLoopEngine) Start(ctx context.Context, req domain.StartRunRequest)
 	if strings.TrimSpace(req.SessionID) != "" {
 		ctx = contextutil.WithSessionID(ctx, req.SessionID)
 	}
+	ctx = contextutil.WithTenantID(ctx, req.TenantID)
 
 	// 启动根Span（覆盖整个Run生命周期）
 	runSpan := e.tracer.StartSpan(ctx, "run", run.ID)
@@ -417,13 +422,12 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 			StepIndex:  &stepIdx,
 			Display:    &displayFalse,
 		})
-
 		var contentBlockIdx *int
 		displayTrue := true
 
 		onDelta := func(delta string, isThought bool) {
 			if isThought {
-				// CoT / reasoning：对用户可见的中间思考
+				// CoT / reasoning：按用户选择在对话中实时展示。
 				progress.Emit(ctx, progress.Event{
 					Kind:       progress.KindLLM,
 					Phase:      progress.PhaseProgress,
@@ -439,8 +443,7 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 				})
 				return
 			}
-			// 工具前正文也是中间思考：用 assistant_draft 展示，避免与最终回答块混淆。
-			// 最终回答在确认无 tool_calls 后另发 final_answer。
+			// 工具调用前正文作为 assistant_draft 实时展示，最终回答另发 final_answer。
 			if contentBlockIdx == nil {
 				idx := rc.NextBlockIndex()
 				contentBlockIdx = &idx
@@ -524,6 +527,11 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 			usage.CompletionTokens += int64(e.estimator.Estimate(ctx, string(payload), req.Agent.DefaultModel))
 		}
 		usage.TotalTokens = usage.CompletionTokens
+		if budget := contract.TreeBudgetFromContext(ctx); budget != nil {
+			if err := budget.Consume(usage.TotalTokens, 0); err != nil {
+				return err
+			}
+		}
 		rc.AddTokens(usage)
 		if limit := req.Agent.RuntimePolicy.MaxTokens; limit > 0 && rc.TokenUsed > limit {
 			return fmt.Errorf("budget exceeded: tokens (used=%d, max=%d)", rc.TokenUsed, limit)
@@ -543,6 +551,7 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 			StopReason: "complete",
 		})
 
+		// ── 分支判断 ─────────────────────────────────────────
 		if contentBlockIdx != nil {
 			progress.Emit(ctx, progress.Event{
 				Kind:       progress.KindLLM,
@@ -557,10 +566,14 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 			})
 		}
 
-		// ── 分支判断 ─────────────────────────────────────────
 		if len(llmResp.ToolCalls) > 0 {
 			if limit := req.Agent.RuntimePolicy.MaxToolCalls; limit > 0 && rc.ToolCalls+len(llmResp.ToolCalls) > limit {
 				return fmt.Errorf("budget exceeded: tool_calls (used=%d, requested=%d, max=%d)", rc.ToolCalls, len(llmResp.ToolCalls), limit)
+			}
+			if budget := contract.TreeBudgetFromContext(ctx); budget != nil {
+				if err := budget.Consume(0, len(llmResp.ToolCalls)); err != nil {
+					return err
+				}
 			}
 			rc.ToolCalls += len(llmResp.ToolCalls)
 
@@ -569,7 +582,7 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 			rc.Messages = append(rc.Messages, llmResp)
 
 			if llmResp.Content != "" {
-				iterLog.Info("LLM思考内容", "thought", llmResp.Content)
+				iterLog.Info("LLM思考内容", "thought", summarizeToolOutputForLog(llmResp.Content, 0))
 			}
 
 			toolResults := e.executeToolCalls(ctx, rc, llmResp.ToolCalls, iterLog)
@@ -759,6 +772,9 @@ func toolFailureContent(output string, err error) string {
 	summary := "工具执行失败"
 	if err != nil {
 		summary = fmt.Sprintf("工具执行失败: %s", err.Error())
+		if inferFailureKindFromError(err.Error()) == "tool_arguments_truncated" {
+			summary += "\n参数 JSON 在传输完成前被截断。不要原样重试大型结构化调用；请缩小单次改动、拆分模块，或改用支持 freeform/增量输入的编辑工具。"
+		}
 	}
 	output = strings.TrimSpace(output)
 	if output == "" {
@@ -807,9 +823,13 @@ func (e *ReactLoopEngine) runToolCall(ctx context.Context, rc *runtime.RunContex
 	stepIdx := rc.Iteration
 	displayTrue := true
 	toolName := strings.TrimSpace(tc.Function.Name)
+	if toolName == "Task" {
+		// 在执行 Task 前固定当前父 Run 状态；Builder 会丢弃当前 Task 工具调用及全部工具轨迹。
+		ctx = contextsnapshot.WithParentSnapshot(ctx, rc.Messages, tc.ID)
+	}
 
 	toolLog := log.With("tool", toolName, "call_id", tc.ID)
-	toolLog.Info("执行工具调用", "args", tc.Function.Arguments)
+	toolLog.Info("执行工具调用", "args", summarizeToolArgumentsForLog(tc.Function.Arguments))
 
 	// CollisionGuard（不改写路径）：在 Profile 拒绝文案之前识别 skill 名误调用。
 	// 默认 auto_rewrite 已在 executeToolCalls 前置完成；此处仅处理关闭改写时的结构化纠错。
@@ -933,8 +953,8 @@ func (e *ReactLoopEngine) runToolCall(ctx context.Context, rc *runtime.RunContex
 		toolLog.Warn("工具执行失败",
 			"error", errMsg,
 			"failure_kind", kind,
-			"stdout", truncate(stdout, 500),
-			"stderr", truncate(stderr, 500),
+			"stdout", summarizeToolOutputForLog(stdout, 500),
+			"stderr", summarizeToolOutputForLog(stderr, 500),
 		)
 		e.tracer.EndSpan(ctx, toolSpan, toolErr)
 		detail := errMsg
@@ -960,7 +980,8 @@ func (e *ReactLoopEngine) runToolCall(ctx context.Context, rc *runtime.RunContex
 		// 保留 result JSON（如 ok=false + failure_kind），对齐 Codex RespondToModel(content)。
 		return result, toolErr
 	}
-	toolLog.Info("工具执行成功", "result", result)
+	// 日志仅保存 result 的脱敏摘要；完整结果仍返回模型，避免影响任务执行。
+	toolLog.Info("工具执行成功", "result", summarizeToolResultForLog(result))
 	e.tracer.EndSpan(ctx, toolSpan, nil)
 	progress.Emit(ctx, progress.Event{
 		Kind:       progress.KindTool,
@@ -1147,6 +1168,74 @@ func extractToolFailureLogFields(result string, toolErr error) (kind, stdout, st
 	return kind, stdout, stderr
 }
 
+// summarizeToolResultForLog 构造仅用于日志的 ToolResult 副本。
+// stdout/stderr 可能包含用户文档、表格或命令输出，不能把完整内容写入 agent.log。
+// 保留字节数和 SHA-256 以便关联排障；原始 result 不会被修改，仍完整交给模型。
+func summarizeToolResultForLog(result string) string {
+	var payload any
+	if err := json.Unmarshal([]byte(result), &payload); err != nil {
+		return summarizeToolOutputForLog(result, 0)
+	}
+	summarizeToolPayloadFields(payload)
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return "[工具结果日志序列化失败]"
+	}
+	return string(encoded)
+}
+
+// summarizeToolArgumentsForLog 避免把待写文件、补丁或其他正文载荷写入 agent.log。
+// 非法/截断 JSON 无法安全区分元数据与正文，因此整段只保留长度和哈希。
+func summarizeToolArgumentsForLog(arguments string) string {
+	var payload any
+	if err := json.Unmarshal([]byte(arguments), &payload); err != nil {
+		return summarizeToolOutputForLog(arguments, 0)
+	}
+	summarizeToolPayloadFields(payload)
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return "[工具参数日志序列化失败]"
+	}
+	return string(encoded)
+}
+
+func summarizeToolPayloadFields(value any) {
+	switch current := value.(type) {
+	case map[string]any:
+		for key, item := range current {
+			switch strings.ToLower(key) {
+			case "content", "patch", "stdout", "stderr", "payload", "data":
+				if text, ok := item.(string); ok {
+					current[key] = summarizeToolOutputForLog(text, 0)
+				}
+			default:
+				summarizeToolPayloadFields(item)
+			}
+		}
+	case []any:
+		for _, item := range current {
+			summarizeToolPayloadFields(item)
+		}
+	}
+}
+
+// summarizeToolOutputForLog 对 stdout/stderr 做凭据脱敏；previewLimit 为 0 时不保留正文。
+func summarizeToolOutputForLog(value string, previewLimit int) string {
+	if value == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(value))
+	cleaned, err := (sanitize.Default{}).Sanitize(value)
+	if err != nil {
+		return fmt.Sprintf("[日志输出已省略: bytes=%d sha256=%x reason=invalid_text]", len(value), sum)
+	}
+	if previewLimit > 0 {
+		preview := truncate(cleaned, previewLimit)
+		return fmt.Sprintf("%s [日志已截断: bytes=%d sha256=%x]", preview, len(value), sum)
+	}
+	return fmt.Sprintf("[日志输出已省略: bytes=%d sha256=%x]", len(value), sum)
+}
+
 func stringField(m map[string]any, key string) string {
 	if m == nil {
 		return ""
@@ -1166,6 +1255,8 @@ func stringField(m map[string]any, key string) string {
 func inferFailureKindFromError(msg string) string {
 	lower := strings.ToLower(msg)
 	switch {
+	case strings.Contains(lower, "unexpected eof"), strings.Contains(lower, "unexpected end of json input"), strings.Contains(lower, "unterminated string"):
+		return "tool_arguments_truncated"
 	case strings.Contains(lower, "execution_path_contract_violation"), strings.Contains(lower, "path_contract"):
 		return "path_contract_violation"
 	case strings.Contains(lower, "dependency_missing"):
@@ -1261,13 +1352,15 @@ func renderSkillScriptBridge(injection skillInjectionOutput) string {
 该 Skill 的 Markdown 是可移植规范，不要求其中出现 Genesis 专用工具名。
 当说明要求执行包内脚本或命令（例如 python scripts/foo.py、python3 scripts/foo.py、node scripts/foo.js、python -m some_module、npm 脚本包装 scripts/foo.js）时，必须改用 run_skill_command：skill=%q，command 直接填写原始命令行。
 按技能文档示例选择解释器：文档是 require()/'.js'/node 则用 node；是 python/python -m 则用 python。不要把 Node 包当成 python -m <pkg> 执行。
-需要执行 JS/Python 时，默认先 write_file("$WORK_DIR/foo.py|.js")，再 run_skill_command(command="python foo.py"|"node foo.js", inputs=["$WORK_DIR/foo.py|.js"])。禁止用 python -c / node -e / node --eval 塞多行或长串内联（Windows 与远程 sandbox 的 shell 嵌套引号极易 SyntaxError）；仅允许极短单行探测（无换行、载荷约≤80字符、无嵌套引号），短探测若失败，先区分引号/语法问题与真正的缺模块，再决定是否 install_skill_dependencies。
+需要执行 JS/Python 时，默认先 write_file("$WORK_DIR/foo.py|.js")，再 run_skill_command(command="python foo.py"|"node foo.js", inputs=["$WORK_DIR/foo.py|.js"])。用户要求新建的 Markdown、文本、代码清单等最终交付文件必须直接 write_file("$OUTPUT_DIR/文件名")；只有中间脚本和跨步骤状态才写 $WORK_DIR。用户明确指定目标路径时按指定路径写入。禁止用 python -c / node -e / node --eval 塞多行或长串内联（Windows 与远程 sandbox 的 shell 嵌套引号极易 SyntaxError）；仅允许极短单行探测（无换行、载荷约≤80字符、无嵌套引号），短探测若失败，先区分引号/语法问题与真正的缺模块，再决定是否 install_skill_dependencies。
+生成脚本较长时按职责拆成多个小模块，并用多次较小的 write_file 调用；若当前工具列表提供 apply_patch，也可用它创建大文件。单文件仍较长时，首次 write_file 后用 append=true，并把上次返回的 hash 作为 expected_hash 逐块原子追加。不要在一次大型 JSON 工具参数被截断后原样重试。平台暂未提供 freeform 编辑传输时，拆分/安全追加是可靠性约束，不是特定文档类型的规则。
 SKILL 中写明须先 Read 的链接文档（如 *.md），以及 QA Required / Content QA 中的校验命令，必须实际执行，不可跳过。
 不要把 script resource id、args 拆成旧模型字段；运行时会先 materialize 完整 Skill 包，再在受控工作目录或远端 session workspace 中执行 command。
-如需把现有文件交给脚本处理，使用 run_skill_command.inputs 传入**控制面**路径：优先 $WORK_DIR/foo.ext 或工作区相对路径；运行时会 stage 到 Skill 工作目录，command 必须使用相对文件名（例如 python foo.ext / node foo.ext）。禁止：① 把执行面绝对路径（如 /workspace/...）写入 inputs 或 write_file.path；② 把 $WORK_DIR/$INPUT_DIR/$OUTPUT_DIR/$TMPDIR/$SKILL_DIR 写进 command 字符串（本地宿主与远程 sandbox API 均不展开这些字面量）。正确示例：write_file("$WORK_DIR/create_pdfs.py") → run_skill_command(command="python create_pdfs.py", inputs=["$WORK_DIR/create_pdfs.py"])。文件已在 Skill 工作目录或仅跑包内 scripts/ 时省略 inputs。
+如需把现有文件交给脚本处理，使用 run_skill_command.inputs 传入**控制面**路径：优先 $WORK_DIR/foo.ext 或工作区相对路径；用户在本次任务中指定的宿主机绝对文件（如 E:\\docs\\report.pdf）也应直接放入 inputs，由运行时在执行审批后 stage 到 Skill 工作目录，禁止用 run_command / Copy-Item 手动搬运。command 必须使用 stage 后的相对文件名（例如 python foo.ext / node foo.ext）。禁止：① 把执行面绝对路径（如 /workspace/...）写入 inputs 或 write_file.path；② 把 $WORK_DIR/$INPUT_DIR/$OUTPUT_DIR/$TMPDIR/$SKILL_DIR 写进 command 字符串（本地宿主与远程 sandbox API 均不展开这些字面量）。正确示例：write_file("$WORK_DIR/create_pdfs.py") → run_skill_command(command="python create_pdfs.py", inputs=["$WORK_DIR/create_pdfs.py"])。文件已在 Skill 工作目录或仅跑包内 scripts/ 时省略 inputs。
 run_skill_command 返回的 metadata.execution_backend / degraded 表示本次生效执行环境；首次或 backend/降级变化时另含 path_map（仅说明执行面环境变量映射，禁止把 path_map 右侧抄进 inputs 或 command）。artifacts[].path 是工作区相对的受控交付路径（形如 .genesis/runs/<run>/output/<skill>/file.pptx；远程 session 回收到同等相对路径，不会回传宿主机绝对路径）。成功生成后直接以此为交付结果，不要再 copy/cp/write_file 搬到 $OUTPUT_DIR 或仓库根；禁止用 write_file 伪造 .pptx/.docx/.xlsx/.pdf。
 不要用 run_skill_command 执行 npm install、npm install -g、pip install、python -m pip install 等依赖安装命令（含 SKILL 正文里写成示例的 npm/pip 安装行——那是依赖说明，不是要你执行的安装步骤）。
 运行期依赖由 Skill frontmatter 的 dependencies.runtime 与 profile/镜像提供；缺包且工具结果返回 dependency_missing / suggested_install 时，再用 install_skill_dependencies 安装已声明包，或报告 profile 需补齐。
+对于 frontmatter 已声明的运行期依赖，不要额外编写一次性探测脚本预检；直接执行实际业务脚本，让 run_skill_command 的统一 preflight 返回 dependency_missing，避免重复流程和误判。
 禁止为绕过声明而全局装包；需要额外包时先扩展该 Skill 的 dependencies.runtime，再安装。
 生成含中文/日文/韩文的 PDF（reportlab 等）时，必须先注册支持 CJK 的字体：若技能包提供 scripts/register_cjk_font.py，先 python scripts/register_cjk_font.py 确认路径，生成脚本内 from register_cjk_font import ensure_reportlab_cjk 并 fontName=ensure_reportlab_cjk()；禁止仅用 Helvetica/Times 等默认英文字体导致缺字黑块。缺字体时如实报错，不要交付黑块 PDF。
 脚本执行期可通过 WORK_DIR、INPUT_DIR、OUTPUT_DIR、TMP_DIR、SKILL_DIR 访问受控目录（执行 cwd 内）；最终交付以返回的 artifacts 为准，不要假设 $OUTPUT_DIR 等于 runs/.../output。

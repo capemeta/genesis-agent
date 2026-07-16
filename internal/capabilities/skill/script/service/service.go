@@ -230,14 +230,21 @@ func (s *Service) Run(ctx context.Context, req scriptcontract.RunRequest) (*scri
 		runID = fmt.Sprintf("run-%d", time.Now().UnixNano())
 	}
 
+	approvalDisplay := meta.Name
+	approvalMetadata := map[string]string{"skill": meta.Name, "command": command}
+	if len(req.Inputs) > 0 {
+		approvalDisplay = fmt.Sprintf("%s（stage %d 个输入）", meta.Name, len(req.Inputs))
+		// 审批与审计必须能看见实际将被读取并导入执行环境的控制面路径。
+		approvalMetadata["inputs"] = strings.Join(req.Inputs, "\n")
+	}
 	decision, err := s.approval.Authorize(ctx, approvalmodel.Request{
 		ToolName:        "run_skill_command",
 		Action:          approvalmodel.ActionCommandExec,
-		Resource:        approvalmodel.Resource{Type: "skill_command", URI: meta.Name, Display: meta.Name},
-		Reason:          "执行 Skill 命令",
+		Resource:        approvalmodel.Resource{Type: "skill_command", URI: meta.Name, Display: approvalDisplay},
+		Reason:          "执行 Skill 命令；输入文件将在批准后 stage 到受控工作目录",
 		Risk:            approvalmodel.RiskMedium,
 		SuggestedScopes: []approvalmodel.GrantScope{approvalmodel.GrantScopeOnce, approvalmodel.GrantScopeSession},
-		Metadata:        map[string]string{"skill": meta.Name, "command": command},
+		Metadata:        approvalMetadata,
 	})
 	if err != nil {
 		return nil, err
@@ -665,7 +672,10 @@ func stageInputs(workspaceRoot string, ws execmodel.ExecutionWorkspace, destDir 
 		if err != nil {
 			return nil, fmt.Errorf("解析输入失败 %s: %w（已尝试: %s）", raw, err, strings.Join(tried, ", "))
 		}
-		if !isWithinPath(srcReal, rootReal) {
+		// 相对路径仍只能从工作区读取，避免通过 ../ 或符号链接越界。
+		// 用户在本次任务中直接指定的宿主机绝对文件则允许作为受控 stage 源：
+		// 文件仅复制到当前 Run 的 Skill 工作目录，命令与脚本始终只能访问 stage 后的相对文件名。
+		if !filepath.IsAbs(raw) && !isWithinPath(srcReal, rootReal) {
 			return nil, fmt.Errorf("输入路径必须位于工作区内: %s", raw)
 		}
 		data, err := os.ReadFile(srcReal)
