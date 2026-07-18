@@ -11,8 +11,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	execmodel "genesis-agent/internal/capabilities/execution/model"
 	hookcontract "genesis-agent/internal/capabilities/hook/contract"
 	hookmodel "genesis-agent/internal/capabilities/hook/model"
+	workcontract "genesis-agent/internal/capabilities/workspace/contract"
+	workmodel "genesis-agent/internal/capabilities/workspace/model"
 	"genesis-agent/internal/domain"
 	"genesis-agent/internal/platform/contextutil"
 	"genesis-agent/internal/platform/logger"
@@ -34,6 +37,7 @@ type Controller struct {
 	projector result.Projector
 	store     contract.InstanceStore
 	proj      contract.ProjectionSink
+	workspace WorkspaceRuntime
 
 	mu        sync.RWMutex
 	instances map[string]*entry
@@ -49,6 +53,17 @@ type entry struct {
 	done      chan struct{}
 	parentCtx context.Context
 	manifest  *result.ManifestRegistry
+}
+
+// WorkspaceRuntime 为每个子 Run 重新解析独立 binding，禁止继承父级可写 cwd。
+type WorkspaceRuntime struct {
+	Preparer      workcontract.ControlPlane
+	ProjectRoot   *workmodel.ResourceRef
+	ProjectDir    string
+	ProductModes  []execmodel.WorkspaceMode
+	PolicyModes   []execmodel.WorkspaceMode
+	BackendModes  []execmodel.WorkspaceMode
+	MaximumAccess execmodel.WorkspaceAccess
 }
 
 // New 创建控制器。
@@ -81,6 +96,11 @@ func WithInstanceStore(store contract.InstanceStore) Option {
 // Option 扩展 Controller 的产品无关依赖。
 type Option func(*Controller)
 
+// WithWorkspaceRuntime 注入子 Run 工作空间控制面。
+func WithWorkspaceRuntime(value WorkspaceRuntime) Option {
+	return func(controller *Controller) { controller.workspace = value }
+}
+
 // WithResultPipeline 注入可测试的终态归约与交付投影。
 func WithResultPipeline(reducer result.Reducer, projector result.Projector) Option {
 	return func(controller *Controller) {
@@ -107,6 +127,13 @@ func (c *Controller) Spawn(ctx context.Context, req contract.SpawnRequest) (mode
 	if strings.TrimSpace(req.Prompt) == "" {
 		return empty, fmt.Errorf("subagent prompt不能为空")
 	}
+	ctx, parent, err := c.resolveParentContext(ctx, req.ParentRunID)
+	if err != nil {
+		return empty, err
+	}
+	req.ParentRunID = parent.Manifest.RunID
+	req.TenantID = parent.Manifest.Scope.TenantID
+	req.SessionID = parent.Execution.Binding.Owner.SessionID
 	if req.Depth <= 0 {
 		req.Depth = 1
 	}
@@ -118,9 +145,6 @@ func (c *Controller) Spawn(ctx context.Context, req contract.SpawnRequest) (mode
 	}
 	if req.Depth > req.MaxDepth {
 		return empty, fmt.Errorf("agent depth limit reached: max=%d；本层不可再委派，请自行完成", req.MaxDepth)
-	}
-	if strings.TrimSpace(req.SessionID) == "" {
-		req.SessionID = strings.TrimSpace(req.ParentRunID)
 	}
 	if err := dispatchSubagentStart(ctx, req); err != nil {
 		return empty, err
@@ -182,6 +206,30 @@ func (c *Controller) Spawn(ctx context.Context, req contract.SpawnRequest) (mode
 	return instance, nil
 }
 
+func (c *Controller) resolveParentContext(ctx context.Context, parentRunID string) (context.Context, workmodel.PreparedRun, error) {
+	if prepared, ok := workcontract.PreparedRunFromContext(ctx); ok && strings.TrimSpace(prepared.Manifest.RunID) != "" {
+		return ctx, prepared, nil
+	}
+	if c.workspace.Preparer == nil || strings.TrimSpace(parentRunID) == "" {
+		return ctx, workmodel.PreparedRun{}, fmt.Errorf("subagent 缺少父 Run 工作空间快照")
+	}
+	tenantID, ok := contextutil.GetTenantID(ctx)
+	if !ok || strings.TrimSpace(tenantID) == "" {
+		return ctx, workmodel.PreparedRun{}, fmt.Errorf("恢复父 Run manifest 缺少 tenant_id")
+	}
+	manifest, err := c.workspace.Preparer.GetRunManifest(ctx, tenantID, parentRunID)
+	if err != nil {
+		return ctx, workmodel.PreparedRun{}, fmt.Errorf("恢复父 Run manifest: %w", err)
+	}
+	if manifest.RunID != parentRunID || len(manifest.Executions) == 0 {
+		return ctx, workmodel.PreparedRun{}, fmt.Errorf("父 Run manifest 不完整")
+	}
+	prepared := workmodel.PreparedRun{Manifest: manifest, Execution: manifest.Executions[0]}
+	ctx = workcontract.WithPreparedRun(ctx, prepared)
+	ctx = workcontract.WithControlPlane(ctx, c.workspace.Preparer)
+	return ctx, prepared, nil
+}
+
 func toolNames(tools []domain.ToolRef) []string {
 	names := make([]string, 0, len(tools))
 	for _, tool := range tools {
@@ -223,6 +271,9 @@ func (c *Controller) Resume(ctx context.Context, agentID, prompt string) (model.
 		return model.Instance{}, fmt.Errorf("subagent %q 尚未结束，不能 resume", agentID)
 	}
 	request.Prompt = followupPrompt(previous.Result, prompt)
+	// Resume 只从已持久化请求恢复可信租户作用域，禁止退化为仅按 parent_run_id 查询。
+	ctx = contextutil.WithTenantID(ctx, request.TenantID)
+	ctx = contextutil.WithSessionID(ctx, request.SessionID)
 	return c.Spawn(ctx, request)
 }
 
@@ -242,7 +293,31 @@ func (c *Controller) run(ctx context.Context, req contract.SpawnRequest, e *entr
 		}
 		c.finish(ctx, e, run, err)
 	}()
-	run, err = c.engine.Start(ctx, domain.StartRunRequest{SessionID: req.SessionID, TenantID: req.TenantID, UserInput: req.Prompt, Agent: req.Agent})
+	if c.workspace.Preparer == nil {
+		err = fmt.Errorf("subagent Run 工作空间控制面未配置")
+		return
+	}
+	parent, ok := workcontract.PreparedRunFromContext(ctx)
+	if !ok {
+		err = fmt.Errorf("subagent 缺少父 Run 工作空间快照")
+		return
+	}
+	access := execmodel.WorkspaceAccessReadWrite
+	if req.ReadOnly {
+		access = execmodel.WorkspaceAccessReadOnly
+	}
+	prepared, prepareErr := c.workspace.Preparer.PrepareRun(ctx, workcontract.PrepareRunRequest{
+		Scope: parent.Manifest.Scope, SessionID: req.SessionID, ParentRunID: req.ParentRunID, AgentID: req.Agent.ID,
+		App: parent.Manifest.AgentApp, Intent: workcontract.ExecutionIntent{RequiredMode: execmodel.WorkspaceModeTask, BoundedInputs: true, BoundedOutputs: true, HasProject: parent.Manifest.ProjectRoot != nil},
+		ProjectRoot: parent.Manifest.ProjectRoot, ProjectDir: parent.Manifest.ProjectDir, ProductModes: c.workspace.ProductModes, PolicyModes: c.workspace.PolicyModes, BackendModes: c.workspace.BackendModes, MaximumAccess: c.workspace.MaximumAccess, RequestedAccess: access,
+	})
+	if prepareErr != nil {
+		err = fmt.Errorf("准备 subagent Run 工作空间: %w", prepareErr)
+		return
+	}
+	ctx = workcontract.WithPreparedRun(ctx, prepared)
+	ctx = workcontract.WithControlPlane(ctx, c.workspace.Preparer)
+	run, err = c.engine.Start(ctx, domain.StartRunRequest{RunID: prepared.Manifest.RunID, SessionID: req.SessionID, TenantID: req.TenantID, UserInput: req.Prompt, Agent: req.Agent})
 }
 
 func (c *Controller) finish(ctx context.Context, e *entry, run *domain.Run, err error) {

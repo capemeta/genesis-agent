@@ -13,7 +13,23 @@ import (
 	execmodel "genesis-agent/internal/capabilities/execution/model"
 	skillcontract "genesis-agent/internal/capabilities/skill/contract"
 	skillmodel "genesis-agent/internal/capabilities/skill/model"
+	workcontract "genesis-agent/internal/capabilities/workspace/contract"
+	workmodel "genesis-agent/internal/capabilities/workspace/model"
 )
+
+type installTestControl struct {
+	execution workmodel.PreparedExecutionSnapshot
+}
+
+func (c installTestControl) PrepareRun(context.Context, workcontract.PrepareRunRequest) (workmodel.PreparedRun, error) {
+	return workmodel.PreparedRun{}, nil
+}
+func (c installTestControl) PrepareExecution(context.Context, workcontract.PrepareExecutionRequest) (workmodel.PreparedExecutionSnapshot, error) {
+	return c.execution, nil
+}
+func (c installTestControl) GetRunManifest(context.Context, string, string) (workmodel.RunManifest, error) {
+	return workmodel.RunManifest{}, nil
+}
 
 type allowAllApproval struct{}
 
@@ -76,7 +92,7 @@ func TestInstallRejectsPackageNotInWhitelist(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = tool.Execute(context.Background(), `{"skill":"office-ppt","packages":[{"manager":"npm","name":"left-pad"}]}`)
+	_, err = tool.Execute(installTestContext(), `{"skill":"office-ppt","packages":[{"manager":"npm","name":"left-pad"}]}`)
 	if err == nil || !strings.Contains(err.Error(), "未在该 skill 的 dependencies.runtime 中声明") {
 		t.Fatalf("err=%v", err)
 	}
@@ -91,7 +107,7 @@ func TestInstallRejectsWhenNoRuntimeDeclared(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = tool.Execute(context.Background(), `{"skill":"office-ppt","packages":[{"manager":"npm","name":"pptxgenjs"}]}`)
+	_, err = tool.Execute(installTestContext(), `{"skill":"office-ppt","packages":[{"manager":"npm","name":"pptxgenjs"}]}`)
 	if err == nil || !strings.Contains(err.Error(), "未声明") {
 		t.Fatalf("err=%v", err)
 	}
@@ -99,14 +115,15 @@ func TestInstallRejectsWhenNoRuntimeDeclared(t *testing.T) {
 
 func TestInstallDeniedByApproval(t *testing.T) {
 	tool, err := New(Deps{
-		Skills:   fakeSkills{meta: testMeta(skillmodel.RuntimeDeps{Node: []skillmodel.RuntimePackage{{Name: "pptxgenjs"}}})},
-		Runner:   &fakeRunner{},
-		Approval: denyApproval{},
+		Skills:        fakeSkills{meta: testMeta(skillmodel.RuntimeDeps{Node: []skillmodel.RuntimePackage{{Name: "pptxgenjs"}}})},
+		Runner:        &fakeRunner{},
+		Approval:      denyApproval{},
+		WorkspaceRoot: t.TempDir(),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	body, err := tool.Execute(context.Background(), `{"skill":"office-ppt","packages":[{"manager":"npm","name":"pptxgenjs"}]}`)
+	body, err := tool.Execute(installTestContext(), `{"skill":"office-ppt","packages":[{"manager":"npm","name":"pptxgenjs"}]}`)
 	if err == nil {
 		t.Fatal("expected approval error")
 	}
@@ -127,7 +144,7 @@ func TestInstallSuccessRunsWhitelistedCommand(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	body, err := tool.Execute(context.Background(), `{"skill":"office-ppt","packages":[{"manager":"npm","name":"pptxgenjs"}],"scope":"workspace"}`)
+	body, err := tool.Execute(installTestContext(root), `{"skill":"office-ppt","packages":[{"manager":"npm","name":"pptxgenjs"}],"scope":"workspace"}`)
 	if err != nil {
 		t.Fatalf("Execute: %v body=%s", err, body)
 	}
@@ -138,7 +155,7 @@ func TestInstallSuccessRunsWhitelistedCommand(t *testing.T) {
 	if !payload.OK || payload.Scope != "workspace" {
 		t.Fatalf("payload=%+v", payload)
 	}
-	installRoot := filepath.Join(root, ".genesis", "skill-deps", "office-ppt")
+	installRoot := filepath.Join(root, ".genesis", "cache", "skill-deps", "office-ppt")
 	wantCwd := filepath.Join(installRoot, "node")
 	wantCommand := "npm install pptxgenjs"
 	if runner.lastCmd.Command != wantCommand {
@@ -147,8 +164,8 @@ func TestInstallSuccessRunsWhitelistedCommand(t *testing.T) {
 	if runner.lastCmd.Cwd != wantCwd {
 		t.Fatalf("cwd=%q want=%q", runner.lastCmd.Cwd, wantCwd)
 	}
-	if runner.lastOpts.Workspace.WorkDir != wantCwd {
-		t.Fatalf("workspace=%+v want workdir=%q", runner.lastOpts.Workspace, wantCwd)
+	if runner.lastOpts.Workspace.WorkDir != root {
+		t.Fatalf("workspace=%+v want workdir=%s", runner.lastOpts.Workspace, root)
 	}
 	if runner.lastOpts.Sandbox.Operation != execmodel.SandboxOperationBuildDependencies {
 		t.Fatalf("operation=%s", runner.lastOpts.Sandbox.Operation)
@@ -166,7 +183,7 @@ func TestInstallSuccessRunsWhitelistedCommand(t *testing.T) {
 
 func TestBuildInstallStepsAvoidsQuotedAbsolutePrefix(t *testing.T) {
 	// 模拟 Windows 绝对路径字符串（任意 OS 可断言），禁止回归到 --prefix "D:\..." 形态。
-	installRoot := `D:\workspace\go\genesis-agent\.genesis\skill-deps\office-ppt`
+	installRoot := `D:\workspace\go\genesis-agent\.genesis\cache\skill-deps\office-ppt`
 	steps, err := buildInstallSteps(
 		[]packageInput{
 			{Manager: "npm", Name: "pptxgenjs"},
@@ -220,14 +237,14 @@ func TestInstallPipUsesVenv(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	body, err := tool.Execute(context.Background(), `{"skill":"office-ppt","packages":[{"manager":"pip","name":"markitdown[pptx]"}],"scope":"workspace"}`)
+	body, err := tool.Execute(installTestContext(root), `{"skill":"office-ppt","packages":[{"manager":"pip","name":"markitdown[pptx]"}],"scope":"workspace"}`)
 	if err != nil {
 		t.Fatalf("Execute: %v body=%s", err, body)
 	}
 	if len(runner.cmds) < 2 {
 		t.Fatalf("cmds=%+v", runner.cmds)
 	}
-	installRoot := filepath.Join(root, ".genesis", "skill-deps", "office-ppt")
+	installRoot := filepath.Join(root, ".genesis", "cache", "skill-deps", "office-ppt")
 	if runner.cmds[0].Command != "python -m venv venv" || runner.cmds[0].Cwd != installRoot {
 		t.Fatalf("venv step=%+v", runner.cmds[0])
 	}
@@ -264,7 +281,7 @@ func TestInstallWorkspaceScopeRejectedForRemoteGenesisSandbox(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	body, err := tool.Execute(context.Background(), `{"skill":"office-ppt","packages":[{"manager":"npm","name":"pptxgenjs"}],"scope":"workspace"}`)
+	body, err := tool.Execute(installTestContext(), `{"skill":"office-ppt","packages":[{"manager":"npm","name":"pptxgenjs"}],"scope":"workspace"}`)
 	if err == nil {
 		t.Fatal("expected remote workspace install visibility error")
 	}
@@ -285,7 +302,7 @@ func TestInstallImageScopeForbidden(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	body, err := tool.Execute(context.Background(), `{"skill":"office-ppt","packages":[{"manager":"npm","name":"pptxgenjs"}],"scope":"image"}`)
+	body, err := tool.Execute(installTestContext(), `{"skill":"office-ppt","packages":[{"manager":"npm","name":"pptxgenjs"}],"scope":"image"}`)
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -303,7 +320,7 @@ func TestInstallSessionScopeUnsupportedInGateB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	body, err := tool.Execute(context.Background(), `{"skill":"office-ppt","packages":[{"manager":"npm","name":"pptxgenjs"}],"scope":"session"}`)
+	body, err := tool.Execute(installTestContext(), `{"skill":"office-ppt","packages":[{"manager":"npm","name":"pptxgenjs"}],"scope":"session"}`)
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -327,4 +344,15 @@ func TestRejectUnsafePackageName(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected path traversal reject")
 	}
+}
+
+func installTestContext(roots ...string) context.Context {
+	workspaceRoot := "test-project"
+	if len(roots) > 0 {
+		workspaceRoot = roots[0]
+	}
+	binding := execmodel.ExecutionBinding{ID: "skill-deps-binding", Mode: execmodel.WorkspaceModeProject, Access: execmodel.WorkspaceAccessReadWrite, PathPolicy: execmodel.PathPolicyPermissionOnly, Owner: execmodel.ExecutionOwnerRef{RunID: "run-install-test", TaskID: "skill-deps:office-ppt"}}
+	execution := workmodel.PreparedExecutionSnapshot{Binding: binding, Workspace: execmodel.ExecutionWorkspace{WorkDir: workspaceRoot}}
+	ctx := workcontract.WithPreparedRun(context.Background(), workmodel.PreparedRun{Manifest: workmodel.RunManifest{RunID: "run-install-test"}, Execution: execution})
+	return workcontract.WithControlPlane(ctx, installTestControl{execution: execution})
 }

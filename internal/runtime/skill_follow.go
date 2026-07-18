@@ -44,26 +44,66 @@ var commandHeads = map[string]struct{}{
 
 // SkillFollowState 跟踪本 Run 已加载技能正文中的必读引用与 QA 完成情况（软门禁）。
 type SkillFollowState struct {
-	mu            sync.Mutex
-	bodies        []string
-	requiredReads map[string]struct{} // 全文 .md 链接（备用）
-	creatingReads map[string]struct{} // 前置章节内链接：产出前必读
-	readSet       map[string]struct{}
-	qaCommands    []string            // 从 QA 章节抽出的校验命令
-	qaMatched     map[string]struct{} // 已成功匹配的声明命令
-	requiresQA    bool
-	qaDone        bool
-	delivered     map[string]struct{} // 已交付产物 basename（通用，不绑扩展名）
+	mu             sync.Mutex
+	bodies         []string
+	requiredReads  map[string]struct{} // 全文 .md 链接（备用）
+	creatingReads  map[string]struct{} // 前置章节内链接：产出前必读
+	readSet        map[string]struct{}
+	qaCommands     []string            // 从 QA 章节抽出的校验命令
+	qaMatched      map[string]struct{} // 已成功匹配的声明命令
+	requiresQA     bool
+	qaDone         bool
+	qaEnvFailures  map[string]struct{} // 确定性环境失败的 QA 命令；同命令不再执行
+	qaFailedActual map[string]string   // normalize 后的实际失败命令，用于终态审计，不用模板命令冒充
 }
 
 // NewSkillFollowState 创建空跟踪状态。
 func NewSkillFollowState() *SkillFollowState {
 	return &SkillFollowState{
-		requiredReads: make(map[string]struct{}),
-		creatingReads: make(map[string]struct{}),
-		readSet:       make(map[string]struct{}),
-		qaMatched:     make(map[string]struct{}),
-		delivered:     make(map[string]struct{}),
+		requiredReads:  make(map[string]struct{}),
+		creatingReads:  make(map[string]struct{}),
+		readSet:        make(map[string]struct{}),
+		qaMatched:      make(map[string]struct{}),
+		qaEnvFailures:  make(map[string]struct{}),
+		qaFailedActual: make(map[string]string),
+	}
+}
+
+// NoteQAEnvironmentFailure 记录不可通过原样重试解决的 QA 环境失败。
+func (s *SkillFollowState) NoteQAEnvironmentFailure(command, failureKind string) {
+	if s == nil || !isTerminalQAEnvironmentFailure(failureKind) {
+		return
+	}
+	key := normalizeCommand(command)
+	if key == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.qaEnvFailures[key] = struct{}{}
+	s.qaFailedActual[key] = strings.TrimSpace(command)
+}
+
+// ShouldBlockQA 表示命令已经确定性失败，或本 Run 的 QA 环境失败预算已耗尽。
+func (s *SkillFollowState) ShouldBlockQA(command string) bool {
+	if s == nil {
+		return false
+	}
+	key := normalizeCommand(command)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, failed := s.qaEnvFailures[key]; failed {
+		return true
+	}
+	return len(s.qaEnvFailures) >= 2 && s.matchesQACommandLocked(command)
+}
+
+func isTerminalQAEnvironmentFailure(kind string) bool {
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case "dependency_missing", "sandbox_unavailable", "unsupported_environment", "qa_unavailable":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -125,50 +165,6 @@ func (s *SkillFollowState) MarkResourceRead(resource string) {
 	}
 }
 
-// NoteDeliveredArtifacts 记录 run_skill_command 已交付的产物名（basename），供后续 write_file 软提示。
-func (s *SkillFollowState) NoteDeliveredArtifacts(names []string) {
-	if s == nil {
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.delivered == nil {
-		s.delivered = make(map[string]struct{})
-	}
-	for _, name := range names {
-		base := strings.ToLower(path.Base(strings.ReplaceAll(strings.TrimSpace(name), `\`, `/`)))
-		if base == "" || base == "." {
-			continue
-		}
-		s.delivered[base] = struct{}{}
-	}
-}
-
-// HasDeliveredArtifacts 是否已有受控产物交付记录。
-func (s *SkillFollowState) HasDeliveredArtifacts() bool {
-	if s == nil {
-		return false
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return len(s.delivered) > 0
-}
-
-// IsDeliveredName 判断 basename 是否已交付。
-func (s *SkillFollowState) IsDeliveredName(name string) bool {
-	if s == nil {
-		return false
-	}
-	base := strings.ToLower(path.Base(strings.ReplaceAll(strings.TrimSpace(name), `\`, `/`)))
-	if base == "" || base == "." {
-		return false
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	_, ok := s.delivered[base]
-	return ok
-}
-
 // NoteExecutedCommand 根据实际执行的命令判断是否完成技能声明的 QA。
 // success=false 时不记完成（失败的校验不算做过 QA）。
 // 含管道的声明命令视为可选（如 grep 无匹配常 exit 1）；其余声明命令须全部成功匹配才算 QADone。
@@ -217,6 +213,23 @@ func (s *SkillFollowState) PendingQACommands() []string {
 		}
 		out = append(out, qa)
 	}
+	return out
+}
+
+// FailedQACommands 返回发生确定性环境失败的实际执行命令，而不是 Skill 中的占位模板。
+func (s *SkillFollowState) FailedQACommands() []string {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, 0, len(s.qaFailedActual))
+	for _, command := range s.qaFailedActual {
+		if command != "" {
+			out = append(out, command)
+		}
+	}
+	sort.Strings(out)
 	return out
 }
 
@@ -296,20 +309,6 @@ func (s *SkillFollowState) QADone() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.qaDone
-}
-
-// IncompleteDelivery 终态是否应标 Incomplete：技能声明了 QA、已有交付物、但 QA 未成功完成。
-// 三端统一语义（不绑定技能名 / backend）：
-//   - 无沙箱 / 本地平台沙箱：宿主缺 soffice 等 → QA 失败 → Incomplete（产物可仍交付）
-//   - 远程：镜像有依赖且 QA 成功 → 不触发；镜像缺依赖同 Incomplete
-// 不把任意业务命令失败都标 Incomplete。
-func (s *SkillFollowState) IncompleteDelivery() bool {
-	if s == nil {
-		return false
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.requiresQA && !s.qaDone && len(s.delivered) > 0
 }
 
 // QACommands 返回已解析的 QA 命令副本。

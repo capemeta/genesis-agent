@@ -12,6 +12,7 @@ import (
 	execcontract "genesis-agent/internal/capabilities/execution/contract"
 	execmodel "genesis-agent/internal/capabilities/execution/model"
 	"genesis-agent/internal/capabilities/hook/model"
+	workcontract "genesis-agent/internal/capabilities/workspace/contract"
 )
 
 // Runner 通过 execution.ExecutionRunner 执行 command handler。
@@ -44,7 +45,22 @@ func (r *Runner) Run(ctx context.Context, spec model.HandlerSpec, inputJSON []by
 	if timeout <= 0 {
 		timeout = r.defaultTimeout
 	}
-	result, err := r.exec.Run(ctx, execmodel.Command{Command: command, Stdin: inputJSON, Shell: execmodel.ShellAuto}, execcontract.RunOptions{Timeout: timeout, MaxOutputBytes: 128 * 1024})
+	prepared, ok := workcontract.PreparedRunFromContext(ctx)
+	if !ok {
+		return model.Decision{Continue: true, Err: fmt.Errorf("Hook command 缺少 Run workspace")}
+	}
+	control, ok := workcontract.ControlPlaneFromContext(ctx)
+	if !ok {
+		return model.Decision{Continue: true, Err: fmt.Errorf("Hook command 缺少 workspace control plane")}
+	}
+	execution, err := control.PrepareExecution(ctx, workcontract.PrepareExecutionRequest{Subject: execmodel.ExecutionSubjectRef{TaskID: "hook:" + strings.TrimSpace(spec.Name)}, Intent: workcontract.ExecutionIntent{RequiredMode: prepared.Execution.Binding.Mode, HasProject: prepared.Execution.Binding.Mode == execmodel.WorkspaceModeProject}, RequestedAccess: execmodel.WorkspaceAccessReadWrite})
+	if err != nil {
+		return model.Decision{Continue: true, Err: fmt.Errorf("准备 Hook execution: %w", err)}
+	}
+	result, err := r.exec.Run(ctx, execmodel.Command{Command: command, Cwd: execution.Workspace.WorkDir, Stdin: inputJSON, Shell: execmodel.ShellAuto}, execcontract.RunOptions{
+		Timeout: timeout, MaxOutputBytes: 128 * 1024,
+		Binding: execution.Binding, Workspace: execution.Workspace,
+	})
 	if err != nil {
 		return model.Decision{Continue: true, Err: fmt.Errorf("执行 Hook command失败: %w", err)}
 	}

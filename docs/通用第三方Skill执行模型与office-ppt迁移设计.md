@@ -1,12 +1,15 @@
 # 通用第三方 Skill 执行模型与 office-ppt 迁移设计
 
+> **Superseded（产物/交付语义）：** ProducedResource 登记、Deliverable 发布、Gate/Delivery/完成门禁以 [`docs/superpowers/specs/2026-07-17-produced-resource-artifact-delivery-architecture.md`](superpowers/specs/2026-07-17-produced-resource-artifact-delivery-architecture.md) 为准。本文中 `OutputArtifacts`/`DownloadArtifact` 自动回收、`artifacts[].path`、模型复制路径发布等表述已过时，不得再按该路径实现。
+>
 > 日期：2026-07-12
-> 状态：设计已完成；genesis-agent 侧 Skill 执行模型与 office-ppt 迁移已按本文主方案落地，session scoped WorkspaceFS 远程 API 仍需 genesis-sandbox 侧配合完成最终闭环
+> 状态：Skill verbatim 执行模型仍有效；产物控制面已被 2026-07-17 架构文档取代
 > 试点：`internal/capabilities/skill/adapter/embedded/skills/office-ppt`，源头 `D:\workspace\go\go-project\anthropics-skills\skills\pptx`
 > 关联文档：
+> - `docs/superpowers/specs/2026-07-17-produced-resource-artifact-delivery-architecture.md`（产物与 Artifact Delivery，权威）
 > - `docs/superpowers/specs/2026-07-09-skill-tool-protocol-boundary-design.md`（Skill/Tool 协议边界，权威）
 > - `docs/Skill调用原理对比-Kode-Codex-Genesis.md`（加载协议对比）
-> - `docs/执行工作空间与Sandbox文件路径契约.md`（路径契约、SandboxSession）
+> - `docs/执行工作空间与Sandbox文件路径契约.md`（路径契约、SandboxSession；产物段落已 superseded）
 > - `docs/沙箱API对接与Profile选择规则.md`（Profile 选择）
 > - `docs/Skill三模式执行与依赖闭环设计.md`（依赖闭环）
 > - `D:\workspace\go\genesis-sandbox\docs\session-workspacefs最终形态改造设计.md`（genesis-sandbox 侧 WorkspaceFS 最终形态改造）

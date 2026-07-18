@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"strings"
 
 	approvalcontract "genesis-agent/internal/capabilities/approval/contract"
@@ -16,6 +15,7 @@ import (
 	"genesis-agent/internal/capabilities/filesystem/freshness"
 	"genesis-agent/internal/capabilities/filesystem/model"
 	"genesis-agent/internal/capabilities/filesystem/permission"
+	toolparam "genesis-agent/internal/capabilities/tool/param"
 	"genesis-agent/internal/capabilities/tool/scheduler"
 )
 
@@ -99,15 +99,7 @@ func (d Deps) Validate() error {
 
 // DecodeParams 严格解析工具参数，避免模型拼错字段后被静默忽略。
 func DecodeParams(params string, dst any) error {
-	decoder := json.NewDecoder(strings.NewReader(params))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(dst); err != nil {
-		return fmt.Errorf("参数解析失败: %w", err)
-	}
-	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		return fmt.Errorf("参数只能包含一个JSON对象")
-	}
-	return nil
+	return toolparam.Decode(params, dst)
 }
 
 // ResolveRequire 解析路径并通过通用 approval 授权。

@@ -53,10 +53,10 @@ func DefaultPaths() (Paths, error) {
 
 // MarketplaceOptions 控制 marketplace 与 runtime adapter 的共享。
 type MarketplaceOptions struct {
-	Adapters     capcontract.RuntimeAdapterRegistry
-	Install      platformconfig.SkillsInstallConfig
-	ConfigDir    string // 可选；空则不从磁盘重载，仅用 Install 字段
-	SkipLoadCfg  bool   // 测试用：跳过 LoadWithOptions
+	Adapters    capcontract.RuntimeAdapterRegistry
+	Install     platformconfig.SkillsInstallConfig
+	ConfigDir   string // 可选；空则不从磁盘重载，仅用 Install 字段
+	SkipLoadCfg bool   // 测试用：跳过 LoadWithOptions
 }
 
 func NewMarketplaceService() (*marketservice.Service, Paths, error) {

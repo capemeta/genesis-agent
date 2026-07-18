@@ -21,10 +21,38 @@ import (
 	localexec "genesis-agent/shared/local/execution"
 )
 
-type allowAllApproval struct{}
+type allowAllApproval struct{ calls *int }
 
-func (allowAllApproval) Authorize(context.Context, approvalmodel.Request) (approvalmodel.Decision, error) {
+func (a allowAllApproval) Authorize(context.Context, approvalmodel.Request) (approvalmodel.Decision, error) {
+	if a.calls != nil {
+		*a.calls = *a.calls + 1
+	}
 	return approvalmodel.Decision{Type: approvalmodel.DecisionApproved}, nil
+}
+
+func TestSkillCommandMissingGeneratedEntryIsBlockedBeforeApproval(t *testing.T) {
+	approvalCalls := 0
+	svc := newTestServiceWithApproval(t, fstest.MapFS{
+		"demo/SKILL.md": {Data: []byte("---\nname: demo\ndescription: demo skill\nallowed-tools:\n  - run_skill_command\n---\nDemo")},
+	}, allowAllApproval{calls: &approvalCalls})
+	result, err := svc.Run(context.Background(), skillRunRequest("demo", "node create_ppt.js", t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.OK || result.FailureKind != "input_binding_missing" || result.SuggestedAction != "stage_command_entry_via_inputs" || !result.Retryable {
+		t.Fatalf("result=%+v", result)
+	}
+	if approvalCalls != 0 || result.ApprovalDurationMS != 0 || result.ExecutionDurationMS != 0 {
+		t.Fatalf("缺失入口必须在审批和执行前阻断: calls=%d result=%+v", approvalCalls, result)
+	}
+	if len(result.RequiredInputs) != 1 || result.RequiredInputs[0] != "$WORK_DIR/create_ppt.js" || result.ExactCall == nil {
+		t.Fatalf("缺少精确 inputs 纠错: %+v", result)
+	}
+	args := result.ExactCall.Arguments
+	inputs, _ := args["inputs"].([]string)
+	if result.ExactCall.Tool != "run_skill_command" || args["command"] != "node create_ppt.js" || len(inputs) != 1 || inputs[0] != "$WORK_DIR/create_ppt.js" {
+		t.Fatalf("exact_call=%+v", result.ExactCall)
+	}
 }
 
 func TestSkillCommandServiceRunsLocalSkillCommand(t *testing.T) {
@@ -40,23 +68,24 @@ func TestSkillCommandServiceRunsLocalSkillCommand(t *testing.T) {
 	if !result.OK {
 		t.Fatalf("result=%+v", result)
 	}
+	if result.DurationMS < result.ExecutionDurationMS || result.ExecutionDurationMS <= 0 || result.ApprovalDurationMS < 0 || result.StagingDurationMS < 0 {
+		t.Fatalf("分阶段耗时无效: total=%d approval=%d staging=%d execution=%d", result.DurationMS, result.ApprovalDurationMS, result.StagingDurationMS, result.ExecutionDurationMS)
+	}
 	if result.WorkDir == "" || result.SkillDir == "" {
 		t.Fatalf("missing workdir: %+v", result)
 	}
-	wantWorkRel := filepath.ToSlash(filepath.Join(".genesis", "runs", "test-run", "work", "skills", "demo"))
+	wantWorkRel := filepath.ToSlash(filepath.Join(".genesis", "runtime", "runs", "test-run", "work", "test-run-skill-demo", "skills", "demo"))
 	if result.WorkDir != wantWorkRel || result.SkillDir != wantWorkRel {
 		t.Fatalf("host-backed work/skill dir should be workspace-relative: work=%q skill=%q want=%q", result.WorkDir, result.SkillDir, wantWorkRel)
 	}
+	if result.Metadata[metaExecutionBackend] != executionBackendLocalHost {
+		t.Fatalf("execution_backend=%q", result.Metadata[metaExecutionBackend])
+	}
+	if _, ok := result.Metadata["path_map"]; ok {
+		t.Fatalf("path_map must not be returned to model: %v", result.Metadata)
+	}
 	if got := filepath.Join(root, filepath.FromSlash(result.WorkDir), "made.txt"); !containsProduced(result.Produced, "made.txt") {
 		t.Fatalf("expected produced made.txt, produced=%v path=%s", result.Produced, got)
-	}
-	wantArtifactRel := filepath.ToSlash(filepath.Join(".genesis", "runs", "test-run", "output", "demo", "made.txt"))
-	wantArtifactAbs := filepath.Join(root, filepath.FromSlash(wantArtifactRel))
-	if len(result.Artifacts) != 1 || result.Artifacts[0].Path != wantArtifactRel {
-		t.Fatalf("artifact path for model should be workspace-relative: %+v want=%q", result.Artifacts, wantArtifactRel)
-	}
-	if _, err := os.Stat(wantArtifactAbs); err != nil {
-		t.Fatalf("artifact missing under output: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(result.WorkDir), "made.txt")); err != nil {
 		t.Fatalf("produced file should still exist in skill work dir: %v", err)
@@ -72,10 +101,12 @@ func TestSkillCommandServiceRejectsHelperModuleEntry(t *testing.T) {
 		"demo/scripts/path_contract.py": {Data: []byte("print('bad')")},
 	})
 	result, err := svc.Run(context.Background(), scriptcontract.RunRequest{
-		Catalog:       skillcontract.CatalogRequest{},
-		Skill:         "demo",
-		Command:       "python scripts/path_contract.py",
-		WorkspaceRoot: t.TempDir(),
+		Catalog:    skillcontract.CatalogRequest{},
+		Skill:      "demo",
+		Command:    "python scripts/path_contract.py",
+		Binding:    testBinding("test-run"),
+		StateRoot:  testStateRoot(t.TempDir()),
+		ProjectDir: t.TempDir(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -104,6 +135,22 @@ func TestSkillCommandServiceRejectsDependencyInstallCommand(t *testing.T) {
 	}
 }
 
+func TestSkillCommandServiceRejectsDeclaredRuntimeProbeBeforeExecution(t *testing.T) {
+	svc := newTestService(t, fstest.MapFS{
+		"demo/SKILL.md": {Data: []byte("---\nname: demo\ndescription: demo skill\nallowed-tools:\n  - run_skill_command\ndependencies:\n  runtime:\n    node:\n      - name: pptxgenjs\n        require: pptxgenjs\n---\nDemo")},
+	})
+	result, err := svc.Run(context.Background(), skillRunRequest("demo", `node -e "require('pptxgenjs'); console.log('ok')"`, t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.OK || result.FailureKind != "runtime_probe_unnecessary" || result.SuggestedAction != "run_declared_business_command_directly" {
+		t.Fatalf("result=%+v", result)
+	}
+	if result.ApprovalDurationMS != 0 || result.ExecutionDurationMS != 0 {
+		t.Fatalf("冗余探测必须在审批和执行前阻断: %+v", result)
+	}
+}
+
 func TestSkillEnvIncludesRemoteNodeRuntimeSearchPath(t *testing.T) {
 	env := skillEnv("/workspace", "/workspace/tmp")
 	nodePath := env["NODE_PATH"]
@@ -116,8 +163,8 @@ func TestSkillEnvIncludesRemoteNodeRuntimeSearchPath(t *testing.T) {
 
 func TestSkillEnvUsesControlledLocalDependencyPaths(t *testing.T) {
 	root := t.TempDir()
-	workDir := filepath.Join(root, ".genesis", "runs", "run-1", "work", "skills", "office-ppt")
-	depRoot := filepath.Join(root, ".genesis", "skill-deps", "office-ppt")
+	workDir := filepath.Join(root, ".genesis", "runtime", "runs", "run-1", "work", "skills", "office-ppt")
+	depRoot := filepath.Join(root, ".genesis", "cache", "skill-deps", "office-ppt")
 	binDir := filepath.Join(depRoot, "venv", "bin")
 	pyName := "python"
 	if runtime.GOOS == "windows" {
@@ -130,7 +177,7 @@ func TestSkillEnvUsesControlledLocalDependencyPaths(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(binDir, pyName), []byte(""), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	env := skillEnv(workDir, filepath.Join(root, ".genesis", "runs", "run-1", "tmp"))
+	env := skillEnv(workDir, filepath.Join(root, ".genesis", "runtime", "runs", "run-1", "tmp"))
 
 	if !strings.Contains(env["NODE_PATH"], filepath.Join(depRoot, "node", "node_modules")) {
 		t.Fatalf("NODE_PATH missing controlled dependency dir: %s", env["NODE_PATH"])
@@ -147,10 +194,14 @@ func TestSkillEnvUsesControlledLocalDependencyPaths(t *testing.T) {
 }
 
 func skillRunRequest(skill, command, root string) scriptcontract.RunRequest {
-	return scriptcontract.RunRequest{Catalog: skillcontract.CatalogRequest{}, Skill: skill, Command: command, RunID: "test-run", WorkspaceRoot: root, Sandbox: execmodel.SandboxProfile{Mode: execmodel.SandboxDisabled}}
+	return scriptcontract.RunRequest{Catalog: skillcontract.CatalogRequest{}, Skill: skill, Command: command, Binding: testBinding("test-run"), StateRoot: testStateRoot(root), ProjectDir: root, Sandbox: execmodel.SandboxProfile{Mode: execmodel.SandboxDisabled}}
 }
 
 func newTestService(t *testing.T, fsys fstest.MapFS) *Service {
+	return newTestServiceWithApproval(t, fsys, allowAllApproval{})
+}
+
+func newTestServiceWithApproval(t *testing.T, fsys fstest.MapFS, approval allowAllApproval) *Service {
 	t.Helper()
 	source, err := embedded.NewSource(skillmodel.Authority{Kind: skillmodel.SourceKindEmbedded, ID: "test"}, skillmodel.ScopeSystem, fsys, skillparser.New())
 	if err != nil {
@@ -161,16 +212,16 @@ func newTestService(t *testing.T, fsys fstest.MapFS) *Service {
 	if err != nil {
 		t.Fatal(err)
 	}
-	svc, err := New(Deps{Skills: skills, Runner: runner, Approval: allowAllApproval{}})
+	svc, err := New(Deps{Skills: skills, Runner: runner, Approval: approval, Provisioner: testProvisioner{}, ProducedResources: &collectingProducedRegistrar{}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return svc
 }
 
-func containsProduced(values []string, suffix string) bool {
+func containsProduced(values []scriptcontract.ProducedCandidate, suffix string) bool {
 	for _, value := range values {
-		if strings.HasSuffix(value, suffix) {
+		if strings.HasSuffix(value.Name, suffix) {
 			return true
 		}
 	}

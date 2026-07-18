@@ -1,3 +1,5 @@
+> **Superseded：** 产物登记、Deliverable 发布与 durable executor object 以 [`2026-07-17-produced-resource-artifact-delivery-architecture.md`](superpowers/specs/2026-07-17-produced-resource-artifact-delivery-architecture.md) 为准；下文部分 `OutputArtifacts`/`DownloadArtifact` 自动回收描述已过时。
+
 # 执行工作空间与 Sandbox 文件路径契约
 
 ## 1. 结论

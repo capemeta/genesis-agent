@@ -2,6 +2,7 @@ package react
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync/atomic"
@@ -98,8 +99,12 @@ type countingFailRegistry struct {
 	calls  atomic.Int64
 }
 
-func (f *countingFailRegistry) Register(tool.Tool)   {}
-func (f *countingFailRegistry) Unregister(string)    {}
+func (f *countingFailRegistry) Register(tool.Tool) error { return nil }
+func (f *countingFailRegistry) Replace(string, string, tool.Tool) error {
+	return errors.New("unsupported")
+}
+func (f *countingFailRegistry) Owner(string) (string, bool) { return "", false }
+func (f *countingFailRegistry) Unregister(string)           {}
 func (f *countingFailRegistry) Get(string) tool.Tool {
 	return nil
 }
@@ -110,4 +115,3 @@ func (f *countingFailRegistry) Execute(context.Context, string, string) (string,
 func (f *countingFailRegistry) ListInfos() []*tool.Info           { return nil }
 func (f *countingFailRegistry) FilterInfos([]string) []*tool.Info { return nil }
 func (f *countingFailRegistry) Names() []string                   { return nil }
-

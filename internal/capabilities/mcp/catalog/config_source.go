@@ -68,6 +68,16 @@ func MapServerDTO(name string, dto platformconfig.MCPServerConfig, mcp platformc
 	if typ == model.McpTransportStdio && strings.TrimSpace(dto.Command) == "" {
 		return model.McpServerConfig{}, fmt.Errorf("mcp.servers.%s: stdio 需要 command", name)
 	}
+	placement := model.McpPlacement(strings.TrimSpace(dto.Placement))
+	if typ == model.McpTransportStdio {
+		switch placement {
+		case model.McpPlacementLocalStdio, model.McpPlacementLocalSandboxStdio, model.McpPlacementRemoteSandboxStdio:
+		default:
+			return model.McpServerConfig{}, fmt.Errorf("mcp.servers.%s: stdio 必须显式声明 placement", name)
+		}
+	} else if placement == "" {
+		placement = model.McpPlacementStreamableHTTP
+	}
 	if typ == model.McpTransportStreamableHTTP && strings.TrimSpace(dto.URL) == "" {
 		return model.McpServerConfig{}, fmt.Errorf("mcp.servers.%s: streamable_http 需要 url", name)
 	}
@@ -87,7 +97,9 @@ func MapServerDTO(name string, dto platformconfig.MCPServerConfig, mcp platformc
 		Command:        dto.Command,
 		Args:           append([]string(nil), dto.Args...),
 		Env:            copyMap(dto.Env),
+		InheritEnv:     append([]string(nil), dto.InheritEnv...),
 		Cwd:            dto.Cwd,
+		Placement:      placement,
 		URL:            dto.URL,
 		BearerTokenEnv: dto.BearerTokenEnv,
 		CredentialRef:  dto.CredentialRef,

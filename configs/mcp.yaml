@@ -9,7 +9,10 @@ mcp:
   servers:
     mcp_server_mysql:
       type: stdio
+      placement: local_stdio
       command: npx
+      # 仅继承启动 Node 所需的最小宿主环境；不会继承其他 secret。
+      inherit_env: [PATH, PATHEXT, SystemRoot, TEMP, TMP]
       args:
         - "-y"
         - "@benborla29/mcp-server-mysql"

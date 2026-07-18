@@ -2,9 +2,11 @@ package service
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"genesis-agent/internal/capabilities/approval/adapter/memory"
+	"genesis-agent/internal/capabilities/approval/contract"
 	"genesis-agent/internal/capabilities/approval/model"
 	auditmodel "genesis-agent/internal/capabilities/audit/model"
 	"genesis-agent/internal/platform/contextutil"
@@ -45,7 +47,6 @@ func TestAuthorizeAllowDoesNotCallRequester(t *testing.T) {
 		t.Fatalf("decision = %q, want approved", decision.Type)
 	}
 }
-
 
 func TestAuthorizeWritesAuditWithRunID(t *testing.T) {
 	audit := &captureAudit{}
@@ -133,8 +134,8 @@ func TestAuthorizeAbortDecisionReturned(t *testing.T) {
 		t.Fatal(err)
 	}
 	decision, err := svc.Authorize(context.Background(), testRequest())
-	if err != nil {
-		t.Fatal(err)
+	if !errors.Is(err, contract.ErrRunAborted) {
+		t.Fatalf("err = %v, want ErrRunAborted", err)
 	}
 	if decision.Type != model.DecisionAbort {
 		t.Fatalf("decision = %q, want abort", decision.Type)

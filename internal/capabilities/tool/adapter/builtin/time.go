@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"genesis-agent/internal/capabilities/tool/contract"
+	toolparam "genesis-agent/internal/capabilities/tool/param"
 )
 
 // CurrentTimeTool 获取当前时间的工具
@@ -29,7 +30,10 @@ func (t *CurrentTimeTool) GetInfo() *tool.Info {
 	}
 }
 
-func (t *CurrentTimeTool) Execute(_ context.Context, _ string) (string, error) {
+func (t *CurrentTimeTool) Execute(_ context.Context, params string) (string, error) {
+	if err := toolparam.DecodeOptional(params, &struct{}{}); err != nil {
+		return "", fmt.Errorf("参数解析失败: %w", err)
+	}
 	now := time.Now()
 	return fmt.Sprintf("%s（时区：%s）", now.Format("2006年01月02日 15:04:05"), now.Location().String()), nil
 }

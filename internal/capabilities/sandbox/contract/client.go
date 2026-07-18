@@ -3,6 +3,7 @@ package contract
 
 import (
 	"context"
+	"time"
 
 	execcontract "genesis-agent/internal/capabilities/execution/contract"
 	execmodel "genesis-agent/internal/capabilities/execution/model"
@@ -96,6 +97,12 @@ type SandboxSession interface {
 	Workspace() WorkspaceRef
 	Run(ctx context.Context, req CommandRequest) (*execmodel.Result, error)
 	Close(ctx context.Context) error
+}
+
+// LeasedSandboxSession 额外暴露服务端确认的 lease 到期时间；Harness 不得自行猜测 TTL。
+type LeasedSandboxSession interface {
+	SandboxSession
+	ExpiresAt() time.Time
 }
 
 // SessionClient 打开长会话 sandbox。

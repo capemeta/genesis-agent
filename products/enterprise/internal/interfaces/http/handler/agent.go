@@ -49,9 +49,10 @@ func NewAgentHandler(svc app.AgentService) *AgentHandler {
 
 // RunRequest POST /v1/runs 请求体
 type RunRequest struct {
-	SessionID string                    `json:"session_id"` // 可选：指定会话 ID，否则自动创建新会话
-	UserID    string                    `json:"user_id"`    // 开发期身份占位；生产环境应由认证中间件注入
-	Input     string                    `json:"input"`      // 必填：用户输入内容
+	SessionID string                    `json:"session_id"`       // 可选：指定会话 ID，否则自动创建新会话
+	AppID     string                    `json:"app_id,omitempty"` // 选择租户策略允许的 Agent App
+	UserID    string                    `json:"user_id"`          // 开发期身份占位；生产环境应由认证中间件注入
+	Input     string                    `json:"input"`            // 必填：用户输入内容
 	Sandbox   *execmodel.SandboxProfile `json:"sandbox,omitempty"`
 }
 
@@ -96,6 +97,10 @@ func (h *AgentHandler) Run(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "input 字段不能为空")
 		return
 	}
+	req.AppID = strings.TrimSpace(req.AppID)
+	if req.AppID == "" {
+		req.AppID = "enterprise-default"
+	}
 
 	userID := strings.TrimSpace(req.UserID)
 	if userID == "" {
@@ -104,19 +109,20 @@ func (h *AgentHandler) Run(w http.ResponseWriter, r *http.Request) {
 	// 创建或使用已有会话
 	sessionID := req.SessionID
 	if sessionID == "" {
-		session, err := h.svc.CreateSession(r.Context(), app.SessionScope{TenantID: "dev", UserID: userID})
+		session, err := h.svc.CreateSession(r.Context(), app.SessionScope{TenantID: "dev", UserID: userID, AppID: req.AppID})
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, fmt.Sprintf("创建会话失败: %v", err))
 			return
 		}
 		sessionID = session.ID
-	} else if _, err := h.svc.ResumeSession(r.Context(), sessionID, app.SessionScope{TenantID: "dev", UserID: userID}); err != nil {
+	} else if _, err := h.svc.ResumeSession(r.Context(), sessionID, app.SessionScope{TenantID: "dev", UserID: userID, AppID: req.AppID}); err != nil {
 		writeError(w, http.StatusNotFound, fmt.Sprintf("会话不可恢复: %v", err))
 		return
 	}
 
 	result, err := h.svc.RunOnce(r.Context(), app.RunRequest{
 		SessionID: sessionID,
+		AppID:     req.AppID,
 		TenantID:  "dev", // Phase 1A 硬编码租户，Phase 1B 从 JWT 解析
 		UserID:    userID,
 		Input:     req.Input,
@@ -148,6 +154,10 @@ func (h *AgentHandler) RunStream(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "input 字段不能为空")
 		return
 	}
+	req.AppID = strings.TrimSpace(req.AppID)
+	if req.AppID == "" {
+		req.AppID = "enterprise-default"
+	}
 
 	userID := strings.TrimSpace(req.UserID)
 	if userID == "" {
@@ -156,13 +166,13 @@ func (h *AgentHandler) RunStream(w http.ResponseWriter, r *http.Request) {
 	// 创建或使用已有会话
 	sessionID := req.SessionID
 	if sessionID == "" {
-		session, err := h.svc.CreateSession(r.Context(), app.SessionScope{TenantID: "dev", UserID: userID})
+		session, err := h.svc.CreateSession(r.Context(), app.SessionScope{TenantID: "dev", UserID: userID, AppID: req.AppID})
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, fmt.Sprintf("创建会话失败: %v", err))
 			return
 		}
 		sessionID = session.ID
-	} else if _, err := h.svc.ResumeSession(r.Context(), sessionID, app.SessionScope{TenantID: "dev", UserID: userID}); err != nil {
+	} else if _, err := h.svc.ResumeSession(r.Context(), sessionID, app.SessionScope{TenantID: "dev", UserID: userID, AppID: req.AppID}); err != nil {
 		writeError(w, http.StatusNotFound, fmt.Sprintf("会话不可恢复: %v", err))
 		return
 	}
@@ -196,6 +206,7 @@ func (h *AgentHandler) RunStream(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		res, err := h.svc.RunOnce(r.Context(), app.RunRequest{
 			SessionID: sessionID,
+			AppID:     req.AppID,
 			TenantID:  tenantID,
 			UserID:    userID,
 			Input:     req.Input,

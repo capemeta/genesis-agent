@@ -83,4 +83,3 @@ Body`)
 		t.Fatalf("whitelist missing pip:pillow: %+v", wl)
 	}
 }
-

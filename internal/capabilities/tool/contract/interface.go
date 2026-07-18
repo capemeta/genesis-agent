@@ -125,7 +125,7 @@ func DefaultTraits(name string) ToolTraits {
 		return ToolTraits{Exposure: ToolExposureDirect, ReadOnly: false, ConcurrencySafe: false, NeedsPermission: true}
 	case "list_mcp_resources", "read_mcp_resource":
 		return ToolTraits{Exposure: ToolExposureDirect, ReadOnly: true, ConcurrencySafe: true, NeedsPermission: true}
-	case "mcp_search":
+	case "search_mcp_tools":
 		return ToolTraits{Exposure: ToolExposureDirect, ReadOnly: false, ConcurrencySafe: true, NeedsPermission: true}
 	default:
 		if strings.HasPrefix(name, "mcp__") {
@@ -152,8 +152,12 @@ type ExposureUpdater interface {
 
 // Registry 工具注册表接口
 type Registry interface {
-	// Register 注册一个工具，若名称重复则覆盖
-	Register(t Tool)
+	// Register 注册一个工具。名称已存在时必须失败，禁止静默覆盖。
+	Register(t Tool) error
+	// Replace 显式替换工具。只有现有工具 owner 与 expectedOwner 一致时才允许替换。
+	Replace(name, expectedOwner string, t Tool) error
+	// Owner 返回已注册工具的稳定来源标识。
+	Owner(name string) (string, bool)
 	// Unregister 按名称移除工具；不存在时为 no-op
 	Unregister(name string)
 	// Get 按名称获取工具，返回 nil 表示未找到

@@ -14,7 +14,7 @@ func TestValidateCommandAllowsLogicalDirsInStrictMode(t *testing.T) {
 	err := ValidateCommand(execmodel.Command{
 		Command: `python -c "open('${INPUT_DIR}/data.csv').read(); open('${OUTPUT_DIR}/result.csv','w').write('ok')"`,
 	}, execcontract.RunOptions{
-		Workspace: execmodel.ExecutionWorkspace{PathPolicy: execmodel.PathPolicyStrictWorkspace},
+		Binding: strictBinding(),
 	})
 	if err != nil {
 		t.Fatalf("ValidateCommand() error = %v", err)
@@ -25,7 +25,7 @@ func TestValidateCommandRejectsHostPathsInStrictMode(t *testing.T) {
 	err := ValidateCommand(execmodel.Command{
 		Command: `python process.py D:\data\input.xlsx --out /Users/alice/out.pdf`,
 	}, execcontract.RunOptions{
-		Workspace: execmodel.ExecutionWorkspace{PathPolicy: execmodel.PathPolicyStrictWorkspace},
+		Binding: strictBinding(),
 	})
 	if code := execcontract.CodeOf(err); code != execcontract.ErrCodeInvalidInput {
 		t.Fatalf("CodeOf(err)=%s err=%v", code, err)
@@ -39,7 +39,7 @@ func TestValidateCommandRejectsTmpOutputInStrictMode(t *testing.T) {
 	err := ValidateCommand(execmodel.Command{
 		Command: `python -c "open('/tmp/result.csv','w').write('bad')"`,
 	}, execcontract.RunOptions{
-		Workspace: execmodel.ExecutionWorkspace{PathPolicy: execmodel.PathPolicyStrictWorkspace},
+		Binding: strictBinding(),
 	})
 	if code := execcontract.CodeOf(err); code != execcontract.ErrCodeInvalidInput {
 		t.Fatalf("CodeOf(err)=%s err=%v", code, err)
@@ -53,7 +53,7 @@ func TestValidateCommandRejectsNonWorkspaceAbsolutePath(t *testing.T) {
 	err := ValidateCommand(execmodel.Command{
 		Command: `python -c "open('/var/logs/result.txt','w').write('bad')"`,
 	}, execcontract.RunOptions{
-		Workspace: execmodel.ExecutionWorkspace{PathPolicy: execmodel.PathPolicyStrictWorkspace},
+		Binding: strictBinding(),
 	})
 	if code := execcontract.CodeOf(err); code != execcontract.ErrCodeInvalidInput {
 		t.Fatalf("CodeOf(err)=%s err=%v", code, err)
@@ -64,7 +64,7 @@ func TestValidateCommandRejectsGenericUnixAbsolutePath(t *testing.T) {
 	err := ValidateCommand(execmodel.Command{
 		Command: `python -c "open('/etc/passwd').read()"`,
 	}, execcontract.RunOptions{
-		Workspace: execmodel.ExecutionWorkspace{PathPolicy: execmodel.PathPolicyStrictWorkspace},
+		Binding: strictBinding(),
 	})
 	if code := execcontract.CodeOf(err); code != execcontract.ErrCodeInvalidInput {
 		t.Fatalf("CodeOf(err)=%s err=%v", code, err)
@@ -78,7 +78,7 @@ func TestValidateCommandRejectsUNCPath(t *testing.T) {
 	err := ValidateCommand(execmodel.Command{
 		Command: `python process.py \\server\share\data.csv`,
 	}, execcontract.RunOptions{
-		Workspace: execmodel.ExecutionWorkspace{PathPolicy: execmodel.PathPolicyStrictWorkspace},
+		Binding: strictBinding(),
 	})
 	if code := execcontract.CodeOf(err); code != execcontract.ErrCodeInvalidInput {
 		t.Fatalf("CodeOf(err)=%s err=%v", code, err)
@@ -92,7 +92,7 @@ func TestValidateCommandDoesNotTreatURLAsFilePath(t *testing.T) {
 	err := ValidateCommand(execmodel.Command{
 		Command: `python -c "print('https://example.com/report.csv')"`,
 	}, execcontract.RunOptions{
-		Workspace: execmodel.ExecutionWorkspace{PathPolicy: execmodel.PathPolicyStrictWorkspace},
+		Binding: strictBinding(),
 	})
 	if err != nil {
 		t.Fatalf("ValidateCommand() error = %v", err)
@@ -103,10 +103,37 @@ func TestValidateCommandDoesNotTreatSedDelimiterAsFilePath(t *testing.T) {
 	err := ValidateCommand(execmodel.Command{
 		Command: `sed "s/foo/bar/" ${INPUT_DIR}/data.txt`,
 	}, execcontract.RunOptions{
-		Workspace: execmodel.ExecutionWorkspace{PathPolicy: execmodel.PathPolicyStrictWorkspace},
+		Binding: strictBinding(),
 	})
 	if err != nil {
 		t.Fatalf("ValidateCommand() error = %v", err)
+	}
+}
+
+func TestValidateCommandAllowsKnownWindowsSlashSwitches(t *testing.T) {
+	err := ValidateCommand(execmodel.Command{
+		Command: `python -m markitdown deck.pptx | findstr /I "placeholder" && dir /b deck.pptx`,
+		Shell:   execmodel.ShellCmd,
+	}, strictOptions())
+	if err != nil {
+		t.Fatalf("Windows 命令开关不应被误判为绝对路径: %v", err)
+	}
+}
+
+func TestValidateCommandKeepsUnixAbsolutePathRulesForBash(t *testing.T) {
+	err := ValidateCommand(execmodel.Command{Command: `printf x /I`, Shell: execmodel.ShellBash}, strictOptions())
+	if code := execcontract.CodeOf(err); code != execcontract.ErrCodeInvalidInput {
+		t.Fatalf("Bash 中 /I 仍是绝对路径语法，code=%s err=%v", code, err)
+	}
+}
+
+func TestValidateCommandRejectsRelativeWorkspaceEscape(t *testing.T) {
+	err := ValidateCommand(execmodel.Command{Command: `copy deck.pptx ..\..\..\deck.pptx`, Shell: execmodel.ShellCmd}, strictOptions())
+	if code := execcontract.CodeOf(err); code != execcontract.ErrCodeInvalidInput {
+		t.Fatalf("相对路径越界必须被拒绝，code=%s err=%v", code, err)
+	}
+	if !strings.Contains(err.Error(), "Deliverable") {
+		t.Fatalf("错误必须给出正式交付修复建议: %v", err)
 	}
 }
 
@@ -114,7 +141,7 @@ func TestValidateCommandRejectsAbsolutePathAfterEquals(t *testing.T) {
 	err := ValidateCommand(execmodel.Command{
 		Command: `python tool.py --config=/etc/app/config.yaml`,
 	}, execcontract.RunOptions{
-		Workspace: execmodel.ExecutionWorkspace{PathPolicy: execmodel.PathPolicyStrictWorkspace},
+		Binding: strictBinding(),
 	})
 	if code := execcontract.CodeOf(err); code != execcontract.ErrCodeInvalidInput {
 		t.Fatalf("CodeOf(err)=%s err=%v", code, err)
@@ -125,7 +152,7 @@ func TestValidateCommandAllowsSandboxWorkspacePath(t *testing.T) {
 	err := ValidateCommand(execmodel.Command{
 		Command: `python -c "open('/workspace/output/result.txt','w').write('ok')"`,
 	}, execcontract.RunOptions{
-		Workspace: execmodel.ExecutionWorkspace{PathPolicy: execmodel.PathPolicyStrictWorkspace},
+		Binding: strictBinding(),
 	})
 	if err != nil {
 		t.Fatalf("ValidateCommand() error = %v", err)
@@ -136,10 +163,7 @@ func TestValidateCommandPermissionOnlyAllowsLocalCodingPaths(t *testing.T) {
 	err := ValidateCommand(execmodel.Command{
 		Command: `type D:\workspace\go\genesis-agent\go.mod`,
 	}, execcontract.RunOptions{
-		Workspace: execmodel.ExecutionWorkspace{
-			Mode:       execmodel.WorkspaceModeLocalCoding,
-			PathPolicy: execmodel.PathPolicyPermissionOnly,
-		},
+		Binding: projectBinding(),
 	})
 	if err != nil {
 		t.Fatalf("ValidateCommand() error = %v", err)
@@ -168,7 +192,7 @@ Path("/var/logs/result.txt").write_text("bad")
 		Command: `python process.py`,
 		Cwd:     dir,
 	}, execcontract.RunOptions{
-		Workspace: execmodel.ExecutionWorkspace{PathPolicy: execmodel.PathPolicyStrictWorkspace},
+		Binding: strictBinding(),
 	})
 	if code := execcontract.CodeOf(err); code != execcontract.ErrCodeInvalidInput {
 		t.Fatalf("CodeOf(err)=%s err=%v", code, err)
@@ -194,7 +218,7 @@ open(output_path, "w").write("ok")
 		Command: `python process.py`,
 		Cwd:     dir,
 	}, execcontract.RunOptions{
-		Workspace: execmodel.ExecutionWorkspace{PathPolicy: execmodel.PathPolicyStrictWorkspace},
+		Binding: strictBinding(),
 	})
 	if err != nil {
 		t.Fatalf("ValidateCommand() error = %v", err)
@@ -469,6 +493,20 @@ func (a staticAnalyzer) Analyze(AnalysisInput) ([]Violation, error) {
 
 func strictOptions() execcontract.RunOptions {
 	return execcontract.RunOptions{
-		Workspace: execmodel.ExecutionWorkspace{PathPolicy: execmodel.PathPolicyStrictWorkspace},
+		Binding: strictBinding(),
+	}
+}
+
+func strictBinding() execmodel.ExecutionBinding {
+	return execmodel.ExecutionBinding{
+		ID: "path-test-task", Mode: execmodel.WorkspaceModeTask, Access: execmodel.WorkspaceAccessReadWrite,
+		PathPolicy: execmodel.PathPolicyStrictWorkspace, Owner: execmodel.ExecutionOwnerRef{RunID: "path-test-run"},
+	}
+}
+
+func projectBinding() execmodel.ExecutionBinding {
+	return execmodel.ExecutionBinding{
+		ID: "path-test-project", Mode: execmodel.WorkspaceModeProject, Access: execmodel.WorkspaceAccessReadWrite,
+		PathPolicy: execmodel.PathPolicyPermissionOnly, Owner: execmodel.ExecutionOwnerRef{RunID: "path-test-run"},
 	}
 }

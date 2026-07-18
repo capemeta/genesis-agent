@@ -2,12 +2,12 @@ package builtin
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 
 	plancontract "genesis-agent/internal/capabilities/plan/contract"
 	planmodel "genesis-agent/internal/capabilities/plan/model"
 	"genesis-agent/internal/capabilities/tool/contract"
+	toolparam "genesis-agent/internal/capabilities/tool/param"
 	"genesis-agent/internal/platform/contextutil"
 )
 
@@ -55,7 +55,7 @@ func (t *TodoUpdateStepTool) Execute(ctx context.Context, params string) (string
 		Explanation string               `json:"explanation"`
 	}
 
-	if err := json.Unmarshal([]byte(params), &args); err != nil {
+	if err := toolparam.Decode(params, &args); err != nil {
 		return "", fmt.Errorf("unmarshal parameters failed: %w", err)
 	}
 

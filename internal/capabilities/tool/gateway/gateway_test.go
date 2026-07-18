@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	hookcontract "genesis-agent/internal/capabilities/hook/contract"
@@ -60,7 +61,24 @@ func newFakeRegistry() *fakeRegistry {
 	return r
 }
 
-func (r *fakeRegistry) Register(t tool.Tool)      { r.tools[t.GetInfo().Name] = t }
+func (r *fakeRegistry) Register(t tool.Tool) error {
+	if _, exists := r.tools[t.GetInfo().Name]; exists {
+		return fmt.Errorf("duplicate tool: %s", t.GetInfo().Name)
+	}
+	r.tools[t.GetInfo().Name] = t
+	return nil
+}
+func (r *fakeRegistry) Replace(name, expectedOwner string, t tool.Tool) error {
+	if _, exists := r.tools[name]; !exists || expectedOwner != "fake" {
+		return fmt.Errorf("replace rejected")
+	}
+	r.tools[name] = t
+	return nil
+}
+func (r *fakeRegistry) Owner(name string) (string, bool) {
+	_, ok := r.tools[name]
+	return "fake", ok
+}
 func (r *fakeRegistry) Unregister(name string)    { delete(r.tools, name) }
 func (r *fakeRegistry) Get(name string) tool.Tool { return r.tools[name] }
 func (r *fakeRegistry) Execute(ctx context.Context, name, params string) (string, error) {

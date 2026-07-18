@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	execcontract "genesis-agent/internal/capabilities/execution/contract"
 	execmodel "genesis-agent/internal/capabilities/execution/model"
@@ -33,6 +34,12 @@ func Open(ctx context.Context, deps Deps, opts Options) (*Session, error) {
 		return nil, fmt.Errorf("sandbox filesystem client未配置")
 	}
 	opts = mergeOptions(DefaultOptions(), opts)
+	if err := opts.Run.Binding.Validate(); err != nil {
+		return nil, execcontract.NewError(execcontract.ErrCodeExecutionBindingRequired, fmt.Errorf("打开 sandbox session 需要有效 ExecutionBinding: %w", err))
+	}
+	if err := opts.Run.Workspace.ValidateFor(opts.Run.Binding); err != nil {
+		return nil, execcontract.NewError(execcontract.ErrCodeExecutionBindingConflict, fmt.Errorf("sandbox session workspace 与 binding 不一致: %w", err))
+	}
 	raw, err := deps.Sessions.OpenSession(ctx, sandboxcontract.SessionOptions{
 		Workspace: opts.Workspace,
 		Sandbox:   opts.Sandbox,
@@ -56,6 +63,17 @@ func (s *Session) Workspace() sandboxcontract.WorkspaceRef {
 		return sandboxcontract.WorkspaceRef{}
 	}
 	return s.workspace
+}
+
+// ExpiresAt 返回底层实现提供的权威 lease；不支持时返回零值并由 Harness fail closed。
+func (s *Session) ExpiresAt() time.Time {
+	if s == nil || s.raw == nil {
+		return time.Time{}
+	}
+	if leased, ok := s.raw.(interface{ ExpiresAt() time.Time }); ok {
+		return leased.ExpiresAt()
+	}
+	return time.Time{}
 }
 
 // Raw 返回底层 session 端口。
@@ -241,24 +259,21 @@ func mergeRunOptions(base, override execcontract.RunOptions) execcontract.RunOpt
 	if override.Sandbox.Mode != "" || override.Sandbox.Provider != "" || override.Sandbox.RuntimeProfile != "" || override.Sandbox.TaskType != "" || override.Sandbox.Operation != "" {
 		out.Sandbox = override.Sandbox
 	}
-	out.Workspace = mergeExecutionWorkspace(out.Workspace, override.Workspace)
-	if len(override.InputArtifacts) > 0 {
-		out.InputArtifacts = override.InputArtifacts
+	if override.Binding.ID != "" || override.Binding.Mode != "" || override.Binding.Owner.RunID != "" {
+		out.Binding = override.Binding
 	}
-	if override.ArtifactCollectionPolicy != "" {
-		out.ArtifactCollectionPolicy = override.ArtifactCollectionPolicy
+	out.Workspace = mergeExecutionWorkspace(out.Workspace, override.Workspace)
+	if len(override.StagedInputs) > 0 {
+		out.StagedInputs = override.StagedInputs
+	}
+	if override.OutputDiscoveryPolicy != "" {
+		out.OutputDiscoveryPolicy = override.OutputDiscoveryPolicy
 	}
 	return out
 }
 
 func mergeExecutionWorkspace(base, override execmodel.ExecutionWorkspace) execmodel.ExecutionWorkspace {
 	out := base
-	if override.Mode != "" {
-		out.Mode = override.Mode
-	}
-	if override.PathPolicy != "" {
-		out.PathPolicy = override.PathPolicy
-	}
 	if override.WorkDir != "" {
 		out.WorkDir = override.WorkDir
 	}

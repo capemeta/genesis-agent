@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	capmodel "genesis-agent/internal/capabilities/capability/model"
-	"io"
 	"path"
 	"strings"
 
@@ -16,6 +15,7 @@ import (
 	skillcontract "genesis-agent/internal/capabilities/skill/contract"
 	"genesis-agent/internal/capabilities/skill/model"
 	tool "genesis-agent/internal/capabilities/tool/contract"
+	toolparam "genesis-agent/internal/capabilities/tool/param"
 )
 
 type Deps struct {
@@ -75,13 +75,8 @@ func (t *Tool) GetInfo() *tool.Info {
 
 func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 	var in input
-	decoder := json.NewDecoder(strings.NewReader(params))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&in); err != nil {
+	if err := toolparam.Decode(params, &in); err != nil {
 		return "", fmt.Errorf("解析read_skill_resource参数失败: %w", err)
-	}
-	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		return "", fmt.Errorf("解析read_skill_resource参数失败: 参数只能包含一个JSON对象")
 	}
 	name, err := normalizeSkillName(in.Name, in.Skill)
 	if err != nil {

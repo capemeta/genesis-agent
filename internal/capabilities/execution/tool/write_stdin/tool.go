@@ -5,11 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"strings"
 
 	execcontract "genesis-agent/internal/capabilities/execution/contract"
 	tool "genesis-agent/internal/capabilities/tool/contract"
+	toolparam "genesis-agent/internal/capabilities/tool/param"
 )
 
 // Deps 是 write_stdin 工具的依赖项。
@@ -85,13 +85,5 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 }
 
 func decodeParams(params string, dst any) error {
-	decoder := json.NewDecoder(strings.NewReader(params))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(dst); err != nil {
-		return fmt.Errorf("参数解析失败: %w", err)
-	}
-	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		return fmt.Errorf("参数只能包含一个JSON对象")
-	}
-	return nil
+	return toolparam.Decode(params, dst)
 }

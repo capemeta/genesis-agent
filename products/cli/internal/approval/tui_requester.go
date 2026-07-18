@@ -5,8 +5,8 @@ import (
 	"context"
 	"sync"
 
-	tea "github.com/charmbracelet/bubbletea"
 	"genesis-agent/internal/capabilities/approval/model"
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 // ApprovalRequiredMsg 审批挂起消息，供 TUI 捕获并在主更新循环中渲染卡片与拦截键盘
@@ -56,6 +56,13 @@ func (r *TUIApprovalRequester) RequestApproval(ctx context.Context, req model.Re
 	// 阻塞等待用户从 TUI 侧写入决策
 	select {
 	case <-ctx.Done():
+		// TUI 的 abort 会先投递显式决策再取消 Run。两者同时就绪时优先保留
+		// 用户语义与审批审计，避免退化成无法区分来源的 context cancelled。
+		select {
+		case dec := <-decisionCh:
+			return dec, nil
+		default:
+		}
 		return model.Decision{Type: model.DecisionDenied, Reason: "context cancelled"}, ctx.Err()
 	case dec := <-decisionCh:
 		return dec, nil

@@ -14,6 +14,7 @@ import (
 	skillcontract "genesis-agent/internal/capabilities/skill/contract"
 	"genesis-agent/internal/capabilities/skill/model"
 	tool "genesis-agent/internal/capabilities/tool/contract"
+	toolparam "genesis-agent/internal/capabilities/tool/param"
 )
 
 const (
@@ -119,8 +120,8 @@ func (t *Tool) renderDescription(ctx context.Context) (string, error) {
 
 func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 	var in input
-	if err := json.Unmarshal([]byte(params), &in); err != nil {
-		return "", fmt.Errorf("解析Skill参数失败: %w", err)
+	if err := toolparam.Decode(params, &in); err != nil {
+		return "", fmt.Errorf("解析Skill参数失败（参数仅支持 skill/resource/args，必须提供 skill或resource）: %w", err)
 	}
 	return t.load(ctx, in, true, "model")
 }

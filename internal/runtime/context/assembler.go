@@ -149,8 +149,8 @@ func (a *DefaultContextAssembler) assembleSystemPrompt(ctx context.Context, opt 
 func (a *DefaultContextAssembler) assembleHistory(ctx context.Context, opt AssemblerOptions) []*domain.Message {
 	var historyMsgs []*domain.Message
 
-	// 放入滚动摘要 (如果有，且在预算之内)
-	if opt.HistorySummary != nil && opt.Budget.Summary > 0 {
+	// 放入滚动摘要（若 GetRecent 已按 leaf 回填 conversation_summary，则不再重复注入）
+	if opt.HistorySummary != nil && opt.Budget.Summary > 0 && !historyContainsSummary(opt.HistoryMessages) {
 		summaryMsg := domain.NewConversationSummaryMessage(opt.HistorySummary.Content)
 		summaryTokens := a.estimator.EstimateMessages(ctx, []*domain.Message{summaryMsg}, opt.Model)
 		if summaryTokens <= opt.Budget.Summary {
@@ -185,6 +185,15 @@ func (a *DefaultContextAssembler) assembleHistory(ctx context.Context, opt Assem
 	}
 
 	return historyMsgs
+}
+
+func historyContainsSummary(msgs []*domain.Message) bool {
+	for _, m := range msgs {
+		if m != nil && m.NormalizedKind() == domain.MessageKindConversationSummary {
+			return true
+		}
+	}
+	return false
 }
 
 // 格式化用户画像内置字段和自定义字段为文本呈现

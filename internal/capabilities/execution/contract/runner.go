@@ -21,6 +21,9 @@ const (
 	ErrCodeRunnerFailed             ErrorCode = "runner_failed"
 	ErrCodeSandboxUnavailable       ErrorCode = "sandbox_unavailable"
 	ErrCodeSandboxPolicyUnsupported ErrorCode = "sandbox_policy_unsupported"
+	ErrCodeExecutionBindingRequired ErrorCode = "execution_binding_required"
+	ErrCodeExecutionBindingConflict ErrorCode = "execution_binding_conflict"
+	ErrCodeWorkspaceModeNotAllowed  ErrorCode = "workspace_mode_not_allowed"
 )
 
 // Error 携带稳定 code，方便工具输出和后续 HTTP/审计映射。
@@ -62,12 +65,13 @@ func CodeOf(err error) ErrorCode {
 
 // RunOptions 控制命令执行。
 type RunOptions struct {
-	Timeout                  time.Duration
-	MaxOutputBytes           int64
-	Sandbox                  model.SandboxProfile
-	Workspace                model.ExecutionWorkspace
-	InputArtifacts           []model.InputArtifactRef
-	ArtifactCollectionPolicy model.ArtifactCollectionPolicy
+	Timeout               time.Duration
+	MaxOutputBytes        int64
+	Sandbox               model.SandboxProfile
+	Binding               model.ExecutionBinding
+	Workspace             model.ExecutionWorkspace
+	StagedInputs          []model.StagedInputRef
+	OutputDiscoveryPolicy model.OutputDiscoveryPolicy
 }
 
 // CommandRunner 是不带沙箱编排语义的直接命令执行端口。

@@ -4,10 +4,51 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
+	artifactcontract "genesis-agent/internal/capabilities/artifact/contract"
+	artifactmodel "genesis-agent/internal/capabilities/artifact/model"
+	sandboxcontract "genesis-agent/internal/capabilities/sandbox/contract"
+	workspacememory "genesis-agent/internal/capabilities/workspace/adapter/memory"
+	workcontract "genesis-agent/internal/capabilities/workspace/contract"
+	workmodel "genesis-agent/internal/capabilities/workspace/model"
 	enterprisebootstrap "genesis-agent/products/enterprise/bootstrap"
 )
+
+type testArtifactControl struct{}
+
+func (testArtifactControl) RegisterProducedResource(context.Context, workcontract.RegisterProducedResourceRequest) (workmodel.ProducedResourceDescriptor, error) {
+	return workmodel.ProducedResourceDescriptor{}, nil
+}
+func (testArtifactControl) BindRemoteSession(context.Context, string, string, string, sandboxcontract.WorkspaceRef, time.Time) error {
+	return nil
+}
+func (testArtifactControl) InitializeRun(context.Context, artifactcontract.RunInitializationRequest) error {
+	return nil
+}
+func (testArtifactControl) FinalizeRequired(context.Context, string, string) (artifactmodel.FinalizationResult, error) {
+	return artifactmodel.FinalizationResult{}, nil
+}
+func (testArtifactControl) SelectAndFinalize(context.Context, string, string, string, string) (artifactmodel.DeliveryResult, error) {
+	return artifactmodel.DeliveryResult{}, nil
+}
+func (testArtifactControl) EvaluateCompletion(context.Context, string, string) (artifactcontract.CompletionDecision, error) {
+	return artifactcontract.CompletionDecision{Complete: true}, nil
+}
+func (testArtifactControl) RecordPassed(context.Context, artifactcontract.QAPassRequest) error {
+	return nil
+}
+func (testArtifactControl) Reserve(context.Context, artifactcontract.ReserveRequest) (artifactcontract.ReserveResult, error) {
+	return artifactcontract.ReserveResult{}, nil
+}
+func (testArtifactControl) CreateDeliverable(context.Context, artifactmodel.DeliverableSpec) error {
+	return nil
+}
+func (testArtifactControl) ListDeliverables(context.Context, string, string) ([]artifactmodel.DeliverableSpec, error) {
+	return nil, nil
+}
 
 func TestEnterpriseContainerWiresSkillTools(t *testing.T) {
 	dir := t.TempDir()
@@ -43,12 +84,29 @@ func TestEnterpriseContainerWiresSkillTools(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(configDir, "llm.yaml"), llmCfg, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	c := enterprisebootstrap.NewContainer(&configDir, true)
+	c := enterprisebootstrap.NewContainer(enterprisebootstrap.ContainerOptions{
+		ConfigDirRef: &configDir,
+		Quiet:        true,
+		Dependencies: enterprisebootstrap.Dependencies{
+			RunManifests: workspacememory.NewManifestStore(), ProducedResources: testArtifactControl{},
+			RemoteSessions: testArtifactControl{}, Reservations: testArtifactControl{}, Deliverables: testArtifactControl{}, ArtifactRuns: testArtifactControl{}, Finalizer: testArtifactControl{},
+			Completion: testArtifactControl{},
+			QAEvidence: testArtifactControl{},
+		},
+	})
 	t.Cleanup(func() { _ = c.Close() })
 	if err := c.Init(context.Background()); err != nil {
 		t.Fatalf("init: %v", err)
 	}
 	if c.Service() == nil {
 		t.Fatal("service is nil")
+	}
+}
+
+func TestEnterpriseContainerRequiresTenantRunManifestStore(t *testing.T) {
+	c := enterprisebootstrap.NewContainer(enterprisebootstrap.ContainerOptions{})
+	err := c.Init(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "RunManifestStore 未配置") {
+		t.Fatalf("expected fail-closed tenant store error, got %v", err)
 	}
 }

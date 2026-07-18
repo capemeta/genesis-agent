@@ -95,7 +95,13 @@ func TestOpenRunAndWorkspaceFSUseSameSessionWorkspace(t *testing.T) {
 			Operation:      execmodel.SandboxOperationRunSkill,
 			Language:       "python",
 		},
-		Run: execcontract.RunOptions{Timeout: 2 * time.Minute},
+		Run: execcontract.RunOptions{
+			Timeout: 2 * time.Minute,
+			Binding: execmodel.ExecutionBinding{
+				ID: "binding-session-1", Mode: execmodel.WorkspaceModeSession, Access: execmodel.WorkspaceAccessReadWrite,
+				Owner: execmodel.ExecutionOwnerRef{RunID: "run-session-1"},
+			},
+		},
 	})
 	if err != nil {
 		t.Fatal(err)

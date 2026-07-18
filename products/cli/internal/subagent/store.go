@@ -68,7 +68,7 @@ func NewFileStore(workspaceRoot string) (*FileStore, error) {
 	if err != nil {
 		return nil, fmt.Errorf("解析工作区路径失败: %w", err)
 	}
-	dir := filepath.Join(filepath.Clean(abs), ".genesis", "subagents")
+	dir := filepath.Join(filepath.Clean(abs), ".genesis", "runtime", "subagents")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("创建 subagent store 目录失败: %w", err)
 	}

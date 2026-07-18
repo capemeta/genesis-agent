@@ -63,7 +63,7 @@ func TestFileStoreRejectsMismatchedRecordAgentID(t *testing.T) {
 	if err := store.Save(context.Background(), contract.StoredInstance{Instance: model.Instance{AgentID: "agent-good", Status: model.StatusCompleted}}); err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(root, ".genesis", "subagents", "agent-good.json")
+	path := filepath.Join(root, ".genesis", "runtime", "subagents", "agent-good.json")
 	raw, err := json.Marshal(record{SchemaVersion: storeSchemaVersion, Stored: contract.StoredInstance{Instance: model.Instance{AgentID: "agent-other", Status: model.StatusCompleted}}})
 	if err != nil {
 		t.Fatal(err)
@@ -112,7 +112,7 @@ func TestFileStoreCleanupKeepsRunningByDefault(t *testing.T) {
 		if err := store.Save(context.Background(), value); err != nil {
 			t.Fatal(err)
 		}
-		path := filepath.Join(root, ".genesis", "subagents", value.Instance.AgentID+".json")
+		path := filepath.Join(root, ".genesis", "runtime", "subagents", value.Instance.AgentID+".json")
 		if err := os.Chtimes(path, old, old); err != nil {
 			t.Fatal(err)
 		}

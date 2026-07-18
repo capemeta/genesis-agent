@@ -2,14 +2,10 @@ package react
 
 import (
 	"encoding/json"
-	"path"
 	"strings"
 
-	"genesis-agent/internal/platform/logger"
 	"genesis-agent/internal/runtime"
 )
-
-const deliveryHintText = "artifacts[].path is already the controlled delivery path; do not copy/write_file the artifact again to $OUTPUT_DIR or workspace root; do not forge binary documents via write_file"
 
 // annotateSkillFollowHints 按已加载技能正文做软门禁提示，不改变成功/失败语义。
 // 规则全部来自技能正文结构（前置章节链接、QA 章节命令），不绑定具体技能名或产物类型。
@@ -29,11 +25,6 @@ func annotateSkillFollowHints(rc *runtime.RunContext, toolName, args, content st
 		if cmd := extractCommandArg(args); cmd != "" {
 			follow.NoteExecutedCommand(cmd, toolResultOK(content))
 		}
-		if toolResultOK(content) {
-			if names := extractDeliveredBasenames(content); len(names) > 0 {
-				follow.NoteDeliveredArtifacts(names)
-			}
-		}
 	}
 
 	hints := map[string]any{}
@@ -49,6 +40,7 @@ func annotateSkillFollowHints(rc *runtime.RunContext, toolName, args, content st
 		}
 	}
 	if name == "run_skill_command" && isQA && !toolResultOK(content) {
+		follow.NoteQAEnvironmentFailure(cmd, extractFailureKind(content))
 		hints["qa_failed"] = true
 		hints["skill_follow"] = "qa_failed"
 		if kind := extractFailureKind(content); kind != "" {
@@ -68,127 +60,10 @@ func annotateSkillFollowHints(rc *runtime.RunContext, toolName, args, content st
 			hints["qa_hint"] = "Skill requires QA before finishing; run the QA steps declared in the skill via run_skill_command and confirm results."
 		}
 	}
-	if name == "run_skill_command" && hasProducedArtifact(content) && toolResultOK(content) {
-		hints["delivery_hint"] = deliveryHintText
-		hints["warning"] = "Artifact already delivered at artifacts[].path — treat that path as final; do not re-copy with write_file."
-	}
-	if name == "write_file" && shouldWarnRedeivery(follow, args, content) {
-		hints["delivery_hint"] = deliveryHintText
-		hints["skill_follow"] = "delivery_complete"
-		hints["warning"] = "Do not re-deliver or forge artifacts with write_file; use artifacts[].path from the earlier run_skill_command result."
-	}
-	if name == "write_file" && isLikelyFinalTextWrittenToWork(args) {
-		hints["delivery_path_mismatch"] = true
-		hints["delivery_path_hint"] = "$WORK_DIR is for intermediate scripts/state. If this file is the user-requested final deliverable, write the same content to $OUTPUT_DIR/<name> (or the user's explicit destination) before finishing."
-		hints["warning"] = "Possible delivery path mismatch: a document was written to $WORK_DIR instead of $OUTPUT_DIR."
-	}
 	if len(hints) == 0 {
 		return content
 	}
 	return mergeJSONHints(content, hints)
-}
-
-func isLikelyFinalTextWrittenToWork(args string) bool {
-	writePath := strings.TrimSpace(extractWritePath(args))
-	if writePath == "" {
-		return false
-	}
-	normalized := strings.ToLower(strings.ReplaceAll(writePath, `\`, "/"))
-	if normalized != "$work_dir" && !strings.HasPrefix(normalized, "$work_dir/") &&
-		!strings.HasPrefix(normalized, "${work_dir}/") && !strings.HasPrefix(normalized, "%work_dir%/") {
-		return false
-	}
-	switch path.Ext(normalized) {
-	case ".md", ".markdown", ".txt", ".csv", ".tsv", ".html", ".htm":
-		return true
-	default:
-		return false
-	}
-}
-
-func shouldWarnRedeivery(follow *runtime.SkillFollowState, args, content string) bool {
-	if looksLikeArtifactInvalid(content) {
-		return true
-	}
-	writePath := extractWritePath(args)
-	if writePath == "" {
-		return false
-	}
-	lower := strings.ToLower(strings.ReplaceAll(writePath, `\`, `/`))
-	base := path.Base(lower)
-	if follow != nil && follow.IsDeliveredName(base) {
-		return true
-	}
-	if follow != nil && follow.HasDeliveredArtifacts() && looksLikeBinaryArtifactName(base) {
-		return true
-	}
-	return false
-}
-
-func looksLikeArtifactInvalid(content string) bool {
-	lower := strings.ToLower(content)
-	return strings.Contains(lower, "artifact_invalid") || strings.Contains(content, "冒充")
-}
-
-func looksLikeBinaryArtifactName(base string) bool {
-	switch path.Ext(base) {
-	case ".pptx", ".ppt", ".docx", ".doc", ".xlsx", ".xls", ".pdf", ".zip", ".png", ".jpg", ".jpeg", ".gif", ".webp":
-		return true
-	default:
-		return false
-	}
-}
-
-func extractWritePath(args string) string {
-	var raw map[string]any
-	if err := json.Unmarshal([]byte(args), &raw); err != nil {
-		return ""
-	}
-	if v, ok := raw["path"].(string); ok {
-		return strings.TrimSpace(v)
-	}
-	return ""
-}
-
-func extractDeliveredBasenames(content string) []string {
-	var raw map[string]any
-	if err := json.Unmarshal([]byte(content), &raw); err != nil {
-		return nil
-	}
-	seen := map[string]struct{}{}
-	var out []string
-	add := func(name string) {
-		base := strings.ToLower(path.Base(strings.ReplaceAll(strings.TrimSpace(name), `\`, `/`)))
-		if base == "" || base == "." {
-			return
-		}
-		if _, ok := seen[base]; ok {
-			return
-		}
-		seen[base] = struct{}{}
-		out = append(out, base)
-	}
-	if arts, ok := raw["artifacts"].([]any); ok {
-		for _, item := range arts {
-			m, ok := item.(map[string]any)
-			if !ok {
-				continue
-			}
-			if n, ok := m["name"].(string); ok {
-				add(n)
-			} else if p, ok := m["path"].(string); ok {
-				add(p)
-			}
-		}
-	}
-	if produced, ok := raw["produced"].([]any); ok {
-		for _, item := range produced {
-			if s, ok := item.(string); ok {
-				add(s)
-			}
-		}
-	}
-	return out
 }
 
 func extractReadTarget(args, content string) string {
@@ -227,7 +102,7 @@ func extractCommandArg(args string) string {
 
 func toolResultOK(content string) bool {
 	var raw map[string]any
-	if err := json.Unmarshal([]byte(content), &raw); err != nil {
+	if !decodeFirstJSONObject(content, &raw) {
 		// 非 JSON 结果：不视为成功 QA（避免误清 pending）
 		return false
 	}
@@ -249,7 +124,7 @@ func toolResultOK(content string) bool {
 
 func extractFailureKind(content string) string {
 	var raw map[string]any
-	if err := json.Unmarshal([]byte(content), &raw); err != nil {
+	if !decodeFirstJSONObject(content, &raw) {
 		return ""
 	}
 	if v, ok := raw["failure_kind"].(string); ok {
@@ -258,34 +133,32 @@ func extractFailureKind(content string) string {
 	return ""
 }
 
+// decodeFirstJSONObject 接受 Tool Gateway 在结构化结果后追加的人类可读错误摘要。
+// 只读取首个 JSON 对象，不把尾随诊断误当成协议字段。
+func decodeFirstJSONObject(content string, target *map[string]any) bool {
+	if target == nil {
+		return false
+	}
+	decoder := json.NewDecoder(strings.NewReader(strings.TrimSpace(content)))
+	return decoder.Decode(target) == nil && *target != nil
+}
+
 func hasProducedArtifact(content string) bool {
 	var raw map[string]any
 	if err := json.Unmarshal([]byte(content), &raw); err != nil {
 		return false
 	}
-	if arts, ok := raw["artifacts"].([]any); ok && len(arts) > 0 {
-		return true
-	}
 	if produced, ok := raw["produced"].([]any); ok && len(produced) > 0 {
-		return true
-	}
-	if p, ok := raw["path"].(string); ok && strings.TrimSpace(p) != "" && looksLikeArtifactPath(p) {
 		return true
 	}
 	return false
 }
 
-func looksLikeArtifactPath(p string) bool {
-	base := strings.ToLower(path.Base(strings.ReplaceAll(p, `\`, `/`)))
-	if base == "" || base == "." {
-		return false
-	}
-	return strings.Contains(base, ".")
-}
-
 func mergeJSONHints(content string, hints map[string]any) string {
 	var raw map[string]any
-	if err := json.Unmarshal([]byte(content), &raw); err != nil || raw == nil {
+	trimmed := strings.TrimSpace(content)
+	decoder := json.NewDecoder(strings.NewReader(trimmed))
+	if err := decoder.Decode(&raw); err != nil || raw == nil {
 		payload := map[string]any{"result": content}
 		for k, v := range hints {
 			payload[k] = v
@@ -295,6 +168,11 @@ func mergeJSONHints(content string, hints map[string]any) string {
 			return content
 		}
 		return string(data)
+	}
+	if offset := decoder.InputOffset(); offset < int64(len(trimmed)) {
+		if diagnostic := strings.TrimSpace(trimmed[offset:]); diagnostic != "" {
+			raw["diagnostic"] = diagnostic
+		}
 	}
 	for k, v := range hints {
 		raw[k] = v
@@ -315,23 +193,4 @@ func registerSkillInjectionFollow(rc *runtime.RunContext, content string) {
 		rc.SkillFollow = runtime.NewSkillFollowState()
 	}
 	rc.SkillFollow.RegisterInjection(content)
-}
-
-// applySkillFollowIncomplete 终态：已交付但技能 QA 未成功完成时标 Incomplete（三端共用）。
-func applySkillFollowIncomplete(rc *runtime.RunContext, log logger.Logger) bool {
-	if rc == nil || rc.Run == nil || rc.SkillFollow == nil {
-		return false
-	}
-	if !rc.SkillFollow.IncompleteDelivery() {
-		return false
-	}
-	rc.Run.Incomplete = true
-	pending := rc.SkillFollow.PendingQACommands()
-	if log != nil {
-		log.Warn("Skill QA 未完成，Run 标为 Incomplete",
-			"pending_qa", strings.Join(pending, "; "),
-			"delivered", true,
-		)
-	}
-	return true
 }

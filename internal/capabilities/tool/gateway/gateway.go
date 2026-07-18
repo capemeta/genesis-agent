@@ -118,7 +118,13 @@ func (g *Gateway) SetAuthorizer(authz Authorizer) {
 }
 
 // Register 透传工具注册。产品 bootstrap 仍应优先注册后再创建 Gateway。
-func (g *Gateway) Register(t tool.Tool) { g.registry.Register(t) }
+func (g *Gateway) Register(t tool.Tool) error { return g.registry.Register(t) }
+
+func (g *Gateway) Replace(name, expectedOwner string, t tool.Tool) error {
+	return g.registry.Replace(name, expectedOwner, t)
+}
+
+func (g *Gateway) Owner(name string) (string, bool) { return g.registry.Owner(name) }
 
 // Unregister 透传工具注销（供 MCP listChanged / 断连动态撤下工具）。
 func (g *Gateway) Unregister(name string) { g.registry.Unregister(name) }

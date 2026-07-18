@@ -5,8 +5,13 @@ import (
 	"strings"
 )
 
-var pathLikePattern = regexp.MustCompile(`(?i)(\$?\{?(?:INPUT_DIR|OUTPUT_DIR|TMPDIR|WORK_DIR|SKILL_DIR|GENESIS_WORKSPACE)\}?[/\\][^\s"'` + "`" + `;|&)]*|%?(?:INPUT_DIR|OUTPUT_DIR|TMPDIR|WORK_DIR|SKILL_DIR|GENESIS_WORKSPACE)%?[/\\][^\s"'` + "`" + `;|&)]*|[a-z]:[/\\][^\s"'` + "`" + `;|&)]*|\\\\[^\s"'` + "`" + `;|&)]*|/[A-Za-z0-9._~${%][^\s"'` + "`" + `;|&)]*)`)
+var pathLikePattern = regexp.MustCompile(`(?i)(\$?\{?(?:INPUT_DIR|OUTPUT_DIR|TMPDIR|WORK_DIR|SKILL_DIR|GENESIS_WORKSPACE)\}?[/\\][^\s"'` + "`" + `;|&)]*|%?(?:INPUT_DIR|OUTPUT_DIR|TMPDIR|WORK_DIR|SKILL_DIR|GENESIS_WORKSPACE)%?[/\\][^\s"'` + "`" + `;|&)]*|[a-z]:[/\\][^\s"'` + "`" + `;|&)]*|\\\\[^\s"'` + "`" + `;|&)]*|(?:\.\.[/\\])+[^\s"'` + "`" + `;|&)]*|/[A-Za-z0-9._~${%][^\s"'` + "`" + `;|&)]*)`)
 var windowsAbsPattern = regexp.MustCompile(`^[a-z]:/`)
+
+type indexedPathFragment struct {
+	Value      string
+	Start, End int
+}
 
 // pathScanMode 控制路径片段放行策略。
 // shell 命令行保持严格；源码字面量允许「系统工具探测根」（which/PROGRAMFILES 回退），
@@ -29,8 +34,8 @@ func violationsFromTextMode(analyzer, location, text string, mode pathScanMode) 
 	}
 	seen := map[string]bool{}
 	violations := make([]Violation, 0, len(matches))
-	for _, raw := range matches {
-		fragment := trimPathFragment(raw)
+	for _, match := range matches {
+		fragment := trimPathFragment(match.Value)
 		if fragment == "" || seen[fragment] || !isMeaningfulPathFragment(fragment) || allowedStrictFragment(fragment) {
 			continue
 		}
@@ -81,12 +86,12 @@ func isSystemToolDiscoveryFragment(fragment string) bool {
 	return false
 }
 
-func pathFragmentsInText(text string) []string {
+func pathFragmentsInText(text string) []indexedPathFragment {
 	indexes := pathLikePattern.FindAllStringIndex(text, -1)
 	if len(indexes) == 0 {
 		return nil
 	}
-	fragments := make([]string, 0, len(indexes))
+	fragments := make([]indexedPathFragment, 0, len(indexes))
 	for _, index := range indexes {
 		start, end := index[0], index[1]
 		if start > 0 && text[start-1] == ':' {
@@ -99,7 +104,7 @@ func pathFragmentsInText(text string) []string {
 		if strings.HasPrefix(fragment, "/") && start > 0 && !isPathBoundary(text[start-1]) {
 			continue
 		}
-		fragments = append(fragments, fragment)
+		fragments = append(fragments, indexedPathFragment{Value: fragment, Start: start, End: end})
 	}
 	return fragments
 }
@@ -171,6 +176,9 @@ func isMeaningfulPathFragment(fragment string) bool {
 			return false
 		}
 	}
+	if strings.HasPrefix(normalized, "../") {
+		return true
+	}
 	return true
 }
 
@@ -195,6 +203,14 @@ func violationFor(fragment, location string) Violation {
 	normalized := strings.ReplaceAll(fragment, `\`, `/`)
 	lower := strings.ToLower(normalized)
 	switch {
+	case strings.HasPrefix(lower, "../"):
+		return Violation{
+			Severity: SeverityError,
+			Fragment: fragment,
+			Location: location,
+			Reason:   "任务型执行不能通过相对路径逃逸当前 execution workspace",
+			Fix:      "输入通过 inputs staging，最终文件由 Harness 按 Deliverable 契约交付；不要用 ../ 搬运文件",
+		}
 	case windowsAbsPattern.MatchString(lower),
 		strings.HasPrefix(lower, "//"),
 		strings.HasPrefix(lower, "/users/"),

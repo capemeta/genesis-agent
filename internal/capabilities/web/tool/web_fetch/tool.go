@@ -5,11 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"strings"
 	"time"
 
 	"genesis-agent/internal/capabilities/tool/contract"
+	toolparam "genesis-agent/internal/capabilities/tool/param"
 	webcontract "genesis-agent/internal/capabilities/web/contract"
 )
 
@@ -121,13 +121,5 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 }
 
 func decodeParams(params string, dst any) error {
-	decoder := json.NewDecoder(strings.NewReader(params))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(dst); err != nil {
-		return fmt.Errorf("invalid parameters: %w", err)
-	}
-	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		return fmt.Errorf("parameters must contain exactly one JSON object")
-	}
-	return nil
+	return toolparam.Decode(params, dst)
 }

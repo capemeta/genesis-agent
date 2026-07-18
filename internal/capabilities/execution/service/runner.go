@@ -16,8 +16,6 @@ import (
 	"genesis-agent/internal/runtime/progress"
 )
 
-const sandboxFallbackWarning = "sandbox runner unavailable; fell back to local execution"
-
 // Runner 根据 SandboxProfile 在 direct runner 和 sandbox runner 之间做最小编排。
 type Runner struct {
 	direct        execcontract.CommandRunner
@@ -72,6 +70,12 @@ func NewRunner(direct execcontract.CommandRunner, sandbox execcontract.SandboxRu
 
 // Run 执行命令，并按 SandboxProfile 选择 direct 或 sandbox runner。
 func (r *Runner) Run(ctx context.Context, cmd execmodel.Command, opts execcontract.RunOptions) (*execmodel.Result, error) {
+	if err := validateExecutionBinding(opts); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(cmd.Cwd) == "" {
+		cmd.Cwd = opts.Workspace.WorkDir
+	}
 	cmd = applyExecutionWorkspaceEnv(cmd, opts.Workspace)
 	validator := r.pathValidator
 	if validator == nil {
@@ -123,47 +127,31 @@ func (r *Runner) Run(ctx context.Context, cmd execmodel.Command, opts execcontra
 		return result, err
 	case execmodel.SandboxOptional:
 		if r.sandbox == nil {
-			l.Info("准备在[本地宿主机]执行命令 (未配置沙箱，降级到本地)")
+			l.Warn("可选沙箱未配置；返回控制面，由 Harness 决定是否创建独立 Host attempt")
 			progress.Emit(ctx, progress.Event{
 				Kind:      progress.KindSandbox,
 				Phase:     progress.PhaseError,
 				Level:     progress.LevelWarn,
 				Component: "execution-runner",
-				Name:      "local_host",
-				Summary:   "自动降级：本地宿主机直接执行 (沙箱未配置)",
+				Name:      "sandbox",
+				Summary:   "沙箱不可用，等待 Harness 决策",
 			})
-			result, err := r.direct.Run(ctx, cmd, opts)
-			ensureEnvironment(result, execmodel.EnvironmentLocal, "")
-			addWarning(result, sandboxFallbackWarning)
-			if err != nil {
-				l.Error("本地宿主机命令执行失败", "error", err)
-			} else {
-				l.Info("本地宿主机命令执行完成", "exit_code", result.ExitCode)
-			}
-			return result, err
+			return nil, execcontract.NewError(execcontract.ErrCodeSandboxUnavailable, fmt.Errorf("SandboxRunner未配置；Harness 必须创建独立 backend attempt 后重试"))
 		}
 		l.Info("准备在[沙箱环境]执行命令 (可选沙箱)", "provider", opts.Sandbox.Provider, "sandbox_type", resolveSandboxType(opts.Sandbox.Provider), "runtime_profile", string(opts.Sandbox.RuntimeProfile))
 		result, err := r.sandbox.RunInSandbox(ctx, cmd, opts.Sandbox, opts)
 		if err != nil && (execcontract.CodeOf(err) == execcontract.ErrCodeSandboxUnavailable || execcontract.CodeOf(err) == execcontract.ErrCodeSandboxPolicyUnsupported) {
-			l.Warn("沙箱服务不可用或不支持当前策略，自动降级至本地宿主机执行", "error", err)
+			l.Warn("沙箱服务不可用或策略不支持；返回控制面，由 Harness 决定独立 attempt", "error", err)
 			progress.Emit(ctx, progress.Event{
 				Kind:      progress.KindSandbox,
 				Phase:     progress.PhaseError,
 				Level:     progress.LevelWarn,
 				Component: "execution-runner",
-				Name:      "local_host",
-				Summary:   "自动降级：本地宿主机直接执行 (沙箱策略未就绪)",
+				Name:      "sandbox",
+				Summary:   "沙箱不可用，等待 Harness 决策",
 				Detail:    err.Error(),
 			})
-			result, directErr := r.direct.Run(ctx, cmd, opts)
-			ensureEnvironment(result, execmodel.EnvironmentLocal, "")
-			addWarning(result, sandboxFallbackWarning+": "+err.Error())
-			if directErr != nil {
-				l.Error("降级本地执行命令失败", "error", directErr)
-			} else {
-				l.Info("降级本地执行命令完成", "exit_code", result.ExitCode)
-			}
-			return result, directErr
+			return nil, err
 		}
 		if err != nil {
 			l.Error("沙箱命令执行失败", "error", err)
@@ -199,15 +187,6 @@ func (r *Runner) Run(ctx context.Context, cmd execmodel.Command, opts execcontra
 }
 
 func applyExecutionWorkspaceEnv(cmd execmodel.Command, workspace execmodel.ExecutionWorkspace) execmodel.Command {
-	if workspace.WorkDir == "" {
-		workspace.WorkDir = cmd.Cwd
-	}
-	if workspace.WorkDir == "" {
-		workspace.WorkDir = "."
-	}
-	if workspace.TmpDir == "" {
-		workspace.TmpDir = os.TempDir()
-	}
 	env := make(map[string]string, len(cmd.Env)+5)
 	for k, v := range cmd.Env {
 		env[k] = v
@@ -228,6 +207,24 @@ func applyExecutionWorkspaceEnv(cmd execmodel.Command, workspace execmodel.Execu
 	}
 	cmd.Env = env
 	return cmd
+}
+
+func validateExecutionBinding(opts execcontract.RunOptions) error {
+	if strings.TrimSpace(opts.Binding.ID) == "" || strings.TrimSpace(opts.Binding.Owner.RunID) == "" {
+		return execcontract.NewError(execcontract.ErrCodeExecutionBindingRequired, fmt.Errorf("执行命令缺少可信 ExecutionBinding"))
+	}
+	switch opts.Binding.Mode {
+	case execmodel.WorkspaceModeProject, execmodel.WorkspaceModeTask, execmodel.WorkspaceModeSession:
+	default:
+		return execcontract.NewError(execcontract.ErrCodeWorkspaceModeNotAllowed, fmt.Errorf("不支持的 workspace mode: %q", opts.Binding.Mode))
+	}
+	if err := opts.Binding.Validate(); err != nil {
+		return execcontract.NewError(execcontract.ErrCodeExecutionBindingConflict, fmt.Errorf("ExecutionBinding 无效: %w", err))
+	}
+	if err := opts.Workspace.ValidateFor(opts.Binding); err != nil {
+		return execcontract.NewError(execcontract.ErrCodeExecutionBindingConflict, fmt.Errorf("ExecutionWorkspace 与 binding 不一致: %w", err))
+	}
+	return nil
 }
 
 func setIfNonEmpty(env map[string]string, key, value string) {

@@ -37,4 +37,3 @@ func IsExecutableScriptEntry(resourceOrName string) bool {
 	}
 	return true
 }
-

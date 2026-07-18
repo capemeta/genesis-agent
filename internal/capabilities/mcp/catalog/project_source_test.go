@@ -18,7 +18,7 @@ func TestProjectSourceLoadsYAML(t *testing.T) {
 	if err := os.MkdirAll(genesis, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	raw := []byte("servers:\n  demo:\n    type: stdio\n    command: echo\n    enabled: true\n")
+	raw := []byte("servers:\n  demo:\n    type: stdio\n    placement: local_stdio\n    command: echo\n    enabled: true\n")
 	if err := os.WriteFile(filepath.Join(genesis, "mcp.yaml"), raw, 0o644); err != nil {
 		t.Fatal(err)
 	}

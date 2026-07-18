@@ -2,12 +2,12 @@ package builtin
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 
 	plancontract "genesis-agent/internal/capabilities/plan/contract"
 	planmodel "genesis-agent/internal/capabilities/plan/model"
 	"genesis-agent/internal/capabilities/tool/contract"
+	toolparam "genesis-agent/internal/capabilities/tool/param"
 	"genesis-agent/internal/platform/contextutil"
 )
 
@@ -30,10 +30,10 @@ func (t *TodoWriteTool) GetInfo() *tool.Info {
 			Required: []string{"steps"},
 			Properties: map[string]*tool.ParameterSchema{
 				"steps": {
-					Type: "array",
+					Type:        "array",
 					Description: "新的完整待办事项步骤数组。会全量覆盖旧列表。",
 					Items: &tool.ParameterSchema{
-						Type: "object",
+						Type:     "object",
 						Required: []string{"title", "status"},
 						Properties: map[string]*tool.ParameterSchema{
 							"title":    {Type: "string", Description: "步骤文字描述（请精炼在 5-10 个字内，如 '分析配置文件'）"},
@@ -45,7 +45,7 @@ func (t *TodoWriteTool) GetInfo() *tool.Info {
 					},
 				},
 				"explanation": {
-					Type: "string", 
+					Type:        "string",
 					Description: "说明本次全量重构或规划的核心原因，用以写入审计历史。",
 				},
 			},
@@ -70,7 +70,7 @@ func (t *TodoWriteTool) Execute(ctx context.Context, params string) (string, err
 		Explanation string           `json:"explanation"`
 	}
 
-	if err := json.Unmarshal([]byte(params), &args); err != nil {
+	if err := toolparam.Decode(params, &args); err != nil {
 		return "", fmt.Errorf("unmarshal parameters failed: %w", err)
 	}
 

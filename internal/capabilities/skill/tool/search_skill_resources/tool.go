@@ -12,6 +12,7 @@ import (
 	skillcontract "genesis-agent/internal/capabilities/skill/contract"
 	"genesis-agent/internal/capabilities/skill/model"
 	tool "genesis-agent/internal/capabilities/tool/contract"
+	toolparam "genesis-agent/internal/capabilities/tool/param"
 )
 
 type Deps struct {
@@ -50,7 +51,7 @@ func (t *Tool) GetInfo() *tool.Info {
 
 func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 	var in input
-	if err := json.Unmarshal([]byte(params), &in); err != nil {
+	if err := toolparam.Decode(params, &in); err != nil {
 		return "", fmt.Errorf("解析search_skill_resources参数失败: %w", err)
 	}
 	if strings.TrimSpace(in.Query) == "" {

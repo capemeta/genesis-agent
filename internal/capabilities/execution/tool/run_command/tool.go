@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"strings"
 	"time"
 
@@ -17,7 +16,9 @@ import (
 	fscontract "genesis-agent/internal/capabilities/filesystem/contract"
 	fsmodel "genesis-agent/internal/capabilities/filesystem/model"
 	tool "genesis-agent/internal/capabilities/tool/contract"
+	toolparam "genesis-agent/internal/capabilities/tool/param"
 	"genesis-agent/internal/capabilities/tool/scheduler"
+	workcontract "genesis-agent/internal/capabilities/workspace/contract"
 	"genesis-agent/internal/platform/contextutil"
 )
 
@@ -173,10 +174,16 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 	}
 	defer release()
 
+	prepared, ok := workcontract.PreparedRunFromContext(ctx)
+	if !ok {
+		return "", execcontract.NewError(execcontract.ErrCodeExecutionBindingRequired, fmt.Errorf("run_command 缺少控制面 ExecutionBinding"))
+	}
 	runOpts := execcontract.RunOptions{
 		Timeout:        timeoutOf(in.TimeoutMS),
 		MaxOutputBytes: outputLimitOf(in.MaxOutputBytes),
 		Sandbox:        sandboxProfile(ctx, t.deps.Sandbox),
+		Binding:        prepared.Execution.Binding,
+		Workspace:      prepared.Execution.Workspace,
 	}
 	if runOpts.Sandbox.Metadata == nil {
 		runOpts.Sandbox.Metadata = make(map[string]string)
@@ -389,15 +396,7 @@ func outputLimitOf(limit int64) int64 {
 }
 
 func decodeParams(params string, dst any) error {
-	decoder := json.NewDecoder(strings.NewReader(params))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(dst); err != nil {
-		return fmt.Errorf("参数解析失败: %w", err)
-	}
-	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		return fmt.Errorf("参数只能包含一个JSON对象")
-	}
-	return nil
+	return toolparam.Decode(params, dst)
 }
 
 func toJSON(v any) (string, error) {

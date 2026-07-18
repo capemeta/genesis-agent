@@ -42,12 +42,33 @@ func (a *Adapter) Register(ctx context.Context, capability capmodel.CapabilityIn
 		return fmt.Errorf("tool capability缺少name和id")
 	}
 	wrapped := &capabilityTool{capability: capability}
+	a.mu.RLock()
+	previous := a.tools[capability.ID]
+	a.mu.RUnlock()
+	if a.registry != nil {
+		if previous != nil && previous.GetInfo().Name == name && a.registry.Get(name) == previous {
+			owner, ok := a.registry.Owner(name)
+			if !ok {
+				return fmt.Errorf("更新 tool capability %q: registry owner 缺失", capability.ID)
+			}
+			if err := a.registry.Replace(name, owner, wrapped); err != nil {
+				return fmt.Errorf("更新 tool capability %q: %w", capability.ID, err)
+			}
+		} else {
+			if err := a.registry.Register(wrapped); err != nil {
+				return fmt.Errorf("注册 tool capability %q: %w", capability.ID, err)
+			}
+			if previous != nil {
+				a.registry.Unregister(previous.GetInfo().Name)
+			}
+		}
+	}
+	if previous != nil {
+		previous.setEnabled(false)
+	}
 	a.mu.Lock()
 	a.tools[capability.ID] = wrapped
 	a.mu.Unlock()
-	if a.registry != nil {
-		a.registry.Register(wrapped)
-	}
 	return nil
 }
 
@@ -56,11 +77,15 @@ func (a *Adapter) Unregister(ctx context.Context, capability capmodel.Capability
 		return err
 	}
 	a.mu.Lock()
-	defer a.mu.Unlock()
-	if wrapped := a.tools[capability.ID]; wrapped != nil {
+	wrapped := a.tools[capability.ID]
+	if wrapped != nil {
 		wrapped.setEnabled(false)
 	}
 	delete(a.tools, capability.ID)
+	a.mu.Unlock()
+	if wrapped != nil && a.registry != nil && a.registry.Get(wrapped.GetInfo().Name) == wrapped {
+		a.registry.Unregister(wrapped.GetInfo().Name)
+	}
 	return nil
 }
 

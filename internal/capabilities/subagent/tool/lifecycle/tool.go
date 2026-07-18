@@ -8,6 +8,7 @@ import (
 	"time"
 
 	tool "genesis-agent/internal/capabilities/tool/contract"
+	toolparam "genesis-agent/internal/capabilities/tool/param"
 	"genesis-agent/internal/platform/contextutil"
 	"genesis-agent/internal/runtime/multiagent/contract"
 	"genesis-agent/internal/runtime/multiagent/model"
@@ -89,7 +90,7 @@ func outputInfo() *tool.Info {
 }
 func (t *OutputTool) Execute(ctx context.Context, params string) (string, error) {
 	var in query
-	if err := json.Unmarshal([]byte(params), &in); err != nil {
+	if err := toolparam.Decode(params, &in); err != nil {
 		return "", fmt.Errorf("解析 TaskOutput 参数失败: %w", err)
 	}
 	instance, timedOut, err := t.waitForResult(ctx, in)
@@ -111,7 +112,7 @@ func (t *OutputTool) Execute(ctx context.Context, params string) (string, error)
 }
 func (t *StopTool) Execute(ctx context.Context, params string) (string, error) {
 	var in query
-	if err := json.Unmarshal([]byte(params), &in); err != nil {
+	if err := toolparam.Decode(params, &in); err != nil {
 		return "", fmt.Errorf("解析 TaskStop 参数失败: %w", err)
 	}
 	instance, err := t.controller.Get(ctx, in.AgentID)

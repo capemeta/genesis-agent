@@ -13,9 +13,12 @@ import (
 
 	"genesis-agent/internal/app"
 	shared "genesis-agent/internal/bootstrap"
+	agentappmemory "genesis-agent/internal/capabilities/agentapp/adapter/memory"
+	agentappmodel "genesis-agent/internal/capabilities/agentapp/model"
 	approvalmemory "genesis-agent/internal/capabilities/approval/adapter/memory"
 	approvalcontract "genesis-agent/internal/capabilities/approval/contract"
 	approvalservice "genesis-agent/internal/capabilities/approval/service"
+	artifactcontract "genesis-agent/internal/capabilities/artifact/contract"
 	auditfile "genesis-agent/internal/capabilities/audit/adapter/file"
 	auditmemory "genesis-agent/internal/capabilities/audit/adapter/memory"
 	auditcontract "genesis-agent/internal/capabilities/audit/contract"
@@ -53,7 +56,6 @@ import (
 	skillmodel "genesis-agent/internal/capabilities/skill/model"
 	skillparser "genesis-agent/internal/capabilities/skill/parser"
 	scriptservice "genesis-agent/internal/capabilities/skill/script/service"
-	scriptworkspace "genesis-agent/internal/capabilities/skill/script/workspace"
 	skillservice "genesis-agent/internal/capabilities/skill/service"
 	installskilldeps "genesis-agent/internal/capabilities/skill/tool/install_skill_dependencies"
 	installskillfromsource "genesis-agent/internal/capabilities/skill/tool/install_skill_from_source"
@@ -65,10 +67,16 @@ import (
 	toolcapability "genesis-agent/internal/capabilities/tool/adapter/capability"
 	toolcontract "genesis-agent/internal/capabilities/tool/contract"
 	"genesis-agent/internal/capabilities/tool/scheduler"
+	toolvalidation "genesis-agent/internal/capabilities/tool/validation"
 	usagefile "genesis-agent/internal/capabilities/usage/adapter/file"
 	usagememory "genesis-agent/internal/capabilities/usage/adapter/memory"
 	usagecontract "genesis-agent/internal/capabilities/usage/contract"
+	workspaceadapter "genesis-agent/internal/capabilities/workspace/adapter/sandbox"
+	workcontract "genesis-agent/internal/capabilities/workspace/contract"
+	workmodel "genesis-agent/internal/capabilities/workspace/model"
+	workservice "genesis-agent/internal/capabilities/workspace/service"
 	platformconfig "genesis-agent/internal/platform/config"
+	"genesis-agent/internal/platform/idgen"
 	"genesis-agent/internal/platform/logger"
 	multicontract "genesis-agent/internal/runtime/multiagent/contract"
 	multiagentmodel "genesis-agent/internal/runtime/multiagent/model"
@@ -82,12 +90,14 @@ import (
 	cliskill "genesis-agent/products/cli/internal/skill"
 	clisubagent "genesis-agent/products/cli/internal/subagent"
 	"genesis-agent/products/cli/internal/tui"
+	localartifactcontrol "genesis-agent/shared/local/artifactcontrol"
 	localexec "genesis-agent/shared/local/execution"
 	localfs "genesis-agent/shared/local/filesystem"
 	localresolver "genesis-agent/shared/local/pathresolver"
 	localplan "genesis-agent/shared/local/plan"
 	windowssandbox "genesis-agent/shared/local/sandbox/windows"
 	localskill "genesis-agent/shared/local/skill"
+	localworkspace "genesis-agent/shared/local/workspace"
 
 	httpfetcher "genesis-agent/internal/capabilities/web/adapter/fetch/http"
 	ddg "genesis-agent/internal/capabilities/web/adapter/search/fallback/duckduckgo"
@@ -133,6 +143,9 @@ type productRuntime struct {
 	hookExecutionRunner  execcontract.ExecutionRunner
 	config               *platformconfig.Config
 	workspaceRoot        string
+	artifactRuns         artifactcontract.RunInitializer
+	completion           artifactcontract.CompletionPolicy
+	qaEvidence           artifactcontract.QAEvidenceRecorder
 }
 
 // Execute 执行 CLI 产品命令树。
@@ -181,7 +194,7 @@ func (c *Container) Init(ctx context.Context) error {
 		}
 		sandboxCfg = clisandbox.MergeSessionOverride(sandboxCfg, c.sandbox)
 		c.sandbox = sandboxCfg
-		prof := profile.DefaultProfile()
+		prof := profile.DefaultProfile(cfg.MCP.Enabled)
 		runtime, log, err := buildProductRuntime(ctx, configDir, cfg, c.quiet, sandboxCfg, prof, workspaceRootOrDot(c.workspaceRoot))
 		if err != nil {
 			c.initErr = err
@@ -195,7 +208,7 @@ func (c *Container) Init(ctx context.Context) error {
 			c.initErr = err
 			return
 		}
-		planRepoDir := filepath.Join(filepath.Dir(configDir), ".genesis", "plans")
+		planRepoDir := filepath.Join(filepath.Dir(configDir), ".genesis", "runtime", "plans")
 		planRepo, err := localplan.NewFileRepository(planRepoDir)
 		if err != nil {
 			_ = c.logging.Close()
@@ -217,6 +230,13 @@ func (c *Container) Init(ctx context.Context) error {
 			c.initErr = err
 			return
 		}
+		runWorkspace, err := buildLocalRunWorkspace(runtime.workspaceRoot, runtime.artifactRuns, runtime.completion, runtime.qaEvidence)
+		if err != nil {
+			_ = c.logging.Close()
+			c.logging = nil
+			c.initErr = fmt.Errorf("初始化 CLI Run 工作空间失败: %w", err)
+			return
+		}
 		c.bundle, c.initErr = shared.BuildAgentService(ctx, shared.BuildOptions{
 			Product:                        "cli",
 			ConfigDir:                      configDir,
@@ -225,6 +245,7 @@ func (c *Container) Init(ctx context.Context) error {
 			DefaultAgentID:                 "default-agent",
 			DefaultAgentName:               "Genesis Agent",
 			Profile:                        prof,
+			RunWorkspace:                   runWorkspace,
 			AdditionalTools:                runtime.tools,
 			PromptInjectors:                runtime.promptInjectors,
 			Logger:                         runtime.logger,
@@ -262,6 +283,17 @@ func (c *Container) Init(ctx context.Context) error {
 		}
 		c.mcpStack = mcpStack
 		c.mcpStore = mcpStore
+		if err := toolvalidation.ValidateEnabled(c.bundle.ToolRegistry, prof.Tools.Enabled); err != nil {
+			if c.mcpStack != nil {
+				_ = c.mcpStack.Close(context.Background())
+				c.mcpStack = nil
+			}
+			_ = c.logging.Close()
+			c.logging = nil
+			c.bundle = nil
+			c.initErr = fmt.Errorf("CLI 工具装配与 Profile 不一致: %w", err)
+			return
+		}
 	})
 	return c.initErr
 }
@@ -407,12 +439,17 @@ func buildProductRuntime(ctx context.Context, configDir string, cfg *platformcon
 		_ = runtimeLogging.Close()
 		return productRuntime{}, nil, err
 	}
-
+	stateRoot := filepath.Join(workspaceRoot, ".genesis")
 	workspaceRoot = workspaceRootOrDot(workspaceRoot)
 	productTools, execStack, err := buildProductTools(sandboxCfg, baseApprovalSvc, log, workspaceRoot)
 	if err != nil {
 		_ = runtimeLogging.Close()
 		return productRuntime{}, nil, err
+	}
+	artifactControl, err := buildCLIArtifactControl(stateRoot, workspaceRoot, execStack)
+	if err != nil {
+		_ = runtimeLogging.Close()
+		return productRuntime{}, nil, fmt.Errorf("初始化 Artifact 控制面失败: %w", err)
 	}
 	environmentInjector := promptbuilder.NewEnvironmentContextInjector(cliEnvironmentContext(ctx, workspaceRoot, sandboxCfg.ExecutionProfile(), execStack.Shells))
 	tools := productTools
@@ -440,6 +477,21 @@ func buildProductRuntime(ctx context.Context, configDir string, cfg *platformcon
 	}
 	startSkillWatcher(ctx, roots, skillSvc)
 	catalogReq := skillcontract.CatalogRequest{Product: profilemodel.ChannelCLI, Environment: profilemodel.EnvironmentLocal, EnabledSkills: prof.Skills.Enabled, DisabledSkills: prof.Skills.Disabled}
+	inputRegistry, err := localworkspace.NewResourceRegistry(workspaceRoot)
+	if err != nil {
+		_ = runtimeLogging.Close()
+		return productRuntime{}, nil, err
+	}
+	inputStore, err := localworkspace.NewInputSnapshotStore(stateRoot)
+	if err != nil {
+		_ = runtimeLogging.Close()
+		return productRuntime{}, nil, err
+	}
+	inputStager, err := workservice.NewInputStager(inputRegistry, inputStore, idgen.NewUUIDGenerator())
+	if err != nil {
+		_ = runtimeLogging.Close()
+		return productRuntime{}, nil, err
+	}
 	// 依赖预检以 Profile 可见工具集为准（含 shared builder 注册的 builtin/web），不是仅 AdditionalTools。
 	enabledToolInventory := append([]string(nil), prof.Tools.Enabled...)
 	skillGateway, err := skilltool.New(skilltool.Deps{Service: skillSvc, Approval: baseApprovalSvc, CatalogRequest: catalogReq, EnabledTools: enabledToolInventory})
@@ -478,6 +530,12 @@ func buildProductRuntime(ctx context.Context, configDir string, cfg *platformcon
 		Logger:                log,
 		EnablePreflight:       cfg.Skills.EnablePreflight,
 		AutoRetryAfterInstall: cfg.Skills.AutoRetryAfterInstall,
+		Provisioner:           localworkspace.NewProvisioner(),
+		InputSnapshots:        inputStore,
+		ProducedResources:     artifactControl.produced,
+		RemoteSessions:        artifactControl.remoteSessions,
+		Reservations:          artifactControl.reservations,
+		Deliverables:          artifactControl.deliverables,
 	})
 	if err != nil {
 		_ = runtimeLogging.Close()
@@ -487,7 +545,9 @@ func buildProductRuntime(ctx context.Context, configDir string, cfg *platformcon
 		Runner:         skillScriptSvc,
 		CatalogRequest: catalogReq,
 		Sandbox:        sandboxCfg.ExecutionProfile(),
-		WorkspaceRoot:  workspaceRoot,
+		InputResolver:  inputRegistry,
+		InputStager:    inputStager,
+		Finalizer:      artifactControl.finalizer,
 	})
 	if err != nil {
 		_ = runtimeLogging.Close()
@@ -514,26 +574,14 @@ func buildProductRuntime(ctx context.Context, configDir string, cfg *platformcon
 		_ = runtimeLogging.Close()
 		return productRuntime{}, nil, err
 	}
-	tools = append(tools, skillGateway, listResources, readResource, searchResources, runSkillCommand, installDeps, installFromSource)
+	tools = append(tools, skillGateway, listResources, readResource, searchResources, runSkillCommand, artifactControl.selector, installDeps, installFromSource)
 	skillMatcher := &skillcollision.Matcher{Service: skillSvc, CatalogRequest: catalogReq}
 	skillMentions := &react.MentionSelector{Service: skillSvc, CatalogRequest: catalogReq}
 	// system 仅短硬规则；完整 catalog 挂在 Skill 工具 DescriptionFunc。
 	injector := promptbuilder.ContextInjectorFunc(func(ctx context.Context, req promptbuilder.BuildRequest) (promptbuilder.Fragment, error) {
 		var b strings.Builder
 		b.WriteString("Skills 是任务流程包，不是可执行工具。加载技能必须调用 Skill(skill=...)；禁止把 office-ppt 等技能名当作独立工具调用。用户输入中的 $skill 或 skill:// 引用会在回合开始自动注入。用户指定的宿主机文件应直接作为 run_skill_command.inputs，由运行时在审批后 stage，禁止 run_command / Copy-Item 手动搬运。可用技能列表见 Skill 工具描述中的 <available_skills>。用户给出 Skill 的 GitHub/URL 地址要求安装时：调用 install_skill_from_source（须审批），禁止 run_command/curl/git clone 旁路。若 run_skill_command 返回 failure_kind=dependency_missing：调用 install_skill_dependencies（须审批，仅装 runtime 白名单包）后，用相同参数再跑命令（安装成功会清零重复失败计数）；sandbox_violation 勿当成缺包。收到 failure_kind=repeated_failure：禁止再次提交相同调用，必须改参或改策略。收到 failure_kind=no_progress：必须总结阻塞或询问用户，禁止继续空转。")
-		b.WriteString("\n\nRun 文件落点：中间脚本/临时文件用 write_file(\"$WORK_DIR/...\")；最终交付进 $OUTPUT_DIR；禁止写到仓库根目录。")
-		if req.Run != nil && strings.TrimSpace(req.Run.ID) != "" {
-			if ws, err := scriptworkspace.PrepareLocalTask(workspaceRoot, req.Run.ID); err == nil {
-				rel := func(abs string) string {
-					r, err := filepath.Rel(workspaceRoot, abs)
-					if err != nil {
-						return abs
-					}
-					return filepath.ToSlash(r)
-				}
-				b.WriteString(fmt.Sprintf("\n本 Run：WORK_DIR=%s OUTPUT_DIR=%s INPUT_DIR=%s", rel(ws.WorkDir), rel(ws.OutputDir), rel(ws.InputDir)))
-			}
-		}
+		b.WriteString("\n\nRun 文件落点：中间脚本/临时文件用 write_file(\"$WORK_DIR/...\")。run_skill_command 返回不透明 candidate_id；required 交付物唯一匹配时 Harness 自动 Gate、发布与交付，多个匹配时只能用 select_deliverable_candidate 选择返回的 candidate_id。禁止提交路径或 locator，也禁止复制到仓库根或内部 runs 目录。")
 		return promptbuilder.Fragment{
 			Name:     "skills_instructions",
 			Contents: b.String(),
@@ -555,6 +603,9 @@ func buildProductRuntime(ctx context.Context, configDir string, cfg *platformcon
 		hookExecutionRunner:  execStack.Runner,
 		config:               cfg,
 		workspaceRoot:        workspaceRoot,
+		artifactRuns:         artifactControl.initializer,
+		completion:           artifactControl.completion,
+		qaEvidence:           artifactControl.qaEvidence,
 	}, log, nil
 }
 
@@ -657,7 +708,7 @@ func buildProductTools(sandboxCfg clisandbox.Config, baseApprovalSvc approvalcon
 		// 远程 sandbox 的 OS/Shell 不能从宿主机推断；服务端未返回能力前仅向模型暴露 auto。
 		shellProvider = nil
 	}
-	sandboxRunner, sessionClient, fileClient, workspaceRef, err := buildSandboxStack(directRunner, sandboxCfg, log)
+	sandboxRunner, sessionClient, fileClient, workspaceRef, err := buildSandboxStack(directRunner, sandboxCfg, log, workspaceRoot)
 	if err != nil {
 		return nil, productExecStack{}, err
 	}
@@ -728,14 +779,13 @@ func cliEnvironmentContext(ctx context.Context, cwd string, sandbox execmodel.Sa
 	return environment
 }
 
-func buildSandboxStack(directRunner *localexec.Runner, sandboxCfg clisandbox.Config, log logger.Logger) (execcontract.SandboxRunner, sandboxcontract.SessionClient, sandboxcontract.FileSystemClient, sandboxcontract.WorkspaceRef, error) {
+func buildSandboxStack(directRunner *localexec.Runner, sandboxCfg clisandbox.Config, log logger.Logger, workspaceRoot string) (execcontract.SandboxRunner, sandboxcontract.SessionClient, sandboxcontract.FileSystemClient, sandboxcontract.WorkspaceRef, error) {
 	switch sandboxCfg.Mode {
 	case clisandbox.ModeDockerSandbox, clisandbox.ModeRemoteSandbox:
 		client, err := sandboxhttp.New(sandboxhttp.Config{
-			BaseURL:           sandboxCfg.Endpoint,
-			APIKey:            sandboxCfg.APIKey,
-			Timeout:           sandboxCfg.Timeout,
-			LocalArtifactRoot: filepath.Join(".", ".genesis", "artifacts"),
+			BaseURL: sandboxCfg.Endpoint,
+			APIKey:  sandboxCfg.APIKey,
+			Timeout: sandboxCfg.Timeout,
 		})
 		if err != nil {
 			return nil, nil, nil, sandboxcontract.WorkspaceRef{}, fmt.Errorf("初始化genesis-sandbox HTTP client失败: %w", err)
@@ -960,6 +1010,77 @@ func newApprovalRequester(quiet bool) approvalcontract.Requester {
 		return cliapproval.GlobalTUIRequester
 	}
 	return cliapproval.NewTerminalRequester(os.Stdin, os.Stderr)
+}
+
+type cliArtifactControl struct {
+	produced       workcontract.ProducedResourceRegistrar
+	remoteSessions scriptservice.RemoteSessionBinder
+	reservations   artifactcontract.OutputReservationAllocator
+	deliverables   artifactcontract.DeliverableSpecStore
+	finalizer      artifactcontract.RequiredDeliverableFinalizer
+	initializer    artifactcontract.RunInitializer
+	completion     artifactcontract.CompletionPolicy
+	qaEvidence     artifactcontract.QAEvidenceRecorder
+	selector       toolcontract.Tool
+}
+
+func buildCLIArtifactControl(stateRoot, workspaceRoot string, execStack productExecStack) (cliArtifactControl, error) {
+	var downloader workspaceadapter.ArtifactByteDownloader
+	if execStack.FileClient != nil {
+		if d, ok := execStack.FileClient.(workspaceadapter.ArtifactByteDownloader); ok {
+			downloader = d
+		}
+	}
+	built, err := localartifactcontrol.Build(localartifactcontrol.Options{
+		StateRoot:             stateRoot,
+		DeliveryWorkspaceRoot: workspaceRoot,
+		FileClient:            execStack.FileClient,
+		ArtifactDownloader:    downloader,
+	})
+	if err != nil {
+		return cliArtifactControl{}, err
+	}
+	return cliArtifactControl{
+		produced:       built.Produced,
+		remoteSessions: built.RemoteSessions,
+		reservations:   built.Reservations,
+		deliverables:   built.Deliverables,
+		finalizer:      built.Finalizer,
+		initializer:    built.Initializer,
+		completion:     built.Completion,
+		qaEvidence:     built.QAEvidence,
+		selector:       built.Selector,
+	}, nil
+}
+
+func buildLocalRunWorkspace(projectDir string, artifactRuns artifactcontract.RunInitializer, completion artifactcontract.CompletionPolicy, qaEvidence artifactcontract.QAEvidenceRecorder) (app.RunWorkspaceRuntime, error) {
+	stateRoot := filepath.Join(projectDir, ".genesis")
+	manifests, err := localworkspace.NewManifestStore(stateRoot)
+	if err != nil {
+		return app.RunWorkspaceRuntime{}, err
+	}
+	ids := idgen.NewUUIDGenerator()
+	resolver, err := workservice.NewWorkspaceResolver(ids)
+	if err != nil {
+		return app.RunWorkspaceRuntime{}, err
+	}
+	localProvisioner := localworkspace.NewProvisioner()
+	provisioner, err := workservice.NewBackendProvisioner(localProvisioner, localProvisioner, workspaceadapter.NewProvisioner())
+	if err != nil {
+		return app.RunWorkspaceRuntime{}, err
+	}
+	preparer, err := workservice.NewRunPreparer(ids, resolver, localworkspace.StateRootResolver{ProjectStateDir: stateRoot, UserStateDir: stateRoot}, provisioner, manifests)
+	if err != nil {
+		return app.RunWorkspaceRuntime{}, err
+	}
+	modes := []execmodel.WorkspaceMode{execmodel.WorkspaceModeProject, execmodel.WorkspaceModeTask, execmodel.WorkspaceModeSession}
+	profile := agentappmodel.EffectiveProfile{ID: "code", Version: "1", Workspace: agentappmodel.WorkspaceSpec{DefaultMode: execmodel.WorkspaceModeProject, AllowedModes: modes, DefaultAccess: execmodel.WorkspaceAccessReadWrite}}
+	appResolver, err := agentappmemory.NewResolver(profile.ID, []agentappmodel.EffectiveProfile{profile})
+	if err != nil {
+		return app.RunWorkspaceRuntime{}, err
+	}
+	projectRef := &workmodel.ResourceRef{Authority: "host", Scheme: "project", ID: filepath.ToSlash(projectDir), Path: "."}
+	return app.RunWorkspaceRuntime{Preparer: preparer, AgentApps: appResolver, IntentResolver: workservice.NewTaskIntentResolver(), ProjectRoot: projectRef, ProjectDir: projectDir, ProductModes: modes, BackendModes: modes, MaximumAccess: execmodel.WorkspaceAccessReadWrite, ArtifactRuns: artifactRuns, Completion: completion, QAEvidence: qaEvidence}, nil
 }
 
 func buildWebOptions(cfg *platformconfig.Config, log logger.Logger) (shared.WebBuildOptions, error) {

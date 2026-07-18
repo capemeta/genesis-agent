@@ -15,6 +15,7 @@ import (
 	"genesis-agent/internal/capabilities/skill/model"
 	"genesis-agent/internal/capabilities/skill/script/scriptutil"
 	tool "genesis-agent/internal/capabilities/tool/contract"
+	toolparam "genesis-agent/internal/capabilities/tool/param"
 )
 
 type Deps struct {
@@ -53,10 +54,8 @@ func (t *Tool) GetInfo() *tool.Info {
 
 func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 	var in input
-	if strings.TrimSpace(params) != "" {
-		if err := json.Unmarshal([]byte(params), &in); err != nil {
-			return "", fmt.Errorf("解析list_skill_resources参数失败: %w", err)
-		}
+	if err := toolparam.DecodeOptional(params, &in); err != nil {
+		return "", fmt.Errorf("解析list_skill_resources参数失败: %w", err)
 	}
 	pkg := model.PackageID(strings.TrimSpace(in.Package))
 	name := strings.TrimSpace(in.Name)
@@ -160,4 +159,3 @@ func firstNonEmpty(values ...string) string {
 	}
 	return ""
 }
-

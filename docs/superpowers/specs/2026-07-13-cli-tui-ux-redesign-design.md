@@ -56,7 +56,7 @@
 
 ```text
 ┌ header（极简 + 状态 chips）─────────────────────────────┐
-│ genesis / chat          qwen3-max · sandbox · ctx~%    │
+│ genesis / chat          qwen3-max · sandbox · ui-ctx~% │
 ├ transcript（消息主区，可滚动）───────────────────────────┤
 │  [你] 用户消息                                          │
 │  [Ag] Agent 回答 + 行内动作提示（复制/展开过程）         │
@@ -68,7 +68,7 @@
 
 ### 3.2 视觉原则（基线 = 体验细节版）
 
-1. **顶栏安静**：去掉满宽厚重紫色色块；用文字层级 + 小号 status chip（模型、sandbox、基于 transcript 字符估算的 `ctx~` 上下文占用）。该估算仅用于提示，不用于计费或截断决策。
+1. **顶栏安静**：去掉满宽厚重紫色色块；用文字层级 + 小号 status chip（模型、sandbox、基于可见 UI transcript 字符估算的 `ui-ctx~` 占用）。该估算仅用于提示，不代表真实 LLM 装配用量，不用于计费或截断决策。
 2. **消息去气泡化**：user/agent 用小头像块或安静标签，正文为正常前景色，避免大面积色块背景（利于阅读；也为将来选择模式留空间）。
 3. **过程不抢戏**：运行过程默认折叠为一行摘要（步数 / tokens / 耗时 / 成败）；`o` 或点击等价快捷键展开。
 4. **反馈可见**：复制成功、取消本轮、审批结果等用短时 toast（约 2s），不永久污染 transcript。
@@ -246,7 +246,7 @@ Toast 为正交短时状态，不改变 Mode。
 
 1. 终端原生拖选（默认不捕获鼠标）
 2. `/copy` 子命令  
-3. 上下文占用 chip（当前为基于 transcript 的 `ctx~` 近似值；后续可替换为 provider usage）  
+3. 上下文占用 chip（当前为基于可见 UI transcript 的 `ui-ctx~` 近似值；后续可替换为真实装配 token / provider usage）  
 4. 应用内选择模式（P2）  
 5. 斜杠命令菜单与补全（输入 `/` 自动展示，`↑/↓` 选择，`Enter` 填入，`Tab` 补全）  
 
@@ -287,7 +287,7 @@ Toast 为正交短时状态，不改变 Mode。
 
 1. ~~空闲态 `Ctrl+C`：已拍板，二次确认退出（§5.1）。~~ ✅ 已关闭  
 2. ~~Composer 字符上限与后端/LLM 上下文策略的最终数值。~~ 当前设为 4000 字符；后续由后端约束统一调整。  
-3. ~~上下文占用 chip 的数据源。~~ 当前使用 transcript 字符估算并标记为 `ctx~`；后续可接入 provider usage。  
+3. ~~上下文占用 chip 的数据源。~~ 当前使用可见 UI transcript 字符估算并标记为 `ui-ctx~`；后续可接入真实装配 token / provider usage。  
 
 ---
 

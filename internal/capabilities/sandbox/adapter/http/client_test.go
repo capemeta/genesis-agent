@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -63,6 +62,7 @@ func TestRunCommandUsesLeaseLifecycleAndMapsResult(t *testing.T) {
 					JobID:       "job-1",
 					Name:        "report.docx",
 					Size:        12,
+					SHA256:      "abc123",
 					MIME:        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
 				}},
 				StdoutTruncated: true,
@@ -114,11 +114,14 @@ func TestRunCommandUsesLeaseLifecycleAndMapsResult(t *testing.T) {
 	if result.Cwd != "/workspace" {
 		t.Fatalf("result cwd=%q", result.Cwd)
 	}
-	if len(result.Artifacts) != 1 || result.Artifacts[0].ID != "artifact-1" || result.Artifacts[0].Name != "report.docx" {
-		t.Fatalf("artifacts=%+v", result.Artifacts)
+	if len(result.OutputObjects) != 1 || result.OutputObjects[0].ID != "artifact-1" || result.OutputObjects[0].Name != "report.docx" {
+		t.Fatalf("output objects=%+v", result.OutputObjects)
 	}
-	if !strings.HasSuffix(result.Artifacts[0].RemoteURL, "/v1/artifacts/artifact-1") {
-		t.Fatalf("remote url=%q", result.Artifacts[0].RemoteURL)
+	if result.OutputObjects[0].MediaType != "application/vnd.openxmlformats-officedocument.wordprocessingml.document" {
+		t.Fatalf("media type=%q", result.OutputObjects[0].MediaType)
+	}
+	if result.OutputObjects[0].Version != "sha256:abc123" {
+		t.Fatalf("version=%q", result.OutputObjects[0].Version)
 	}
 	if !released {
 		t.Fatal("sandbox was not released")
@@ -149,7 +152,7 @@ func TestRunCommandOutputOnlyWarnsWhenNoArtifacts(t *testing.T) {
 	result, err := client.RunCommand(context.Background(), sandboxcontract.CommandRequest{
 		Command: execmodel.Command{Command: "python script.py"},
 		Options: execcontract.RunOptions{
-			ArtifactCollectionPolicy: execmodel.ArtifactCollectionOutputOnly,
+			OutputDiscoveryPolicy: execmodel.OutputDiscoveryDeclared,
 		},
 	})
 	if err != nil {
@@ -235,7 +238,7 @@ func TestRunCommandUsesSandboxWorkspaceEnvAndInputArtifacts(t *testing.T) {
 			Shell:   execmodel.ShellSh,
 		},
 		Options: execcontract.RunOptions{
-			InputArtifacts: []execmodel.InputArtifactRef{{ID: "input-1"}},
+			StagedInputs: []execmodel.StagedInputRef{{ID: "input-1"}},
 		},
 	})
 	if err != nil {
@@ -265,7 +268,7 @@ func TestSessionRunUsesNamedSessionExecAndClose(t *testing.T) {
 			if err := json.NewDecoder(r.Body).Decode(&created); err != nil {
 				t.Fatal(err)
 			}
-			_ = json.NewEncoder(w).Encode(sessionRecord{SessionID: "session-1", WorkspaceID: "ws-1", ActiveSandboxID: "sandbox-1", RuntimeProfile: "code-polyglot-basic", StatePolicy: "session"})
+			_ = json.NewEncoder(w).Encode(sessionRecord{SessionID: "session-1", WorkspaceID: "ws-1", ActiveSandboxID: "sandbox-1", RuntimeProfile: "code-polyglot-basic", StatePolicy: "session", ExpiresAt: time.Now().Add(time.Hour)})
 		case r.URL.Path == "/v1/sessions/session-1/exec" && r.Method == http.MethodPost:
 			if err := json.NewDecoder(r.Body).Decode(&execReq); err != nil {
 				t.Fatal(err)
@@ -322,6 +325,101 @@ func TestSessionRunUsesNamedSessionExecAndClose(t *testing.T) {
 	}
 }
 
+func TestOpenSessionRejectsMissingExpiresAtAndDeletesSession(t *testing.T) {
+	deleted := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v1/sessions" && r.Method == http.MethodPost:
+			_ = json.NewEncoder(w).Encode(sessionRecord{SessionID: "session-1", WorkspaceID: "ws-1", ActiveSandboxID: "sandbox-1"})
+		case r.URL.Path == "/v1/sessions/session-1" && r.Method == http.MethodDelete:
+			deleted = true
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	client, err := New(Config{BaseURL: server.URL, RenewInterval: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.OpenSession(context.Background(), sandboxcontract.SessionOptions{}); err == nil {
+		t.Fatal("expected missing expires_at to fail")
+	}
+	if !deleted {
+		t.Fatal("invalid session must be deleted")
+	}
+}
+
+func TestOpenSessionHeartbeatUsesSessionRenewNotSandboxRenew(t *testing.T) {
+	var renewPath string
+	var extendSeconds int
+	expires := time.Now().Add(2 * time.Minute).UTC().Truncate(time.Second)
+	renewed := expires.Add(90 * time.Second)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v1/sessions" && r.Method == http.MethodPost:
+			_ = json.NewEncoder(w).Encode(sessionRecord{
+				SessionID: "session-1", WorkspaceID: "ws-1", ActiveSandboxID: "sandbox-1",
+				RuntimeProfile: "office-basic", StatePolicy: "session", ExpiresAt: expires,
+			})
+		case r.URL.Path == "/v1/sessions/session-1/renew" && r.Method == http.MethodPost:
+			renewPath = r.URL.Path
+			var payload map[string]int
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatal(err)
+			}
+			extendSeconds = payload["extend_seconds"]
+			_ = json.NewEncoder(w).Encode(sessionRecord{
+				SessionID: "session-1", WorkspaceID: "ws-1", ActiveSandboxID: "sandbox-1",
+				ExpiresAt: renewed,
+			})
+		case strings.HasPrefix(r.URL.Path, "/v1/sandboxes/") && strings.HasSuffix(r.URL.Path, "/renew"):
+			t.Fatalf("session heartbeat must not call sandbox renew: %s", r.URL.Path)
+		case r.URL.Path == "/v1/sessions/session-1" && r.Method == http.MethodDelete:
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client, err := New(Config{BaseURL: server.URL, RenewInterval: 20 * time.Millisecond, RenewExtend: 90 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := client.OpenSession(context.Background(), sandboxcontract.SessionOptions{
+		Workspace: sandboxcontract.WorkspaceRef{ID: "ws-1"},
+		Sandbox:   execmodel.SandboxProfile{RuntimeProfile: execmodel.RuntimeProfileOfficeBasic},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	leased, ok := session.(sandboxcontract.LeasedSandboxSession)
+	if !ok {
+		t.Fatal("OpenSession must return LeasedSandboxSession")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if renewPath != "" && leased.ExpiresAt().Equal(renewed) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if renewPath != "/v1/sessions/session-1/renew" {
+		t.Fatalf("renew path=%q", renewPath)
+	}
+	if extendSeconds != 90 {
+		t.Fatalf("extend_seconds=%d", extendSeconds)
+	}
+	if !leased.ExpiresAt().Equal(renewed) {
+		t.Fatalf("expiresAt=%v want=%v", leased.ExpiresAt(), renewed)
+	}
+	if err := session.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestSandboxSessionWorkingDirRejectsHostPaths(t *testing.T) {
 	got := sandboxSessionWorkingDir(`D:\workspace\go\genesis-agent`, execmodel.ExecutionWorkspace{WorkDir: "/workspace"})
 	if got != "/workspace" {
@@ -334,7 +432,7 @@ func TestSessionRunWrapsCwdAndEnvForNamedSession(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/v1/sessions" && r.Method == http.MethodPost:
-			_ = json.NewEncoder(w).Encode(sessionRecord{SessionID: "session-1", WorkspaceID: "ws-1", ActiveSandboxID: "sandbox-1", RuntimeProfile: "office-basic", StatePolicy: "session"})
+			_ = json.NewEncoder(w).Encode(sessionRecord{SessionID: "session-1", WorkspaceID: "ws-1", ActiveSandboxID: "sandbox-1", RuntimeProfile: "office-basic", StatePolicy: "session", ExpiresAt: time.Now().Add(time.Hour)})
 		case r.URL.Path == "/v1/sessions/session-1/exec" && r.Method == http.MethodPost:
 			if err := json.NewDecoder(r.Body).Decode(&execReq); err != nil {
 				t.Fatal(err)
@@ -498,7 +596,8 @@ func TestFSErrorFromExecMapsDockerStatMissingFileToNotFound(t *testing.T) {
 		t.Fatalf("err=%v code=%s", got, fscontract.CodeOf(got))
 	}
 }
-func TestRunCommandMaterializesArtifacts(t *testing.T) {
+func TestRunCommandDoesNotDownloadOutputObjects(t *testing.T) {
+	downloaded := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/v1/sandboxes:lease" && r.Method == http.MethodPost:
@@ -526,7 +625,8 @@ func TestRunCommandMaterializesArtifacts(t *testing.T) {
 				}},
 			})
 		case r.URL.Path == "/v1/artifacts/artifact-1" && r.Method == http.MethodGet:
-			_, _ = w.Write([]byte("doc bytes"))
+			downloaded = true
+			t.Fatal("RunCommand must not download executor output objects")
 		case r.URL.Path == "/v1/sandboxes/sandbox-1/release" && r.Method == http.MethodPost:
 			w.WriteHeader(http.StatusNoContent)
 		default:
@@ -535,8 +635,7 @@ func TestRunCommandMaterializesArtifacts(t *testing.T) {
 	}))
 	defer server.Close()
 
-	root := t.TempDir()
-	client, err := New(Config{BaseURL: server.URL, LocalArtifactRoot: root, RenewInterval: time.Hour})
+	client, err := New(Config{BaseURL: server.URL, RenewInterval: time.Hour})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -547,18 +646,8 @@ func TestRunCommandMaterializesArtifacts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(result.Artifacts) != 1 || result.Artifacts[0].LocalPath == "" {
-		t.Fatalf("artifacts=%+v", result.Artifacts)
-	}
-	if !strings.Contains(result.Artifacts[0].LocalPath, "ws-1") || !strings.HasSuffix(result.Artifacts[0].LocalPath, "report.docx") {
-		t.Fatalf("local path=%s", result.Artifacts[0].LocalPath)
-	}
-	data, err := os.ReadFile(result.Artifacts[0].LocalPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(data) != "doc bytes" {
-		t.Fatalf("data=%q", data)
+	if downloaded || len(result.OutputObjects) != 1 || result.OutputObjects[0].ID != "artifact-1" {
+		t.Fatalf("downloaded=%v output_objects=%+v", downloaded, result.OutputObjects)
 	}
 }
 
@@ -601,8 +690,6 @@ func TestRunCommandWithLeaseLifecyclePollsDownloadsAndReleases(t *testing.T) {
 					MIME:        "text/plain",
 				}},
 			})
-		case r.URL.Path == "/v1/artifacts/artifact-1" && r.Method == http.MethodGet:
-			_, _ = w.Write([]byte("hello"))
 		case r.URL.Path == "/v1/sandboxes/sandbox-1/release" && r.Method == http.MethodPost:
 			released = true
 			w.WriteHeader(http.StatusNoContent)
@@ -612,13 +699,11 @@ func TestRunCommandWithLeaseLifecyclePollsDownloadsAndReleases(t *testing.T) {
 	}))
 	defer server.Close()
 
-	root := t.TempDir()
 	client, err := New(Config{
-		BaseURL:           server.URL,
-		LocalArtifactRoot: root,
-		RenewInterval:     time.Hour,
-		PollStart:         time.Millisecond,
-		PollMax:           time.Millisecond,
+		BaseURL:       server.URL,
+		RenewInterval: time.Hour,
+		PollStart:     time.Millisecond,
+		PollMax:       time.Millisecond,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -647,15 +732,8 @@ func TestRunCommandWithLeaseLifecyclePollsDownloadsAndReleases(t *testing.T) {
 	if !released {
 		t.Fatal("sandbox was not released")
 	}
-	if result.Stdout != "generated" || len(result.Artifacts) != 1 || result.Artifacts[0].LocalPath == "" {
+	if result.Stdout != "generated" || len(result.OutputObjects) != 1 || result.OutputObjects[0].ID != "artifact-1" {
 		t.Fatalf("result=%+v", result)
-	}
-	data, err := os.ReadFile(result.Artifacts[0].LocalPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(data) != "hello" {
-		t.Fatalf("artifact data=%q", data)
 	}
 }
 

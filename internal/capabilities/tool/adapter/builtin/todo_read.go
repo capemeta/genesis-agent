@@ -8,6 +8,7 @@ import (
 	plancontract "genesis-agent/internal/capabilities/plan/contract"
 	planmodel "genesis-agent/internal/capabilities/plan/model"
 	"genesis-agent/internal/capabilities/tool/contract"
+	toolparam "genesis-agent/internal/capabilities/tool/param"
 	"genesis-agent/internal/platform/contextutil"
 )
 
@@ -39,7 +40,10 @@ func (t *TodoReadTool) GetInfo() *tool.Info {
 	}
 }
 
-func (t *TodoReadTool) Execute(ctx context.Context, _ string) (string, error) {
+func (t *TodoReadTool) Execute(ctx context.Context, params string) (string, error) {
+	if err := toolparam.DecodeOptional(params, &struct{}{}); err != nil {
+		return "", fmt.Errorf("参数解析失败: %w", err)
+	}
 	sessionID, ok := contextutil.GetSessionID(ctx)
 	if !ok || sessionID == "" {
 		return "", fmt.Errorf("context missing session_id")
@@ -107,12 +111,12 @@ func (t *TodoReadTool) Execute(ctx context.Context, _ string) (string, error) {
 
 	// 2. 格式化输出
 	type PrunedResponse struct {
-		SessionID         string             `json:"session_id"`
-		Steps             []planmodel.Step   `json:"steps"`
-		LatestExplanation string             `json:"latest_explanation,omitempty"`
-		Version           int64              `json:"version"`
-		ArchivedCompleted int                `json:"archived_completed_count"`
-		Message           string             `json:"message,omitempty"`
+		SessionID         string           `json:"session_id"`
+		Steps             []planmodel.Step `json:"steps"`
+		LatestExplanation string           `json:"latest_explanation,omitempty"`
+		Version           int64            `json:"version"`
+		ArchivedCompleted int              `json:"archived_completed_count"`
+		Message           string           `json:"message,omitempty"`
 	}
 
 	resp := PrunedResponse{

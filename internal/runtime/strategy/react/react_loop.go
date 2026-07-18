@@ -10,10 +10,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
+	approvalcontract "genesis-agent/internal/capabilities/approval/contract"
+	artifactcontract "genesis-agent/internal/capabilities/artifact/contract"
 	hookcontract "genesis-agent/internal/capabilities/hook/contract"
 	hookmodel "genesis-agent/internal/capabilities/hook/model"
 	"genesis-agent/internal/capabilities/llm/contract"
@@ -22,6 +26,7 @@ import (
 	"genesis-agent/internal/capabilities/tool/contract"
 	"genesis-agent/internal/capabilities/tool/scheduler"
 	"genesis-agent/internal/capabilities/trace/contract"
+	workcontract "genesis-agent/internal/capabilities/workspace/contract"
 	"genesis-agent/internal/domain"
 	"genesis-agent/internal/platform/contextutil"
 	"genesis-agent/internal/platform/logger"
@@ -146,8 +151,11 @@ func (e *ReactLoopEngine) GetStrategyName() string { return "react_loop" }
 
 // Start 启动并执行一次完整的ReAct Loop
 func (e *ReactLoopEngine) Start(ctx context.Context, req domain.StartRunRequest) (*domain.Run, error) {
+	if strings.TrimSpace(req.RunID) == "" {
+		return nil, fmt.Errorf("启动 Run 缺少控制面生成的 Run ID")
+	}
 	run := &domain.Run{
-		ID:        newRunID(),
+		ID:        req.RunID,
 		TenantID:  req.TenantID,
 		SessionID: req.SessionID,
 		Status:    domain.RunStatusRunning,
@@ -194,6 +202,12 @@ func (e *ReactLoopEngine) Start(ctx context.Context, req domain.StartRunRequest)
 	run.FinishedAt = &now
 
 	if err != nil {
+		if errors.Is(err, approvalcontract.ErrRunAborted) || errors.Is(err, context.Canceled) {
+			run.Status = domain.RunStatusCancelled
+			log.Info("Run已取消", "steps", len(run.Steps), "tokens", run.TotalTokens)
+			progress.Emit(ctx, progress.Event{Kind: progress.KindRun, Phase: progress.PhaseComplete, Level: progress.LevelWarn, RunID: run.ID, Summary: "Agent 运行已取消", StopReason: "cancelled"})
+			return run, err
+		}
 		run.Status = domain.RunStatusFailed
 		log.Error("Run失败", "error", err, "steps", len(run.Steps), "tokens", run.TotalTokens)
 		progress.Emit(ctx, progress.Event{Kind: progress.KindRun, Phase: progress.PhaseError, Level: progress.LevelError, RunID: run.ID, Summary: "Agent 运行失败", Detail: err.Error()})
@@ -210,17 +224,28 @@ func (e *ReactLoopEngine) Start(ctx context.Context, req domain.StartRunRequest)
 }
 
 // loop 核心执行循环
-func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req domain.StartRunRequest, log logger.Logger) error {
+func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req domain.StartRunRequest, log logger.Logger) (err error) {
 	agent := req.Agent
 	maxIter := agent.RuntimePolicy.MaxIterations
 	if maxIter <= 0 {
 		maxIter = 50
 	}
 
+	// historyLen 供 defer 截取本 Run 增量；仅在上下文装配成功后启用落盘。
+	// 装配成功后的任意出口（成功 / Incomplete / LLM 失败 / 取消 / 超迭代）都落盘，保证「请继续」可恢复。
+	historyLen := 0
+	assembled := false
+	defer func() {
+		if !assembled {
+			return
+		}
+		e.persistRunSessionMessages(ctx, req.SessionID, rc, historyLen, err, log)
+	}()
+
 	if dispatcher := hookcontract.FromContext(ctx); dispatcher != nil {
-		result, err := dispatcher.Dispatch(ctx, hookmodel.Event{Name: hookmodel.EventUserPromptSubmit, Payload: map[string]any{"user_prompt": req.UserInput}})
-		if err != nil {
-			return fmt.Errorf("执行 UserPromptSubmit Hook 失败: %w", err)
+		result, hookErr := dispatcher.Dispatch(ctx, hookmodel.Event{Name: hookmodel.EventUserPromptSubmit, Payload: map[string]any{"user_prompt": req.UserInput}})
+		if hookErr != nil {
+			return fmt.Errorf("执行 UserPromptSubmit Hook 失败: %w", hookErr)
 		}
 		hookcontract.AppendAdditionalContext(ctx, result.AdditionalContext...)
 		if result.Blocked {
@@ -234,7 +259,11 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 
 	// ── 步骤2: 构建初始消息列表与弹性预算装配 ──────────────────
 	// System消息（Persona System Prompt）
-	systemPrompt, err := e.prompt.BuildSystem(ctx, prompt.BuildRequest{Agent: agent, Run: rc.Run})
+	systemPrompt, err := e.prompt.BuildSystem(ctx, prompt.BuildRequest{
+		Agent:          agent,
+		Run:            rc.Run,
+		AvailableTools: activeToolNames,
+	})
 	if err != nil {
 		return err
 	}
@@ -340,17 +369,19 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 		inputBudget = int(float64(e.contextWindow)*e.effectiveContextRatio) - e.outputReserveTokens
 	}
 
-	// 拉取适量历史消息
+	// 拉取适量历史消息；加载失败必须中止，禁止静默空历史导致「请继续」失忆。
 	recentOpt := memory.RecentOptions{
 		MaxTokens: budget.History,
 		Model:     req.Agent.DefaultModel,
 	}
-	res, err := e.memory.GetRecent(ctx, ref, recentOpt)
-	if err != nil {
-		log.Warn("加载历史记录失败，将从空历史开始", "error", err)
+	var history []*domain.Message
+	if e.memory != nil {
+		res, getErr := e.memory.GetRecent(ctx, ref, recentOpt)
+		if getErr != nil {
+			return fmt.Errorf("加载短期记忆历史失败: %w", getErr)
+		}
+		history = res.Messages
 	}
-	history := res.Messages
-	historyLen := len(history)
 
 	// 精密组装 messages (system -> history -> working_obs -> user)
 	assembler := runtimecontext.NewDefaultContextAssembler(e.estimator)
@@ -370,6 +401,10 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 	if err != nil {
 		return fmt.Errorf("assemble context messages failed: %w", err)
 	}
+	// historyLen 必须等于装配后实际进入 rc.Messages 的历史条数（可能被预算截断），
+	// 不能用 GetRecent 原始条数，否则 SessionMessagesFromRun 起点越界导致整轮不落盘。
+	historyLen = countAssembledHistoryLen(rc.Messages)
+	assembled = true
 
 	// mention 自动注入（在首轮 LLM 前；走 Skill 网关，含 Approval / 去重 / 收窄）
 	e.injectMentionedSkills(ctx, rc, req.UserInput, &activeToolNames, &toolInfos, log)
@@ -383,6 +418,7 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 
 	// ── 步骤3: 主循环 ─────────────────────────────────────────
 	stopBlocks := 0
+	deliveryBlocks := 0
 	for rc.Iteration = 0; rc.Iteration < maxIter; rc.Iteration++ {
 		if additions := hookcontract.DrainAdditionalContext(ctx); len(additions) > 0 {
 			rc.Messages = append(rc.Messages, domain.NewSystemMessage(strings.Join(additions, "\n")))
@@ -478,9 +514,9 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 		// 两级压缩编排接线
 		if e.compactor != nil {
 			// 1. L1 Micro-Compact 大工具结果就地外置卸载
-			microRes, err := e.compactor.MaybeMicroCompact(ctx, rc)
-			if err != nil {
-				iterLog.Warn("L1 Micro Compact 失败", "err", err)
+			microRes, microErr := e.compactor.MaybeMicroCompact(ctx, rc)
+			if microErr != nil {
+				iterLog.Warn("L1 Micro Compact 失败", "err", microErr)
 			} else if microRes.Triggered {
 				iterLog.Info("L1 Micro Compact 成功触发", "saved_tokens", microRes.TokensSaved)
 			}
@@ -488,9 +524,9 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 			// 在压缩前，先记下本 Run 产生的增量消息数 N
 			deltaCount := len(rc.Messages) - historyLen
 
-			autoRes, err := e.compactor.MaybeAutoCompact(ctx, rc, ref)
-			if err != nil {
-				iterLog.Warn("L2 Auto Compact 失败", "err", err)
+			autoRes, compactErr := e.compactor.MaybeAutoCompact(ctx, rc, ref)
+			if compactErr != nil {
+				iterLog.Warn("L2 Auto Compact 失败", "err", compactErr)
 			} else if autoRes.Triggered {
 				iterLog.Info("L2 Auto Compact 成功触发", "saved_tokens", autoRes.TokensSaved, "summary_id", autoRes.SummaryID)
 				// 自适应调整 historyLen，防止增量历史截断指针在重构后越界
@@ -502,7 +538,9 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 		}
 
 		// ForModel：完整链送给 LLM（含 skill_injection / tool）；UI 另走 ForUI，禁止双写存储
-		llmResp, err := e.llm.StreamGenerate(ctx, transcript.ProjectForModel(rc.Messages), toolInfos, onDelta)
+		// 使用命名返回值 err，避免 := 遮蔽导致 defer 落盘读到错误的失败原因。
+		var llmResp *domain.Message
+		llmResp, err = e.llm.StreamGenerate(ctx, transcript.ProjectForModel(rc.Messages), toolInfos, onDelta)
 		if err != nil {
 			e.tracer.EndSpan(ctx, stepSpan, err)
 			progress.Emit(ctx, progress.Event{
@@ -585,7 +623,11 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 				iterLog.Info("LLM思考内容", "thought", summarizeToolOutputForLog(llmResp.Content, 0))
 			}
 
-			toolResults := e.executeToolCalls(ctx, rc, llmResp.ToolCalls, iterLog)
+			toolResults, toolErr := e.executeToolCalls(ctx, rc, llmResp.ToolCalls, iterLog)
+			if toolErr != nil {
+				e.tracer.EndSpan(ctx, stepSpan, toolErr)
+				return toolErr
+			}
 			for _, toolResult := range toolResults {
 				if e.applySkillToolResult(rc, toolResult, &activeToolNames, &toolInfos, iterLog) {
 					continue
@@ -602,19 +644,34 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 				step.FinishedAt = &now
 				rc.AddStep(step)
 				e.tracer.EndSpan(ctx, stepSpan, stopErr)
-				if rc.Run.Incomplete {
-					e.persistRunSessionMessages(ctx, req.SessionID, rc, historyLen, log)
-				}
 				return stopErr
 			}
 
 		} else if llmResp.Content != "" {
 			// ── 路径B: 最终回答 ──────────────────────────────
 			step.ActionType = domain.ActionTypeFinalAnswer
-			iterLog.Info("获得最终回答", "content_preview", truncate(llmResp.Content, 100))
+			pending, reminder, completionErr := artifactCompletionPending(ctx)
+			if completionErr != nil {
+				return fmt.Errorf("评估 Artifact 完成门禁: %w", completionErr)
+			}
+			if pending {
+				deliveryBlocks++
+				if deliveryBlocks > 1 {
+					return artifactcontract.NewError(artifactcontract.ErrCodeArtifactDeliveryRequired, fmt.Errorf("required Deliverable 尚未满足持久化完成门禁；%s", reminder))
+				}
+				rc.Messages = append(rc.Messages, llmResp, domain.NewSystemMessage(reminder))
+				now := time.Now()
+				step.Status = domain.StepStatusCompleted
+				step.FinishedAt = &now
+				rc.AddStep(step)
+				e.tracer.EndSpan(ctx, stepSpan, nil)
+				continue
+			}
 			if rc.RepeatGuard != nil {
 				_ = rc.RepeatGuard.EndIteration(rc.Iteration, true)
 			}
+
+			iterLog.Info("获得最终回答", "content_preview", truncate(llmResp.Content, 100))
 
 			if dispatcher := hookcontract.FromContext(ctx); dispatcher != nil {
 				result, hookErr := dispatcher.Dispatch(ctx, hookmodel.Event{Name: hookmodel.EventStop, Payload: map[string]any{"final_answer": llmResp.Content, "iterations": rc.Iteration + 1, "stop_active": stopBlocks > 0}})
@@ -638,7 +695,6 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 			}
 			rc.Run.FinalAnswer = llmResp.Content
 			rc.Run.Status = domain.RunStatusCompleted
-			applySkillFollowIncomplete(rc, iterLog)
 			stopReason := "complete"
 			if rc.Run.Incomplete {
 				stopReason = "partial_complete"
@@ -691,9 +747,6 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 			llmResp.EnsureKind()
 			rc.Messages = append(rc.Messages, llmResp)
 
-			// 本 Run 完整消息链写入短期记忆（含 tool / skill_injection；不含重建的基线 system）
-			e.persistRunSessionMessages(ctx, req.SessionID, rc, historyLen, log)
-
 			now := time.Now()
 			step.Status = domain.StepStatusCompleted
 			step.FinishedAt = &now
@@ -720,13 +773,33 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 	return fmt.Errorf("超过最大迭代次数 %d，Loop未能得出最终答案", maxIter)
 }
 
+func artifactCompletionPending(ctx context.Context) (bool, string, error) {
+	policy, ok := artifactcontract.CompletionPolicyFromContext(ctx)
+	if !ok {
+		return false, "", nil
+	}
+	prepared, ok := workcontract.PreparedRunFromContext(ctx)
+	if !ok {
+		return false, "", fmt.Errorf("completion policy 已配置但缺少 prepared run")
+	}
+	decision, err := policy.EvaluateCompletion(ctx, prepared.Manifest.Scope.TenantID, prepared.Manifest.RunID)
+	if err != nil {
+		return false, "", err
+	}
+	if decision.Complete {
+		return false, "", nil
+	}
+	data, _ := json.Marshal(decision)
+	return true, "Harness 根据持久化 Deliverable/Publication/Delivery/QA 事实判定尚未完成。若 run_skill_command 返回多个候选，只能调用 select_deliverable_candidate 选择 candidate_id；不得提交路径或自行复制文件。decision=" + string(data), nil
+}
+
 type toolExecutionResult struct {
 	ID      string
 	Name    string
 	Content string
 }
 
-func (e *ReactLoopEngine) executeToolCalls(ctx context.Context, rc *runtime.RunContext, calls []domain.ToolCall, log logger.Logger) []toolExecutionResult {
+func (e *ReactLoopEngine) executeToolCalls(ctx context.Context, rc *runtime.RunContext, calls []domain.ToolCall, log logger.Logger) ([]toolExecutionResult, error) {
 	// 先做 CollisionGuard 改写，再判定 Skill 独占轮，确保 office-ppt 等同轮误调用也能走 Skill 路径。
 	calls = e.rewriteSkillCollisions(ctx, calls, log)
 
@@ -735,10 +808,13 @@ func (e *ReactLoopEngine) executeToolCalls(ctx context.Context, rc *runtime.RunC
 		for i, call := range calls {
 			out[i] = toolExecutionResult{ID: call.ID, Name: call.Function.Name, Content: "跳过：Skill 加载必须独占本轮；注入完成后请在下一轮再调用其他工具。"}
 		}
-		out[skillIndex] = e.executeOneToolCall(ctx, rc, calls[skillIndex], log)
-		return out
+		result, err := e.executeOneToolCall(ctx, rc, calls[skillIndex], log)
+		out[skillIndex] = result
+		return out, err
 	}
 
+	executionCtx, cancelExecutions := context.WithCancel(ctx)
+	defer cancelExecutions()
 	tasks := make([]scheduler.Task, 0, len(calls))
 	for _, tc := range calls {
 		tc := tc
@@ -747,24 +823,34 @@ func (e *ReactLoopEngine) executeToolCalls(ctx context.Context, rc *runtime.RunC
 			traits = tool.TraitsOf(registered.GetInfo())
 		}
 		tasks = append(tasks, scheduler.Task{ID: tc.ID, Name: tc.Function.Name, Params: tc.Function.Arguments, Traits: traits, Run: func(taskCtx context.Context) (string, error) {
-			return e.runToolCall(taskCtx, rc, tc, log)
+			result, err := e.runToolCall(taskCtx, rc, tc, log)
+			if errors.Is(err, approvalcontract.ErrRunAborted) || errors.Is(err, context.Canceled) {
+				cancelExecutions()
+			}
+			return result, err
 		}})
 	}
-	results := scheduler.NewQueue().Run(ctx, tasks)
+	results := scheduler.NewQueue().Run(executionCtx, tasks)
 	argsByID := map[string]string{}
 	for _, tc := range calls {
 		argsByID[tc.ID] = tc.Function.Arguments
 	}
 	out := make([]toolExecutionResult, 0, len(results))
 	for _, result := range results {
+		if errors.Is(result.Err, approvalcontract.ErrRunAborted) || errors.Is(result.Err, context.Canceled) {
+			return nil, result.Err
+		}
 		content := result.Output
 		if result.Err != nil {
 			content = toolFailureContent(result.Output, result.Err)
 		}
+		if err := recordSkillQAEvidence(ctx, rc, result.Name, argsByID[result.ID], content); err != nil {
+			return nil, err
+		}
 		content = annotateSkillFollowHints(rc, result.Name, argsByID[result.ID], content)
 		out = append(out, toolExecutionResult{ID: result.ID, Name: result.Name, Content: content})
 	}
-	return out
+	return out, nil
 }
 
 // toolFailureContent 对齐 Codex/Kode：失败时仍把工具 stdout/JSON 交给模型，禁止只回 error 摘要。
@@ -809,20 +895,56 @@ func (e *ReactLoopEngine) rewriteSkillCollisions(ctx context.Context, calls []do
 	return out
 }
 
-func (e *ReactLoopEngine) executeOneToolCall(ctx context.Context, rc *runtime.RunContext, tc domain.ToolCall, log logger.Logger) toolExecutionResult {
+func (e *ReactLoopEngine) executeOneToolCall(ctx context.Context, rc *runtime.RunContext, tc domain.ToolCall, log logger.Logger) (toolExecutionResult, error) {
 	content, err := e.runToolCall(ctx, rc, tc, log)
+	if errors.Is(err, approvalcontract.ErrRunAborted) || errors.Is(err, context.Canceled) {
+		return toolExecutionResult{ID: tc.ID, Name: tc.Function.Name}, err
+	}
 	if err != nil {
 		content = toolFailureContent(content, err)
 	}
+	if evidenceErr := recordSkillQAEvidence(ctx, rc, tc.Function.Name, tc.Function.Arguments, content); evidenceErr != nil {
+		return toolExecutionResult{ID: tc.ID, Name: tc.Function.Name}, evidenceErr
+	}
 	content = annotateSkillFollowHints(rc, tc.Function.Name, tc.Function.Arguments, content)
-	return toolExecutionResult{ID: tc.ID, Name: tc.Function.Name, Content: content}
+	return toolExecutionResult{ID: tc.ID, Name: tc.Function.Name, Content: content}, nil
+}
+
+func recordSkillQAEvidence(ctx context.Context, rc *runtime.RunContext, toolName, args, content string) error {
+	if strings.TrimSpace(toolName) != "run_skill_command" || rc == nil || rc.SkillFollow == nil || !toolResultOK(content) {
+		return nil
+	}
+	command := extractCommandArg(args)
+	if command == "" || !rc.SkillFollow.IsQACommand(command) {
+		return nil
+	}
+	recorder, ok := artifactcontract.QAEvidenceRecorderFromContext(ctx)
+	if !ok {
+		return nil
+	}
+	prepared, ok := workcontract.PreparedRunFromContext(ctx)
+	if !ok {
+		return fmt.Errorf("QA evidence recorder 已配置但缺少 prepared run")
+	}
+	digest := sha256.Sum256([]byte(command))
+	return recorder.RecordPassed(ctx, artifactcontract.QAPassRequest{TenantID: prepared.Manifest.Scope.TenantID, RunID: prepared.Manifest.RunID, Validator: "skill-command:sha256:" + fmt.Sprintf("%x", digest[:])})
 }
 
 func (e *ReactLoopEngine) runToolCall(ctx context.Context, rc *runtime.RunContext, tc domain.ToolCall, log logger.Logger) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	runID := rc.Run.ID
 	stepIdx := rc.Iteration
 	displayTrue := true
 	toolName := strings.TrimSpace(tc.Function.Name)
+	if toolName == "run_skill_command" && rc != nil && rc.SkillFollow != nil {
+		command := extractCommandArg(tc.Function.Arguments)
+		if rc.SkillFollow.ShouldBlockQA(command) {
+			log.Warn("Harness 已阻止重复 QA 环境探测", "command", truncate(command, 160))
+			return `{"ok":false,"failure_kind":"qa_unavailable","suggested_action":"publish_and_finish_incomplete","error":"QA 环境失败预算已耗尽；禁止搜索宿主或其他插件路径重试"}`, nil
+		}
+	}
 	if toolName == "Task" {
 		// 在执行 Task 前固定当前父 Run 状态；Builder 会丢弃当前 Task 工具调用及全部工具轨迹。
 		ctx = contextsnapshot.WithParentSnapshot(ctx, rc.Messages, tc.ID)
@@ -976,6 +1098,7 @@ func (e *ReactLoopEngine) runToolCall(ctx context.Context, rc *runtime.RunContex
 			StepIndex:  &stepIdx,
 			Display:    &displayTrue,
 			StopReason: "error",
+			Metadata:   toolTimingMetadata(toolName, result),
 		})
 		// 保留 result JSON（如 ok=false + failure_kind），对齐 Codex RespondToModel(content)。
 		return result, toolErr
@@ -997,8 +1120,32 @@ func (e *ReactLoopEngine) runToolCall(ctx context.Context, rc *runtime.RunContex
 		StepIndex:  &stepIdx,
 		Display:    &displayTrue,
 		StopReason: "complete",
+		Metadata:   toolTimingMetadata(toolName, result),
 	})
 	return result, nil
+}
+
+func toolTimingMetadata(toolName, result string) map[string]string {
+	if toolName != "run_skill_command" {
+		return nil
+	}
+	var payload map[string]any
+	if !decodeFirstJSONObject(result, &payload) {
+		return nil
+	}
+	keys := []string{"duration_ms", "approval_duration_ms", "staging_duration_ms", "execution_duration_ms"}
+	metadata := make(map[string]string, len(keys))
+	for _, key := range keys {
+		value, ok := payload[key].(float64)
+		if !ok || value < 0 {
+			continue
+		}
+		metadata[key] = strconv.FormatInt(int64(value), 10)
+	}
+	if len(metadata) == 0 {
+		return nil
+	}
+	return metadata
 }
 
 // applyRepeatGuardProgress 评估 L2 进展门禁；若 partial_complete 则结束 Run（err=nil）。
@@ -1068,10 +1215,37 @@ func lastMessageIsAssistantWithContent(msgs []*domain.Message, content string) b
 	return last != nil && last.Role == domain.RoleAssistant && last.Content == content
 }
 
+// countAssembledHistoryLen 计算 Assemble 之后、本轮 user_turn 之前的历史消息条数。
+// 布局： [system?] + [history…] + [user_turn] + [reminder?]
+func countAssembledHistoryLen(msgs []*domain.Message) int {
+	if len(msgs) == 0 {
+		return 0
+	}
+	start := 0
+	if msgs[0] != nil && msgs[0].Role == domain.RoleSystem && msgs[0].NormalizedKind() == domain.MessageKindSystem {
+		start = 1
+	}
+	end := len(msgs)
+	if end > start && msgs[end-1] != nil && msgs[end-1].NormalizedKind() == domain.MessageKindReminder {
+		end--
+	}
+	if end > start && msgs[end-1] != nil && msgs[end-1].NormalizedKind() == domain.MessageKindUserTurn {
+		end--
+	}
+	if end < start {
+		return 0
+	}
+	return end - start
+}
+
 // persistRunSessionMessages 将本 Run 新增的完整消息链追加到短期记忆。
-func (e *ReactLoopEngine) persistRunSessionMessages(ctx context.Context, sessionID string, rc *runtime.RunContext, historyLen int, log logger.Logger) {
+// runErr 非空且非 Incomplete 时，追加一条 reminder 中断标记，供下一轮续跑感知。
+func (e *ReactLoopEngine) persistRunSessionMessages(ctx context.Context, sessionID string, rc *runtime.RunContext, historyLen int, runErr error, log logger.Logger) {
 	if e.memory == nil || rc == nil || strings.TrimSpace(sessionID) == "" {
 		return
+	}
+	if runErr != nil && (rc.Run == nil || !rc.Run.Incomplete) {
+		e.appendRunInterruptMarker(rc, runErr)
 	}
 	toSave := domain.SessionMessagesFromRun(rc.Messages, historyLen)
 	if len(toSave) == 0 {
@@ -1085,7 +1259,32 @@ func (e *ReactLoopEngine) persistRunSessionMessages(ctx context.Context, session
 		log.Warn("保存对话历史失败", "error", err, "message_count", len(toSave))
 		return
 	}
-	log.Info("已保存本 Run 完整消息链", "message_count", len(toSave), "history_len", historyLen)
+	log.Info("已保存本 Run 完整消息链", "message_count", len(toSave), "history_len", historyLen, "interrupted", runErr != nil && (rc.Run == nil || !rc.Run.Incomplete))
+}
+
+// appendRunInterruptMarker 在消息链末尾写入运行中断 reminder（ForModel 可见，ForUI 默认隐藏）。
+func (e *ReactLoopEngine) appendRunInterruptMarker(rc *runtime.RunContext, runErr error) {
+	if rc == nil || runErr == nil {
+		return
+	}
+	detail := strings.TrimSpace(runErr.Error())
+	if detail == "" {
+		detail = "unknown error"
+	}
+	if len([]rune(detail)) > 500 {
+		detail = string([]rune(detail)[:500]) + "…"
+	}
+	marker := domain.NewReminderMessage("上一次运行中断：" + detail)
+	marker.Source = domain.MessageSourceRunEngine
+	if len(rc.Messages) > 0 {
+		last := rc.Messages[len(rc.Messages)-1]
+		if last != nil && last.NormalizedKind() == domain.MessageKindReminder &&
+			last.Source == domain.MessageSourceRunEngine &&
+			strings.HasPrefix(last.Content, "上一次运行中断：") {
+			return
+		}
+	}
+	rc.Messages = append(rc.Messages, marker)
 }
 
 func indexOfLoadSkill(calls []domain.ToolCall) int {
@@ -1132,11 +1331,6 @@ func (e *ReactLoopEngine) filterToolInfos(ctx context.Context, names []string) [
 		return withCtx.FilterInfosContext(ctx, names)
 	}
 	return filterToolInfosByName(e.registry.ListInfos(), names)
-}
-
-// newRunID 生成唯一RunID（MVP阶段用纳秒时间戳）
-func newRunID() string {
-	return fmt.Sprintf("run-%d", time.Now().UnixNano())
 }
 
 // extractToolFailureLogFields 从工具 JSON 结果提取 failure_kind / stdout / stderr，便于 agent.log 排障。
@@ -1349,22 +1543,12 @@ func renderSkillScriptBridge(injection skillInjectionOutput) string {
 	return fmt.Sprintf(`
 
 <skill_runtime_bridge>
-该 Skill 的 Markdown 是可移植规范，不要求其中出现 Genesis 专用工具名。
-当说明要求执行包内脚本或命令（例如 python scripts/foo.py、python3 scripts/foo.py、node scripts/foo.js、python -m some_module、npm 脚本包装 scripts/foo.js）时，必须改用 run_skill_command：skill=%q，command 直接填写原始命令行。
-按技能文档示例选择解释器：文档是 require()/'.js'/node 则用 node；是 python/python -m 则用 python。不要把 Node 包当成 python -m <pkg> 执行。
-需要执行 JS/Python 时，默认先 write_file("$WORK_DIR/foo.py|.js")，再 run_skill_command(command="python foo.py"|"node foo.js", inputs=["$WORK_DIR/foo.py|.js"])。用户要求新建的 Markdown、文本、代码清单等最终交付文件必须直接 write_file("$OUTPUT_DIR/文件名")；只有中间脚本和跨步骤状态才写 $WORK_DIR。用户明确指定目标路径时按指定路径写入。禁止用 python -c / node -e / node --eval 塞多行或长串内联（Windows 与远程 sandbox 的 shell 嵌套引号极易 SyntaxError）；仅允许极短单行探测（无换行、载荷约≤80字符、无嵌套引号），短探测若失败，先区分引号/语法问题与真正的缺模块，再决定是否 install_skill_dependencies。
-生成脚本较长时按职责拆成多个小模块，并用多次较小的 write_file 调用；若当前工具列表提供 apply_patch，也可用它创建大文件。单文件仍较长时，首次 write_file 后用 append=true，并把上次返回的 hash 作为 expected_hash 逐块原子追加。不要在一次大型 JSON 工具参数被截断后原样重试。平台暂未提供 freeform 编辑传输时，拆分/安全追加是可靠性约束，不是特定文档类型的规则。
-SKILL 中写明须先 Read 的链接文档（如 *.md），以及 QA Required / Content QA 中的校验命令，必须实际执行，不可跳过。
-不要把 script resource id、args 拆成旧模型字段；运行时会先 materialize 完整 Skill 包，再在受控工作目录或远端 session workspace 中执行 command。
-如需把现有文件交给脚本处理，使用 run_skill_command.inputs 传入**控制面**路径：优先 $WORK_DIR/foo.ext 或工作区相对路径；用户在本次任务中指定的宿主机绝对文件（如 E:\\docs\\report.pdf）也应直接放入 inputs，由运行时在执行审批后 stage 到 Skill 工作目录，禁止用 run_command / Copy-Item 手动搬运。command 必须使用 stage 后的相对文件名（例如 python foo.ext / node foo.ext）。禁止：① 把执行面绝对路径（如 /workspace/...）写入 inputs 或 write_file.path；② 把 $WORK_DIR/$INPUT_DIR/$OUTPUT_DIR/$TMPDIR/$SKILL_DIR 写进 command 字符串（本地宿主与远程 sandbox API 均不展开这些字面量）。正确示例：write_file("$WORK_DIR/create_pdfs.py") → run_skill_command(command="python create_pdfs.py", inputs=["$WORK_DIR/create_pdfs.py"])。文件已在 Skill 工作目录或仅跑包内 scripts/ 时省略 inputs。
-run_skill_command 返回的 metadata.execution_backend / degraded 表示本次生效执行环境；首次或 backend/降级变化时另含 path_map（仅说明执行面环境变量映射，禁止把 path_map 右侧抄进 inputs 或 command）。artifacts[].path 是工作区相对的受控交付路径（形如 .genesis/runs/<run>/output/<skill>/file.pptx；远程 session 回收到同等相对路径，不会回传宿主机绝对路径）。成功生成后直接以此为交付结果，不要再 copy/cp/write_file 搬到 $OUTPUT_DIR 或仓库根；禁止用 write_file 伪造 .pptx/.docx/.xlsx/.pdf。
-不要用 run_skill_command 执行 npm install、npm install -g、pip install、python -m pip install 等依赖安装命令（含 SKILL 正文里写成示例的 npm/pip 安装行——那是依赖说明，不是要你执行的安装步骤）。
-运行期依赖由 Skill frontmatter 的 dependencies.runtime 与 profile/镜像提供；缺包且工具结果返回 dependency_missing / suggested_install 时，再用 install_skill_dependencies 安装已声明包，或报告 profile 需补齐。
-对于 frontmatter 已声明的运行期依赖，不要额外编写一次性探测脚本预检；直接执行实际业务脚本，让 run_skill_command 的统一 preflight 返回 dependency_missing，避免重复流程和误判。
-禁止为绕过声明而全局装包；需要额外包时先扩展该 Skill 的 dependencies.runtime，再安装。
-生成含中文/日文/韩文的 PDF（reportlab 等）时，必须先注册支持 CJK 的字体：若技能包提供 scripts/register_cjk_font.py，先 python scripts/register_cjk_font.py 确认路径，生成脚本内 from register_cjk_font import ensure_reportlab_cjk 并 fontName=ensure_reportlab_cjk()；禁止仅用 Helvetica/Times 等默认英文字体导致缺字黑块。缺字体时如实报错，不要交付黑块 PDF。
-脚本执行期可通过 WORK_DIR、INPUT_DIR、OUTPUT_DIR、TMP_DIR、SKILL_DIR 访问受控目录（执行 cwd 内）；最终交付以返回的 artifacts 为准，不要假设 $OUTPUT_DIR 等于 runs/.../output。
-不要改写第三方 SKILL.md 或 references 才能运行；适配由运行时完成。
+Skill Markdown 可移植，不必含 Genesis 工具名；适配由本 bridge 完成，不要改写第三方 SKILL.md / references。
+执行：文档中的 shell/脚本命令（python/python3/node/python -m 等）一律 run_skill_command(skill=%q, command=原文)。解释器跟文档（.js/require→node；python/-m→python），勿把 Node 包装成 python -m。运行时会 materialize 完整 Skill 包到工作目录后再执行。
+写与 stage：刚 write_file("$WORK_DIR/...") 的下一跳 run_skill_command **必须**带 inputs=["$WORK_DIR/..."]（漏传会 input_binding_missing）；command 只用 stage 后相对名。用户指定的宿主路径可直接进 inputs（勿 run_command 搬运）。禁止把 /workspace 等执行面路径写入 inputs/write_file.path；禁止把 $WORK_DIR/$INPUT_DIR/$OUTPUT_DIR/$TMPDIR/$SKILL_DIR 写进 command（不会展开）。仅跑包内 scripts/ 或文件已在技能 cwd 时可省略 inputs。大脚本可拆分多次 write_file，或 append=true + expected_hash；工具参数截断后勿原样重试。
+禁止多行/长串 python -c、node -e/--eval（本地与远程 shell 引号均易失败）；仅极短单行探测。依赖：勿用 run_skill_command 跑 npm/pip install（含 SKILL 里的安装示例行）；靠 dependencies.runtime / profile，缺包看 dependency_missing 再用 install_skill_dependencies，勿先写探测脚本、勿全局装包绕过声明。
+产物与交付：produced[] 只有 Harness 的 candidate_id/name；唯一 required 候选自动发布，多候选只用 select_deliverable_candidate。禁止提交路径/locator，禁止 write_file 伪造办公二进制。最终以 Publication/Delivery 为准，勿把 runs 或 $OUTPUT_DIR 当作用户已交付。Skill 命令产出按 SKILL 写相对 cwd；元数据 execution_backend 标明执行面——remote_sandbox/remote_session 时宿主 glob/list_dir/walk_dir/read_file 看不到技能 cwd 文件；run_skill_command 刚列出的文件须继续用 run_skill_command 查看/QA，禁止改用宿主 read_file。
+SKILL 要求先 Read 的链接与 QA 命令须执行；用 grep/rg 检测「不应出现」的文本时，exit_code=1 且空 stderr 视为未命中/通过，勿当脚本崩溃反复重试。因 dependency_missing/sandbox_unavailable/unsupported_environment 失败时如实报告缺口，勿换绝对路径或搜用户目录硬扛。
 </skill_runtime_bridge>`, name)
 }
 func namesOfToolInfos(infos []*tool.Info) []string {

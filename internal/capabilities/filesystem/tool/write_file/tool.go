@@ -50,12 +50,12 @@ func (t *Tool) GetInfo() *tool.Info {
 			"当 content 预估超过 2000 词（约 8000 字符）时，必须拆分：优先使用 apply_patch 的 Add File 操作创建大文件，" +
 			"或首次写入骨架后多次 append=true 追加各段（append 时须提供上次返回的 hash 作 expected_hash）。" +
 			"不要原样重试被截断的调用，改变策略拆分后再试。" +
-			"Run 中间脚本请写 $WORK_DIR/...，最终交付写 $OUTPUT_DIR/...，禁止写仓库根。" +
+			"请优先使用相对路径（如 src/main.go、script.py）；最终交付写 output/...（或 $OUTPUT_DIR/...）。" +
 			"修改已有文件优先用 apply_patch。默认允许覆盖；可传 create_parents、overwrite=false、expected_hash。",
 		Parameters: &tool.ParameterSchema{
 			Type: "object",
 			Properties: map[string]*tool.ParameterSchema{
-				"path":           {Type: "string", Description: "workspace 内或经审批的外部文件路径；Run 中间脚本/跨步骤状态用 $WORK_DIR/...，用户要求生成的最终文本交付物用 $OUTPUT_DIR/...；用户明确指定目标路径时按指定路径写入（勿写仓库根）"},
+				"path":           {Type: "string", Description: "工作区相对路径或经审批的外部路径；中间脚本/状态用相对路径或 $WORK_DIR/...，最终文本交付物用 output/... 或 $OUTPUT_DIR/...；用户指定目标时按指定路径写入"},
 				"content":        {Type: "string", Description: "要写入的文件内容；超过约 8000 字符时请改用 apply_patch Add File 或多次 append，避免 JSON 传输截断"},
 				"create_parents": {Type: "boolean", Description: "是否创建父目录"},
 				"overwrite":      {Type: "boolean", Description: "是否允许覆盖已有文件，默认true"},

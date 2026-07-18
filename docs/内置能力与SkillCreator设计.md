@@ -281,6 +281,14 @@ Tool 只依赖 contract/service，不直接绑定产品实现。
 | 网络类     | `web_search`、`web_fetch`、HTTP request                  | 需要网络策略、域名策略、密钥策略           |
 | Skill 类 | `Skill`、`read_skill_resource`、`list_skill_resources`、`search_skill_resources` | 加载需 Approval；外部依赖需审批；skill 名不得作为独立 Tool |
 
+#### 注册、暴露与参数契约
+
+- Tool Registry 对名称实行全局唯一约束；普通 `Register` 遇到重名必须失败，禁止静默覆盖。确需替换时只能调用显式 `Replace(name, expectedOwner, tool)`，并校验当前 owner。
+- 产品启动完成后必须统一校验 Product Profile 中的每个精确工具名均已注册；动态命名空间通配符由对应能力网关管理。MCP 等条件能力只在配置启用且完成装配时写入 Effective Profile。
+- 提示词片段只能引用同时满足“已注册且已启用”的工具。计划提醒依赖 `todo_write` / `todo_update_step`，若工具不可用则不得注入该提醒。
+- 所有内置 Tool 使用统一严格参数解析：拒绝未知字段、尾随 JSON 值和不符合 Schema 的空参数；无参数工具仅接受空输入或空对象。
+- `search_mcp_tools` 只搜索和提升 deferred MCP tools；MCP resources 继续由 `list_mcp_resources` / `read_mcp_resource` 负责。
+
 
 
 

@@ -2,6 +2,7 @@ package react
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -96,8 +97,10 @@ func (f *fakeSkillMatcher) Match(context.Context, string) (string, bool, error) 
 
 type emptyRegistry struct{}
 
-func (emptyRegistry) Register(tool.Tool) {}
-func (emptyRegistry) Unregister(string)  {}
+func (emptyRegistry) Register(tool.Tool) error                { return nil }
+func (emptyRegistry) Replace(string, string, tool.Tool) error { return errors.New("unsupported") }
+func (emptyRegistry) Owner(string) (string, bool)             { return "", false }
+func (emptyRegistry) Unregister(string)                       {}
 func (emptyRegistry) Get(string) tool.Tool {
 	return nil
 }
@@ -173,12 +176,19 @@ func TestApplySkillToolResultInjectsUserMessage(t *testing.T) {
 }
 func TestRenderSkillInjectionAddsRuntimeBridge(t *testing.T) {
 	body := renderSkillInjection(skillInjectionOutput{QualifiedName: "third-party", Content: "Run python scripts/do_work.py"})
-	for _, want := range []string{"<skill_runtime_bridge>", "run_skill_command", "完整 Skill 包", "third-party", "不要用 run_skill_command 执行 npm install", "npm install -g", "dependencies.runtime", "按技能文档示例选择解释器", "不要把 Node 包当成", "须先 Read", "QA Required", "node -e", "python -c", "默认先 write_file", "当前工具列表提供 apply_patch", "register_cjk_font", "缺字黑块", "控制面", "/workspace", "execution_backend", "path_map", "写进 command", "inputs=[\"$WORK_DIR/create_pdfs.py\"]", "相对文件名", "极短单行探测", "大型 JSON 工具参数被截断", "append=true", "expected_hash", "不要额外编写一次性探测脚本"} {
+	for _, want := range []string{
+		"<skill_runtime_bridge>", "run_skill_command", "third-party", "完整 Skill 包",
+		"$WORK_DIR", "inputs=", "input_binding_missing", "python -c", "node -e", "dependencies.runtime",
+		"install_skill_dependencies", "candidate_id", "select_deliverable_candidate",
+		"execution_backend", "remote_session", "glob", "Publication/Delivery",
+		"不要改写第三方", "append=true", "expected_hash",
+		"禁止改用宿主 read_file", "exit_code=1", "未命中",
+	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("missing %q in %s", want, body)
 		}
 	}
-	for _, unexpected := range []string{"office-ppt", "pptxgenjs", "slide.addText", "禁止 pptx.addSlide"} {
+	for _, unexpected := range []string{"office-ppt", "pptxgenjs", "slide.addText", "register_cjk_font", "缺字黑块", "reportlab", "Helvetica"} {
 		if strings.Contains(body, unexpected) {
 			t.Fatalf("bridge must stay skill-agnostic, found %q in %s", unexpected, body)
 		}

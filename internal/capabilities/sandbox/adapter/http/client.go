@@ -9,7 +9,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"path"
 	"path/filepath"
 	"regexp"
@@ -29,28 +28,27 @@ import (
 
 const (
 	defaultQueueWaitSeconds = 10
-	defaultRenewInterval    = 30 * time.Second
-	defaultRenewExtend      = 5 * time.Minute
-	defaultPollStart        = 500 * time.Millisecond
-	defaultPollMax          = 3 * time.Second
-	defaultCloseTimeout     = 30 * time.Second
-	defaultRenewTimeout     = 15 * time.Second
-	defaultSessionTTL       = 300
+	// 与 genesis-sandbox/sdks/go/sandbox 默认心跳参数对齐。
+	defaultRenewInterval = 30 * time.Second
+	defaultRenewExtend   = 90 * time.Second
+	defaultPollStart     = 500 * time.Millisecond
+	defaultPollMax       = 3 * time.Second
+	defaultCloseTimeout  = 30 * time.Second
+	defaultRenewTimeout  = 15 * time.Second
+	defaultSessionTTL    = 300
 )
 
 // Config 描述 genesis-sandbox HTTP client 配置。
 type Config struct {
-	BaseURL string
-	APIKey  string
-	Timeout time.Duration
-	Client  *http.Client
-	// LocalArtifactRoot 为空时只返回远程 artifact 元数据；非空时自动下载到该目录。
-	LocalArtifactRoot string
-	RenewInterval     time.Duration
-	RenewExtend       time.Duration
-	PollStart         time.Duration
-	PollMax           time.Duration
-	CloseTimeout      time.Duration
+	BaseURL       string
+	APIKey        string
+	Timeout       time.Duration
+	Client        *http.Client
+	RenewInterval time.Duration
+	RenewExtend   time.Duration
+	PollStart     time.Duration
+	PollMax       time.Duration
+	CloseTimeout  time.Duration
 }
 
 // Client 实现 sandbox CommandClient。
@@ -58,7 +56,6 @@ type Client struct {
 	baseURL       *url.URL
 	apiKey        string
 	httpClient    *http.Client
-	artifactRoot  string
 	renewInterval time.Duration
 	renewExtend   time.Duration
 	pollStart     time.Duration
@@ -111,7 +108,6 @@ func New(cfg Config) (*Client, error) {
 		baseURL:       parsed,
 		apiKey:        strings.TrimSpace(cfg.APIKey),
 		httpClient:    httpClient,
-		artifactRoot:  strings.TrimSpace(cfg.LocalArtifactRoot),
 		renewInterval: renewInterval,
 		renewExtend:   renewExtend,
 		pollStart:     pollStart,
@@ -133,7 +129,7 @@ func (c *Client) RunCommand(ctx context.Context, req sandboxcontract.CommandRequ
 	}
 	progress.Emit(ctx, progress.Event{Kind: progress.KindSandbox, Phase: progress.PhaseComplete, Component: "genesis-sandbox", Name: lease.SandboxID, Summary: "sandbox 租约已就绪"})
 	renewCtx, cancelRenew := context.WithCancel(context.Background())
-	go c.renewLoop(renewCtx, lease.SandboxID)
+	go c.renewLoop(renewCtx, lease.SandboxID, nil)
 	defer func() {
 		cancelRenew()
 		progress.Emit(ctx, progress.Event{Kind: progress.KindSandbox, Phase: progress.PhaseStart, Component: "genesis-sandbox", Name: lease.SandboxID, Summary: "释放 sandbox 租约"})
@@ -193,6 +189,10 @@ func (c *Client) OpenSession(ctx context.Context, opts sandboxcontract.SessionOp
 	if strings.TrimSpace(record.ActiveSandboxID) == "" {
 		return nil, execcontract.NewError(execcontract.ErrCodeSandboxUnavailable, fmt.Errorf("sandbox session %s缺少active_sandbox_id", record.SessionID))
 	}
+	if record.ExpiresAt.IsZero() || !record.ExpiresAt.After(time.Now()) {
+		_ = c.doJSON(context.Background(), http.MethodDelete, "/v1/sessions/"+url.PathEscape(record.SessionID), nil, nil)
+		return nil, execcontract.NewError(execcontract.ErrCodeSandboxUnavailable, fmt.Errorf("sandbox session %s未返回有效 expires_at", record.SessionID))
+	}
 	workspace := opts.Workspace
 	if strings.TrimSpace(workspace.ID) == "" && strings.TrimSpace(record.WorkspaceID) != "" {
 		workspace.ID = record.WorkspaceID
@@ -207,19 +207,32 @@ func (c *Client) OpenSession(ctx context.Context, opts sandboxcontract.SessionOp
 		workspace: workspace,
 		sandbox:   opts.Sandbox,
 		options:   opts.Options,
+		expiresAt: record.ExpiresAt,
 	}
+	// 对齐 SDK SandboxSession：心跳调用 POST /v1/sessions/{id}/renew，
+	// 由服务端同时延长 Session 与底层 sandbox lease，再回写本地 expiresAt。
+	renewCtx, cancelRenew := context.WithCancel(context.Background())
+	session.cancelRenew = cancelRenew
+	session.renewWG.Add(1)
+	go func() {
+		defer session.renewWG.Done()
+		c.sessionRenewLoop(renewCtx, session)
+	}()
 	progress.Emit(ctx, progress.Event{Kind: progress.KindSandbox, Phase: progress.PhaseComplete, Component: "genesis-sandbox", Name: record.SessionID, Summary: "sandbox session已就绪"})
 	return session, nil
 }
 
 // Session 实现 sandbox 长会话端口。
 type Session struct {
-	client    *Client
-	sessionID string
-	sandboxID string
-	workspace sandboxcontract.WorkspaceRef
-	sandbox   execmodel.SandboxProfile
-	options   execcontract.RunOptions
+	client      *Client
+	sessionID   string
+	sandboxID   string
+	workspace   sandboxcontract.WorkspaceRef
+	sandbox     execmodel.SandboxProfile
+	options     execcontract.RunOptions
+	expiresAt   time.Time
+	cancelRenew context.CancelFunc
+	renewWG     sync.WaitGroup
 
 	mu     sync.Mutex
 	closed bool
@@ -238,6 +251,16 @@ func (s *Session) Workspace() sandboxcontract.WorkspaceRef {
 		}
 	}
 	return sandboxcontract.WorkspaceRef{ID: s.sessionID, Provider: "genesis-sandbox", Metadata: metadata}
+}
+
+// ExpiresAt 返回服务端 session record 的权威 lease 截止时间。
+func (s *Session) ExpiresAt() time.Time {
+	if s == nil {
+		return time.Time{}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.expiresAt
 }
 
 // Run 在当前 server-side Session 内执行命令，复用 session scoped /workspace。
@@ -312,19 +335,23 @@ func mergeRunOptions(base, override execcontract.RunOptions) execcontract.RunOpt
 	if out.Sandbox.Mode == "" && out.Sandbox.Provider == "" && out.Sandbox.RuntimeProfile == "" && out.Sandbox.TaskType == "" && out.Sandbox.Operation == "" {
 		out.Sandbox = base.Sandbox
 	}
-	if out.Workspace.WorkDir == "" && out.Workspace.InputDir == "" && out.Workspace.OutputDir == "" && out.Workspace.TmpDir == "" && out.Workspace.Mode == "" && out.Workspace.PathPolicy == "" {
+	if out.Binding.ID == "" {
+		out.Binding = base.Binding
+	}
+	if out.Workspace.WorkDir == "" && out.Workspace.InputDir == "" && out.Workspace.OutputDir == "" && out.Workspace.TmpDir == "" && out.Workspace.SkillDir == "" {
 		out.Workspace = base.Workspace
 	}
-	if len(out.InputArtifacts) == 0 {
-		out.InputArtifacts = base.InputArtifacts
+	if len(out.StagedInputs) == 0 {
+		out.StagedInputs = base.StagedInputs
 	}
-	if out.ArtifactCollectionPolicy == "" {
-		out.ArtifactCollectionPolicy = base.ArtifactCollectionPolicy
+	if out.OutputDiscoveryPolicy == "" {
+		out.OutputDiscoveryPolicy = base.OutputDiscoveryPolicy
 	}
 	return out
 }
 
 // Close 删除服务端 Session，并释放其 active sandbox。
+// 对齐 SDK：先停心跳并等待退出，再 DeleteSession。
 func (s *Session) Close(ctx context.Context) error {
 	if s == nil || s.client == nil {
 		return nil
@@ -335,7 +362,13 @@ func (s *Session) Close(ctx context.Context) error {
 		return nil
 	}
 	s.closed = true
+	cancelRenew := s.cancelRenew
+	s.cancelRenew = nil
 	s.mu.Unlock()
+	if cancelRenew != nil {
+		cancelRenew()
+		s.renewWG.Wait()
+	}
 	baseCtx := context.Background()
 	if ctx != nil {
 		baseCtx = ctx
@@ -360,17 +393,12 @@ func (c *Client) resultFromJob(ctx context.Context, req sandboxcontract.CommandR
 		DurationMS:      job.DurationMS,
 		OutputTruncated: job.StdoutTruncated || job.StderrTruncated,
 		Error:           firstNonEmpty(job.Error, job.ErrorMessage, job.ErrorCode),
-		Artifacts:       c.artifactsFromJob(job.OutputArtifacts),
-	}
-	if c.artifactRoot != "" && len(result.Artifacts) > 0 {
-		if warnings := c.materializeArtifacts(ctx, result.Artifacts); len(warnings) > 0 {
-			result.Warnings = append(result.Warnings, warnings...)
-		}
+		OutputObjects:   outputObjectsFromJob(job.OutputArtifacts),
 	}
 	if job.Status == "timed_out" || job.ErrorCode == "EXEC_TIMEOUT" {
 		result.TimedOut = true
 	}
-	if req.Options.ArtifactCollectionPolicy == execmodel.ArtifactCollectionOutputOnly && job.ExitCode == 0 && len(result.Artifacts) == 0 {
+	if req.Options.OutputDiscoveryPolicy == execmodel.OutputDiscoveryDeclared && job.ExitCode == 0 && len(result.OutputObjects) == 0 {
 		result.Warnings = append(result.Warnings,
 			"NO_OUTPUT_ARTIFACTS: 代码执行成功，但没有在OUTPUT_DIR发现可回传成果物；请把最终文件写入环境变量OUTPUT_DIR指向的目录",
 		)
@@ -436,7 +464,9 @@ func (c *Client) pollJob(ctx context.Context, jobID string, timeout time.Duratio
 	return nil, execcontract.NewError(execcontract.ErrCodeTimeout, fmt.Errorf("sandbox job %s timed out after %s", jobID, timeout))
 }
 
-func (c *Client) renewLoop(ctx context.Context, sandboxID string) {
+// renewLoop 仅用于一次性 Job 路径的 sandbox lease 心跳。
+// Session 长会话必须走 sessionRenewLoop / RenewSession，避免只续 lease 不续 session。
+func (c *Client) renewLoop(ctx context.Context, sandboxID string, onRenew func(time.Time)) {
 	ticker := time.NewTicker(c.renewInterval)
 	defer ticker.Stop()
 	for {
@@ -445,20 +475,104 @@ func (c *Client) renewLoop(ctx context.Context, sandboxID string) {
 			return
 		case <-ticker.C:
 			renewCtx, cancel := context.WithTimeout(context.Background(), defaultRenewTimeout)
-			_ = c.renewSandbox(renewCtx, sandboxID)
+			expiresAt, err := c.RenewSandbox(renewCtx, sandboxID)
 			cancel()
+			if err == nil && onRenew != nil {
+				onRenew(expiresAt)
+			}
 		}
 	}
 }
 
-func (c *Client) renewSandbox(ctx context.Context, sandboxID string) error {
-	payload := map[string]int{"extend_seconds": int(c.renewExtend.Seconds())}
+// sessionRenewLoop 对齐 SDK heartbeatLoop：周期调用 RenewSession。
+// renew 的 timeout 挂在心跳 ctx 上，Close 取消时能打断 in-flight 请求。
+func (c *Client) sessionRenewLoop(ctx context.Context, session *Session) {
+	if c == nil || session == nil {
+		return
+	}
+	ticker := time.NewTicker(c.renewInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			renewCtx, cancel := context.WithTimeout(ctx, defaultRenewTimeout)
+			expiresAt, err := c.RenewSession(renewCtx, session.sessionID)
+			cancel()
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				progress.Emit(ctx, progress.Event{
+					Kind: progress.KindSandbox, Phase: progress.PhaseError, Level: progress.LevelWarn,
+					Component: "genesis-sandbox", Name: session.sessionID,
+					Summary: "sandbox session 心跳续期失败，将重试", Detail: err.Error(),
+				})
+				continue
+			}
+			if expiresAt.IsZero() {
+				continue
+			}
+			session.mu.Lock()
+			session.expiresAt = expiresAt
+			session.mu.Unlock()
+		}
+	}
+}
+
+// RenewSession 续期命名 Session（同时延长底层 sandbox lease），对齐 SDK Client.RenewSession。
+func (c *Client) RenewSession(ctx context.Context, sessionID string) (time.Time, error) {
+	if c == nil {
+		return time.Time{}, execcontract.NewError(execcontract.ErrCodeSandboxUnavailable, fmt.Errorf("sandbox http client未初始化"))
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return time.Time{}, execcontract.NewError(execcontract.ErrCodeInvalidInput, fmt.Errorf("session id不能为空"))
+	}
+	extendSeconds := int(c.renewExtend.Seconds())
+	if extendSeconds <= 0 {
+		extendSeconds = int(defaultRenewExtend.Seconds())
+	}
+	payload := map[string]int{"extend_seconds": extendSeconds}
 	var body bytes.Buffer
 	if err := json.NewEncoder(&body).Encode(payload); err != nil {
-		return execcontract.NewError(execcontract.ErrCodeInvalidInput, fmt.Errorf("编码sandbox renew请求失败: %w", err))
+		return time.Time{}, execcontract.NewError(execcontract.ErrCodeInvalidInput, fmt.Errorf("编码sandbox session renew请求失败: %w", err))
+	}
+	var record sessionRecord
+	if err := c.doJSON(ctx, http.MethodPost, "/v1/sessions/"+url.PathEscape(sessionID)+"/renew", &body, &record); err != nil {
+		return time.Time{}, err
+	}
+	if record.ExpiresAt.IsZero() {
+		return time.Time{}, execcontract.NewError(execcontract.ErrCodeSandboxUnavailable, fmt.Errorf("sandbox session renew 未返回 expires_at"))
+	}
+	return record.ExpiresAt, nil
+}
+
+// RenewSandbox 续租指定 sandbox，返回服务端确认的新到期时间。
+// 仅用于 Job 路径；Session 路径请使用 RenewSession。
+func (c *Client) RenewSandbox(ctx context.Context, sandboxID string) (time.Time, error) {
+	if c == nil {
+		return time.Time{}, execcontract.NewError(execcontract.ErrCodeSandboxUnavailable, fmt.Errorf("sandbox http client未初始化"))
+	}
+	sandboxID = strings.TrimSpace(sandboxID)
+	if sandboxID == "" {
+		return time.Time{}, execcontract.NewError(execcontract.ErrCodeInvalidInput, fmt.Errorf("sandbox id不能为空"))
+	}
+	extendSeconds := int(c.renewExtend.Seconds())
+	if extendSeconds <= 0 {
+		extendSeconds = int(defaultRenewExtend.Seconds())
+	}
+	payload := map[string]int{"extend_seconds": extendSeconds}
+	var body bytes.Buffer
+	if err := json.NewEncoder(&body).Encode(payload); err != nil {
+		return time.Time{}, execcontract.NewError(execcontract.ErrCodeInvalidInput, fmt.Errorf("编码sandbox renew请求失败: %w", err))
 	}
 	var lease sandboxLease
-	return c.doJSON(ctx, http.MethodPost, "/v1/sandboxes/"+url.PathEscape(sandboxID)+"/renew", &body, &lease)
+	if err := c.doJSON(ctx, http.MethodPost, "/v1/sandboxes/"+url.PathEscape(sandboxID)+"/renew", &body, &lease); err != nil {
+		return time.Time{}, err
+	}
+	return lease.ExpiresAt, nil
 }
 
 func (c *Client) closeSandbox(sandboxID string) error {
@@ -546,56 +660,6 @@ func (c *Client) uploadJobFile(ctx context.Context, jobID, name string, content 
 		return nil, execcontract.NewError(execcontract.ErrCodeRunnerFailed, fmt.Errorf("解析sandbox输入artifact失败: %w", err))
 	}
 	return &artifact, nil
-}
-
-func (c *Client) materializeArtifacts(ctx context.Context, artifacts []execmodel.Artifact) []string {
-	warnings := make([]string, 0)
-	for i := range artifacts {
-		if artifacts[i].ID == "" {
-			continue
-		}
-		progress.Emit(ctx, progress.Event{Kind: progress.KindSandbox, Phase: progress.PhaseStart, Component: "genesis-sandbox", Name: artifacts[i].Name, Summary: "下载 sandbox artifact"})
-		data, err := c.DownloadArtifact(ctx, artifacts[i].ID)
-		if err != nil {
-			warnings = append(warnings, fmt.Sprintf("artifact %s 下载失败: %v", artifacts[i].ID, err))
-			progress.Emit(ctx, progress.Event{Kind: progress.KindSandbox, Phase: progress.PhaseError, Level: progress.LevelWarn, Component: "genesis-sandbox", Name: artifacts[i].Name, Summary: "artifact 下载失败", Detail: err.Error()})
-			continue
-		}
-		localPath, err := c.writeArtifact(artifacts[i], data)
-		if err != nil {
-			warnings = append(warnings, fmt.Sprintf("artifact %s 写入本地失败: %v", artifacts[i].ID, err))
-			progress.Emit(ctx, progress.Event{Kind: progress.KindFile, Phase: progress.PhaseError, Level: progress.LevelWarn, Component: "artifact", Name: artifacts[i].Name, Summary: "artifact 写入本地失败", Detail: err.Error()})
-			continue
-		}
-		artifacts[i].LocalPath = localPath
-		progress.Emit(ctx, progress.Event{Kind: progress.KindFile, Phase: progress.PhaseComplete, Component: "artifact", Name: artifacts[i].Name, Summary: "artifact 已写入本地", Detail: localPath})
-	}
-	return warnings
-}
-
-func (c *Client) writeArtifact(artifact execmodel.Artifact, data []byte) (string, error) {
-	root, err := filepath.Abs(c.artifactRoot)
-	if err != nil {
-		return "", err
-	}
-	group := firstNonEmpty(artifact.WorkspaceID, artifact.JobID, "default")
-	dir := filepath.Join(root, sanitizePathPart(group))
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", err
-	}
-	name := sanitizeFilename(firstNonEmpty(artifact.Name, artifact.ID, "artifact.bin"))
-	target := filepath.Join(dir, name)
-	rel, err := filepath.Rel(dir, target)
-	if err != nil {
-		return "", err
-	}
-	if rel == "." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || rel == ".." || filepath.IsAbs(rel) {
-		return "", fmt.Errorf("artifact路径越界: %s", target)
-	}
-	if err := os.WriteFile(target, data, 0o644); err != nil {
-		return "", err
-	}
-	return target, nil
 }
 
 func (c *Client) doJSON(ctx context.Context, method, path string, body io.Reader, out any) error {
@@ -785,8 +849,8 @@ func execJobRequestFromCommand(req sandboxcontract.CommandRequest) execJobReques
 	}
 	workspace := sandboxWorkspace(req)
 	workingDir := sandboxWorkingDir(req.Command.Cwd, workspace)
-	inputArtifactIDs := make([]string, 0, len(req.Options.InputArtifacts))
-	for _, artifact := range req.Options.InputArtifacts {
+	inputArtifactIDs := make([]string, 0, len(req.Options.StagedInputs))
+	for _, artifact := range req.Options.StagedInputs {
 		if strings.TrimSpace(artifact.ID) != "" {
 			inputArtifactIDs = append(inputArtifactIDs, artifact.ID)
 		}
@@ -811,24 +875,14 @@ func execJobRequestFromCommand(req sandboxcontract.CommandRequest) execJobReques
 }
 
 func sandboxWorkspace(req sandboxcontract.CommandRequest) execmodel.ExecutionWorkspace {
-	workspace := req.Options.Workspace
-	if strings.TrimSpace(workspace.WorkDir) == "" {
-		workspace.WorkDir = "/workspace"
+	workspace := execmodel.ExecutionWorkspace{
+		WorkDir:   "/workspace",
+		InputDir:  "/workspace/input",
+		OutputDir: "/workspace/output",
+		TmpDir:    "/workspace/tmp",
 	}
-	if strings.TrimSpace(workspace.InputDir) == "" {
-		workspace.InputDir = strings.TrimRight(workspace.WorkDir, "/") + "/input"
-	}
-	if strings.TrimSpace(workspace.OutputDir) == "" {
-		workspace.OutputDir = strings.TrimRight(workspace.WorkDir, "/") + "/output"
-	}
-	if strings.TrimSpace(workspace.TmpDir) == "" {
-		workspace.TmpDir = strings.TrimRight(workspace.WorkDir, "/") + "/tmp"
-	}
-	if workspace.Mode == "" {
-		workspace.Mode = execmodel.WorkspaceModeSandboxSess
-	}
-	if workspace.PathPolicy == "" {
-		workspace.PathPolicy = execmodel.PathPolicyStrictWorkspace
+	if strings.TrimSpace(req.Options.Workspace.SkillDir) != "" {
+		workspace.SkillDir = "/workspace"
 	}
 	return workspace
 }
@@ -857,18 +911,6 @@ func sandboxEnv(userEnv map[string]string, workspace execmodel.ExecutionWorkspac
 	return env
 }
 
-func inputArtifactFromRecord(record artifactRecord) execmodel.InputArtifactRef {
-	return execmodel.InputArtifactRef{
-		ID:          record.ArtifactID,
-		Name:        record.Name,
-		WorkspaceID: record.WorkspaceID,
-		JobID:       record.JobID,
-		Size:        record.Size,
-		SHA256:      record.SHA256,
-		MIME:        record.MIME,
-	}
-}
-
 func requestTimeout(req sandboxcontract.CommandRequest) time.Duration {
 	if req.Options.Timeout > 0 {
 		return req.Options.Timeout
@@ -892,25 +934,25 @@ func minDuration(a, b time.Duration) time.Duration {
 	return b
 }
 
-func (c *Client) artifactsFromJob(records []artifactRecord) []execmodel.Artifact {
+func outputObjectsFromJob(records []artifactRecord) []execmodel.ExecutorOutputObject {
 	if len(records) == 0 {
 		return nil
 	}
-	out := make([]execmodel.Artifact, 0, len(records))
+	out := make([]execmodel.ExecutorOutputObject, 0, len(records))
 	for _, record := range records {
-		remoteURL := ""
-		if record.ArtifactID != "" {
-			remoteURL = c.baseURL.ResolveReference(&url.URL{Path: strings.TrimRight(c.baseURL.Path, "/") + "/v1/artifacts/" + url.PathEscape(record.ArtifactID)}).String()
+		version := strings.TrimSpace(record.SHA256)
+		if version != "" && !strings.HasPrefix(strings.ToLower(version), "sha256:") {
+			version = "sha256:" + version
 		}
-		out = append(out, execmodel.Artifact{
+		out = append(out, execmodel.ExecutorOutputObject{
 			ID:          record.ArtifactID,
 			WorkspaceID: record.WorkspaceID,
 			JobID:       record.JobID,
 			Name:        record.Name,
 			Size:        record.Size,
 			SHA256:      record.SHA256,
-			MIME:        record.MIME,
-			RemoteURL:   remoteURL,
+			MediaType:   record.MIME,
+			Version:     version,
 		})
 	}
 	return out

@@ -136,6 +136,22 @@ func TestClassifyFailureNodeMissingScriptEntry(t *testing.T) {
 	}
 }
 
+func TestClassifyFailureWindowsAbsoluteEntryIsNotNPMDependency(t *testing.T) {
+	out := &scriptcontract.RunResult{
+		OK:       false,
+		Script:   commandScriptHint("node create_ppt.js"),
+		Stderr:   `Error: Cannot find module 'D:\workspace\run\skills\office-ppt\create_ppt.js'`,
+		ExitCode: 1,
+	}
+	classifyFailure(out)
+	if out.Script != "create_ppt.js" || out.FailureKind != "script_entry_missing" {
+		t.Fatalf("FailureKind=%q Script=%q Missing=%+v", out.FailureKind, out.Script, out.Missing)
+	}
+	if len(out.Missing) != 0 || out.SuggestedInstall != nil {
+		t.Fatalf("Windows 路径不得被解析为 npm 依赖: Missing=%+v SuggestedInstall=%+v", out.Missing, out.SuggestedInstall)
+	}
+}
+
 func TestClassifyFailurePythonMissingScriptEntry(t *testing.T) {
 	out := &scriptcontract.RunResult{
 		OK:       false,

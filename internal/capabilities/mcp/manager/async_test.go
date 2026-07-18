@@ -39,8 +39,8 @@ func (t *slowTransport) Dial(ctx context.Context, _ contract.ConnectOptions) (co
 
 type fakeDialed struct{}
 
-func (f *fakeDialed) Close() error     { return nil }
-func (f *fakeDialed) Underlying() any  { return nil } // 故意无效，连接会失败；本测试只验证异步不阻塞
+func (f *fakeDialed) Close() error    { return nil }
+func (f *fakeDialed) Underlying() any { return nil } // 故意无效，连接会失败；本测试只验证异步不阻塞
 
 func TestSyncAsyncReturnsBeforeDialCompletes(t *testing.T) {
 	t.Parallel()

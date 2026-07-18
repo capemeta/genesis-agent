@@ -2,8 +2,13 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"io"
+	"mime"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -13,6 +18,8 @@ import (
 
 	approvalcontract "genesis-agent/internal/capabilities/approval/contract"
 	approvalmodel "genesis-agent/internal/capabilities/approval/model"
+	artifactcontract "genesis-agent/internal/capabilities/artifact/contract"
+	artifactmodel "genesis-agent/internal/capabilities/artifact/model"
 	execcontract "genesis-agent/internal/capabilities/execution/contract"
 	execmodel "genesis-agent/internal/capabilities/execution/model"
 	fscontract "genesis-agent/internal/capabilities/filesystem/contract"
@@ -22,10 +29,9 @@ import (
 	skillcontract "genesis-agent/internal/capabilities/skill/contract"
 	skillmodel "genesis-agent/internal/capabilities/skill/model"
 	scriptcontract "genesis-agent/internal/capabilities/skill/script/contract"
-	"genesis-agent/internal/capabilities/skill/script/gate"
 	"genesis-agent/internal/capabilities/skill/script/materialize"
-	scriptworkspace "genesis-agent/internal/capabilities/skill/script/workspace"
-	"genesis-agent/internal/platform/contextutil"
+	workcontract "genesis-agent/internal/capabilities/workspace/contract"
+	workmodel "genesis-agent/internal/capabilities/workspace/model"
 	"genesis-agent/internal/platform/logger"
 )
 
@@ -45,10 +51,16 @@ type Service struct {
 	enablePreflight       bool
 	autoRetryAfterInstall bool
 	installer             DependencyInstaller
+	provisioner           workcontract.Provisioner
+	inputSnapshots        workcontract.InputSnapshotReader
+	producedResources     workcontract.ProducedResourceRegistrar
+	remoteSessions        RemoteSessionBinder
+	reservations          artifactcontract.OutputReservationAllocator
+	deliverables          artifactcontract.DeliverableSpecStore
 
-	mu        sync.Mutex
-	sessions  map[string]*remoteSession
-	pathHints map[string]pathHintState
+	mu       sync.Mutex
+	sessions map[string]*remoteSession
+	entries  map[string]map[string]struct{}
 }
 
 type remoteSession struct {
@@ -70,6 +82,17 @@ type Deps struct {
 	EnablePreflight       bool
 	AutoRetryAfterInstall bool
 	Installer             DependencyInstaller
+	Provisioner           workcontract.Provisioner
+	InputSnapshots        workcontract.InputSnapshotReader
+	ProducedResources     workcontract.ProducedResourceRegistrar
+	RemoteSessions        RemoteSessionBinder
+	Reservations          artifactcontract.OutputReservationAllocator
+	Deliverables          artifactcontract.DeliverableSpecStore
+}
+
+// RemoteSessionBinder 在远程 session 创建后持久绑定纯数据 WorkspaceRef 与权威 lease。
+type RemoteSessionBinder interface {
+	BindRemoteSession(ctx context.Context, tenantID, runID, bindingID string, workspace sandboxcontract.WorkspaceRef, expiresAt time.Time) error
 }
 
 // DependencyInstaller 是可选的同回合安装端口。
@@ -86,6 +109,9 @@ func New(deps Deps) (*Service, error) {
 	}
 	if deps.Approval == nil {
 		return nil, fmt.Errorf("approval service未配置")
+	}
+	if deps.Provisioner == nil {
+		return nil, fmt.Errorf("workspace provisioner未配置")
 	}
 	log := deps.Logger
 	if log == nil {
@@ -104,8 +130,14 @@ func New(deps Deps) (*Service, error) {
 		enablePreflight:       deps.EnablePreflight,
 		autoRetryAfterInstall: deps.AutoRetryAfterInstall,
 		installer:             deps.Installer,
+		provisioner:           deps.Provisioner,
+		inputSnapshots:        deps.InputSnapshots,
+		producedResources:     deps.ProducedResources,
+		remoteSessions:        deps.RemoteSessions,
+		reservations:          deps.Reservations,
+		deliverables:          deps.Deliverables,
 		sessions:              make(map[string]*remoteSession),
-		pathHints:             make(map[string]pathHintState),
+		entries:               make(map[string]map[string]struct{}),
 	}, nil
 }
 
@@ -122,7 +154,7 @@ func (s *Service) Close(ctx context.Context) error {
 		}
 		delete(s.sessions, key)
 	}
-	s.pathHints = make(map[string]pathHintState)
+	s.entries = make(map[string]map[string]struct{})
 	s.mu.Unlock()
 	var firstErr error
 	for _, sess := range sessions {
@@ -183,6 +215,51 @@ func (s *Service) Run(ctx context.Context, req scriptcontract.RunRequest) (*scri
 	if err != nil {
 		return nil, err
 	}
+	if scriptHint != "" {
+		available, checkErr := s.commandEntryAvailable(ctx, req, meta, req.Binding.Owner.RunID, scriptHint)
+		if checkErr != nil {
+			return nil, fmt.Errorf("预检 Skill 命令入口: %w", checkErr)
+		}
+		if !available {
+			required := "$WORK_DIR/" + path.Base(scriptHint)
+			out := &scriptcontract.RunResult{
+				OK:              false,
+				Skill:           meta.Name,
+				Script:          scriptHint,
+				Command:         command,
+				Error:           "命令入口不在 Skill 包、持久执行目录或 staged inputs 中",
+				FailureKind:     "input_binding_missing",
+				SuggestedAction: "stage_command_entry_via_inputs",
+				Retryable:       true,
+				RequiredInputs:  []string{required},
+				DurationMS:      time.Since(started).Milliseconds(),
+			}
+			if len(req.Inputs.Inputs) == 0 && path.Dir(normalizeCommandEntry(scriptHint)) == "." {
+				arguments := map[string]any{"skill": meta.Name, "command": command, "inputs": []string{required}}
+				if req.TimeoutMS > 0 {
+					arguments["timeout_ms"] = req.TimeoutMS
+				}
+				out.ExactCall = &scriptcontract.ToolCallSuggestion{Tool: "run_skill_command", Arguments: arguments}
+			}
+			return out, nil
+		}
+	}
+	if reason, redundant := redundantRuntimeProbe(command, meta.Dependencies.Runtime); redundant {
+		out := &scriptcontract.RunResult{
+			OK:              false,
+			Skill:           meta.Name,
+			Script:          scriptHint,
+			Command:         command,
+			Error:           reason,
+			FailureKind:     "runtime_probe_unnecessary",
+			Retryable:       true,
+			SuggestedAction: "run_declared_business_command_directly",
+			DurationMS:      time.Since(started).Milliseconds(),
+			Warnings:        []string{"Skill Harness 会在正式命令执行前校验声明的 runtime/profile；不要用独立版本或 import/require 探测消耗迭代与审批。"},
+		}
+		classifyFailure(out)
+		return out, nil
+	}
 	sandbox := req.Sandbox
 	sandbox.TaskType = resolveTaskType(meta)
 	sandbox.Operation = execmodel.SandboxOperationRunSkill
@@ -220,23 +297,22 @@ func (s *Service) Run(ctx context.Context, req scriptcontract.RunRequest) (*scri
 		classifyFailureForSkill(out, meta.Dependencies)
 		return out, nil
 	}
-	runID := strings.TrimSpace(req.RunID)
-	if runID == "" {
-		if id, ok := contextutil.GetRunID(ctx); ok {
-			runID = id
-		}
+	if err := req.Binding.Validate(); err != nil {
+		return nil, fmt.Errorf("无效 Skill execution binding: %w", err)
 	}
-	if runID == "" {
-		runID = fmt.Sprintf("run-%d", time.Now().UnixNano())
-	}
+	runID := req.Binding.Owner.RunID
 
 	approvalDisplay := meta.Name
 	approvalMetadata := map[string]string{"skill": meta.Name, "command": command}
-	if len(req.Inputs) > 0 {
-		approvalDisplay = fmt.Sprintf("%s（stage %d 个输入）", meta.Name, len(req.Inputs))
-		// 审批与审计必须能看见实际将被读取并导入执行环境的控制面路径。
-		approvalMetadata["inputs"] = strings.Join(req.Inputs, "\n")
+	if len(req.Inputs.Inputs) > 0 {
+		approvalDisplay = fmt.Sprintf("%s（stage %d 个输入）", meta.Name, len(req.Inputs.Inputs))
+		ids := make([]string, 0, len(req.Inputs.Inputs))
+		for _, input := range req.Inputs.Inputs {
+			ids = append(ids, input.Source.Authority+":"+input.Source.ID+"@"+input.Source.Version)
+		}
+		approvalMetadata["input_refs"] = strings.Join(ids, "\n")
 	}
+	approvalStarted := time.Now()
 	decision, err := s.approval.Authorize(ctx, approvalmodel.Request{
 		ToolName:        "run_skill_command",
 		Action:          approvalmodel.ActionCommandExec,
@@ -246,11 +322,12 @@ func (s *Service) Run(ctx context.Context, req scriptcontract.RunRequest) (*scri
 		SuggestedScopes: []approvalmodel.GrantScope{approvalmodel.GrantScopeOnce, approvalmodel.GrantScopeSession},
 		Metadata:        approvalMetadata,
 	})
+	approvalDurationMS := time.Since(approvalStarted).Milliseconds()
 	if err != nil {
 		return nil, err
 	}
 	if decision.Type != approvalmodel.DecisionApproved && decision.Type != approvalmodel.DecisionApprovedForScope {
-		out := &scriptcontract.RunResult{OK: false, Skill: meta.Name, Command: command, Error: fmt.Sprintf("approval %s: %s", decision.Type, decision.Reason)}
+		out := &scriptcontract.RunResult{OK: false, Skill: meta.Name, Command: command, Error: fmt.Sprintf("approval %s: %s", decision.Type, decision.Reason), ApprovalDurationMS: approvalDurationMS, DurationMS: time.Since(started).Milliseconds()}
 		classifyFailure(out)
 		return out, nil
 	}
@@ -260,10 +337,11 @@ func (s *Service) Run(ctx context.Context, req scriptcontract.RunRequest) (*scri
 		timeout = time.Duration(req.TimeoutMS) * time.Millisecond
 	}
 	out := &scriptcontract.RunResult{
-		OK:      false,
-		Skill:   meta.Name,
-		Script:  commandScriptHint(command),
-		Command: command,
+		OK:                 false,
+		Skill:              meta.Name,
+		Script:             commandScriptHint(command),
+		Command:            command,
+		ApprovalDurationMS: approvalDurationMS,
 		Metadata: map[string]string{
 			"runtime_profile": string(sandbox.RuntimeProfile),
 			"task_type":       string(sandbox.TaskType),
@@ -271,7 +349,7 @@ func (s *Service) Run(ctx context.Context, req scriptcontract.RunRequest) (*scri
 	}
 
 	if s.enablePreflight && !useRemoteSession(sandbox) {
-		if miss := s.preflightRuntime(ctx, meta, out.Script, req.WorkspaceRoot); len(miss) > 0 {
+		if miss := s.preflightRuntime(ctx, meta, out.Script, req.ProjectDir); len(miss) > 0 {
 			installable := installableMissing(miss)
 			if len(installable) == 0 {
 				for _, m := range miss {
@@ -300,34 +378,34 @@ func (s *Service) Run(ctx context.Context, req scriptcontract.RunRequest) (*scri
 	}
 
 	for attempt := 0; attempt < 2; attempt++ {
-		var result *execmodel.Result
-		var produced []string
-		var workDir string
-		var staged []string
-		var artifacts []scriptcontract.Artifact
-		var warnings []string
 		intendedRemote := useRemoteSession(sandbox)
+		var execution skillExecutionAttempt
 		if intendedRemote {
-			result, produced, workDir, staged, artifacts, warnings, err = s.runRemote(ctx, meta, runID, req, timeout, sandbox)
+			execution = s.runRemote(ctx, meta, runID, req, timeout, sandbox)
 		} else {
-			result, produced, workDir, staged, artifacts, warnings, err = s.runLocal(ctx, meta, runID, req, timeout, sandbox)
+			execution = s.runLocal(ctx, meta, runID, req, timeout, sandbox)
+		}
+		s.noteKnownEntries(sessionKey(runID, req.Binding.ID, meta.Name), execution.Staged, execution.Produced)
+		result, err := execution.Result, execution.Err
+		out.StagingDurationMS += execution.StagingDurationMS
+		if result != nil {
+			out.ExecutionDurationMS += result.DurationMS
 		}
 		degraded := result != nil && result.Environment == execmodel.EnvironmentLocal && sandbox.Mode != execmodel.SandboxDisabled
 		executionBackend := resolveExecutionBackend(sandbox, intendedRemote, degraded)
-		includeMap := s.shouldIncludePathMap(formatPathContextKey(runID, meta.Name), executionBackend, degraded)
-		attachExecutionPathContext(out, executionBackend, degraded, includeMap, runID, sanitize(string(meta.PackageID)))
-		out.WorkDir = workDir
-		out.SkillDir = workDir
+		attachExecutionPathContext(out, executionBackend, degraded)
+		out.WorkDir = execution.WorkDir
+		out.SkillDir = execution.WorkDir
 		// 按路径命名空间投影：/workspace 保留；宿主 abs（含远程 optional 降级到本地）相对化。
 		// 本地平台沙箱与无沙箱同属宿主工作区命名空间。
-		if !isSandboxNamespacePath(workDir) {
-			out.WorkDir = projectHostWorkDirsForModel(req.WorkspaceRoot, workDir)
+		if !isSandboxNamespacePath(execution.WorkDir) {
+			out.WorkDir = projectHostWorkDirsForModel(req.ProjectDir, execution.WorkDir)
 			out.SkillDir = out.WorkDir
 		}
-		out.Produced = append([]string(nil), produced...)
-		out.StagedInputs = append([]string(nil), staged...)
-		if len(warnings) > 0 {
-			out.Warnings = append(out.Warnings, warnings...)
+		out.Produced = s.projectProducedCandidates(ctx, req.Binding.Owner.TenantID, runID, execution.Descriptors)
+		out.StagedInputs = append([]string(nil), execution.Staged...)
+		if len(execution.Warnings) > 0 {
+			out.Warnings = append(out.Warnings, execution.Warnings...)
 		}
 		if err != nil {
 			out.Error = err.Error()
@@ -368,17 +446,7 @@ func (s *Service) Run(ctx context.Context, req scriptcontract.RunRequest) (*scri
 				out.Error = result.Error
 			}
 		}
-		// 对外 Path 一律工作区相对；磁盘落地仍用绝对路径（land/collect 内部）
-		out.Artifacts = projectArtifactsForModel(req.WorkspaceRoot, artifacts)
-		for _, art := range out.Artifacts {
-			ext := strings.ToLower(filepath.Ext(art.Name))
-			if (ext == ".pptx" || ext == ".docx" || ext == ".xlsx" || ext == ".pdf") && !art.OK {
-				out.OK = false
-				if out.Error == "" {
-					out.Error = "artifact gate failed: " + art.Reason
-				}
-			}
-		}
+		// produced 仅投影不透明候选；正式交付由 Deliverable 驱动的 Harness 决定。
 		if out.OK && looksJSON(result.Stdout) {
 			trimmed := strings.TrimSpace(result.Stdout)
 			if strings.Contains(trimmed, `"ok":false`) {
@@ -397,130 +465,173 @@ func (s *Service) Run(ctx context.Context, req scriptcontract.RunRequest) (*scri
 	return out, nil
 }
 
-func (s *Service) runLocal(ctx context.Context, meta skillmodel.Metadata, runID string, req scriptcontract.RunRequest, timeout time.Duration, sandbox execmodel.SandboxProfile) (*execmodel.Result, []string, string, []string, []scriptcontract.Artifact, []string, error) {
-	ws, err := scriptworkspace.PrepareLocalTask(req.WorkspaceRoot, runID)
+type skillExecutionAttempt struct {
+	Result            *execmodel.Result
+	Produced          []string
+	Descriptors       []workmodel.ProducedResourceDescriptor
+	WorkDir           string
+	Staged            []string
+	Warnings          []string
+	Workspace         execmodel.ExecutionWorkspace
+	StagingDurationMS int64
+	Err               error
+}
+
+func (s *Service) runLocal(ctx context.Context, meta skillmodel.Metadata, runID string, req scriptcontract.RunRequest, timeout time.Duration, sandbox execmodel.SandboxProfile) skillExecutionAttempt {
+	prepared, err := s.provisioner.Prepare(ctx, workcontract.PrepareRequest{StateRoot: req.StateRoot, Binding: req.Binding, Backend: req.Backend})
 	if err != nil {
-		return nil, nil, "", nil, nil, nil, err
+		return skillExecutionAttempt{Err: err}
 	}
+	ws := prepared.Workspace
 	skillDir := filepath.Join(ws.WorkDir, "skills", sanitize(string(meta.PackageID)))
+	executionWorkspace := buildSkillWorkspace(ws, skillDir, prepared.Binding.Mode)
 	if err := os.MkdirAll(skillDir, 0o755); err != nil {
-		return nil, nil, "", nil, nil, nil, err
+		return skillExecutionAttempt{Workspace: executionWorkspace, Err: err}
 	}
 	mat := &materialize.Materializer{Service: s.skills}
 	if _, err := mat.MaterializePackageScripts(ctx, req.Catalog, meta, skillDir); err != nil {
-		return nil, nil, "", nil, nil, nil, err
+		return skillExecutionAttempt{Workspace: executionWorkspace, Err: err}
 	}
-	staged, err := stageInputs(req.WorkspaceRoot, ws, skillDir, req.Inputs)
+	stagingStarted := time.Now()
+	staged, err := stageInputManifestLocal(ctx, s.inputSnapshots, req.Binding, req.Inputs, skillDir)
+	stagingDurationMS := time.Since(stagingStarted).Milliseconds()
 	if err != nil {
-		return nil, nil, skillDir, nil, nil, nil, err
+		return skillExecutionAttempt{WorkDir: skillDir, Workspace: executionWorkspace, StagingDurationMS: stagingDurationMS, Err: err}
 	}
 	before, err := snapshotLocalFiles(skillDir)
 	if err != nil {
-		return nil, nil, skillDir, staged, nil, nil, err
+		return skillExecutionAttempt{WorkDir: skillDir, Staged: staged, Workspace: executionWorkspace, StagingDurationMS: stagingDurationMS, Err: err}
 	}
-	// 执行期 cwd/env 仍钉在 skillDir（与 PathPolicy 一致）；OUTPUT_DIR 故意等于 skillDir，
-	// 避免脚本写到 runs/output 被路径契约拒绝。交付对齐远程：执行后再落到 output/<skill>/。
-	cmd := execmodel.Command{Command: req.Command, Cwd: skillDir, Shell: "auto", Env: skillEnv(skillDir, ws.TmpDir)}
-	result, err := s.runner.Run(ctx, cmd, execcontract.RunOptions{Timeout: timeout, Sandbox: sandbox, Workspace: buildSkillWorkspace(ws, skillDir)})
+	outputDir := executionWorkspace.OutputDir
+	if strings.TrimSpace(outputDir) == "" {
+		outputDir = skillDir
+	}
+	reserveResult, reservedEnv, err := s.prepareOutputReservations(ctx, prepared.Binding, runID, outputDir)
 	if err != nil {
-		return nil, nil, skillDir, staged, nil, nil, err
+		return skillExecutionAttempt{WorkDir: skillDir, Staged: staged, Workspace: executionWorkspace, StagingDurationMS: stagingDurationMS, Err: err}
+	}
+	if err := ensureLocalReservationDirs(outputDir, reserveResult.Reservations); err != nil {
+		return skillExecutionAttempt{WorkDir: skillDir, Staged: staged, Workspace: executionWorkspace, StagingDurationMS: stagingDurationMS, Err: err}
+	}
+	// cwd 钉在可写 Skill execution view；OUTPUT_DIR 必须与 reservation 物理根一致。
+	baseEnv := skillEnv(skillDir, ws.TmpDir)
+	baseEnv["OUTPUT_DIR"] = outputDir
+	cmd := execmodel.Command{Command: req.Command, Cwd: skillDir, Shell: "auto", Env: mergeReservedEnv(baseEnv, reservedEnv)}
+	result, err := s.runner.Run(ctx, cmd, execcontract.RunOptions{Timeout: timeout, Sandbox: sandbox, Binding: prepared.Binding, Workspace: executionWorkspace})
+	if err != nil {
+		return skillExecutionAttempt{WorkDir: skillDir, Staged: staged, Workspace: executionWorkspace, StagingDurationMS: stagingDurationMS, Err: err}
 	}
 	after, err := snapshotLocalFiles(skillDir)
 	if err != nil {
-		return nil, nil, skillDir, staged, nil, nil, err
+		return skillExecutionAttempt{Result: result, WorkDir: skillDir, Staged: staged, Workspace: executionWorkspace, StagingDurationMS: stagingDurationMS, Err: err}
 	}
-	produced := diffSnapshots(before, after)
-	artifactRoot := filepath.Join(ws.OutputDir, sanitize(string(meta.PackageID)))
-	artifacts, warnings := landLocalProducedToRunOutput(skillDir, artifactRoot, produced)
-	return result, produced, skillDir, staged, artifacts, warnings, nil
+	discovered := diffSnapshots(before, after)
+	reservedHits := collectReservedHitsLocal(outputDir, skillDir, reserveResult.Reservations, after)
+	produced := mergeProducedCandidates(reservedHits, discovered)
+	produced, err = s.filterProducedByDeliverables(ctx, prepared.Binding.Owner.TenantID, runID, reservedHits, produced)
+	if err != nil {
+		return skillExecutionAttempt{Result: result, WorkDir: skillDir, Staged: staged, Workspace: executionWorkspace, StagingDurationMS: stagingDurationMS, Err: err}
+	}
+	descriptors, err := s.registerProducedResources(ctx, runID, req.Binding, meta, produced, after, workmodel.ResourceAvailabilityDurable, nil)
+	return skillExecutionAttempt{Result: result, Produced: produced, Descriptors: descriptors, WorkDir: skillDir, Staged: staged, Workspace: executionWorkspace, StagingDurationMS: stagingDurationMS, Err: err}
 }
 
-func (s *Service) runRemote(ctx context.Context, meta skillmodel.Metadata, runID string, req scriptcontract.RunRequest, timeout time.Duration, sandbox execmodel.SandboxProfile) (*execmodel.Result, []string, string, []string, []scriptcontract.Artifact, []string, error) {
+func (s *Service) runRemote(ctx context.Context, meta skillmodel.Metadata, runID string, req scriptcontract.RunRequest, timeout time.Duration, sandbox execmodel.SandboxProfile) skillExecutionAttempt {
+	remoteWorkspace := remoteSkillWorkspace(req.Binding, meta)
 	if s.sessionClient == nil || s.fileClient == nil {
-		if sandbox.Mode == execmodel.SandboxRequired {
-			return nil, nil, "", nil, nil, nil, fmt.Errorf("genesis-sandbox session/file client未配置，且 sandbox.mode=required，拒绝降级")
-		}
-		result, produced, workDir, staged, artifacts, warnings, err := s.runLocal(ctx, meta, runID, req, timeout, sandboxLocalDisabled(sandbox))
-		warnings = append([]string{"genesis-sandbox session/file client未配置，sandbox optional 已降级到本地执行"}, warnings...)
-		return result, produced, workDir, staged, artifacts, warnings, err
+		return skillExecutionAttempt{Workspace: remoteWorkspace, Err: fmt.Errorf("sandbox_unavailable: genesis-sandbox session/file client未配置")}
 	}
 	s.cleanupStaleSessions(context.Background())
-	key := sessionKey(runID, meta.Name)
+	key := sessionKey(runID, req.Binding.ID, meta.Name)
 	s.mu.Lock()
 	cached := s.sessions[key]
 	s.mu.Unlock()
 	if cached == nil {
-		sess, err := sandboxsession.Open(ctx, sandboxsession.Deps{Sessions: s.sessionClient, Files: s.fileClient}, sandboxsession.Options{Workspace: s.workspaceRef, Sandbox: sandbox})
+		sess, err := sandboxsession.Open(ctx, sandboxsession.Deps{Sessions: s.sessionClient, Files: s.fileClient}, sandboxsession.Options{
+			Workspace: s.workspaceRef,
+			Sandbox:   sandbox,
+			Run: execcontract.RunOptions{
+				Binding:   req.Binding,
+				Workspace: remoteWorkspace,
+			},
+		})
 		if err != nil {
-			openErr := err
-			if sandbox.Mode == execmodel.SandboxRequired {
-				return nil, nil, "", nil, nil, nil, err
-			}
-			result, produced, workDir, staged, artifacts, warnings, err := s.runLocal(ctx, meta, runID, req, timeout, sandboxLocalDisabled(sandbox))
-			warnings = append([]string{"genesis-sandbox session打开失败，sandbox optional 已降级到本地执行: " + openErr.Error()}, warnings...)
-			return result, produced, workDir, staged, artifacts, warnings, err
+			return skillExecutionAttempt{Workspace: remoteWorkspace, Err: fmt.Errorf("sandbox_unavailable: genesis-sandbox session打开失败: %w", err)}
 		}
-		cached = &remoteSession{session: sess, skillDir: "/workspace", lastUsed: time.Now()}
+		cached = &remoteSession{session: sess, skillDir: remoteWorkspace.SkillDir, lastUsed: time.Now()}
+		if s.remoteSessions == nil {
+			_ = sess.Close(context.Background())
+			return skillExecutionAttempt{Workspace: remoteWorkspace, Err: fmt.Errorf("远程 execution 未装配持久 SessionBindingStore")}
+		}
+		expiresAt := sess.ExpiresAt()
+		if expiresAt.IsZero() || !expiresAt.After(time.Now()) {
+			_ = sess.Close(context.Background())
+			return skillExecutionAttempt{Workspace: remoteWorkspace, Err: fmt.Errorf("sandbox_unavailable: 远程 session 未返回有效 lease")}
+		}
+		if err := s.remoteSessions.BindRemoteSession(ctx, req.Binding.Owner.TenantID, runID, req.Binding.ID, sess.Workspace(), expiresAt); err != nil {
+			_ = sess.Close(context.Background())
+			return skillExecutionAttempt{Workspace: remoteWorkspace, Err: err}
+		}
 		s.mu.Lock()
 		s.sessions[key] = cached
 		s.mu.Unlock()
 	}
 	cached.lastUsed = time.Now()
-	// 同一 runID 下只建一套本地 runs 目录：materialize / stage / 产物回收都落在这里，禁止 -materialize 旁路目录。
-	ws, err := scriptworkspace.PrepareLocalTask(req.WorkspaceRoot, runID)
-	if err != nil {
-		return nil, nil, cached.skillDir, nil, nil, nil, err
-	}
-	localSkillDir := filepath.Join(ws.WorkDir, "skills", sanitize(string(meta.PackageID)))
-	if err := os.MkdirAll(localSkillDir, 0o755); err != nil {
-		return nil, nil, cached.skillDir, nil, nil, nil, err
+	if err := ensureRemoteWorkspace(ctx, cached.session, remoteWorkspace); err != nil {
+		return skillExecutionAttempt{WorkDir: cached.skillDir, Workspace: remoteWorkspace, Err: err}
 	}
 	if !cached.materialized {
-		mat := &materialize.Materializer{Service: s.skills}
-		matResult, err := mat.MaterializePackageScripts(ctx, req.Catalog, meta, localSkillDir)
-		if err != nil {
-			return nil, nil, cached.skillDir, nil, nil, nil, err
-		}
-		for _, rel := range matResult.PackageFiles {
-			data, err := os.ReadFile(filepath.Join(matResult.SkillDir, filepath.FromSlash(rel)))
-			if err != nil {
-				return nil, nil, cached.skillDir, nil, nil, nil, err
-			}
-			if err := cached.session.WriteFile(ctx, rel, data, fscontract.WriteOptions{CreateParents: true, Overwrite: true}); err != nil {
-				return nil, nil, cached.skillDir, nil, nil, nil, err
-			}
+		if err := s.materializePackageRemote(ctx, req.Catalog, meta, cached.session, remoteWorkspace.SkillDir); err != nil {
+			return skillExecutionAttempt{WorkDir: cached.skillDir, Workspace: remoteWorkspace, Err: err}
 		}
 		cached.materialized = true
 	}
-	staged, err := stageInputs(req.WorkspaceRoot, ws, localSkillDir, req.Inputs)
+	stagingStarted := time.Now()
+	staged, err := stageInputManifestRemote(ctx, s.inputSnapshots, req.Binding, req.Inputs, cached.session, remoteWorkspace.SkillDir)
+	stagingDurationMS := time.Since(stagingStarted).Milliseconds()
 	if err != nil {
-		return nil, nil, cached.skillDir, nil, nil, nil, err
+		return skillExecutionAttempt{WorkDir: cached.skillDir, Workspace: remoteWorkspace, StagingDurationMS: stagingDurationMS, Err: err}
 	}
-	for _, name := range staged {
-		data, err := os.ReadFile(filepath.Join(localSkillDir, name))
-		if err != nil {
-			return nil, nil, cached.skillDir, staged, nil, nil, err
-		}
-		if err := cached.session.WriteFile(ctx, name, data, fscontract.WriteOptions{CreateParents: true, Overwrite: true}); err != nil {
-			return nil, nil, cached.skillDir, staged, nil, nil, err
-		}
-	}
-	before, err := snapshotRemoteFiles(ctx, cached.session)
+	before, err := snapshotRemoteFiles(ctx, cached.session, remoteWorkspace.SkillDir)
 	if err != nil {
-		return nil, nil, cached.skillDir, staged, nil, nil, err
+		return skillExecutionAttempt{WorkDir: cached.skillDir, Staged: staged, Workspace: remoteWorkspace, StagingDurationMS: stagingDurationMS, Err: err}
 	}
-	result, err := cached.session.Run(ctx, execmodel.Command{Command: req.Command, Cwd: "/workspace", Shell: "auto", Env: skillEnv("/workspace", "/workspace/tmp")}, execcontract.RunOptions{Timeout: timeout, Sandbox: sandbox, Workspace: remoteSkillWorkspace()})
+	outputDir := remoteWorkspace.OutputDir
+	if strings.TrimSpace(outputDir) == "" {
+		outputDir = remoteWorkspace.SkillDir
+	}
+	reserveResult, reservedEnv, err := s.prepareOutputReservations(ctx, req.Binding, runID, outputDir)
 	if err != nil {
-		return nil, nil, cached.skillDir, staged, nil, nil, err
+		return skillExecutionAttempt{WorkDir: cached.skillDir, Staged: staged, Workspace: remoteWorkspace, StagingDurationMS: stagingDurationMS, Err: err}
 	}
-	after, err := snapshotRemoteFiles(ctx, cached.session)
+	if err := ensureRemoteReservationDirs(ctx, cached.session, outputDir, reserveResult.Reservations); err != nil {
+		return skillExecutionAttempt{WorkDir: cached.skillDir, Staged: staged, Workspace: remoteWorkspace, StagingDurationMS: stagingDurationMS, Err: err}
+	}
+	result, err := cached.session.Run(ctx, execmodel.Command{Command: req.Command, Cwd: remoteWorkspace.SkillDir, Shell: "auto", Env: mergeReservedEnv(remoteSkillEnv(remoteWorkspace), reservedEnv)}, execcontract.RunOptions{Timeout: timeout, Sandbox: sandbox, Binding: req.Binding, Workspace: remoteWorkspace})
 	if err != nil {
-		return nil, nil, cached.skillDir, staged, nil, nil, err
+		return skillExecutionAttempt{WorkDir: cached.skillDir, Staged: staged, Workspace: remoteWorkspace, StagingDurationMS: stagingDurationMS, Err: err}
 	}
-	produced := diffSnapshots(before, after)
-	// 远程产物回收到本 Run output/<skill>/，与设计「落回本 Run output」对齐。
-	artifacts, warnings := collectRemoteArtifactsByProduced(ctx, cached.session, filepath.Join(ws.OutputDir, sanitize(string(meta.PackageID))), produced)
-	return result, produced, cached.skillDir, staged, artifacts, warnings, nil
+	after, err := snapshotRemoteFiles(ctx, cached.session, remoteWorkspace.SkillDir)
+	if err != nil {
+		return skillExecutionAttempt{Result: result, WorkDir: cached.skillDir, Staged: staged, Workspace: remoteWorkspace, StagingDurationMS: stagingDurationMS, Err: err}
+	}
+	discovered := diffSnapshots(before, after)
+	reservedHits := collectReservedHitsRemote(ctx, cached.session, outputDir, remoteWorkspace.SkillDir, reserveResult.Reservations, after)
+	produced := mergeProducedCandidates(reservedHits, discovered)
+	produced, err = s.filterProducedByDeliverables(ctx, req.Binding.Owner.TenantID, runID, reservedHits, produced)
+	if err != nil {
+		return skillExecutionAttempt{Result: result, WorkDir: cached.skillDir, Staged: staged, Workspace: remoteWorkspace, StagingDurationMS: stagingDurationMS, Err: err}
+	}
+	// 登记前用 live Session.ExpiresAt 刷新 binding，避免心跳滑动后 produced > binding 快照。
+	expiresAt := cached.session.ExpiresAt()
+	if expiresAt.IsZero() || !expiresAt.After(time.Now()) {
+		return skillExecutionAttempt{Result: result, WorkDir: cached.skillDir, Staged: staged, Workspace: remoteWorkspace, StagingDurationMS: stagingDurationMS, Err: fmt.Errorf("sandbox_unavailable: 远程 session lease 已失效")}
+	}
+	if err := s.remoteSessions.BindRemoteSession(ctx, req.Binding.Owner.TenantID, runID, req.Binding.ID, cached.session.Workspace(), expiresAt); err != nil {
+		return skillExecutionAttempt{Result: result, WorkDir: cached.skillDir, Staged: staged, Workspace: remoteWorkspace, StagingDurationMS: stagingDurationMS, Err: err}
+	}
+	descriptors, err := s.registerProducedResources(ctx, runID, req.Binding, meta, produced, after, workmodel.ResourceAvailabilityLeased, &expiresAt)
+	return skillExecutionAttempt{Result: result, Produced: produced, Descriptors: descriptors, WorkDir: cached.skillDir, Staged: staged, Workspace: remoteWorkspace, StagingDurationMS: stagingDurationMS, Err: err}
 }
 
 func (s *Service) cleanupStaleSessions(ctx context.Context) {
@@ -534,15 +645,73 @@ func (s *Service) cleanupStaleSessions(ctx context.Context) {
 		stale = append(stale, item.session)
 		delete(s.sessions, key)
 	}
-	for key, hint := range s.pathHints {
-		if now.Sub(hint.lastUsed) > sessionIdleTTL {
-			delete(s.pathHints, key)
-		}
-	}
 	s.mu.Unlock()
 	for _, sess := range stale {
 		_ = sess.Close(ctx)
 	}
+}
+
+func (s *Service) commandEntryAvailable(ctx context.Context, req scriptcontract.RunRequest, meta skillmodel.Metadata, runID, entry string) (bool, error) {
+	entry = normalizeCommandEntry(entry)
+	if entry == "" {
+		return true, nil
+	}
+	for _, input := range req.Inputs.Inputs {
+		if normalizeCommandEntry(input.Name) == entry || (path.Dir(entry) == "." && path.Base(entry) == path.Base(normalizeCommandEntry(input.Name))) {
+			return true, nil
+		}
+	}
+	key := sessionKey(runID, req.Binding.ID, meta.Name)
+	s.mu.Lock()
+	_, known := s.entries[key][entry]
+	s.mu.Unlock()
+	if known {
+		return true, nil
+	}
+	listed, err := s.skills.ListResources(ctx, skillcontract.ListResourcesRequest{
+		ResolveRequest: skillcontract.ResolveRequest{CatalogRequest: req.Catalog, Name: meta.Name, Resource: string(meta.MainResource)},
+		PackageID:      meta.PackageID,
+	})
+	if err != nil {
+		return false, err
+	}
+	prefix := strings.TrimSuffix(strings.ReplaceAll(string(meta.PackageID), `\`, "/"), "/") + "/"
+	for _, resource := range listed.Resources {
+		rel := strings.TrimPrefix(strings.ReplaceAll(string(resource.Resource), `\`, "/"), prefix)
+		if normalizeCommandEntry(rel) == entry {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (s *Service) noteKnownEntries(key string, staged, produced []string) {
+	if strings.TrimSpace(key) == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.entries[key] == nil {
+		s.entries[key] = make(map[string]struct{})
+	}
+	for _, candidate := range append(append([]string(nil), staged...), produced...) {
+		if normalized := normalizeCommandEntry(candidate); normalized != "" {
+			s.entries[key][normalized] = struct{}{}
+		}
+	}
+}
+
+func normalizeCommandEntry(value string) string {
+	value = strings.TrimSpace(strings.ReplaceAll(value, `\`, "/"))
+	value = strings.TrimPrefix(value, "./")
+	if value == "" {
+		return ""
+	}
+	clean := path.Clean(value)
+	if clean == "." || strings.HasPrefix(clean, "../") || path.IsAbs(clean) {
+		return ""
+	}
+	return clean
 }
 
 func skillEnv(workDir, tmpDir string) map[string]string {
@@ -582,17 +751,62 @@ func skillEnv(workDir, tmpDir string) map[string]string {
 	return env
 }
 
-func buildSkillWorkspace(base execmodel.ExecutionWorkspace, skillDir string) execmodel.ExecutionWorkspace {
-	base.Mode = execmodel.WorkspaceModeLocalTask
+func buildSkillWorkspace(base execmodel.ExecutionWorkspace, skillDir string, mode execmodel.WorkspaceMode) execmodel.ExecutionWorkspace {
 	base.WorkDir = skillDir
-	base.InputDir = skillDir
-	base.OutputDir = skillDir
 	base.SkillDir = skillDir
+	if mode == execmodel.WorkspaceModeSession {
+		// Skill session 以相对 cwd 为唯一可变工作视图；输入通过显式 staging 进入该视图，
+		// produced 也从该视图显式发布。真正的 task_job 仍保持 input/work/output 分离。
+		base.InputDir = skillDir
+		base.OutputDir = skillDir
+	}
 	return base
 }
 
-func remoteSkillWorkspace() execmodel.ExecutionWorkspace {
-	return execmodel.ExecutionWorkspace{Mode: execmodel.WorkspaceModeSandboxSess, PathPolicy: execmodel.PathPolicyStrictWorkspace, WorkDir: "/workspace", InputDir: "/workspace", OutputDir: "/workspace", TmpDir: "/workspace/tmp", SkillDir: "/workspace"}
+func remoteSkillWorkspace(binding execmodel.ExecutionBinding, meta skillmodel.Metadata) execmodel.ExecutionWorkspace {
+	bindingID := sanitize(binding.ID)
+	skillID := sanitize(string(meta.PackageID))
+	workDir := "/workspace/work/" + bindingID
+	skillDir := workDir + "/skills/" + skillID
+	if binding.Mode == execmodel.WorkspaceModeSession {
+		return execmodel.ExecutionWorkspace{
+			WorkDir:   skillDir,
+			InputDir:  skillDir,
+			OutputDir: skillDir,
+			TmpDir:    "/workspace/tmp/" + bindingID,
+			SkillDir:  skillDir,
+		}
+	}
+	return execmodel.ExecutionWorkspace{
+		WorkDir:   workDir,
+		InputDir:  "/workspace/input/" + bindingID,
+		OutputDir: "/workspace/output/" + bindingID,
+		TmpDir:    "/workspace/tmp/" + bindingID,
+		SkillDir:  skillDir,
+	}
+}
+
+// ensureRemoteWorkspace 只负责把统一 ExecutionWorkspace 契约投影到远程 session。
+// 宿主与本地平台沙箱仍由 Provisioner 管理其物理目录，不经过此适配。
+func ensureRemoteWorkspace(ctx context.Context, session *sandboxsession.Session, workspace execmodel.ExecutionWorkspace) error {
+	for _, dir := range []string{workspace.WorkDir, workspace.InputDir, workspace.OutputDir, workspace.TmpDir, workspace.SkillDir} {
+		if err := session.MkdirAll(ctx, remoteRelativePath(dir, ""), fscontract.MkdirOptions{Parents: true}); err != nil {
+			return fmt.Errorf("创建远程执行目录 %s 失败: %w", dir, err)
+		}
+	}
+	return nil
+}
+
+// remoteSkillEnv 使用与宿主相同的环境变量契约，但保留远程 task job 的目录隔离。
+func remoteSkillEnv(workspace execmodel.ExecutionWorkspace) map[string]string {
+	env := skillEnv(workspace.SkillDir, workspace.TmpDir)
+	env["WORK_DIR"] = workspace.SkillDir
+	env["SKILL_DIR"] = workspace.SkillDir
+	env["INPUT_DIR"] = workspace.InputDir
+	env["OUTPUT_DIR"] = workspace.OutputDir
+	env["TMP_DIR"] = workspace.TmpDir
+	env["TMPDIR"] = workspace.TmpDir
+	return env
 }
 
 func resolveTaskType(meta skillmodel.Metadata) execmodel.SandboxTaskType {
@@ -630,126 +844,318 @@ func isOfficeRuntime(deps skillmodel.RuntimeDeps) bool {
 }
 
 func commandScriptHint(command string) string {
-	for _, part := range strings.Fields(strings.ReplaceAll(command, "\"", "")) {
+	for _, part := range strings.Fields(strings.NewReplacer("\"", "", "'", "").Replace(command)) {
 		clean := strings.TrimSpace(strings.ReplaceAll(part, "\\", "/"))
-		if strings.HasPrefix(clean, "scripts/") {
+		switch strings.ToLower(path.Ext(clean)) {
+		case ".py", ".js", ".mjs", ".cjs", ".ts", ".ps1", ".sh":
 			return clean
 		}
 	}
 	return ""
 }
 
-func sessionKey(runID, skill string) string {
-	return runID + "::" + strings.ToLower(strings.TrimSpace(skill))
+func sessionKey(runID, bindingID, skill string) string {
+	return runID + "::" + strings.TrimSpace(bindingID) + "::" + strings.ToLower(strings.TrimSpace(skill))
 }
 
-func stageInputs(workspaceRoot string, ws execmodel.ExecutionWorkspace, destDir string, inputs []string) ([]string, error) {
-	if len(inputs) == 0 {
+// remoteRelativePath 把 executor 绝对业务路径转换成 session WorkspaceFS 相对路径。
+// 该转换只存在于远程 adapter 边界，不能泄漏到模型可见的 run:/ 引用。
+func remoteRelativePath(root, child string) string {
+	root = strings.ReplaceAll(strings.TrimSpace(root), `\`, "/")
+	root = strings.TrimPrefix(root, "/workspace/")
+	root = strings.TrimPrefix(root, "/")
+	child = strings.ReplaceAll(strings.TrimSpace(child), `\`, "/")
+	child = strings.TrimPrefix(child, "./")
+	child = strings.TrimPrefix(child, "/")
+	if child == "" {
+		return path.Clean(root)
+	}
+	return path.Join(root, child)
+}
+
+func (s *Service) registerProducedResources(ctx context.Context, runID string, binding execmodel.ExecutionBinding, meta skillmodel.Metadata, produced []string, observed map[string]fileFingerprint, availability workmodel.ResourceAvailability, expiresAt *time.Time) ([]workmodel.ProducedResourceDescriptor, error) {
+	if len(produced) == 0 {
 		return nil, nil
 	}
-	root := strings.TrimSpace(workspaceRoot)
-	if root == "" {
-		wd, err := os.Getwd()
+	if s.producedResources == nil {
+		return nil, workcontract.NewError(workcontract.ErrCodeWorkspaceNotAvailable, fmt.Errorf("execution 已生成候选，但未装配 ProducedResourceRegistrar"))
+	}
+	refs := producedResourceRefs(binding, meta, produced)
+	if len(refs) != len(produced) {
+		return nil, workcontract.NewError(workcontract.ErrCodePathNamespaceMismatch, fmt.Errorf("produced 路径无法映射到稳定逻辑引用"))
+	}
+	descriptors := make([]workmodel.ProducedResourceDescriptor, 0, len(produced))
+	base := "skills/" + sanitize(string(meta.PackageID))
+	for i, candidate := range produced {
+		if !safeRemoteRelativePath(candidate) {
+			return nil, workcontract.NewError(workcontract.ErrCodePathNamespaceMismatch, fmt.Errorf("produced 路径越界: %q", candidate))
+		}
+		fingerprint, ok := observed[candidate]
+		if !ok || fingerprint.Size < 0 {
+			return nil, workcontract.NewError(workcontract.ErrCodeProducedResourceVersionConflict, fmt.Errorf("produced 候选缺少可信文件快照: %s", candidate))
+		}
+		observedPath, logicalRef, err := resolveProducedObservation(binding, meta, base, candidate, refs[i], availability)
 		if err != nil {
 			return nil, err
 		}
-		root = wd
+		if err := observedPath.Validate(); err != nil {
+			return nil, workcontract.NewError(workcontract.ErrCodePathNamespaceMismatch, err)
+		}
+		descriptor, err := s.producedResources.RegisterProducedResource(ctx, workcontract.RegisterProducedResourceRequest{
+			TenantID: binding.Owner.TenantID, RunID: runID, BindingID: binding.ID,
+			LogicalRef: logicalRef, ObservedPath: observedPath, ObservedName: path.Base(normalizeSlash(candidate)),
+			MediaType: mime.TypeByExtension(path.Ext(candidate)), Size: fingerprint.Size,
+			Availability: availability, ExpiresAt: expiresAt,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("登记 produced resource %s 失败: %w", candidate, err)
+		}
+		descriptors = append(descriptors, descriptor)
 	}
-	rootReal, err := boundaryPath(root)
+	return descriptors, nil
+}
+
+// resolveProducedObservation 将 skill 视图内相对候选映射为登记用 ObservedPath/LogicalRef。
+// leased（远程 session-file）：ObservedPath 必须是 /workspace 下完整相对路径（与 LogicalRef 对齐），
+// 不能写成 skills/<pkg>/...，否则会落到错误的 /workspace/skills/...。
+// durable（本地 Host）：ObservedPath 相对 binding WorkDir（skills/<pkg>/... 或 reserved/...）。
+func resolveProducedObservation(binding execmodel.ExecutionBinding, meta skillmodel.Metadata, skillBase, candidate, fallbackLogical string, availability workmodel.ResourceAvailability) (workmodel.WorkspacePath, string, error) {
+	candidate = normalizeSlash(candidate)
+	logicalRef := strings.TrimSpace(fallbackLogical)
+	if logicalRef == "" {
+		observed, logical := producedObservation(binding, meta, skillBase, candidate, "")
+		return observed, logical, nil
+	}
+	if availability == workmodel.ResourceAvailabilityLeased {
+		if !strings.HasPrefix(logicalRef, "run:/") {
+			return "", "", workcontract.NewError(workcontract.ErrCodePathNamespaceMismatch, fmt.Errorf("leased produced logical_ref 无效: %q", logicalRef))
+		}
+		rel := strings.TrimPrefix(logicalRef, "run:/")
+		if !safeRemoteRelativePath(rel) {
+			return "", "", workcontract.NewError(workcontract.ErrCodePathNamespaceMismatch, fmt.Errorf("leased produced ObservedPath 越界: %q", rel))
+		}
+		return workmodel.WorkspacePath(rel), logicalRef, nil
+	}
+	observed, logical := producedObservation(binding, meta, skillBase, candidate, logicalRef)
+	return observed, logical, nil
+}
+
+func producedObservation(binding execmodel.ExecutionBinding, _ skillmodel.Metadata, skillBase, candidate, fallbackLogical string) (workmodel.WorkspacePath, string) {
+	candidate = normalizeSlash(candidate)
+	// reservation：Host 侧相对 OutputDir；逻辑引用优先使用 producedResourceRefs 结果。
+	if strings.HasPrefix(candidate, "reserved/") {
+		logical := fallbackLogical
+		if logical == "" {
+			logical = "run:/work/" + sanitize(binding.ID) + "/output/" + candidate
+		}
+		return workmodel.WorkspacePath(candidate), logical
+	}
+	if strings.HasPrefix(candidate, "output/") || strings.HasPrefix(candidate, "work/") {
+		return workmodel.WorkspacePath(candidate), "run:/" + candidate
+	}
+	logical := fallbackLogical
+	if logical == "" {
+		logical = "run:/" + path.Join("work", sanitize(binding.ID), skillBase, candidate)
+	}
+	return workmodel.WorkspacePath(path.Join(skillBase, candidate)), logical
+}
+
+// projectProducedCandidates 投影最小候选；能唯一匹配 DeliverableSpec 时填 deliverable_id。
+func (s *Service) projectProducedCandidates(ctx context.Context, tenantID, runID string, descriptors []workmodel.ProducedResourceDescriptor) []scriptcontract.ProducedCandidate {
+	specs := s.listDeliverableSpecs(ctx, tenantID, runID)
+	result := make([]scriptcontract.ProducedCandidate, 0, len(descriptors))
+	for _, descriptor := range descriptors {
+		candidate := scriptcontract.ProducedCandidate{CandidateID: descriptor.ID, Name: descriptor.ObservedName, MediaType: descriptor.MediaType}
+		if id := uniqueMatchingDeliverableID(specs, descriptor); id != "" {
+			candidate.DeliverableID = id
+		}
+		result = append(result, candidate)
+	}
+	return result
+}
+
+func (s *Service) listDeliverableSpecs(ctx context.Context, tenantID, runID string) []artifactmodel.DeliverableSpec {
+	if s == nil || s.deliverables == nil || strings.TrimSpace(tenantID) == "" || strings.TrimSpace(runID) == "" {
+		return nil
+	}
+	specs, err := s.deliverables.ListDeliverables(ctx, tenantID, runID)
 	if err != nil {
-		return nil, fmt.Errorf("解析工作区失败: %w", err)
+		return nil
 	}
-	staged := make([]string, 0, len(inputs))
-	for _, raw := range inputs {
-		raw = strings.TrimSpace(raw)
-		if raw == "" {
+	return specs
+}
+
+func uniqueMatchingDeliverableID(specs []artifactmodel.DeliverableSpec, descriptor workmodel.ProducedResourceDescriptor) string {
+	matched := ""
+	for _, spec := range specs {
+		// 投影归属必须按观测文件名/MIME 匹配；不能用 DesiredName 自身去满足后缀约束。
+		if !spec.MatchesObserved(descriptor.ObservedName, descriptor.MediaType) {
 			continue
 		}
-		if isExecutionPlaneAbsoluteInput(raw) {
-			return nil, errInputPathNamespaceMismatch(raw)
+		if matched != "" && matched != spec.ID {
+			return ""
 		}
-		srcReal, tried, err := resolveStageSource(raw, rootReal, ws, destDir)
+		matched = spec.ID
+	}
+	return matched
+}
+
+// materializePackageRemote 直接把不可变 SkillPackageRef 投影到 executor WorkspaceFS，
+// 禁止先借宿主 /workspace 或进程 cwd 建立临时副本。
+func (s *Service) materializePackageRemote(ctx context.Context, catalog skillcontract.CatalogRequest, meta skillmodel.Metadata, session *sandboxsession.Session, skillDir string) error {
+	listed, err := s.skills.ListResources(ctx, skillcontract.ListResourcesRequest{
+		ResolveRequest: skillcontract.ResolveRequest{CatalogRequest: catalog, Name: meta.Name, Resource: string(meta.MainResource)},
+		PackageID:      meta.PackageID,
+	})
+	if err != nil {
+		return fmt.Errorf("列出远程 skill 资源失败: %w", err)
+	}
+	prefix := string(meta.PackageID) + "/"
+	scriptCount := 0
+	for _, info := range listed.Resources {
+		rel := strings.TrimPrefix(string(info.Resource), prefix)
+		if rel == "" || rel == string(info.Resource) || !safeRemoteRelativePath(rel) {
+			continue
+		}
+		content, err := s.skills.ReadResource(ctx, skillcontract.ResourceRequest{
+			ResolveRequest: skillcontract.ResolveRequest{CatalogRequest: catalog, Name: meta.Name, Resource: string(info.Resource)},
+			PackageID:      meta.PackageID,
+			Resource:       info.Resource,
+			MaxBytes:       64 * 1024 * 1024,
+		})
 		if err != nil {
-			return nil, fmt.Errorf("解析输入失败 %s: %w（已尝试: %s）", raw, err, strings.Join(tried, ", "))
+			return fmt.Errorf("读取远程 skill 资源 %s 失败: %w", info.Resource, err)
 		}
-		// 相对路径仍只能从工作区读取，避免通过 ../ 或符号链接越界。
-		// 用户在本次任务中直接指定的宿主机绝对文件则允许作为受控 stage 源：
-		// 文件仅复制到当前 Run 的 Skill 工作目录，命令与脚本始终只能访问 stage 后的相对文件名。
-		if !filepath.IsAbs(raw) && !isWithinPath(srcReal, rootReal) {
-			return nil, fmt.Errorf("输入路径必须位于工作区内: %s", raw)
+		if err := session.WriteFile(ctx, remoteRelativePath(skillDir, rel), []byte(content.Content), fscontract.WriteOptions{CreateParents: true, Overwrite: false}); err != nil {
+			return fmt.Errorf("写入远程 skill 资源 %s 失败: %w", info.Resource, err)
 		}
-		data, err := os.ReadFile(srcReal)
+		if info.Kind == skillmodel.ResourceKindScript && strings.HasPrefix(rel, "scripts/") {
+			scriptCount++
+		}
+	}
+	if scriptCount == 0 {
+		return fmt.Errorf("skill %s 没有可执行 scripts", meta.Name)
+	}
+	return nil
+}
+
+func stageInputManifestRemote(ctx context.Context, reader workcontract.InputSnapshotReader, binding execmodel.ExecutionBinding, manifest workmodel.InputManifest, session *sandboxsession.Session, skillDir string) ([]string, error) {
+	if len(manifest.Inputs) == 0 {
+		return nil, nil
+	}
+	if err := validateInputManifest(binding, manifest); err != nil {
+		return nil, err
+	}
+	if reader == nil {
+		return nil, workcontract.NewError(workcontract.ErrCodeWorkspaceNotAvailable, fmt.Errorf("远程输入缺少 InputSnapshotReader"))
+	}
+	staged := make([]string, 0, len(manifest.Inputs))
+	for _, input := range manifest.Inputs {
+		content, err := readVerifiedSnapshot(ctx, reader, input)
 		if err != nil {
-			return nil, fmt.Errorf("读取输入失败 %s: %w", raw, err)
-		}
-		name := filepath.Base(srcReal)
-		dest := filepath.Join(destDir, name)
-		if err := os.WriteFile(dest, data, 0o644); err != nil {
 			return nil, err
 		}
-		staged = append(staged, name)
+		if err := session.WriteFile(ctx, remoteRelativePath(skillDir, input.Name), content, fscontract.WriteOptions{CreateParents: true, Overwrite: true}); err != nil {
+			return nil, fmt.Errorf("上传输入快照 %s 失败: %w", input.ID, err)
+		}
+		staged = append(staged, input.Name)
 	}
 	return staged, nil
 }
 
-func resolveStageSource(raw, workspaceRoot string, ws execmodel.ExecutionWorkspace, skillDir string) (string, []string, error) {
-	tried := make([]string, 0, 8)
-	tryFile := func(candidate string) (string, bool) {
-		candidate = strings.TrimSpace(candidate)
-		if candidate == "" {
-			return "", false
-		}
-		real, err := boundaryPath(candidate)
-		if err != nil {
-			tried = append(tried, candidate)
-			return "", false
-		}
-		tried = append(tried, real)
-		info, err := os.Stat(real)
-		if err != nil || info.IsDir() {
-			return "", false
-		}
-		return real, true
+func safeRemoteRelativePath(value string) bool {
+	value = normalizeSlash(value)
+	if value == "" || value == "." || strings.HasPrefix(value, "/") || strings.Contains(value, ":") {
+		return false
 	}
-	if rel, ok := scriptworkspace.StripLogicalDirPrefix(raw); ok {
-		base := scriptworkspace.DirBase(rel.Prefix, ws)
-		if base == "" {
-			return "", tried, fmt.Errorf("逻辑目录 %s 未注入", rel.Prefix)
+	for _, part := range strings.Split(value, "/") {
+		if part == "" || part == "." || part == ".." {
+			return false
 		}
-		if found, ok := tryFile(filepath.Join(base, filepath.FromSlash(rel.Rest))); ok {
-			return found, tried, nil
+	}
+	return true
+}
+
+func stageInputManifestLocal(ctx context.Context, reader workcontract.InputSnapshotReader, binding execmodel.ExecutionBinding, manifest workmodel.InputManifest, destDir string) ([]string, error) {
+	if len(manifest.Inputs) == 0 {
+		return nil, nil
+	}
+	if err := validateInputManifest(binding, manifest); err != nil {
+		return nil, err
+	}
+	if reader == nil {
+		return nil, workcontract.NewError(workcontract.ErrCodeWorkspaceNotAvailable, fmt.Errorf("本地输入缺少 InputSnapshotReader"))
+	}
+	staged := make([]string, 0, len(manifest.Inputs))
+	for _, input := range manifest.Inputs {
+		content, err := readVerifiedSnapshot(ctx, reader, input)
+		if err != nil {
+			return nil, err
 		}
-		// 宿主：run 根 $WORK_DIR 与 skill cwd 可能不一致；产物常在 skillDir。
-		// 远程 /workspace 扁平时 skillDir 与 WorkDir 等价，此 fallback 无额外副作用。
-		if (rel.Prefix == scriptworkspace.LogicalWorkDir || rel.Prefix == scriptworkspace.LogicalSkillDir) &&
-			strings.TrimSpace(skillDir) != "" && !samePath(base, skillDir) {
-			if found, ok := tryFile(filepath.Join(skillDir, filepath.FromSlash(rel.Rest))); ok {
-				return found, tried, nil
+		target := filepath.Join(destDir, input.Name)
+		tmp, err := os.CreateTemp(destDir, ".input-view-*")
+		if err != nil {
+			return nil, err
+		}
+		tmpName := tmp.Name()
+		if _, err = tmp.Write(content); err == nil {
+			err = tmp.Sync()
+		}
+		closeErr := tmp.Close()
+		if err == nil {
+			err = closeErr
+		}
+		if err == nil {
+			err = os.Chmod(tmpName, 0o400)
+		}
+		if err == nil {
+			if chmodErr := os.Chmod(target, 0o600); chmodErr != nil && !os.IsNotExist(chmodErr) {
+				err = chmodErr
 			}
 		}
-		return "", tried, fmt.Errorf("文件不存在")
-	}
-	if filepath.IsAbs(raw) {
-		if found, ok := tryFile(raw); ok {
-			return found, tried, nil
+		if err == nil {
+			if removeErr := os.Remove(target); removeErr != nil && !os.IsNotExist(removeErr) {
+				err = removeErr
+			}
 		}
-		return "", tried, fmt.Errorf("文件不存在")
-	}
-	candidates := []string{
-		filepath.Join(workspaceRoot, raw),
-		filepath.Join(ws.WorkDir, raw),
-		filepath.Join(ws.OutputDir, raw),
-		filepath.Join(ws.InputDir, raw),
-		filepath.Join(ws.TmpDir, raw),
-		filepath.Join(ws.SkillDir, raw),
-		filepath.Join(skillDir, raw),
-	}
-	for _, c := range candidates {
-		if found, ok := tryFile(c); ok {
-			return found, tried, nil
+		if err == nil {
+			err = os.Rename(tmpName, target)
 		}
+		if err != nil {
+			_ = os.Remove(tmpName)
+			return nil, fmt.Errorf("建立输入只读视图 %s 失败: %w", input.Name, err)
+		}
+		staged = append(staged, input.Name)
 	}
-	return "", tried, fmt.Errorf("文件不存在")
+	return staged, nil
+}
+
+func validateInputManifest(binding execmodel.ExecutionBinding, manifest workmodel.InputManifest) error {
+	if manifest.RunID != binding.Owner.RunID || manifest.BindingID != binding.ID {
+		return workcontract.NewError(workcontract.ErrCodeWorkspaceNotAvailable, fmt.Errorf("InputManifest 与 ExecutionBinding 不匹配"))
+	}
+	return nil
+}
+
+func readVerifiedSnapshot(ctx context.Context, reader workcontract.InputSnapshotReader, input workmodel.InputRef) ([]byte, error) {
+	handle, err := reader.OpenSnapshot(ctx, input.StagedPath)
+	if err != nil {
+		return nil, err
+	}
+	defer handle.Close()
+	limited := io.LimitReader(handle, input.Size+1)
+	content, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(content)) != input.Size {
+		return nil, workcontract.NewError(workcontract.ErrCodeResourceVersionConflict, fmt.Errorf("输入快照 %s 大小已变化", input.ID))
+	}
+	digest := sha256.Sum256(content)
+	if hex.EncodeToString(digest[:]) != input.SHA256 {
+		return nil, workcontract.NewError(workcontract.ErrCodeResourceVersionConflict, fmt.Errorf("输入快照 %s hash 已变化", input.ID))
+	}
+	return content, nil
 }
 
 func snapshotLocalFiles(root string) (map[string]fileFingerprint, error) {
@@ -771,8 +1177,9 @@ func snapshotLocalFiles(root string) (map[string]fileFingerprint, error) {
 	return out, err
 }
 
-func snapshotRemoteFiles(ctx context.Context, sess *sandboxsession.Session) (map[string]fileFingerprint, error) {
-	walk, err := sess.Walk(ctx, ".", fscontract.WalkOptions{})
+func snapshotRemoteFiles(ctx context.Context, sess *sandboxsession.Session, root string) (map[string]fileFingerprint, error) {
+	rootRel := normalizeSlash(remoteRelativePath(root, ""))
+	walk, err := sess.Walk(ctx, rootRel, fscontract.WalkOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -784,7 +1191,15 @@ func snapshotRemoteFiles(ctx context.Context, sess *sandboxsession.Session) (map
 		if entry.Type == fsmodel.EntryTypeDir {
 			continue
 		}
-		out[normalizeSlash(entry.Path)] = fileFingerprint{Size: entry.Size, ModTime: entry.ModifiedAt.UnixNano()}
+		entryPath := normalizeSlash(entry.Path)
+		if !strings.HasPrefix(entryPath, rootRel+"/") {
+			return nil, workcontract.NewError(workcontract.ErrCodePathNamespaceMismatch, fmt.Errorf("远程 Walk 返回执行目录外路径: %q", entry.Path))
+		}
+		rel := strings.TrimPrefix(entryPath, rootRel+"/")
+		if !safeRemoteRelativePath(rel) {
+			return nil, workcontract.NewError(workcontract.ErrCodePathNamespaceMismatch, fmt.Errorf("远程 Walk 返回非法相对路径: %q", entry.Path))
+		}
+		out[rel] = fileFingerprint{Size: entry.Size, ModTime: entry.ModifiedAt.UnixNano()}
 	}
 	return out, nil
 }
@@ -827,175 +1242,27 @@ func shouldIgnoreProducedPath(rel string) bool {
 	return false
 }
 
-func collectArtifactsByProduced(workDir string, produced []string) ([]scriptcontract.Artifact, []string) {
-	artifacts := make([]scriptcontract.Artifact, 0, len(produced))
-	warnings := make([]string, 0)
-	for _, rel := range produced {
-		if shouldIgnoreProducedPath(rel) {
+func producedResourceRefs(binding execmodel.ExecutionBinding, meta skillmodel.Metadata, produced []string) []string {
+	result := make([]string, 0, len(produced))
+	base := "work/" + sanitize(binding.ID) + "/skills/" + sanitize(string(meta.PackageID))
+	for _, candidate := range produced {
+		candidate = normalizeSlash(candidate)
+		if !safeRemoteRelativePath(candidate) {
 			continue
 		}
-		path := filepath.Join(workDir, filepath.FromSlash(rel))
-		info, err := os.Stat(path)
-		if err != nil || info.IsDir() {
+		if strings.HasPrefix(candidate, "output/") || strings.HasPrefix(candidate, "work/") {
+			result = append(result, "run:/"+candidate)
 			continue
 		}
-		ok, kind, reason := gate.CheckDelivery(path)
-		artifact := scriptcontract.Artifact{Name: filepath.Base(path), Path: path, Size: info.Size(), Kind: kind, OK: ok, Reason: reason}
-		artifacts = append(artifacts, artifact)
-		if !ok {
-			warnings = append(warnings, artifact.Name+": "+reason)
-		}
+		result = append(result, "run:/"+base+"/"+candidate)
 	}
-	return artifacts, warnings
-}
-
-// landLocalProducedToRunOutput 把宿主 skill cwd 中的 produced 复制到 runs/<id>/output/<skill>/。
-// 对齐远程 collectRemoteArtifactsByProduced 的交付落点；不改变执行期 cwd/env，不碰 remote 路径。
-func landLocalProducedToRunOutput(skillDir, artifactRoot string, produced []string) ([]scriptcontract.Artifact, []string) {
-	if len(produced) == 0 {
-		return nil, nil
-	}
-	root, err := boundaryPath(artifactRoot)
-	if err != nil {
-		arts, warns := collectArtifactsByProduced(skillDir, produced)
-		return arts, append([]string{"artifact_root: " + err.Error()}, warns...)
-	}
-	if err := os.MkdirAll(root, 0o755); err != nil {
-		arts, warns := collectArtifactsByProduced(skillDir, produced)
-		return arts, append([]string{"artifact_root: " + err.Error()}, warns...)
-	}
-	artifacts := make([]scriptcontract.Artifact, 0, len(produced))
-	warnings := make([]string, 0)
-	for _, rel := range produced {
-		if shouldIgnoreProducedPath(rel) {
-			continue
-		}
-		src := filepath.Join(skillDir, filepath.FromSlash(rel))
-		srcReal, err := boundaryPath(src)
-		if err != nil {
-			warnings = append(warnings, rel+": "+err.Error())
-			continue
-		}
-		info, err := os.Stat(srcReal)
-		if err != nil || info.IsDir() {
-			continue
-		}
-		dest := filepath.Join(root, filepath.Base(srcReal))
-		destReal, err := boundaryPath(dest)
-		if err != nil || !isWithinPath(destReal, root) {
-			warnings = append(warnings, rel+": artifact path outside root")
-			continue
-		}
-		data, err := os.ReadFile(srcReal)
-		if err != nil {
-			warnings = append(warnings, rel+": "+err.Error())
-			continue
-		}
-		if err := os.WriteFile(destReal, data, 0o644); err != nil {
-			warnings = append(warnings, rel+": "+err.Error())
-			continue
-		}
-		ok, kind, reason := gate.CheckDelivery(destReal)
-		artifact := scriptcontract.Artifact{Name: filepath.Base(destReal), Path: destReal, Size: int64(len(data)), Kind: kind, OK: ok, Reason: reason}
-		artifacts = append(artifacts, artifact)
-		if !ok {
-			warnings = append(warnings, artifact.Name+": "+reason)
-		}
-	}
-	return artifacts, warnings
-}
-
-func collectRemoteArtifactsByProduced(ctx context.Context, sess *sandboxsession.Session, artifactRoot string, produced []string) ([]scriptcontract.Artifact, []string) {
-	artifacts := make([]scriptcontract.Artifact, 0, len(produced))
-	warnings := make([]string, 0)
-	root, err := boundaryPath(artifactRoot)
-	if err != nil {
-		return artifacts, []string{"artifact_root: " + err.Error()}
-	}
-	if err := os.MkdirAll(root, 0o755); err != nil {
-		return artifacts, []string{"artifact_root: " + err.Error()}
-	}
-	for _, rel := range produced {
-		if shouldIgnoreProducedPath(rel) {
-			continue
-		}
-		remotePath := normalizeSlash(rel)
-		if remotePath == "" || remotePath == "." {
-			continue
-		}
-		stat, err := sess.Stat(ctx, remotePath)
-		if err != nil || stat == nil || stat.Type == fsmodel.EntryTypeDir {
-			continue
-		}
-		data, err := sess.ReadFile(ctx, remotePath, fscontract.ReadOptions{})
-		if err != nil {
-			warnings = append(warnings, remotePath+": "+err.Error())
-			continue
-		}
-		localPath := filepath.Join(root, filepath.FromSlash(remotePath))
-		localPath, err = boundaryPath(localPath)
-		if err != nil || !isWithinPath(localPath, root) {
-			warnings = append(warnings, remotePath+": artifact path outside root")
-			continue
-		}
-		if err := os.MkdirAll(filepath.Dir(localPath), 0o755); err != nil {
-			warnings = append(warnings, remotePath+": "+err.Error())
-			continue
-		}
-		if err := os.WriteFile(localPath, data, 0o644); err != nil {
-			warnings = append(warnings, remotePath+": "+err.Error())
-			continue
-		}
-		ok, kind, reason := gate.CheckDelivery(localPath)
-		artifact := scriptcontract.Artifact{Name: filepath.Base(localPath), Path: localPath, Size: int64(len(data)), Kind: kind, OK: ok, Reason: reason}
-		artifacts = append(artifacts, artifact)
-		if !ok {
-			warnings = append(warnings, artifact.Name+": "+reason)
-		}
-	}
-	return artifacts, warnings
+	return result
 }
 
 func sanitize(v string) string {
 	v = strings.TrimSpace(v)
 	replacer := strings.NewReplacer(`/`, `_`, `\\`, `_`, `:`, `_`, `*`, `_`, `?`, `_`, `"`, `_`, `<`, `_`, `>`, `_`, `|`, `_`)
 	return replacer.Replace(v)
-}
-
-func boundaryPath(pathValue string) (string, error) {
-	abs, err := filepath.Abs(pathValue)
-	if err != nil {
-		return "", err
-	}
-	abs = filepath.Clean(abs)
-	if real, err := filepath.EvalSymlinks(abs); err == nil {
-		return filepath.Clean(real), nil
-	}
-	info, err := os.Lstat(abs)
-	if err == nil && info.Mode()&os.ModeSymlink != 0 {
-		return "", fmt.Errorf("无法解析符号链接: %s", pathValue)
-	}
-	return abs, nil
-}
-
-func isWithinPath(pathValue, root string) bool {
-	pathValue = filepath.Clean(pathValue)
-	root = filepath.Clean(root)
-	if samePath(pathValue, root) {
-		return true
-	}
-	rel, err := filepath.Rel(root, pathValue)
-	if err != nil {
-		return false
-	}
-	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
-}
-
-func samePath(left, right string) bool {
-	if runtime.GOOS == "windows" {
-		return strings.EqualFold(left, right)
-	}
-	return left == right
 }
 
 func normalizeSlash(value string) string {
@@ -1055,13 +1322,6 @@ func pythonRuntimeSearchPath(workDir, scriptPath string) string {
 		return scriptPath
 	}
 	parts := []string{scriptPath}
-	if depRoot := skillDependencyRoot(workDir); depRoot != "" {
-		// 兼容旧 --target 落点；优先依赖 PATH 上的 venv python。
-		legacy := filepath.Join(depRoot, "python")
-		if st, err := os.Stat(legacy); err == nil && st.IsDir() {
-			parts = append(parts, legacy)
-		}
-	}
 	return joinUniquePaths(string(os.PathListSeparator), parts)
 }
 
@@ -1085,9 +1345,7 @@ func joinUniquePaths(sep string, values []string) string {
 func nodeModuleSearchPath(workspaceRoot string) string {
 	root := strings.TrimSpace(workspaceRoot)
 	if root == "" {
-		if wd, err := os.Getwd(); err == nil {
-			root = wd
-		}
+		return ""
 	}
 	if abs, err := filepath.Abs(root); err == nil {
 		root = abs
@@ -1116,7 +1374,7 @@ func skillDependencyRoot(workDir string) string {
 	}
 	for dir := root; ; {
 		if strings.EqualFold(filepath.Base(dir), ".genesis") {
-			return filepath.Join(dir, "skill-deps", skillID)
+			return filepath.Join(dir, "cache", "skill-deps", skillID)
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
@@ -1140,85 +1398,6 @@ func venvPythonExists(venvDir string) bool {
 	}
 	info, err := os.Stat(py)
 	return err == nil && !info.IsDir()
-}
-
-func materializeResultArtifacts(outputDir string, resultArtifacts []execmodel.Artifact) ([]scriptcontract.Artifact, []string) {
-	if len(resultArtifacts) == 0 {
-		return nil, nil
-	}
-	out := make([]scriptcontract.Artifact, 0, len(resultArtifacts))
-	warnings := make([]string, 0)
-	outputAbs, err := boundaryPath(outputDir)
-	if err != nil {
-		return nil, []string{"解析输出目录失败: " + err.Error()}
-	}
-	if err := os.MkdirAll(outputAbs, 0o755); err != nil {
-		return nil, []string{"创建输出目录失败: " + err.Error()}
-	}
-	for _, artifact := range resultArtifacts {
-		if strings.TrimSpace(artifact.LocalPath) == "" {
-			continue
-		}
-		local, warning := materializeResultArtifact(outputAbs, artifact)
-		if warning != "" {
-			warnings = append(warnings, warning)
-		}
-		if local.Name != "" {
-			out = append(out, local)
-		}
-	}
-	return out, warnings
-}
-
-func materializeResultArtifact(outputDir string, artifact execmodel.Artifact) (scriptcontract.Artifact, string) {
-	name := safeArtifactName(firstNonEmpty(artifact.Name, filepath.Base(artifact.LocalPath)))
-	src, err := boundaryPath(artifact.LocalPath)
-	if err != nil {
-		return scriptcontract.Artifact{}, fmt.Sprintf("%s: 解析执行产物失败: %v", name, err)
-	}
-	if !isWithinPath(src, outputDir) {
-		dest := filepath.Join(outputDir, name)
-		if err := copyFile(src, dest); err != nil {
-			return scriptcontract.Artifact{}, fmt.Sprintf("%s: 同步执行产物失败: %v", name, err)
-		}
-		src = dest
-	}
-	info, err := os.Stat(src)
-	if err != nil {
-		return scriptcontract.Artifact{}, fmt.Sprintf("%s: 读取产物信息失败: %v", name, err)
-	}
-	ok, kind, reason := gate.CheckDelivery(src)
-	local := scriptcontract.Artifact{Name: filepath.Base(src), Path: src, Size: info.Size(), Kind: kind, OK: ok, Reason: reason}
-	if !ok {
-		return local, local.Name + ": " + reason
-	}
-	return local, ""
-}
-
-func safeArtifactName(raw string) string {
-	name := filepath.Base(filepath.FromSlash(strings.TrimSpace(raw)))
-	if name == "" || name == "." || name == string(filepath.Separator) {
-		return "artifact"
-	}
-	return name
-}
-
-func copyFile(src, dest string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	out, err := os.Create(dest)
-	if err != nil {
-		return err
-	}
-	_, copyErr := out.ReadFrom(in)
-	closeErr := out.Close()
-	if copyErr != nil {
-		return copyErr
-	}
-	return closeErr
 }
 
 func shellJoin(parts []string) string {

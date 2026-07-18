@@ -78,4 +78,23 @@ func TestAdapterUnregisterHidesRegisteredTool(t *testing.T) {
 	if len(gw.ListInfos()) != 0 {
 		t.Fatalf("unregistered capability tool should not be visible: %+v", gw.ListInfos())
 	}
+	if err := toolRegistry.Register(&capabilityTool{capability: capmodel.CapabilityIndexRecord{ID: "other", Name: "preview", Enabled: true}}); err != nil {
+		t.Fatalf("注销后名称应可重新注册: %v", err)
+	}
+}
+
+func TestAdapterUpdatesSameCapabilityThroughExplicitReplace(t *testing.T) {
+	toolRegistry := registry.NewRegistry()
+	adapter := New(toolRegistry)
+	capability := capmodel.CapabilityIndexRecord{ID: "local@demo:tool:preview", Type: capmodel.CapabilityTypeTool, Name: "preview", Description: "old", Enabled: true}
+	if err := adapter.Register(context.Background(), capability); err != nil {
+		t.Fatal(err)
+	}
+	capability.Description = "new"
+	if err := adapter.Register(context.Background(), capability); err != nil {
+		t.Fatalf("同一 capability 更新应显式替换成功: %v", err)
+	}
+	if got := toolRegistry.Get("preview").GetInfo().Description; got != "new" {
+		t.Fatalf("更新未生效: %q", got)
+	}
 }

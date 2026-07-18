@@ -30,8 +30,6 @@ type DelegationEnvelope struct {
 	PromptOrigin   string
 	Objective      string
 	ExpectedOutput string
-	WorkspaceRoot  string
-	PathFormat     string
 	Capabilities   []string
 	MaxTurns       int
 	MaxTokens      int64

@@ -43,7 +43,7 @@ func (a *Authorizer) SetDefinitions(defs []model.McpServerDefinition) {
 func (a *Authorizer) AuthorizeTool(ctx context.Context, request gateway.AuthorizationRequest) (gateway.AuthorizationDecision, error) {
 	name := strings.TrimSpace(request.ToolName)
 	isMCPTool := strings.HasPrefix(name, mcpToolPrefix)
-	isMCPResource := name == "list_mcp_resources" || name == "read_mcp_resource" || name == "mcp_search"
+	isMCPResource := name == "list_mcp_resources" || name == "read_mcp_resource" || name == "search_mcp_tools"
 	if !isMCPTool && !isMCPResource {
 		return gateway.AuthorizationDecision{Allowed: true}, nil
 	}

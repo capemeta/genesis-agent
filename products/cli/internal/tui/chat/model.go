@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
@@ -133,8 +134,26 @@ func NewModel(
 	s.Spinner = spinner.Dot
 	s.Style = lipgloss.NewStyle().Foreground(styles.ColorYellow)
 
-	// Viewport 初始尺寸为 0，收到 WindowSizeMsg 后更新
+	// Viewport 初始尺寸为 0，收到 WindowSizeMsg 后更新。
+	// 禁用 pager 字母键（b/f/j/k/u/d/空格），避免与 Composer 输入冲突；
+	// ↑↓ 由 Update 显式处理，PgUp/PgDn 与鼠标滚轮交给 viewport。
 	vp := viewport.New(0, minViewport)
+	vp.KeyMap = viewport.KeyMap{
+		PageUp: key.NewBinding(
+			key.WithKeys("pgup"),
+			key.WithHelp("pgup", "page up"),
+		),
+		PageDown: key.NewBinding(
+			key.WithKeys("pgdown"),
+			key.WithHelp("pgdn", "page down"),
+		),
+		HalfPageUp:   key.NewBinding(key.WithDisabled()),
+		HalfPageDown: key.NewBinding(key.WithDisabled()),
+		Up:           key.NewBinding(key.WithDisabled()),
+		Down:         key.NewBinding(key.WithDisabled()),
+		Left:         key.NewBinding(key.WithDisabled()),
+		Right:        key.NewBinding(key.WithDisabled()),
+	}
 	vp.SetContent("")
 
 	return Model{
@@ -725,8 +744,8 @@ func (m Model) sandboxLabel() string {
 	return "sandbox:on"
 }
 
-// contextUsageLabel 根据当前可见 transcript 和模型窗口估算上下文占用。
-// 该值用于交互提示，不作为计费或截断决策依据。
+// contextUsageLabel 根据当前可见 UI 气泡估算占用（非真实 LLM 装配用量）。
+// 真实截断/压缩以 Runtime TokenEstimator + ContextBudgetPlanner 为准；此处仅作交互提示。
 func (m Model) contextUsageLabel() string {
 	if m.svc == nil || m.svc.Config() == nil {
 		return ""
@@ -745,7 +764,8 @@ func (m Model) contextUsageLabel() string {
 	if pct > 100 {
 		pct = 100
 	}
-	return fmt.Sprintf("ctx~%d%%", pct)
+	// ui-ctx：强调这是可见 transcript 近似，避免与模型真实 context 混淆。
+	return fmt.Sprintf("ui-ctx~%d%%", pct)
 }
 
 func waitProgress(ch <-chan progressMsg) tea.Cmd {
@@ -787,6 +807,7 @@ func (m Model) runAgentCmd(input string, progressCh chan<- progressMsg) tea.Cmd 
 		}
 		result, err := m.svc.RunOnce(m.ctx, app.RunRequest{
 			SessionID:  m.session.ID,
+			AppID:      m.session.AppID,
 			TenantID:   m.session.TenantID,
 			UserID:     m.session.UserID,
 			Input:      input,
@@ -862,8 +883,9 @@ const helpText = `可用命令（以 / 开头）:
   ↑ / ↓    输入为空时滚动消息历史（一行）
   PgUp     向上翻页
   PgDn     向下翻页
+  鼠标滚轮 滚动消息历史
   Ctrl+P/N 上一条/下一条输入历史
-  鼠标拖选 终端原生选取文本；消息滚动请使用 ↑/↓ 或 PgUp/PgDn`
+  Shift+拖选 终端原生选取文本（启用鼠标捕获后需按住 Shift）`
 
 // welcomeMsg 首次进入对话时显示的欢迎消息
 func welcomeMsg(modelName, sessionID string) uiMessage {

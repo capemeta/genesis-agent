@@ -74,6 +74,10 @@ func DefinitionFromRecord(rec capmodel.CapabilityIndexRecord) (model.McpServerDe
 				if meta.Type != "" {
 					cfg.Type = model.McpTransportType(meta.Type)
 				}
+				if meta.Placement != "" {
+					cfg.Placement = model.McpPlacement(meta.Placement)
+				}
+				cfg.InheritEnv = append([]string(nil), meta.InheritEnv...)
 				if len(meta.Args) > 0 {
 					cfg.Args = append([]string(nil), meta.Args...)
 				}
@@ -98,6 +102,12 @@ func DefinitionFromRecord(rec capmodel.CapabilityIndexRecord) (model.McpServerDe
 			}
 		}
 	}
+	if cfg.Type == model.McpTransportStdio && cfg.Placement == "" {
+		return model.McpServerDefinition{}, fmt.Errorf("mcp capability %s: stdio 必须显式声明 placement", name)
+	}
+	if cfg.Type == model.McpTransportStreamableHTTP && cfg.Placement == "" {
+		cfg.Placement = model.McpPlacementStreamableHTTP
+	}
 	cfg.Defaults(0, 0)
 	def := model.McpServerDefinition{Config: cfg, Origin: model.OriginMarketplace}
 	def.ConfigKey = ComputeConfigKey(def)
@@ -106,6 +116,8 @@ func DefinitionFromRecord(rec capmodel.CapabilityIndexRecord) (model.McpServerDe
 
 type marketplaceMCPMeta struct {
 	Type           string            `json:"type"`
+	Placement      string            `json:"placement"`
+	InheritEnv     []string          `json:"inherit_env"`
 	Args           []string          `json:"args"`
 	Env            map[string]string `json:"env"`
 	URL            string            `json:"url"`

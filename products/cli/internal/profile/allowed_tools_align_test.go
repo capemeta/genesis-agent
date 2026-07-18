@@ -14,7 +14,7 @@ import (
 // TestEmbeddedOfficeAllowedToolsAlignWithCLIProfile 保证内置 Office/PDF skill 的
 // allowed-tools 不会声明 CLI 默认 Profile 未启用的工具（避免加载后求交失败）。
 func TestEmbeddedOfficeAllowedToolsAlignWithCLIProfile(t *testing.T) {
-	prof := DefaultProfile()
+	prof := DefaultProfile(false)
 	enabled := map[string]struct{}{}
 	for _, name := range prof.Tools.Enabled {
 		enabled[strings.TrimSpace(name)] = struct{}{}

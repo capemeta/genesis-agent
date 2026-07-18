@@ -151,17 +151,17 @@ func (v *Validator) ValidateCommand(cmd execmodel.Command, opts execcontract.Run
 
 // EffectivePathPolicy 推导本次执行应使用的路径策略。
 func EffectivePathPolicy(opts execcontract.RunOptions) execmodel.PathPolicy {
-	if opts.Workspace.PathPolicy != "" {
-		return opts.Workspace.PathPolicy
+	if opts.Binding.PathPolicy != "" {
+		return opts.Binding.PathPolicy
 	}
-	if opts.Workspace.Mode == execmodel.WorkspaceModeLocalTask || opts.Workspace.Mode == execmodel.WorkspaceModeSandboxSess {
+	switch opts.Binding.Mode {
+	case execmodel.WorkspaceModeTask, execmodel.WorkspaceModeSession:
+		return execmodel.PathPolicyStrictWorkspace
+	case execmodel.WorkspaceModeProject:
+		return execmodel.PathPolicyPermissionOnly
+	default:
 		return execmodel.PathPolicyStrictWorkspace
 	}
-	provider := strings.ToLower(strings.TrimSpace(opts.Sandbox.Provider))
-	if opts.Sandbox.Mode != execmodel.SandboxDisabled && (strings.Contains(provider, "genesis") || strings.Contains(provider, "remote") || strings.Contains(provider, "docker")) {
-		return execmodel.PathPolicyStrictWorkspace
-	}
-	return execmodel.PathPolicyPermissionOnly
 }
 
 // AnalyzeCommand 返回命令字符串中的明显路径契约违规。

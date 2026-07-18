@@ -155,13 +155,6 @@ func TestSystemFSIncludesOfficeSkills(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	skillDoc, err := source.Read(context.Background(), contract.ReadRequest{PackageID: "office-ppt", Resource: "office-ppt/SKILL.md"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(skillDoc.Content), "8,000 characters") || !strings.Contains(string(skillDoc.Content), "Do not print the script") {
-		t.Fatal("office-ppt must constrain large script transfer to file-editing tools")
-	}
 	var hasFill, hasForms, hasCJK bool
 	for _, resource := range pdfResources.Resources {
 		if resource.Resource == "office-pdf/scripts/fill_fillable_fields.py" && resource.Text {
@@ -196,6 +189,38 @@ func TestSystemFSIncludesOfficeSkills(t *testing.T) {
 	}
 	if !hasRecalc || !hasSoffice {
 		t.Fatalf("office-excel missing migrated scripts: recalc=%v soffice=%v count=%d", hasRecalc, hasSoffice, len(excelResources.Resources))
+	}
+}
+
+func TestPortableOfficeSkillBodiesDoNotReferenceHostProtocol(t *testing.T) {
+	fsys, err := SystemFS()
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := NewSource(model.Authority{Kind: model.SourceKindEmbedded, ID: "system-test"}, model.ScopeSystem, fsys, parser.New())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// allowed-tools 等宿主装配元数据属于 frontmatter；可移植的任务知识正文不得依赖 Genesis 工具协议。
+	forbidden := []string{
+		"run_skill_command",
+		"`write_file`",
+		"publish_artifact",
+		"$WORK_DIR",
+		"Skill Harness",
+		"file-editing tool",
+	}
+	for _, packageID := range []string{"office-word", "office-excel", "office-ppt", "office-pdf"} {
+		read, readErr := source.Read(context.Background(), contract.ReadRequest{PackageID: model.PackageID(packageID)})
+		if readErr != nil {
+			t.Fatalf("read %s: %v", packageID, readErr)
+		}
+		for _, token := range forbidden {
+			if strings.Contains(read.Content, token) {
+				t.Errorf("%s body references host protocol %q", packageID, token)
+			}
+		}
 	}
 }
 

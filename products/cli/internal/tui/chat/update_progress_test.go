@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"genesis-agent/internal/runtime/progress"
+	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -42,6 +43,48 @@ func TestMouseWheelScrollsViewport(t *testing.T) {
 	got := updated.(Model)
 	if got.viewport.YOffset >= before {
 		t.Fatalf("mouse wheel should scroll: before=%d after=%d", before, got.viewport.YOffset)
+	}
+}
+
+func TestExpandProgressScrollsToBottom(t *testing.T) {
+	m := Model{viewport: viewport.New(40, 4), historyIdx: -1, width: 40}
+	m.messages = []uiMessage{{
+		role:        "system",
+		isProgress:  true,
+		progressLog: []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"},
+	}}
+	m.refreshViewportContent()
+	m.viewport.SetYOffset(0)
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}})
+	got := updated.(Model)
+	if !got.progressExpanded {
+		t.Fatal("expected progress to expand")
+	}
+	if !got.viewport.AtBottom() {
+		t.Fatalf("expand should scroll to bottom: offset=%d", got.viewport.YOffset)
+	}
+}
+
+func TestPageKeysScrollViewportEvenWithComposerText(t *testing.T) {
+	ta := textarea.New()
+	ta.SetValue("draft")
+	m := Model{viewport: viewport.New(40, 4), textarea: ta, historyIdx: -1}
+	m.viewport.SetContent(strings.Repeat("line\n", 20))
+	m.viewport.GotoBottom()
+	before := m.viewport.YOffset
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyPgUp})
+	got := updated.(Model)
+	if got.viewport.YOffset >= before {
+		t.Fatalf("pgup should scroll with composer text: before=%d after=%d", before, got.viewport.YOffset)
+	}
+
+	mid := got.viewport.YOffset
+	updated, _ = got.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+	got = updated.(Model)
+	if got.viewport.YOffset <= mid {
+		t.Fatalf("pgdn should scroll down: before=%d after=%d", mid, got.viewport.YOffset)
 	}
 }
 
@@ -202,5 +245,20 @@ func TestApplyProgressReplacesByCallID(t *testing.T) {
 
 	if len(m.progressLog) != 1 || m.progressLog[0] != "工具执行完成: write_file (路径: a.txt)" {
 		t.Fatalf("expected finally replaced log line for tool complete, got: %#v", m.progressLog)
+	}
+}
+
+func TestProgressSummaryDisplaysRunSkillPhaseTimings(t *testing.T) {
+	got := progressSummary(progress.Event{
+		Kind:     progress.KindTool,
+		Phase:    progress.PhaseComplete,
+		Name:     "run_skill_command",
+		Detail:   `{"command":"node index.js"}`,
+		Metadata: map[string]string{"duration_ms": "3749", "approval_duration_ms": "2000", "staging_duration_ms": "500", "execution_duration_ms": "1100"},
+	})
+	for _, want := range []string{"node index.js", "总计 3.7s", "审批 2.0s", "staging 500ms", "执行 1.1s"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("TUI 耗时摘要缺少 %q: %s", want, got)
+		}
 	}
 }

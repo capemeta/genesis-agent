@@ -18,7 +18,6 @@ import (
 	skillmodel "genesis-agent/internal/capabilities/skill/model"
 	skillparser "genesis-agent/internal/capabilities/skill/parser"
 	scriptcontract "genesis-agent/internal/capabilities/skill/script/contract"
-	scriptworkspace "genesis-agent/internal/capabilities/skill/script/workspace"
 	skillservice "genesis-agent/internal/capabilities/skill/service"
 	"genesis-agent/internal/platform/contextutil"
 )
@@ -48,13 +47,17 @@ func TestRemoteSkillCommandStagesWorkDirInputAndUsesImageNodeModules(t *testing.
 		t.Fatal(err)
 	}
 	skills := skillservice.New([]skillcontract.Source{source}, skillservice.Options{})
+	registrar := &collectingProducedRegistrar{}
 	svc, err := New(Deps{
-		Skills:        skills,
-		Runner:        noopExecutionRunner{},
-		Approval:      allowAllApproval{},
-		SessionClient: client,
-		FileClient:    client,
-		WorkspaceRef:  sandboxcontract.WorkspaceRef{Provider: "genesis-sandbox"},
+		Skills:            skills,
+		Runner:            noopExecutionRunner{},
+		Approval:          allowAllApproval{},
+		SessionClient:     client,
+		FileClient:        client,
+		WorkspaceRef:      sandboxcontract.WorkspaceRef{Provider: "genesis-sandbox"},
+		Provisioner:       testProvisioner{},
+		ProducedResources: registrar,
+		RemoteSessions:    noOpRemoteSessionBinder{},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -65,10 +68,6 @@ func TestRemoteSkillCommandStagesWorkDirInputAndUsesImageNodeModules(t *testing.
 
 	root := t.TempDir()
 	runID := "remote-smoke"
-	ws, err := scriptworkspace.PrepareLocalTask(root, runID)
-	if err != nil {
-		t.Fatal(err)
-	}
 	const scriptName = "deck_gen.js"
 	script := `
 (async () => {
@@ -83,18 +82,23 @@ func TestRemoteSkillCommandStagesWorkDirInputAndUsesImageNodeModules(t *testing.
   process.exit(1);
 });
 `
-	if err := os.WriteFile(filepath.Join(ws.WorkDir, scriptName), []byte(script), 0o644); err != nil {
+	scriptPath := filepath.Join(root, scriptName)
+	if err := os.WriteFile(scriptPath, []byte(script), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	binding := testBinding(runID)
+	manifest, snapshots := testInputManifest(binding, scriptName, []byte(script))
+	svc.inputSnapshots = snapshots
 
 	ctx := contextutil.WithRunID(context.Background(), runID)
 	result, err := svc.Run(ctx, scriptcontract.RunRequest{
-		Skill:         "office-ppt",
-		Command:       "node " + scriptName,
-		Inputs:        []string{"$WORK_DIR/" + scriptName},
-		RunID:         runID,
-		TimeoutMS:     120000,
-		WorkspaceRoot: root,
+		Skill:      "office-ppt",
+		Command:    "node " + scriptName,
+		Inputs:     manifest,
+		Binding:    binding,
+		StateRoot:  testStateRoot(root),
+		ProjectDir: root,
+		TimeoutMS:  120000,
 		Sandbox: execmodel.SandboxProfile{
 			Mode:     execmodel.SandboxRequired,
 			Provider: "genesis-sandbox",
@@ -109,14 +113,10 @@ func TestRemoteSkillCommandStagesWorkDirInputAndUsesImageNodeModules(t *testing.
 	if !containsProduced(result.Produced, "smoke.pptx") {
 		t.Fatalf("produced=%v", result.Produced)
 	}
-	wantRel := ".genesis/runs/remote-smoke/output/office-ppt/smoke.pptx"
-	if len(result.Artifacts) != 1 || result.Artifacts[0].Path != wantRel {
-		t.Fatalf("artifact path for model should be workspace-relative: %+v want=%q", result.Artifacts, wantRel)
+	if len(registrar.registrations) == 0 {
+		t.Fatal("remote produced source was not registered")
 	}
-	if filepath.IsAbs(filepath.FromSlash(result.Artifacts[0].Path)) {
-		t.Fatalf("artifact must not expose host absolute path: %q", result.Artifacts[0].Path)
-	}
-	if _, err := os.Stat(filepath.Join(root, ".genesis", "runs", "remote-smoke-materialize")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(root, ".genesis", "runtime", "runs", "remote-smoke-materialize")); !os.IsNotExist(err) {
 		t.Fatalf("should not create separate -materialize run dir: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(root, "smoke.pptx")); !os.IsNotExist(err) {

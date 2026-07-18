@@ -11,6 +11,8 @@ import (
 
 	"genesis-agent/internal/app"
 	shared "genesis-agent/internal/bootstrap"
+	agentappmemory "genesis-agent/internal/capabilities/agentapp/adapter/memory"
+	agentappmodel "genesis-agent/internal/capabilities/agentapp/model"
 	approvalmemory "genesis-agent/internal/capabilities/approval/adapter/memory"
 	approvalcontract "genesis-agent/internal/capabilities/approval/contract"
 	approvalmodel "genesis-agent/internal/capabilities/approval/model"
@@ -18,6 +20,7 @@ import (
 	auditmemory "genesis-agent/internal/capabilities/audit/adapter/memory"
 	capcontract "genesis-agent/internal/capabilities/capability/contract"
 	capservice "genesis-agent/internal/capabilities/capability/service"
+	execmodel "genesis-agent/internal/capabilities/execution/model"
 	execservice "genesis-agent/internal/capabilities/execution/service"
 	mcpstore "genesis-agent/internal/capabilities/mcp/adapter/store"
 	"genesis-agent/internal/capabilities/mcp/contract"
@@ -25,15 +28,20 @@ import (
 	policyapproval "genesis-agent/internal/capabilities/policy/adapter/approval"
 	policyconfig "genesis-agent/internal/capabilities/policy/adapter/config"
 	profilemodel "genesis-agent/internal/capabilities/profile/model"
+	toolvalidation "genesis-agent/internal/capabilities/tool/validation"
+	workservice "genesis-agent/internal/capabilities/workspace/service"
 	platformconfig "genesis-agent/internal/platform/config"
+	"genesis-agent/internal/platform/idgen"
 	"genesis-agent/internal/platform/logger"
 	multicontract "genesis-agent/internal/runtime/multiagent/contract"
 	multiagentmodel "genesis-agent/internal/runtime/multiagent/model"
 	multiprojection "genesis-agent/internal/runtime/multiagent/projection"
 	promptbuilder "genesis-agent/internal/runtime/prompt"
 	desktopprofile "genesis-agent/products/desktop/internal/profile"
+	localartifactcontrol "genesis-agent/shared/local/artifactcontrol"
 	localexec "genesis-agent/shared/local/execution"
 	"genesis-agent/shared/local/skillmarket"
+	localworkspace "genesis-agent/shared/local/workspace"
 )
 
 // Container 装配 Desktop 产品运行时（复用内核 + MCP；Wails UI 另开）。
@@ -85,7 +93,7 @@ func (c *Container) Init(ctx context.Context) error {
 			c.initErr = err
 			return
 		}
-		prof := desktopprofile.DefaultProfile()
+		prof := desktopprofile.DefaultProfile(cfg.MCP.Enabled)
 		var capabilityRegistry capcontract.Registry
 		var adapterReg *capservice.AdapterRegistry
 		if cfg.MCP.Enabled {
@@ -125,6 +133,13 @@ func (c *Container) Init(ctx context.Context) error {
 			ExternalApproval: true,
 		})
 
+		runWorkspace, err := buildDesktopRunWorkspace()
+		if err != nil {
+			_ = runtimeLogging.Close()
+			c.logging = nil
+			c.initErr = fmt.Errorf("初始化 Desktop Run 工作空间失败: %w", err)
+			return
+		}
 		c.bundle, c.initErr = shared.BuildAgentService(ctx, shared.BuildOptions{
 			Product:                        "desktop",
 			ConfigDir:                      c.configDir,
@@ -133,6 +148,7 @@ func (c *Container) Init(ctx context.Context) error {
 			DefaultAgentID:                 "desktop-default-agent",
 			DefaultAgentName:               "Genesis Desktop Agent",
 			Profile:                        prof,
+			RunWorkspace:                   runWorkspace,
 			PromptInjectors:                []promptbuilder.ContextInjector{environmentInjector},
 			Logger:                         runtimeLogging.AgentLogger,
 			AuditSink:                      auditSink,
@@ -193,6 +209,17 @@ func (c *Container) Init(ctx context.Context) error {
 		}
 		c.mcpStack = mcpStack
 		c.mcpStore = store
+		if err := toolvalidation.ValidateEnabled(c.bundle.ToolRegistry, prof.Tools.Enabled); err != nil {
+			if c.mcpStack != nil {
+				_ = c.mcpStack.Close(context.Background())
+				c.mcpStack = nil
+			}
+			_ = runtimeLogging.Close()
+			c.logging = nil
+			c.bundle = nil
+			c.initErr = fmt.Errorf("Desktop 工具装配与 Profile 不一致: %w", err)
+			return
+		}
 	})
 	return c.initErr
 }
@@ -270,6 +297,56 @@ func (desktopAskApprover) RequestApproval(ctx context.Context, req approvalmodel
 			Reason: "desktop headless auto-approve ask（Wails 弹窗待接入）",
 		}, nil
 	}
+}
+
+func buildDesktopRunWorkspace() (app.RunWorkspaceRuntime, error) {
+	stateRoot, inbox, err := desktopStorageRoots()
+	if err != nil {
+		return app.RunWorkspaceRuntime{}, err
+	}
+	artifactControl, err := localartifactcontrol.Build(localartifactcontrol.Options{
+		StateRoot:             stateRoot,
+		DeliveryWorkspaceRoot: inbox,
+	})
+	if err != nil {
+		return app.RunWorkspaceRuntime{}, fmt.Errorf("装配 Desktop Artifact 控制面失败: %w", err)
+	}
+	manifests, err := localworkspace.NewManifestStore(stateRoot)
+	if err != nil {
+		return app.RunWorkspaceRuntime{}, err
+	}
+	ids := idgen.NewUUIDGenerator()
+	resolver, err := workservice.NewWorkspaceResolver(ids)
+	if err != nil {
+		return app.RunWorkspaceRuntime{}, err
+	}
+	preparer, err := workservice.NewRunPreparer(ids, resolver, localworkspace.StateRootResolver{UserStateDir: stateRoot}, localworkspace.NewProvisioner(), manifests)
+	if err != nil {
+		return app.RunWorkspaceRuntime{}, err
+	}
+	modes := []execmodel.WorkspaceMode{execmodel.WorkspaceModeTask, execmodel.WorkspaceModeSession}
+	appProfile := agentappmodel.EffectiveProfile{ID: "code", Version: "1", Workspace: agentappmodel.WorkspaceSpec{DefaultMode: execmodel.WorkspaceModeTask, AllowedModes: modes, DefaultAccess: execmodel.WorkspaceAccessReadWrite}}
+	appResolver, err := agentappmemory.NewResolver(appProfile.ID, []agentappmodel.EffectiveProfile{appProfile})
+	if err != nil {
+		return app.RunWorkspaceRuntime{}, err
+	}
+	return app.RunWorkspaceRuntime{
+		Preparer: preparer, AgentApps: appResolver, IntentResolver: workservice.NewTaskIntentResolver(),
+		ProductModes: modes, BackendModes: modes, MaximumAccess: execmodel.WorkspaceAccessReadWrite,
+		ArtifactRuns: artifactControl.Initializer, Completion: artifactControl.Completion, QAEvidence: artifactControl.QAEvidence,
+	}, nil
+}
+
+func desktopStorageRoots() (stateRoot, inbox string, err error) {
+	dataRoot, err := os.UserConfigDir()
+	if err != nil {
+		return "", "", err
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", "", err
+	}
+	return filepath.Join(dataRoot, "genesis-agent", "desktop", "state"), filepath.Join(home, "Genesis Agent", "Inbox"), nil
 }
 
 func loadDesktopCapabilityIndex(adapters capcontract.RuntimeAdapterRegistry) (capcontract.Registry, error) {

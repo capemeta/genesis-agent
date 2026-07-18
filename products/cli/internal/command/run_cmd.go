@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path"
 	"strings"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"genesis-agent/internal/app"
+	artifactcontract "genesis-agent/internal/capabilities/artifact/contract"
 	"genesis-agent/internal/domain"
 	"genesis-agent/internal/runtime/progress"
 )
@@ -33,6 +35,7 @@ func newRunCmd(configDirRef *string, sandboxModeRef *string, factory ServiceFact
 		quiet        bool
 		progressMode string
 		resumeID     string
+		deliverables []string
 	)
 
 	cmd := &cobra.Command{
@@ -46,7 +49,8 @@ func newRunCmd(configDirRef *string, sandboxModeRef *string, factory ServiceFact
   agent run "现在几点了？"
   agent run "帮我计算 sqrt(144) + 2^10"
   agent run --json "今天星期几？"               JSON 格式输出
-  agent run --quiet "北京现在几点？" > out.txt  仅输出最终回答（适合重定向）`,
+  agent run --quiet "北京现在几点？" > out.txt  仅输出最终回答（适合重定向）
+  agent run --deliverable deck.pptx "按 brief 做演示文稿"  显式声明交付物（优先于 prompt 猜测）`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := context.Background()
@@ -68,9 +72,9 @@ func newRunCmd(configDirRef *string, sandboxModeRef *string, factory ServiceFact
 
 			var session *domain.Session
 			if id := strings.TrimSpace(resumeID); id != "" {
-				session, err = svc.ResumeSession(ctx, id, app.SessionScope{})
+				session, err = svc.ResumeSession(ctx, id, app.SessionScope{AppID: "code"})
 			} else {
-				session, err = svc.CreateSession(ctx, app.SessionScope{})
+				session, err = svc.CreateSession(ctx, app.SessionScope{AppID: "code"})
 			}
 			if err != nil {
 				return fmt.Errorf("准备会话失败: %w", err)
@@ -88,11 +92,13 @@ func newRunCmd(configDirRef *string, sandboxModeRef *string, factory ServiceFact
 			}
 
 			result, err := svc.RunOnce(ctx, app.RunRequest{
-				SessionID:  session.ID,
-				TenantID:   session.TenantID,
-				UserID:     session.UserID,
-				Input:      input,
-				OnProgress: progressSink,
+				SessionID:    session.ID,
+				AppID:        session.AppID,
+				TenantID:     session.TenantID,
+				UserID:       session.UserID,
+				Input:        input,
+				OnProgress:   progressSink,
+				Deliverables: declaredDeliverablesFromFlags(deliverables),
 			})
 
 			// ── 错误处理 ──────────────────────────────────────────
@@ -156,6 +162,7 @@ func newRunCmd(configDirRef *string, sandboxModeRef *string, factory ServiceFact
 	cmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "仅输出最终回答文本（适合管道操作）")
 	cmd.Flags().StringVar(&progressMode, "progress", "auto", "进度输出模式：auto|off|text|jsonl（输出到stderr）")
 	cmd.Flags().StringVar(&resumeID, "resume", "", "在指定会话中继续单次推理")
+	cmd.Flags().StringArrayVar(&deliverables, "deliverable", nil, "显式声明交付文件名（可重复）；优先于 prompt 启发式")
 
 	return cmd
 }
@@ -205,4 +212,23 @@ func validateProgressMode(mode string) error {
 	default:
 		return fmt.Errorf("未知progress模式 %q，可选: auto|off|text|jsonl", mode)
 	}
+}
+
+func declaredDeliverablesFromFlags(names []string) []artifactcontract.DeclaredDeliverable {
+	if len(names) == 0 {
+		return nil
+	}
+	out := make([]artifactcontract.DeclaredDeliverable, 0, len(names))
+	for _, raw := range names {
+		name := path.Base(strings.ReplaceAll(strings.TrimSpace(raw), `\`, "/"))
+		if name == "" || name == "." || name == ".." {
+			continue
+		}
+		declared := artifactcontract.DeclaredDeliverable{DesiredName: name, Required: true}
+		if ext := strings.ToLower(path.Ext(name)); ext != "" {
+			declared.AcceptedSuffix = []string{ext}
+		}
+		out = append(out, declared)
+	}
+	return out
 }

@@ -873,7 +873,7 @@ D:\workspace\go\go-project\codex\codex-rs\core\src\guardian\approval_request.rs
 
 ## 14. 残留风险与待决策
 
-- **deferred 检索工具的具体形态**（复用 skill 检索还是新增 `mcp_search`）待 M5 结合届时工具规模决定。
+- **deferred 检索工具的具体形态**（复用 skill 检索还是新增 `search_mcp_tools`）待 M5 结合届时工具规模决定。
 - **enterprise 多租户 server 配置持久化**（DB）依赖 Phase 2.5 的租户/RBAC 落地，M3 先用配置 + 内存态，模型预留 `TenantIDs`。
 - **elicitation（server→client 反向请求）**：Phase 1 可先 auto-deny 或忽略，M5/M6 再接（codex 已有完整范本）。
 - **go-sdk 版本与 spec 演进**：需在引入时确认当前最新稳定版与所需 spec 版本，并在 CI 固定。
@@ -1011,7 +1011,7 @@ POST /v1/runs → ReAct loop → registry.Execute(mcp__server__tool)
 | Enterprise `/v1/mcp/*` | **已落地（管理面）** | GET servers、GET detail、POST refresh；tool call 调试 API 未做 |
 | Desktop | **内核可装配** | `products/desktop/bootstrap` 复用 MCP stack；Wails UI 仍待实现 |
 | `ActionMCPCall` 治理接线 | **已落地** | Authorizer + policy matcher + ChainAuthorizer |
-| `mcp_search` 动态提升 | **已落地** | 通过 MCP tool 的受锁 `ExposureUpdater` 更新，不再修改共享 `Info` 指针 |
+| `search_mcp_tools` 动态提升 | **已落地** | 通过 MCP tool 的受锁 `ExposureUpdater` 更新，不再修改共享 `Info` 指针 |
 | go-sdk 稳定版对齐 | **已完成** | `go.mod` 固定 `v1.6.1`；文档已修正此前不存在的 `v1.7.0` 稳定版要求 |
 
 **本次明确延期**：Enterprise 管理 API 补全（`tools/call`、`resources/read`、detail 的 resources/auth）以及 Run SSE MCP 生命周期事件；两项均尚未实现。
@@ -1055,7 +1055,7 @@ POST /v1/runs → ReAct loop → registry.Execute(mcp__server__tool)
 
 - [x] project server 在 `reject → refresh` 后会关闭现有 session 并撤下投影；后台连接提交结果前会校验最新定义，避免撤销与 Dial 并发时重新变为 ready。
 - [x] scope 判断收敛为 MCP 域唯一匹配器，覆盖 channel、tenant、project、agent、user、role、environment，任何受限维度缺失或不匹配均拒绝。
-- [x] `mcp_search` 改为调用 MCP tool 的受锁 `ExposureUpdater`，`GetInfo` 返回快照，消除共享 traits 的直接写入。
+- [x] `search_mcp_tools` 调用 MCP tool 的受锁 `ExposureUpdater`，`GetInfo` 返回快照，消除共享 traits 的直接写入。
 - [x] go-sdk 版本要求已与可用稳定版本对齐：当前稳定版为 `v1.6.1`，`v1.7.0` 尚无稳定标签。
 - [x] 已新增 project 审批热撤销、全维度 scope、deferred tool 提升的回归测试；MCP/Tool 相关包测试通过。
 

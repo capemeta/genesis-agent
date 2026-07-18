@@ -2,10 +2,12 @@ package react
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
 
+	approvalcontract "genesis-agent/internal/capabilities/approval/contract"
 	tool "genesis-agent/internal/capabilities/tool/contract"
 	traceadapter "genesis-agent/internal/capabilities/trace/adapter"
 	"genesis-agent/internal/domain"
@@ -41,12 +43,28 @@ func TestExecuteOneToolCallPreservesJSONOnError(t *testing.T) {
 		tracer:   traceadapter.NewNopTracer(),
 	}
 	rc := runtime.NewRunContext(&domain.Run{ID: "run-1"}, &domain.Agent{})
-	got := e.executeOneToolCall(context.Background(), rc, domain.ToolCall{
+	got, err := e.executeOneToolCall(context.Background(), rc, domain.ToolCall{
 		ID:       "c1",
 		Function: domain.FunctionCall{Name: "run_skill_command", Arguments: `{}`},
 	}, logger.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !strings.Contains(got.Content, `"ok":false`) || !strings.Contains(got.Content, `dependency_missing`) {
 		t.Fatalf("content discarded json: %q", got.Content)
+	}
+}
+
+func TestExecuteToolCallsPropagatesRunAbort(t *testing.T) {
+	e := &ReactLoopEngine{
+		registry: failingJSONRegistry{err: approvalcontract.ErrRunAborted},
+		logger:   logger.NewNop(),
+		tracer:   traceadapter.NewNopTracer(),
+	}
+	rc := runtime.NewRunContext(&domain.Run{ID: "run-abort"}, &domain.Agent{})
+	_, err := e.executeToolCalls(context.Background(), rc, []domain.ToolCall{{ID: "c1", Function: domain.FunctionCall{Name: "run_command", Arguments: `{}`}}}, logger.NewNop())
+	if !errors.Is(err, approvalcontract.ErrRunAborted) {
+		t.Fatalf("err = %v, want ErrRunAborted", err)
 	}
 }
 
@@ -55,8 +73,12 @@ type failingJSONRegistry struct {
 	err    error
 }
 
-func (f failingJSONRegistry) Register(tool.Tool)   {}
-func (f failingJSONRegistry) Unregister(string)    {}
+func (f failingJSONRegistry) Register(tool.Tool) error { return nil }
+func (f failingJSONRegistry) Replace(string, string, tool.Tool) error {
+	return errors.New("unsupported")
+}
+func (f failingJSONRegistry) Owner(string) (string, bool) { return "", false }
+func (f failingJSONRegistry) Unregister(string)           {}
 func (f failingJSONRegistry) Get(string) tool.Tool {
 	return nil
 }
@@ -66,4 +88,3 @@ func (f failingJSONRegistry) Execute(context.Context, string, string) (string, e
 func (f failingJSONRegistry) ListInfos() []*tool.Info           { return nil }
 func (f failingJSONRegistry) FilterInfos([]string) []*tool.Info { return nil }
 func (f failingJSONRegistry) Names() []string                   { return nil }
-

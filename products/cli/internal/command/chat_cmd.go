@@ -38,9 +38,10 @@ func newChatCmd(configDirRef *string, sandboxModeRef *string, factory ServiceFac
   Ctrl+D     退出程序
   Ctrl+Y     复制最近一次 Agent 回答到系统剪贴板
   Esc        推理中取消本轮 / 空闲时清空输入框
-  ↑ / ↓      滚动消息历史
+  ↑ / ↓      输入为空时滚动消息历史
   PgUp/PgDn  快速翻页
-  鼠标拖选   终端原生选取文本并复制
+  鼠标滚轮   滚动消息历史
+  Shift+拖选 终端原生选取文本并复制（启用鼠标捕获后需按住 Shift）
 
 内置命令（以 / 开头）:
   /clear     清空当前会话历史，开始新对话
@@ -62,11 +63,11 @@ func newChatCmd(configDirRef *string, sandboxModeRef *string, factory ServiceFac
 			var session *domain.Session
 			switch {
 			case strings.TrimSpace(resumeID) != "":
-				session, err = svc.ResumeSession(ctx, strings.TrimSpace(resumeID), app.SessionScope{})
+				session, err = svc.ResumeSession(ctx, strings.TrimSpace(resumeID), app.SessionScope{AppID: "code"})
 			case continueLatest:
-				session, err = svc.ContinueSession(ctx, app.SessionScope{})
+				session, err = svc.ContinueSession(ctx, app.SessionScope{AppID: "code"})
 			default:
-				session, err = svc.CreateSession(ctx, app.SessionScope{})
+				session, err = svc.CreateSession(ctx, app.SessionScope{AppID: "code"})
 			}
 			if err != nil {
 				return fmt.Errorf("准备会话失败: %w", err)
@@ -79,10 +80,12 @@ func newChatCmd(configDirRef *string, sandboxModeRef *string, factory ServiceFac
 
 			// 启动 TUI 程序
 			// WithAltScreen: 使用备用屏幕，退出后恢复原始终端内容。
-			// 默认不启用鼠标捕获，让 Windows Console / Terminal 直接处理拖选复制。
+			// WithMouseCellMotion: 接收滚轮事件以滚动消息区。
+			// 原生拖选需按住 Shift（Windows Terminal / 多数现代终端均支持）。
 			p := tea.NewProgram(
 				m,
 				tea.WithAltScreen(),
+				tea.WithMouseCellMotion(),
 			)
 
 			// 绑定全局 TUI 审批器对应的 program 实例

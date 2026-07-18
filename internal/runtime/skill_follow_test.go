@@ -54,16 +54,40 @@ Read [editing.md](editing.md).
 	if s.QADone() {
 		t.Fatal("failed QA must not mark done")
 	}
-	s.NoteDeliveredArtifacts([]string{"output.json"})
-	if !s.IncompleteDelivery() {
-		t.Fatal("delivered + pending QA should be IncompleteDelivery")
-	}
 	s.NoteExecutedCommand("python scripts/verify.py output.json", true)
 	if !s.QADone() {
 		t.Fatal("expected QA done")
 	}
-	if s.IncompleteDelivery() {
-		t.Fatal("QA done must clear IncompleteDelivery")
+}
+
+func TestSkillFollowBoundsDeterministicQAEnvironmentFailures(t *testing.T) {
+	s := runtime.NewSkillFollowState()
+	s.RegisterInjection("## QA (Required)\n```bash\npython scripts/thumbnail.py out.pptx\npython scripts/verify.py out.pptx\n```")
+	s.NoteQAEnvironmentFailure("python scripts/thumbnail.py out.pptx", "dependency_missing")
+	if !s.ShouldBlockQA("python scripts/thumbnail.py out.pptx") {
+		t.Fatal("同一确定性环境失败 QA 必须立即阻止重试")
+	}
+	if s.ShouldBlockQA("python scripts/verify.py out.pptx") {
+		t.Fatal("一个 QA 失败不应阻止其他声明 QA")
+	}
+	s.NoteQAEnvironmentFailure("python scripts/verify.py out.pptx", "unsupported_environment")
+	if !s.ShouldBlockQA("python scripts/verify.py out.pptx") {
+		t.Fatal("第二个环境失败后 QA 预算应耗尽")
+	}
+}
+
+func TestSkillFollowReportsActualFailedQACommand(t *testing.T) {
+	s := runtime.NewSkillFollowState()
+	s.RegisterInjection("## QA (Required)\n```bash\npython scripts/thumbnail.py output.pptx\n```")
+	actual := "python scripts/thumbnail.py ultra5-comparison-summary.pptx"
+	s.NoteQAEnvironmentFailure(actual, "dependency_missing")
+	failed := s.FailedQACommands()
+	if len(failed) != 1 || failed[0] != actual {
+		t.Fatalf("failed QA commands=%v", failed)
+	}
+	pending := s.PendingQACommands()
+	if len(pending) != 1 || pending[0] != "python scripts/thumbnail.py output.pptx" {
+		t.Fatalf("pending template should remain separately auditable: %v", pending)
 	}
 }
 

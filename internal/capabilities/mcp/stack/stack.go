@@ -21,8 +21,8 @@ import (
 	"genesis-agent/internal/capabilities/mcp/manager"
 	"genesis-agent/internal/capabilities/mcp/model"
 	listmcpresources "genesis-agent/internal/capabilities/mcp/resourcetool/list_mcp_resources"
-	mcpsearch "genesis-agent/internal/capabilities/mcp/resourcetool/mcp_search"
 	readmcpresource "genesis-agent/internal/capabilities/mcp/resourcetool/read_mcp_resource"
+	searchmcptools "genesis-agent/internal/capabilities/mcp/resourcetool/search_mcp_tools"
 	mcpscope "genesis-agent/internal/capabilities/mcp/scope"
 	"genesis-agent/internal/capabilities/mcp/transport"
 	profilemodel "genesis-agent/internal/capabilities/profile/model"
@@ -191,10 +191,13 @@ func Build(ctx context.Context, opts Options) (*Stack, error) {
 	tools := []tool.Tool{
 		listmcpresources.New(mgr),
 		readmcpresource.New(mgr),
-		mcpsearch.New(opts.ToolRegistry),
+		searchmcptools.New(opts.ToolRegistry),
 	}
 	for _, t := range tools {
-		opts.ToolRegistry.Register(t)
+		if err := opts.ToolRegistry.Register(t); err != nil {
+			_ = mgr.Close(ctx)
+			return nil, fmt.Errorf("注册 MCP 内置工具 %q: %w", t.GetInfo().Name, err)
+		}
 	}
 
 	return &Stack{

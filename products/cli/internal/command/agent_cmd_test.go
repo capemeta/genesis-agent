@@ -91,7 +91,7 @@ func TestAgentCleanupRemovesOldTerminalRecords(t *testing.T) {
 	if err := store.Save(context.Background(), contract.StoredInstance{Instance: model.Instance{AgentID: "agent-old", Status: model.StatusCompleted, CreatedAt: old}}); err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(workspace, ".genesis", "subagents", "agent-old.json")
+	path := filepath.Join(workspace, ".genesis", "runtime", "subagents", "agent-old.json")
 	if err := os.Chtimes(path, old, old); err != nil {
 		t.Fatal(err)
 	}

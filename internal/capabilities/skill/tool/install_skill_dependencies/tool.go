@@ -18,7 +18,8 @@ import (
 	skillcontract "genesis-agent/internal/capabilities/skill/contract"
 	"genesis-agent/internal/capabilities/skill/model"
 	tool "genesis-agent/internal/capabilities/tool/contract"
-	"genesis-agent/internal/platform/contextutil"
+	toolparam "genesis-agent/internal/capabilities/tool/param"
+	workcontract "genesis-agent/internal/capabilities/workspace/contract"
 )
 
 const (
@@ -135,7 +136,7 @@ func (t *Tool) GetInfo() *tool.Info {
 func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 	started := time.Now()
 	var in input
-	if err := json.Unmarshal([]byte(params), &in); err != nil {
+	if err := toolparam.Decode(params, &in); err != nil {
 		return "", fmt.Errorf("解析install_skill_dependencies参数失败: %w", err)
 	}
 	skillName := strings.TrimSpace(in.Skill)
@@ -205,7 +206,7 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 
 	wsRoot := strings.TrimSpace(t.deps.WorkspaceRoot)
 	if wsRoot == "" {
-		wsRoot = "."
+		return "", fmt.Errorf("安装 Skill 依赖缺少显式 workspace root")
 	}
 	absRoot, err := filepath.Abs(wsRoot)
 	if err != nil {
@@ -263,6 +264,17 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 			return "", fmt.Errorf("创建依赖安装目录失败: %w", err)
 		}
 	}
+	control, ok := workcontract.ControlPlaneFromContext(ctx)
+	if !ok {
+		return "", execcontract.NewError(execcontract.ErrCodeExecutionBindingRequired, fmt.Errorf("安装 Skill 依赖缺少 workspace control plane"))
+	}
+	execution, err := control.PrepareExecution(ctx, workcontract.PrepareExecutionRequest{Subject: execmodel.ExecutionSubjectRef{TaskID: "skill-deps:" + meta.Name}, Intent: workcontract.ExecutionIntent{RequiredMode: execmodel.WorkspaceModeProject, HasProject: true}, RequestedAccess: execmodel.WorkspaceAccessReadWrite})
+	if err != nil {
+		return "", fmt.Errorf("准备 Skill 依赖 execution: %w", err)
+	}
+	if err := ensurePathWithinWorkspace(installRoot, execution.Workspace.WorkDir); err != nil {
+		return "", err
+	}
 
 	sandbox := cloneSandbox(t.deps.Sandbox)
 	// Gate B 最小可用：安装走独立元数据标记 + build Operation；
@@ -290,12 +302,10 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 			Cwd:     step.Cwd,
 			Shell:   "auto",
 		}, execcontract.RunOptions{
-			Timeout: defaultTimeout,
-			Sandbox: sandbox,
-			Workspace: execmodel.ExecutionWorkspace{
-				WorkDir: step.Cwd,
-				TmpDir:  step.Cwd,
-			},
+			Timeout:   defaultTimeout,
+			Sandbox:   sandbox,
+			Binding:   execution.Binding,
+			Workspace: execution.Workspace,
 		})
 		if runErr != nil {
 			out.OK = false
@@ -337,9 +347,7 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 			return marshalFail(out, out.Error)
 		}
 	}
-	if runID, ok := contextutil.GetRunID(ctx); ok {
-		out.Metadata["run_id"] = runID
-	}
+	out.Metadata["run_id"] = execution.Binding.Owner.RunID
 	out.ExitCode = lastCode
 	out.Stdout = stdoutBuf.String()
 	out.Stderr = stderrBuf.String()
@@ -350,6 +358,22 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 		return "", err
 	}
 	return string(data), nil
+}
+
+func ensurePathWithinWorkspace(candidate, workspaceRoot string) error {
+	rootReal, err := filepath.EvalSymlinks(workspaceRoot)
+	if err != nil {
+		return fmt.Errorf("解析依赖 workspace root: %w", err)
+	}
+	candidateReal, err := filepath.EvalSymlinks(candidate)
+	if err != nil {
+		return fmt.Errorf("解析依赖安装目录: %w", err)
+	}
+	rel, err := filepath.Rel(rootReal, candidateReal)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("依赖安装目录越过控制面 project workspace")
+	}
+	return nil
 }
 
 func normalizeAndAuthorizePackages(in []packageInput, deps model.Dependencies) ([]packageInput, error) {
@@ -576,7 +600,7 @@ func venvBinDirName() string {
 
 func skillDependencyInstallRoot(workspaceRoot string, meta model.Metadata) string {
 	skillID := sanitizePathPart(firstNonEmpty(string(meta.PackageID), meta.QualifiedName, meta.Name))
-	return filepath.Join(workspaceRoot, ".genesis", "skill-deps", skillID)
+	return filepath.Join(workspaceRoot, ".genesis", "cache", "skill-deps", skillID)
 }
 
 func sanitizePathPart(raw string) string {

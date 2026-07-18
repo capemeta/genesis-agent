@@ -11,6 +11,8 @@ import (
 	execmodel "genesis-agent/internal/capabilities/execution/model"
 	profilemodel "genesis-agent/internal/capabilities/profile/model"
 	skillcontract "genesis-agent/internal/capabilities/skill/contract"
+	workspaceadapter "genesis-agent/internal/capabilities/workspace/adapter/sandbox"
+	workmodel "genesis-agent/internal/capabilities/workspace/model"
 	"genesis-agent/internal/platform/logger"
 	"genesis-agent/shared/skillstack"
 )
@@ -43,6 +45,8 @@ func TestBuildEmbeddedIncludesSharedOfficeWiring(t *testing.T) {
 		Environment: profilemodel.EnvironmentServer,
 		Approval:    approval,
 		Logger:      logger.NewNop(),
+		StateRoot:   workmodel.StateRoot{ID: "test", Authority: "executor"},
+		Provisioner: workspaceadapter.NewProvisioner(),
 		EnabledTools: []string{
 			"Skill", "run_skill_command", "install_skill_dependencies", "list_skill_resources", "read_skill_resource", "search_skill_resources",
 		},
@@ -77,4 +81,3 @@ func TestBuildEmbeddedIncludesSharedOfficeWiring(t *testing.T) {
 		t.Fatalf("meta=%+v", meta)
 	}
 }
-

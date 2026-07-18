@@ -39,6 +39,56 @@ func (m *memStore) GetSummary(_ context.Context, _ contract.SessionRef) (*domain
 	return nil, nil
 }
 
+func TestCountAssembledHistoryLen(t *testing.T) {
+	msgs := []*domain.Message{
+		domain.NewSystemMessage("sys"),
+		domain.NewUserMessage("旧1"),
+		domain.NewAssistantMessage("旧答"),
+		domain.NewUserMessage("当前问"),
+	}
+	if got := countAssembledHistoryLen(msgs); got != 2 {
+		t.Fatalf("got=%d want 2", got)
+	}
+	msgs = append(msgs, domain.NewReminderMessage("r"))
+	if got := countAssembledHistoryLen(msgs); got != 2 {
+		t.Fatalf("with reminder got=%d want 2", got)
+	}
+}
+
+func TestPersistUsesAssembledHistoryLenNotRawGetRecent(t *testing.T) {
+	// 模拟：GetRecent 返回很多历史，但装配后只保留 2 条；historyLen 必须用装配后条数。
+	store := &memStore{}
+	e := &ReactLoopEngine{memory: store}
+	rc := runtime.NewRunContext(&domain.Run{ID: "r2"}, &domain.Agent{})
+	rc.Messages = []*domain.Message{
+		domain.NewSystemMessage("sys"),
+		domain.NewUserMessage("hist-a"),
+		domain.NewAssistantMessage("hist-b"),
+		domain.NewUserMessage("本轮问题"),
+		domain.NewAssistantMessage("本轮回答"),
+	}
+	historyLen := countAssembledHistoryLen([]*domain.Message{
+		domain.NewSystemMessage("sys"),
+		domain.NewUserMessage("hist-a"),
+		domain.NewAssistantMessage("hist-b"),
+		domain.NewUserMessage("本轮问题"),
+	})
+	// 若误用 raw GetRecent=100，SessionMessagesFromRun 会落盘为空。
+	e.persistRunSessionMessages(context.Background(), "s2", rc, historyLen, nil, logger.NewNop())
+	if len(store.msgs) != 2 {
+		t.Fatalf("saved=%d want 2 (user+assistant), kinds=%v", len(store.msgs), kindsOf(store.msgs))
+	}
+	if store.msgs[0].Content != "本轮问题" || store.msgs[1].Content != "本轮回答" {
+		t.Fatalf("unexpected saved: %+v", store.msgs)
+	}
+
+	store.msgs = nil
+	e.persistRunSessionMessages(context.Background(), "s2", rc, 100, nil, logger.NewNop())
+	if len(store.msgs) != 0 {
+		t.Fatalf("raw oversized historyLen must yield empty save, got %d", len(store.msgs))
+	}
+}
+
 func TestPersistRunSessionMessagesSavesFullChain(t *testing.T) {
 	store := &memStore{}
 	e := &ReactLoopEngine{memory: store}
@@ -56,7 +106,7 @@ func TestPersistRunSessionMessagesSavesFullChain(t *testing.T) {
 		domain.NewAssistantMessage("新答"),
 	)
 
-	e.persistRunSessionMessages(context.Background(), "s1", rc, len(history), logger.NewNop())
+	e.persistRunSessionMessages(context.Background(), "s1", rc, len(history), nil, logger.NewNop())
 
 	if len(store.msgs) != 4 {
 		t.Fatalf("saved=%d %+v", len(store.msgs), store.msgs)

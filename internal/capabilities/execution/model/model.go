@@ -113,13 +113,23 @@ const (
 	SandboxRiskHigh   SandboxRiskLevel = "high"
 )
 
-// WorkspaceMode 描述一次执行的工作路径语义。
+// WorkspaceMode 描述一次执行绑定的资源生命周期语义。
+// 它与产品端、物理 backend 和 sandbox provider 正交。
 type WorkspaceMode string
 
 const (
-	WorkspaceModeLocalCoding WorkspaceMode = "local_coding_workspace"
-	WorkspaceModeLocalTask   WorkspaceMode = "local_task_workspace"
-	WorkspaceModeSandboxSess WorkspaceMode = "sandbox_session_workspace"
+	WorkspaceModeProject WorkspaceMode = "project_workspace"
+	WorkspaceModeTask    WorkspaceMode = "task_job"
+	WorkspaceModeSession WorkspaceMode = "session_workspace"
+)
+
+// WorkspaceAccess 描述执行主体对绑定工作空间的最大访问姿态。
+// 具体文件操作仍须经过 PathResolver、PermissionEngine 和锁/Freshness 校验。
+type WorkspaceAccess string
+
+const (
+	WorkspaceAccessReadOnly  WorkspaceAccess = "read_only"
+	WorkspaceAccessReadWrite WorkspaceAccess = "read_write"
 )
 
 // PathPolicy 描述执行前路径契约强度。
@@ -131,24 +141,59 @@ const (
 	PathPolicyPermissionOnly    PathPolicy = "permission_only"
 )
 
-// ExecutionWorkspace 描述代码执行时注入给进程的逻辑工作目录。
-type ExecutionWorkspace struct {
-	Mode       WorkspaceMode     `json:"mode,omitempty"`
-	PathPolicy PathPolicy        `json:"path_policy,omitempty"`
-	WorkDir    string            `json:"work_dir,omitempty"`
-	InputDir   string            `json:"input_dir,omitempty"`
-	OutputDir  string            `json:"output_dir,omitempty"`
-	TmpDir     string            `json:"tmp_dir,omitempty"`
-	SkillDir   string            `json:"skill_dir,omitempty"` // 本次可执行的 skill 包根（含 scripts/）
-	Metadata   map[string]string `json:"metadata,omitempty"`
+// ExecutionOwnerRef 描述一次执行绑定的可信所有者与关联拓扑。
+// 这些字段由控制面注入，不能从 LLM 工具参数构造。
+type ExecutionOwnerRef struct {
+	TenantID             string `json:"tenant_id,omitempty"`
+	ProjectID            string `json:"project_id,omitempty"`
+	UserID               string `json:"user_id,omitempty"`
+	SessionID            string `json:"session_id,omitempty"`
+	AgentAppID           string `json:"agent_app_id,omitempty"`
+	AgentAppVersion      string `json:"agent_app_version,omitempty"`
+	TaskID               string `json:"task_id,omitempty"`
+	RunID                string `json:"run_id"`
+	ParentRunID          string `json:"parent_run_id,omitempty"`
+	SubAgentInstanceID   string `json:"subagent_instance_id,omitempty"`
+	WorkflowStepID       string `json:"workflow_step_id,omitempty"`
+	CollaborationSpaceID string `json:"collaboration_space_id,omitempty"`
+	MemberID             string `json:"member_id,omitempty"`
 }
 
-// InputArtifactRef 描述已 staging 到执行环境的输入文件或资源。
-type InputArtifactRef struct {
+// ExecutionSubjectRef 只描述 Run 内或编排拓扑中的执行主体。
+// tenant/run/App/session 等授权身份必须由控制面从 Run manifest 补全。
+type ExecutionSubjectRef struct {
+	TaskID               string `json:"task_id,omitempty"`
+	SubAgentInstanceID   string `json:"subagent_instance_id,omitempty"`
+	WorkflowStepID       string `json:"workflow_step_id,omitempty"`
+	CollaborationSpaceID string `json:"collaboration_space_id,omitempty"`
+	MemberID             string `json:"member_id,omitempty"`
+}
+
+// ExecutionBinding 固化一次执行的模式、所有者和能力上限。
+// binding 在 Run 内不可变；切换模式或 owner 必须创建新 binding。
+type ExecutionBinding struct {
+	ID         string            `json:"id"`
+	Mode       WorkspaceMode     `json:"mode"`
+	Access     WorkspaceAccess   `json:"access"`
+	PathPolicy PathPolicy        `json:"path_policy,omitempty"`
+	Owner      ExecutionOwnerRef `json:"owner"`
+}
+
+// ExecutionWorkspace 描述执行 backend 实际注入给进程的逻辑目录映射。
+// 它不携带业务模式或权限；这些语义只存在于 ExecutionBinding。
+type ExecutionWorkspace struct {
+	WorkDir   string            `json:"work_dir,omitempty"`
+	InputDir  string            `json:"input_dir,omitempty"`
+	OutputDir string            `json:"output_dir,omitempty"`
+	TmpDir    string            `json:"tmp_dir,omitempty"`
+	SkillDir  string            `json:"skill_dir,omitempty"` // 本次可执行的 skill 包根（含 scripts/）
+	Metadata  map[string]string `json:"metadata,omitempty"`
+}
+
+// StagedInputRef 描述已由控制面 staging 到执行环境的输入资源。
+type StagedInputRef struct {
 	ID          string            `json:"id,omitempty"`
 	Name        string            `json:"name,omitempty"`
-	LocalPath   string            `json:"local_path,omitempty"`
-	RemotePath  string            `json:"remote_path,omitempty"`
 	WorkspaceID string            `json:"workspace_id,omitempty"`
 	JobID       string            `json:"job_id,omitempty"`
 	Size        int64             `json:"size,omitempty"`
@@ -157,12 +202,12 @@ type InputArtifactRef struct {
 	Metadata    map[string]string `json:"metadata,omitempty"`
 }
 
-// ArtifactCollectionPolicy 描述成果物收集策略。
-type ArtifactCollectionPolicy string
+// OutputDiscoveryPolicy 描述 executor 对输出对象的发现策略；发现结果不是正式 Artifact。
+type OutputDiscoveryPolicy string
 
 const (
-	ArtifactCollectionOutputOnly ArtifactCollectionPolicy = "output_only"
-	ArtifactCollectionDisabled   ArtifactCollectionPolicy = "disabled"
+	OutputDiscoveryDeclared OutputDiscoveryPolicy = "declared_outputs"
+	OutputDiscoveryDisabled OutputDiscoveryPolicy = "disabled"
 )
 
 // SandboxProfile 描述 Docker、genesis-sandbox 或平台沙箱需要的执行上下文。
@@ -192,13 +237,13 @@ type Command struct {
 
 // Result 描述命令执行结果。
 type Result struct {
-	Command         string               `json:"command"`
-	Cwd             string               `json:"cwd"`
-	Shell           ShellKind            `json:"shell,omitempty"`
-	Environment     ExecutionEnvironment `json:"environment,omitempty"`
-	SandboxProvider string               `json:"sandbox_provider,omitempty"`
-	Warnings        []string             `json:"warnings,omitempty"`
-	Artifacts       []Artifact           `json:"artifacts,omitempty"`
+	Command         string                 `json:"command"`
+	Cwd             string                 `json:"cwd"`
+	Shell           ShellKind              `json:"shell,omitempty"`
+	Environment     ExecutionEnvironment   `json:"environment,omitempty"`
+	SandboxProvider string                 `json:"sandbox_provider,omitempty"`
+	Warnings        []string               `json:"warnings,omitempty"`
+	OutputObjects   []ExecutorOutputObject `json:"output_objects,omitempty"`
 	// SandboxViolations 携带 OS sandbox 拒绝的结构化事件（如 macOS Seatbelt denial）。
 	// 每条记录格式为 "operation:path" 或 "operation"（无路径时省略 ":"）。
 	SandboxViolations []string      `json:"sandbox_violations,omitempty"`
@@ -210,18 +255,4 @@ type Result struct {
 	TimedOut          bool          `json:"timed_out"`
 	OutputTruncated   bool          `json:"output_truncated"`
 	Error             string        `json:"error,omitempty"`
-}
-
-// Artifact 描述命令执行产生的远程或已落盘产物。
-type Artifact struct {
-	ID          string            `json:"id,omitempty"`
-	WorkspaceID string            `json:"workspace_id,omitempty"`
-	JobID       string            `json:"job_id,omitempty"`
-	Name        string            `json:"name,omitempty"`
-	Size        int64             `json:"size,omitempty"`
-	SHA256      string            `json:"sha256,omitempty"`
-	MIME        string            `json:"mime,omitempty"`
-	RemoteURL   string            `json:"remote_url,omitempty"`
-	LocalPath   string            `json:"local_path,omitempty"`
-	Metadata    map[string]string `json:"metadata,omitempty"`
 }

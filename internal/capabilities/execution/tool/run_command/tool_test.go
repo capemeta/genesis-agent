@@ -13,6 +13,8 @@ import (
 	fscontract "genesis-agent/internal/capabilities/filesystem/contract"
 	fsmodel "genesis-agent/internal/capabilities/filesystem/model"
 	"genesis-agent/internal/capabilities/tool/scheduler"
+	workcontract "genesis-agent/internal/capabilities/workspace/contract"
+	workmodel "genesis-agent/internal/capabilities/workspace/model"
 	"genesis-agent/internal/platform/contextutil"
 )
 
@@ -83,7 +85,7 @@ func TestToolExecuteRunsApprovedCommand(t *testing.T) {
 	approval := &fakeApproval{decision: approvalmodel.Decision{Type: approvalmodel.DecisionApproved}}
 	runner := &fakeRunner{}
 	tool := newTestTool(t, approval, runner, execmodel.SandboxProfile{Mode: execmodel.SandboxOptional, Provider: "genesis-sandbox"})
-	out, err := tool.Execute(context.Background(), `{"command":"echo hi","shell":"bash","timeout_ms":1000,"max_output_bytes":8}`)
+	out, err := tool.Execute(testRunContext(), `{"command":"echo hi","shell":"bash","timeout_ms":1000,"max_output_bytes":8}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,6 +97,9 @@ func TestToolExecuteRunsApprovedCommand(t *testing.T) {
 	}
 	if runner.opts.Timeout != time.Second || runner.opts.MaxOutputBytes != 8 || runner.opts.Sandbox.Mode != execmodel.SandboxOptional {
 		t.Fatalf("runner opts = %+v", runner.opts)
+	}
+	if runner.opts.Binding.Mode != execmodel.WorkspaceModeProject || runner.opts.Binding.PathPolicy != execmodel.PathPolicyStrictWorkspace || runner.opts.Binding.Owner.RunID != "run-command-test" || runner.opts.Workspace.WorkDir != "C:/workspace" {
+		t.Fatalf("execution binding = %+v workspace = %+v", runner.opts.Binding, runner.opts.Workspace)
 	}
 	var result execmodel.Result
 	if err := json.Unmarshal([]byte(out), &result); err != nil {
@@ -146,7 +151,7 @@ func TestToolExecuteUsesContextSandboxOverride(t *testing.T) {
 		Operation:      execmodel.SandboxOperationRunShell,
 		Language:       "shell",
 	}
-	ctx := contextutil.WithSandboxProfileOverride(context.Background(), override)
+	ctx := contextutil.WithSandboxProfileOverride(testRunContext(), override)
 	if _, err := tool.Execute(ctx, `{"command":"echo hi"}`); err != nil {
 		t.Fatal(err)
 	}
@@ -187,7 +192,7 @@ func TestToolNonZeroExitReturnsStructuredFailureAndRecoveryHint(t *testing.T) {
 	approval := &fakeApproval{decision: approvalmodel.Decision{Type: approvalmodel.DecisionApproved}}
 	runner := &fakeRunner{result: &execmodel.Result{ExitCode: 1, Stderr: "failed"}}
 	tool := newTestTool(t, approval, runner, execmodel.SandboxProfile{})
-	out, err := tool.Execute(context.Background(), `{"command":"ls D:/","shell":"bash"}`)
+	out, err := tool.Execute(testRunContext(), `{"command":"ls D:/","shell":"bash"}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -204,6 +209,28 @@ func TestToolNonZeroExitReturnsStructuredFailureAndRecoveryHint(t *testing.T) {
 	if result.OK || result.FailureKind != "command_exit_nonzero" || result.SuggestedAction == "" || result.SuggestedTool["name"] != "list_dir" || result.OperationFingerprint != "filesystem.list" {
 		t.Fatalf("result = %+v", result)
 	}
+}
+
+func TestToolExecuteRequiresRunBindingContext(t *testing.T) {
+	approval := &fakeApproval{decision: approvalmodel.Decision{Type: approvalmodel.DecisionApproved}}
+	runner := &fakeRunner{}
+	tool := newTestTool(t, approval, runner, execmodel.SandboxProfile{})
+	_, err := tool.Execute(context.Background(), `{"command":"echo hi"}`)
+	if code := execcontract.CodeOf(err); code != execcontract.ErrCodeExecutionBindingRequired {
+		t.Fatalf("CodeOf(err) = %s, want %s, err=%v", code, execcontract.ErrCodeExecutionBindingRequired, err)
+	}
+	if runner.called {
+		t.Fatal("runner called without trusted run context")
+	}
+}
+
+func testRunContext() context.Context {
+	ctx := contextutil.WithRunID(context.Background(), "run-command-test")
+	ctx = contextutil.WithSessionID(ctx, "session-command-test")
+	ctx = contextutil.WithTenantID(ctx, "tenant-command-test")
+	binding := execmodel.ExecutionBinding{ID: "binding-command-test", Mode: execmodel.WorkspaceModeProject, Access: execmodel.WorkspaceAccessReadWrite, PathPolicy: execmodel.PathPolicyStrictWorkspace, Owner: execmodel.ExecutionOwnerRef{RunID: "run-command-test", SessionID: "session-command-test", TenantID: "tenant-command-test"}}
+	prepared := workmodel.PreparedRun{Execution: workmodel.PreparedExecutionSnapshot{Binding: binding, Workspace: execmodel.ExecutionWorkspace{WorkDir: "C:/workspace"}}}
+	return workcontract.WithPreparedRun(ctx, prepared)
 }
 
 func newTestTool(t *testing.T, approval *fakeApproval, runner *fakeRunner, sandbox execmodel.SandboxProfile) *Tool {

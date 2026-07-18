@@ -2,12 +2,12 @@ package readmcpresource
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 
 	"genesis-agent/internal/capabilities/mcp/contract"
 	tool "genesis-agent/internal/capabilities/tool/contract"
+	toolparam "genesis-agent/internal/capabilities/tool/param"
 )
 
 // Tool 按需读取 MCP resource。
@@ -48,7 +48,7 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 		Server string `json:"server"`
 		URI    string `json:"uri"`
 	}
-	if err := json.Unmarshal([]byte(params), &req); err != nil {
+	if err := toolparam.Decode(params, &req); err != nil {
 		return "", fmt.Errorf("参数不是合法 JSON: %w", err)
 	}
 	req.Server = strings.TrimSpace(req.Server)

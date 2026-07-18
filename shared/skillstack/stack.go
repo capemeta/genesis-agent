@@ -3,10 +3,11 @@ package skillstack
 import (
 	"context"
 	"fmt"
-	"path/filepath"
 	"strings"
 
 	approvalcontract "genesis-agent/internal/capabilities/approval/contract"
+	artifactcontract "genesis-agent/internal/capabilities/artifact/contract"
+	selectartifact "genesis-agent/internal/capabilities/artifact/tool/select_deliverable_candidate"
 	execcontract "genesis-agent/internal/capabilities/execution/contract"
 	execmodel "genesis-agent/internal/capabilities/execution/model"
 	profilemodel "genesis-agent/internal/capabilities/profile/model"
@@ -17,7 +18,6 @@ import (
 	skillmodel "genesis-agent/internal/capabilities/skill/model"
 	skillparser "genesis-agent/internal/capabilities/skill/parser"
 	scriptservice "genesis-agent/internal/capabilities/skill/script/service"
-	scriptworkspace "genesis-agent/internal/capabilities/skill/script/workspace"
 	skillservice "genesis-agent/internal/capabilities/skill/service"
 	installskilldeps "genesis-agent/internal/capabilities/skill/tool/install_skill_dependencies"
 	listskillresources "genesis-agent/internal/capabilities/skill/tool/list_skill_resources"
@@ -26,6 +26,8 @@ import (
 	searchskillresources "genesis-agent/internal/capabilities/skill/tool/search_skill_resources"
 	skilltool "genesis-agent/internal/capabilities/skill/tool/skill"
 	toolcontract "genesis-agent/internal/capabilities/tool/contract"
+	workcontract "genesis-agent/internal/capabilities/workspace/contract"
+	workmodel "genesis-agent/internal/capabilities/workspace/model"
 	"genesis-agent/internal/platform/logger"
 	promptbuilder "genesis-agent/internal/runtime/prompt"
 	"genesis-agent/internal/runtime/strategy/react"
@@ -43,15 +45,25 @@ type ExecStack struct {
 
 // Options 描述产品侧 Skill 工具栈装配参数。
 type Options struct {
-	Product        profilemodel.ChannelType
-	Environment    profilemodel.RuntimeEnvironment
-	Approval       approvalcontract.Service
-	Exec           ExecStack
-	Logger         logger.Logger
-	EnabledTools   []string
-	EnabledSkills  []string
-	DisabledSkills []string
-	WorkspaceRoot  string // 可选；install_skill_dependencies 的 workspace cwd
+	Product           profilemodel.ChannelType
+	Environment       profilemodel.RuntimeEnvironment
+	Approval          approvalcontract.Service
+	Exec              ExecStack
+	Logger            logger.Logger
+	EnabledTools      []string
+	EnabledSkills     []string
+	DisabledSkills    []string
+	ProjectDir        string
+	StateRoot         workmodel.StateRoot
+	Provisioner       workcontract.Provisioner
+	InputResolver     runskillcommand.InputResolver
+	InputStager       workcontract.InputStager
+	InputSnapshots    workcontract.InputSnapshotReader
+	ProducedResources workcontract.ProducedResourceRegistrar
+	RemoteSessions    scriptservice.RemoteSessionBinder
+	Reservations      artifactcontract.OutputReservationAllocator
+	Deliverables      artifactcontract.DeliverableSpecStore
+	Finalizer         artifactcontract.RequiredDeliverableFinalizer
 
 	// EnablePreflight / AutoRetryAfterInstall 对齐 CLI skills.* 配置（默认 false）。
 	EnablePreflight       bool
@@ -78,6 +90,9 @@ func BuildEmbedded(opts Options) (*Stack, error) {
 	}
 	if opts.Exec.Runner == nil {
 		return nil, fmt.Errorf("execution runner未配置")
+	}
+	if opts.Provisioner == nil {
+		return nil, fmt.Errorf("workspace provisioner未配置")
 	}
 	if opts.Product == "" {
 		opts.Product = profilemodel.ChannelEnterprise
@@ -116,6 +131,12 @@ func BuildEmbedded(opts Options) (*Stack, error) {
 		EnablePreflight:       opts.EnablePreflight,
 		AutoRetryAfterInstall: opts.AutoRetryAfterInstall,
 		Installer:             opts.Installer,
+		Provisioner:           opts.Provisioner,
+		InputSnapshots:        opts.InputSnapshots,
+		ProducedResources:     opts.ProducedResources,
+		RemoteSessions:        opts.RemoteSessions,
+		Reservations:          opts.Reservations,
+		Deliverables:          opts.Deliverables,
 	})
 	if err != nil {
 		return nil, err
@@ -163,7 +184,9 @@ func BuildEmbedded(opts Options) (*Stack, error) {
 		Runner:         scriptSvc,
 		CatalogRequest: catalogReq,
 		Sandbox:        opts.Exec.Sandbox,
-		WorkspaceRoot:  opts.WorkspaceRoot,
+		InputResolver:  opts.InputResolver,
+		InputStager:    opts.InputStager,
+		Finalizer:      opts.Finalizer,
 	})
 	if err != nil {
 		return nil, err
@@ -174,7 +197,7 @@ func BuildEmbedded(opts Options) (*Stack, error) {
 		Approval:       opts.Approval,
 		CatalogRequest: catalogReq,
 		Sandbox:        opts.Exec.Sandbox,
-		WorkspaceRoot:  opts.WorkspaceRoot,
+		WorkspaceRoot:  opts.ProjectDir,
 	})
 	if err != nil {
 		return nil, err
@@ -185,30 +208,24 @@ func BuildEmbedded(opts Options) (*Stack, error) {
 	injector := promptbuilder.ContextInjectorFunc(func(ctx context.Context, req promptbuilder.BuildRequest) (promptbuilder.Fragment, error) {
 		var b strings.Builder
 		b.WriteString("Skills 是任务流程包，不是可执行工具。加载技能必须调用 Skill(skill=...)；禁止把 office-ppt 等技能名当作独立工具调用。用户输入中的 $skill 或 skill:// 引用会在回合开始自动注入。用户指定的宿主机文件应直接作为 run_skill_command.inputs，由运行时在审批后 stage，禁止 run_command / Copy-Item 手动搬运。可用技能列表见 Skill 工具描述中的 <available_skills>。若 run_skill_command 返回 failure_kind=dependency_missing：调用 install_skill_dependencies（须审批，仅装 runtime 白名单包）后，用相同参数再跑命令（安装成功会清零重复失败计数）；sandbox_violation 勿当成缺包。收到 failure_kind=repeated_failure：禁止再次提交相同调用，必须改参或改策略。收到 failure_kind=no_progress：必须总结阻塞或询问用户，禁止继续空转。")
-		b.WriteString("\n\nRun 文件落点：中间脚本/临时文件用 write_file(\"$WORK_DIR/...\")；最终交付进 $OUTPUT_DIR；禁止写到仓库根目录。")
-		if req.Run != nil && strings.TrimSpace(req.Run.ID) != "" && strings.TrimSpace(opts.WorkspaceRoot) != "" {
-			if ws, err := scriptworkspace.PrepareLocalTask(opts.WorkspaceRoot, req.Run.ID); err == nil {
-				rel := func(abs string) string {
-					r, err := filepath.Rel(opts.WorkspaceRoot, abs)
-					if err != nil {
-						return abs
-					}
-					return filepath.ToSlash(r)
-				}
-				b.WriteString(fmt.Sprintf("\n本 Run：WORK_DIR=%s OUTPUT_DIR=%s INPUT_DIR=%s", rel(ws.WorkDir), rel(ws.OutputDir), rel(ws.InputDir)))
-			}
-		}
+		b.WriteString("\n\nRun 文件落点：中间脚本/临时文件写当前 execution work；run_skill_command 只返回不透明 candidate_id。required 交付物唯一匹配时由 Harness 自动 Gate、发布和交付；多个匹配时只能通过 select_deliverable_candidate 选择返回的 candidate_id，禁止提交路径或 locator。")
 		return promptbuilder.Fragment{
 			Name:     "skills_instructions",
 			Contents: b.String(),
 		}, nil
 	})
 
+	tools := []toolcontract.Tool{skillGateway, listResources, readResource, searchResources, runSkillCommand, installDeps}
+	if opts.Finalizer != nil {
+		selector, err := selectartifact.New(opts.Finalizer)
+		if err != nil {
+			return nil, err
+		}
+		tools = append(tools, selector)
+	}
 	return &Stack{
-		Service: skillSvc,
-		Tools: []toolcontract.Tool{
-			skillGateway, listResources, readResource, searchResources, runSkillCommand, installDeps,
-		},
+		Service:              skillSvc,
+		Tools:                tools,
 		SkillNameMatcher:     matcher,
 		SkillMentionSelector: mentions,
 		SkillExplicitLoader:  explicitLoader,

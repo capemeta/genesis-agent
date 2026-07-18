@@ -6,9 +6,11 @@ import (
 	"path/filepath"
 	"testing"
 
+	execmodel "genesis-agent/internal/capabilities/execution/model"
 	fscontract "genesis-agent/internal/capabilities/filesystem/contract"
 	"genesis-agent/internal/capabilities/filesystem/model"
-	"genesis-agent/internal/platform/contextutil"
+	workcontract "genesis-agent/internal/capabilities/workspace/contract"
+	workmodel "genesis-agent/internal/capabilities/workspace/model"
 )
 
 func TestResolverMarksEscapeAsExternal(t *testing.T) {
@@ -160,16 +162,20 @@ func TestResolverExpandsWorkDirLogicalPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx := contextutil.WithRunID(context.Background(), "run-test-1")
+	workDir := filepath.Join(root, ".genesis", "runtime", "runs", "run-test-1", "work", "binding-root")
+	if err := os.MkdirAll(workDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ctx := workcontract.WithPreparedRun(context.Background(), workmodel.PreparedRun{Execution: workmodel.PreparedExecutionSnapshot{Workspace: execmodel.ExecutionWorkspace{WorkDir: workDir}}})
 	got, err := resolver.Resolve(ctx, model.PathRef{Raw: "$WORK_DIR/deck_gen.js"}, fscontract.ResolveOptions{MustExist: false})
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantRel := ".genesis/runs/run-test-1/work/deck_gen.js"
+	wantRel := ".genesis/runtime/runs/run-test-1/work/binding-root/deck_gen.js"
 	if got.WorkspaceRel != wantRel {
 		t.Fatalf("WorkspaceRel=%q, want %q", got.WorkspaceRel, wantRel)
 	}
-	wantAbs := filepath.Join(root, ".genesis", "runs", "run-test-1", "work", "deck_gen.js")
+	wantAbs := filepath.Join(workDir, "deck_gen.js")
 	if filepath.Clean(got.BackendPath) != filepath.Clean(wantAbs) {
 		t.Fatalf("BackendPath=%q, want %q", got.BackendPath, wantAbs)
 	}

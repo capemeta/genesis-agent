@@ -8,8 +8,11 @@ import (
 	"testing"
 	"time"
 
+	execmodel "genesis-agent/internal/capabilities/execution/model"
 	hookcontract "genesis-agent/internal/capabilities/hook/contract"
 	hookmodel "genesis-agent/internal/capabilities/hook/model"
+	workcontract "genesis-agent/internal/capabilities/workspace/contract"
+	workmodel "genesis-agent/internal/capabilities/workspace/model"
 	"genesis-agent/internal/domain"
 	"genesis-agent/internal/runtime/multiagent/contextsnapshot"
 	"genesis-agent/internal/runtime/multiagent/contract"
@@ -20,6 +23,36 @@ import (
 )
 
 type fakeEngine struct{}
+
+type fakeRunPreparer struct{}
+
+func (fakeRunPreparer) PrepareRun(_ context.Context, req workcontract.PrepareRunRequest) (workmodel.PreparedRun, error) {
+	runID := "child-" + strings.ReplaceAll(time.Now().UTC().Format("150405.000000000"), ".", "")
+	binding := execmodel.ExecutionBinding{ID: runID + "-binding", Mode: execmodel.WorkspaceModeTask, Access: execmodel.WorkspaceAccessReadWrite, PathPolicy: execmodel.PathPolicyStrictWorkspace, Owner: execmodel.ExecutionOwnerRef{RunID: runID, ParentRunID: req.ParentRunID}}
+	execution := workmodel.PreparedExecutionSnapshot{Binding: binding, Workspace: execmodel.ExecutionWorkspace{WorkDir: "/workspace/work/" + runID}}
+	manifest := workmodel.RunManifest{RunID: runID, Scope: req.Scope, Executions: []workmodel.PreparedExecutionSnapshot{execution}}
+	return workmodel.PreparedRun{Manifest: manifest, Execution: execution}, nil
+}
+func (fakeRunPreparer) PrepareExecution(context.Context, workcontract.PrepareExecutionRequest) (workmodel.PreparedExecutionSnapshot, error) {
+	return workmodel.PreparedExecutionSnapshot{}, nil
+}
+func (fakeRunPreparer) GetRunManifest(context.Context, string, string) (workmodel.RunManifest, error) {
+	return testParentPrepared().Manifest, nil
+}
+
+func testWorkspaceOption() Option {
+	return WithWorkspaceRuntime(WorkspaceRuntime{Preparer: fakeRunPreparer{}, MaximumAccess: execmodel.WorkspaceAccessReadWrite})
+}
+
+func testParentContext() context.Context {
+	return workcontract.WithPreparedRun(context.Background(), testParentPrepared())
+}
+
+func testParentPrepared() workmodel.PreparedRun {
+	binding := execmodel.ExecutionBinding{ID: "parent-binding", Mode: execmodel.WorkspaceModeTask, Access: execmodel.WorkspaceAccessReadWrite, Owner: execmodel.ExecutionOwnerRef{RunID: "parent-run", SessionID: "session"}}
+	execution := workmodel.PreparedExecutionSnapshot{Binding: binding}
+	return workmodel.PreparedRun{Manifest: workmodel.RunManifest{RunID: "parent-run", Scope: workmodel.ResourceScope{TenantID: "tenant"}, Executions: []workmodel.PreparedExecutionSnapshot{execution}}, Execution: execution}
+}
 
 func (fakeEngine) GetStrategyName() string { return "fake" }
 
@@ -46,12 +79,12 @@ func TestControllerDispatchesSubagentLifecycleHooks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := New(fakeEngine{}, limiter, nil)
+	c, err := New(fakeEngine{}, limiter, nil, testWorkspaceOption())
 	if err != nil {
 		t.Fatal(err)
 	}
 	dispatcher := &recordingHookDispatcher{}
-	ctx := hookcontract.WithDispatcher(context.Background(), dispatcher)
+	ctx := hookcontract.WithDispatcher(testParentContext(), dispatcher)
 	instance, err := c.Spawn(ctx, contract.SpawnRequest{SessionID: "session", ParentRunID: "parent", SubagentType: "explore", Prompt: "inspect", Agent: &domain.Agent{Name: "explore"}})
 	if err != nil {
 		t.Fatal(err)
@@ -69,12 +102,12 @@ func TestControllerSubagentStartHookBlocksBeforeSlotReservation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := New(fakeEngine{}, limiter, nil)
+	c, err := New(fakeEngine{}, limiter, nil, testWorkspaceOption())
 	if err != nil {
 		t.Fatal(err)
 	}
 	dispatcher := &recordingHookDispatcher{blockStart: true}
-	ctx := hookcontract.WithDispatcher(context.Background(), dispatcher)
+	ctx := hookcontract.WithDispatcher(testParentContext(), dispatcher)
 	if _, err := c.Spawn(ctx, contract.SpawnRequest{SessionID: "session", SubagentType: "explore", Prompt: "inspect", Agent: &domain.Agent{Name: "explore"}}); err == nil {
 		t.Fatal("expected Hook to block spawn")
 	}
@@ -166,13 +199,13 @@ func TestControllerEmitsOnlyParentSubAgentProgress(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := New(fakeEngine{}, limiter, nil)
+	c, err := New(fakeEngine{}, limiter, nil, testWorkspaceOption())
 	if err != nil {
 		t.Fatal(err)
 	}
 	var mu sync.Mutex
 	var events []progress.Event
-	ctx := progress.WithSink(context.Background(), func(event progress.Event) {
+	ctx := progress.WithSink(testParentContext(), func(event progress.Event) {
 		mu.Lock()
 		events = append(events, event)
 		mu.Unlock()
@@ -209,11 +242,11 @@ func TestControllerEmitsProjectionEventsWithoutResultBody(t *testing.T) {
 		t.Fatal(err)
 	}
 	sink := projection.NewMemorySink(model.ProjectionChannelDesktop)
-	c, err := New(fakeEngine{}, limiter, nil, WithProjectionSink(sink))
+	c, err := New(fakeEngine{}, limiter, nil, WithProjectionSink(sink), testWorkspaceOption())
 	if err != nil {
 		t.Fatal(err)
 	}
-	instance, err := c.Spawn(context.Background(), contract.SpawnRequest{SessionID: "session", TenantID: "tenant", ParentRunID: "parent-run", SubagentType: "explore", Prompt: "inspect", Agent: &domain.Agent{Name: "explore"}})
+	instance, err := c.Spawn(testParentContext(), contract.SpawnRequest{SessionID: "session", TenantID: "tenant", ParentRunID: "parent-run", SubagentType: "explore", Prompt: "inspect", Agent: &domain.Agent{Name: "explore"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -265,18 +298,18 @@ func TestControllerAllowsDepthTwoAndRejectsDepthThree(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := New(fakeEngine{}, limiter, nil)
+	c, err := New(fakeEngine{}, limiter, nil, testWorkspaceOption())
 	if err != nil {
 		t.Fatal(err)
 	}
-	instance, err := c.Spawn(context.Background(), contract.SpawnRequest{SessionID: "session", Depth: 2, MaxDepth: 2, Prompt: "inspect", Agent: &domain.Agent{Name: "worker"}})
+	instance, err := c.Spawn(testParentContext(), contract.SpawnRequest{SessionID: "session", Depth: 2, MaxDepth: 2, Prompt: "inspect", Agent: &domain.Agent{Name: "worker"}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := c.Wait(context.Background(), instance.AgentID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.Spawn(context.Background(), contract.SpawnRequest{SessionID: "session", Depth: 3, MaxDepth: 2, Prompt: "inspect", Agent: &domain.Agent{Name: "worker"}}); err == nil {
+	if _, err := c.Spawn(testParentContext(), contract.SpawnRequest{SessionID: "session", Depth: 3, MaxDepth: 2, Prompt: "inspect", Agent: &domain.Agent{Name: "worker"}}); err == nil {
 		t.Fatal("expected depth three spawn to fail")
 	}
 }
@@ -286,11 +319,11 @@ func TestControllerReleasesSlotAfterEnginePanic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := New(panicEngine{}, limiter, nil)
+	c, err := New(panicEngine{}, limiter, nil, testWorkspaceOption())
 	if err != nil {
 		t.Fatal(err)
 	}
-	first, err := c.Spawn(context.Background(), contract.SpawnRequest{SessionID: "session", Prompt: "first", Agent: &domain.Agent{Name: "first"}})
+	first, err := c.Spawn(testParentContext(), contract.SpawnRequest{SessionID: "session", Prompt: "first", Agent: &domain.Agent{Name: "first"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -311,11 +344,11 @@ func TestControllerUsesChildRunTerminalStatus(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := New(failedRunEngine{}, limiter, nil)
+	c, err := New(failedRunEngine{}, limiter, nil, testWorkspaceOption())
 	if err != nil {
 		t.Fatal(err)
 	}
-	instance, err := c.Spawn(context.Background(), contract.SpawnRequest{SessionID: "session", Prompt: "inspect", Agent: &domain.Agent{Name: "explore"}})
+	instance, err := c.Spawn(testParentContext(), contract.SpawnRequest{SessionID: "session", Prompt: "inspect", Agent: &domain.Agent{Name: "explore"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -333,11 +366,11 @@ func TestControllerDoesNotPassParentSnapshotToChildRun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := New(snapshotCheckingEngine{}, limiter, nil)
+	c, err := New(snapshotCheckingEngine{}, limiter, nil, testWorkspaceOption())
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx := contextsnapshot.WithParentSnapshot(context.Background(), []*domain.Message{domain.NewUserMessage("private")}, "call-1")
+	ctx := contextsnapshot.WithParentSnapshot(testParentContext(), []*domain.Message{domain.NewUserMessage("private")}, "call-1")
 	instance, err := c.Spawn(ctx, contract.SpawnRequest{SessionID: "session", Prompt: "inspect", Agent: &domain.Agent{Name: "explore"}})
 	if err != nil {
 		t.Fatal(err)
@@ -360,11 +393,12 @@ func TestControllerReducesRegisteredManifest(t *testing.T) {
 			result.Reducer{Evidence: acceptingEvidenceValidator{}},
 			result.NewProjector(passthroughResourceProjector{}),
 		),
+		testWorkspaceOption(),
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	instance, err := c.Spawn(context.Background(), contract.SpawnRequest{SessionID: "session", Prompt: "生成报告", Agent: &domain.Agent{Name: "report"}})
+	instance, err := c.Spawn(testParentContext(), contract.SpawnRequest{SessionID: "session", Prompt: "生成报告", Agent: &domain.Agent{Name: "report"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -385,11 +419,11 @@ func TestControllerResumeUsesOnlyPriorSafeSummary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := New(fakeEngine{}, limiter, nil)
+	c, err := New(fakeEngine{}, limiter, nil, testWorkspaceOption())
 	if err != nil {
 		t.Fatal(err)
 	}
-	first, err := c.Spawn(context.Background(), contract.SpawnRequest{SessionID: "session", Prompt: "first", Agent: &domain.Agent{Name: "explore"}})
+	first, err := c.Spawn(testParentContext(), contract.SpawnRequest{SessionID: "session", Prompt: "first", Agent: &domain.Agent{Name: "explore"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -419,11 +453,11 @@ func TestControllerGetAndResumeUseInjectedStoreAcrossControllers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	firstController, err := New(fakeEngine{}, limiter, nil, WithInstanceStore(store))
+	firstController, err := New(fakeEngine{}, limiter, nil, WithInstanceStore(store), testWorkspaceOption())
 	if err != nil {
 		t.Fatal(err)
 	}
-	first, err := firstController.Spawn(context.Background(), contract.SpawnRequest{SessionID: "session", TenantID: "tenant", ParentRunID: "parent", Prompt: "first", Agent: &domain.Agent{Name: "explore"}})
+	first, err := firstController.Spawn(testParentContext(), contract.SpawnRequest{SessionID: "session", TenantID: "tenant", ParentRunID: "parent", Prompt: "first", Agent: &domain.Agent{Name: "explore"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -435,7 +469,7 @@ func TestControllerGetAndResumeUseInjectedStoreAcrossControllers(t *testing.T) {
 		t.Fatal("expected stored terminal result")
 	}
 
-	nextController, err := New(fakeEngine{}, limiter, nil, WithInstanceStore(store))
+	nextController, err := New(fakeEngine{}, limiter, nil, WithInstanceStore(store), testWorkspaceOption())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -468,11 +502,11 @@ func TestControllerPersistsTerminalStateAfterParentCancel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := New(waitCancelEngine{}, limiter, nil, WithInstanceStore(store), WithProjectionSink(sink))
+	c, err := New(waitCancelEngine{}, limiter, nil, WithInstanceStore(store), WithProjectionSink(sink), testWorkspaceOption())
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(testParentContext())
 	instance, err := c.Spawn(ctx, contract.SpawnRequest{SessionID: "session", TenantID: "tenant", ParentRunID: "parent", Prompt: "wait", Agent: &domain.Agent{Name: "wait"}})
 	if err != nil {
 		t.Fatal(err)
@@ -507,11 +541,11 @@ func TestControllerDoesNotHoldInstanceLockDuringEvidenceValidation(t *testing.T)
 		t.Fatal(err)
 	}
 	validator := blockingEvidenceValidator{started: make(chan struct{}), release: make(chan struct{})}
-	c, err := New(artifactRegisteringEngine{}, limiter, nil, WithResultPipeline(result.Reducer{Evidence: validator}, result.NewProjector(passthroughResourceProjector{})))
+	c, err := New(artifactRegisteringEngine{}, limiter, nil, WithResultPipeline(result.Reducer{Evidence: validator}, result.NewProjector(passthroughResourceProjector{})), testWorkspaceOption())
 	if err != nil {
 		t.Fatal(err)
 	}
-	instance, err := c.Spawn(context.Background(), contract.SpawnRequest{SessionID: "session", Prompt: "生成报告", Agent: &domain.Agent{Name: "report"}})
+	instance, err := c.Spawn(testParentContext(), contract.SpawnRequest{SessionID: "session", Prompt: "生成报告", Agent: &domain.Agent{Name: "report"}})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -9,11 +9,12 @@ import (
 
 // BuildRequest 描述一次系统提示词构建请求。
 type BuildRequest struct {
-	Agent   *domain.Agent
-	Run     *domain.Run
-	UserID  string
-	TurnID  string
-	Context map[string]string
+	Agent          *domain.Agent
+	Run            *domain.Run
+	UserID         string
+	TurnID         string
+	Context        map[string]string
+	AvailableTools []string
 }
 
 // Fragment 是动态上下文片段。

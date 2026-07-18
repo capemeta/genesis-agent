@@ -42,6 +42,7 @@ import (
 	toolcontract "genesis-agent/internal/capabilities/tool/contract"
 	"genesis-agent/internal/capabilities/tool/gateway"
 	"genesis-agent/internal/capabilities/tool/scheduler"
+	toolvalidation "genesis-agent/internal/capabilities/tool/validation"
 	consoletrace "genesis-agent/internal/capabilities/trace/adapter"
 	tracecontract "genesis-agent/internal/capabilities/trace/contract"
 	usagememory "genesis-agent/internal/capabilities/usage/adapter/memory"
@@ -92,6 +93,7 @@ type BuildOptions struct {
 	DefaultAgentID   string
 	DefaultAgentName string
 	Profile          profilemodel.Profile
+	RunWorkspace     app.RunWorkspaceRuntime
 	AdditionalTools  []toolcontract.Tool
 	PromptInjectors  []promptbuilder.ContextInjector
 	// Logger 由产品层注入；非 nil 时 builder 不再自建文件日志（禁止双 Writer）。
@@ -234,12 +236,18 @@ func BuildAgentService(ctx context.Context, opts BuildOptions) (*RuntimeBundle, 
 	planSvc := service.NewPlanService(planRepo, planBroadcaster, 3)
 
 	baseRegistry := registry.NewRegistry()
-	baseRegistry.Register(builtin.NewCurrentTimeTool())
-	baseRegistry.Register(builtin.NewCalculatorTool())
-	baseRegistry.Register(builtin.NewHTTPRequestTool(httpClient, connectionSvc))
-	baseRegistry.Register(builtin.NewTodoReadTool(planSvc))
-	baseRegistry.Register(builtin.NewTodoWriteTool(planSvc))
-	baseRegistry.Register(builtin.NewTodoUpdateStepTool(planSvc))
+	for _, builtinTool := range []toolcontract.Tool{
+		builtin.NewCurrentTimeTool(),
+		builtin.NewCalculatorTool(),
+		builtin.NewHTTPRequestTool(httpClient, connectionSvc),
+		builtin.NewTodoReadTool(planSvc),
+		builtin.NewTodoWriteTool(planSvc),
+		builtin.NewTodoUpdateStepTool(planSvc),
+	} {
+		if err := baseRegistry.Register(builtinTool); err != nil {
+			return nil, fmt.Errorf("注册内置工具失败: %w", err)
+		}
+	}
 
 	if opts.Web.Enabled {
 		if opts.Web.RegisterSearch {
@@ -250,7 +258,9 @@ func BuildAgentService(ctx context.Context, opts BuildOptions) (*RuntimeBundle, 
 			if err != nil {
 				return nil, fmt.Errorf("failed to create web_search tool: %w", err)
 			}
-			baseRegistry.Register(searchTool)
+			if err := baseRegistry.Register(searchTool); err != nil {
+				return nil, fmt.Errorf("注册 web_search 失败: %w", err)
+			}
 		}
 		if opts.Web.RegisterFetch {
 			if opts.Web.Fetcher == nil {
@@ -260,13 +270,17 @@ func BuildAgentService(ctx context.Context, opts BuildOptions) (*RuntimeBundle, 
 			if err != nil {
 				return nil, fmt.Errorf("failed to create web_fetch tool: %w", err)
 			}
-			baseRegistry.Register(fetchTool)
+			if err := baseRegistry.Register(fetchTool); err != nil {
+				return nil, fmt.Errorf("注册 web_fetch 失败: %w", err)
+			}
 		}
 	}
 
 	for _, t := range opts.AdditionalTools {
 		if t != nil {
-			baseRegistry.Register(t)
+			if err := baseRegistry.Register(t); err != nil {
+				return nil, fmt.Errorf("注册产品工具失败: %w", err)
+			}
 		}
 	}
 	auditSink := opts.AuditSink
@@ -321,7 +335,10 @@ func BuildAgentService(ctx context.Context, opts BuildOptions) (*RuntimeBundle, 
 		}, nil
 	})
 
-	injectors := append([]promptbuilder.ContextInjector{planReminderInjector}, opts.PromptInjectors...)
+	injectors := append([]promptbuilder.ContextInjector(nil), opts.PromptInjectors...)
+	if toolvalidation.PromptToolsAvailable(baseRegistry, toolSet.Enabled, []string{"todo_write", "todo_update_step"}) {
+		injectors = append([]promptbuilder.ContextInjector{planReminderInjector}, injectors...)
+	}
 
 	// 会话历史与日志目录完全解耦，固定保存在项目级工作区的 .genesis/sessions 目录下
 	sessionDir := filepath.Join(".", ".genesis", "sessions")
@@ -427,7 +444,15 @@ func BuildAgentService(ctx context.Context, opts BuildOptions) (*RuntimeBundle, 
 		reducer.Evidence = opts.SubAgentEvidence
 	}
 	projector := multiresult.NewProjector(opts.SubAgentResources)
-	controllerOptions := []controller.Option{controller.WithResultPipeline(reducer, projector)}
+	controllerOptions := []controller.Option{
+		controller.WithResultPipeline(reducer, projector),
+		controller.WithWorkspaceRuntime(controller.WorkspaceRuntime{
+			Preparer:    opts.RunWorkspace.Preparer,
+			ProjectRoot: opts.RunWorkspace.ProjectRoot, ProjectDir: opts.RunWorkspace.ProjectDir,
+			ProductModes: opts.RunWorkspace.ProductModes, PolicyModes: opts.RunWorkspace.PolicyModes,
+			BackendModes: opts.RunWorkspace.BackendModes, MaximumAccess: opts.RunWorkspace.MaximumAccess,
+		}),
+	}
 	if opts.SubAgentStore != nil {
 		controllerOptions = append(controllerOptions, controller.WithInstanceStore(opts.SubAgentStore))
 	}
@@ -503,7 +528,9 @@ func BuildAgentService(ctx context.Context, opts BuildOptions) (*RuntimeBundle, 
 	if skillGateway, ok := toolGateway.Get("Skill").(interface{ SetForkTask(toolcontract.Tool) }); ok {
 		skillGateway.SetForkTask(taskTool)
 	}
-	toolGateway.Register(taskTool)
+	if err := toolGateway.Register(taskTool); err != nil {
+		return nil, fmt.Errorf("注册 Task 工具失败: %w", err)
+	}
 	lifecycleOptions := []subagentlifecycle.Option{}
 	if opts.SubAgentDelivery != nil {
 		lifecycleOptions = append(lifecycleOptions, subagentlifecycle.WithResultDeliveryStore(opts.SubAgentDelivery))
@@ -515,8 +542,12 @@ func BuildAgentService(ctx context.Context, opts BuildOptions) (*RuntimeBundle, 
 	if err != nil {
 		return nil, fmt.Errorf("初始化 Task 生命周期工具失败: %w", err)
 	}
-	toolGateway.Register(taskOutputTool)
-	toolGateway.Register(taskStopTool)
+	if err := toolGateway.Register(taskOutputTool); err != nil {
+		return nil, fmt.Errorf("注册 TaskOutput 工具失败: %w", err)
+	}
+	if err := toolGateway.Register(taskStopTool); err != nil {
+		return nil, fmt.Errorf("注册 TaskStop 工具失败: %w", err)
+	}
 
 	builtinHooks := hookbuiltin.NewDefaultRegistry()
 	hookRunners := []hookcontract.Runner{builtinHooks}
@@ -528,7 +559,7 @@ func BuildAgentService(ctx context.Context, opts BuildOptions) (*RuntimeBundle, 
 		hookRunners = append(hookRunners, commandRunner)
 	}
 	hookDispatcher := hookservice.NewDispatcherWithOptions(hookConfig, []hookservice.DispatcherOption{hookservice.WithAuditSink(auditSink), hookservice.WithTracer(tracer), hookservice.WithDefaultScope(hookScopeForProduct(product))}, hookRunners...)
-	svc := app.NewAgentService(cfg, runEngine, memStore, fileMem, toolGateway, defaultAgent, credentialSvc, connectionSvc, ltm, userProfileStore, hookDispatcher)
+	svc := app.NewAgentService(cfg, runEngine, memStore, fileMem, toolGateway, defaultAgent, credentialSvc, connectionSvc, ltm, userProfileStore, hookDispatcher, opts.RunWorkspace)
 	return &RuntimeBundle{
 		Config:             cfg,
 		Logger:             log,

@@ -11,12 +11,16 @@ import (
 	"context"
 	"time"
 
+	agentappcontract "genesis-agent/internal/capabilities/agentapp/contract"
+	artifactcontract "genesis-agent/internal/capabilities/artifact/contract"
 	connection "genesis-agent/internal/capabilities/connection/contract"
 	credential "genesis-agent/internal/capabilities/credential/contract"
 	execmodel "genesis-agent/internal/capabilities/execution/model"
 	hookcontract "genesis-agent/internal/capabilities/hook/contract"
 	memory "genesis-agent/internal/capabilities/memory/contract"
 	tool "genesis-agent/internal/capabilities/tool/contract"
+	workcontract "genesis-agent/internal/capabilities/workspace/contract"
+	workmodel "genesis-agent/internal/capabilities/workspace/model"
 	"genesis-agent/internal/domain"
 	"genesis-agent/internal/platform/config"
 	"genesis-agent/internal/runtime"
@@ -87,15 +91,36 @@ type SessionScope struct {
 
 // RunRequest RunOnce 的请求参数
 type RunRequest struct {
-	SessionID  string        // 会话 ID（跨 Run 保持对话历史）
-	TenantID   string        // 租户 ID（隔离租户数据）
-	ProjectID  string        // 项目 ID（用于能力适用范围过滤）
-	UserID     string        // 用户 ID（隔离用户画像与长期记忆数据）
-	RoleIDs    []string      // 用户角色（用于能力适用范围过滤）
-	Input      string        // 用户输入内容
-	Agent      *domain.Agent // 可选：指定 Agent 配置；nil 时使用 DefaultAgent
-	Sandbox    *execmodel.SandboxProfile
-	OnProgress progress.Sink // 可选：接收结构化运行进度事件
+	SessionID       string        // 会话 ID（跨 Run 保持对话历史）
+	AppID           string        // 选择产品已注册的 Agent App；权限配置只能由 resolver 返回
+	TenantID        string        // 租户 ID（隔离租户数据）
+	ProjectID       string        // 项目 ID（用于能力适用范围过滤）
+	UserID          string        // 用户 ID（隔离用户画像与长期记忆数据）
+	RoleIDs         []string      // 用户角色（用于能力适用范围过滤）
+	Input           string        // 用户输入内容
+	Agent           *domain.Agent // 可选：指定 Agent 配置；nil 时使用 DefaultAgent
+	Sandbox         *execmodel.SandboxProfile
+	WorkspaceIntent workcontract.ExecutionIntent // 业务执行意图；模式由可信控制面解析
+	ParentRunID     string                       // 子 Run 显式关联父 Run，不继承父级可写 workspace
+	OnProgress      progress.Sink                // 可选：接收结构化运行进度事件
+	// Deliverables 可选显式交付声明（API / App Template / CLI）；非空时优先于 prompt 启发式。
+	Deliverables []artifactcontract.DeclaredDeliverable
+}
+
+// RunWorkspaceRuntime 是产品装配后交给 app 层的工作空间控制面配置。
+type RunWorkspaceRuntime struct {
+	Preparer       workcontract.ControlPlane
+	AgentApps      agentappcontract.Resolver
+	IntentResolver workcontract.IntentResolver
+	ProjectRoot    *workmodel.ResourceRef
+	ProjectDir     string
+	ProductModes   []execmodel.WorkspaceMode
+	PolicyModes    []execmodel.WorkspaceMode
+	BackendModes   []execmodel.WorkspaceMode
+	MaximumAccess  execmodel.WorkspaceAccess
+	ArtifactRuns   artifactcontract.RunInitializer
+	Completion     artifactcontract.CompletionPolicy
+	QAEvidence     artifactcontract.QAEvidenceRecorder
 }
 
 // RunResult RunOnce 的执行结果
@@ -118,6 +143,7 @@ type agentServiceImpl struct {
 	ltm          memory.LongTermMemory
 	userProfiles memory.UserProfileStore
 	hooks        hookcontract.Dispatcher
+	workspace    RunWorkspaceRuntime
 }
 
 // NewAgentService 创建 AgentService 实现（仅由 Container 调用）
@@ -133,6 +159,7 @@ func NewAgentService(
 	ltm memory.LongTermMemory,
 	userProfiles memory.UserProfileStore,
 	hooks hookcontract.Dispatcher,
+	workspace RunWorkspaceRuntime,
 ) AgentService {
 	return &agentServiceImpl{
 		cfg:          cfg,
@@ -146,6 +173,7 @@ func NewAgentService(
 		ltm:          ltm,
 		userProfiles: userProfiles,
 		hooks:        hooks,
+		workspace:    workspace,
 	}
 }
 

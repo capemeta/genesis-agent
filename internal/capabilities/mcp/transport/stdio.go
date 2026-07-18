@@ -24,8 +24,8 @@ func (t *stdioTransport) Dial(ctx context.Context, opts contract.ConnectOptions)
 	if cwd := strings.TrimSpace(t.cfg.Cwd); cwd != "" {
 		cmd.Dir = cwd
 	}
-	// 保留当前进程环境，并允许 cfg.Env 覆盖（调用方可显式收紧）。
-	cmd.Env = mergeEnv(os.Environ(), t.cfg.Env)
+	// stdio 子进程默认不继承宿主环境；仅注入显式白名单和配置值。
+	cmd.Env = selectedEnv(t.cfg.InheritEnv, t.cfg.Env)
 	configureProcessGroup(cmd)
 
 	clientOpts := &mcp.ClientOptions{KeepAlive: 0} // 健康检查由 Manager 统一调度
@@ -60,29 +60,26 @@ func (d *sdkDialed) Underlying() any {
 	return d.session
 }
 
-func mergeEnv(base []string, overrides map[string]string) []string {
-	if len(overrides) == 0 {
-		return base
-	}
-	index := make(map[string]int, len(base))
-	out := append([]string(nil), base...)
-	for i, kv := range out {
-		if eq := strings.IndexByte(kv, '='); eq > 0 {
-			index[strings.ToUpper(kv[:eq])] = i
-		}
-	}
-	for k, v := range overrides {
-		key := strings.TrimSpace(k)
-		if key == "" {
+func selectedEnv(inherit []string, values map[string]string) []string {
+	merged := make(map[string]string, len(inherit)+len(values))
+	for _, name := range inherit {
+		name = strings.TrimSpace(name)
+		if name == "" {
 			continue
 		}
-		entry := key + "=" + v
-		if i, ok := index[strings.ToUpper(key)]; ok {
-			out[i] = entry
-		} else {
-			out = append(out, entry)
-			index[strings.ToUpper(key)] = len(out) - 1
+		if value, ok := os.LookupEnv(name); ok {
+			merged[name] = value
 		}
+	}
+	for name, value := range values {
+		name = strings.TrimSpace(name)
+		if name != "" {
+			merged[name] = value
+		}
+	}
+	out := make([]string, 0, len(merged))
+	for name, value := range merged {
+		out = append(out, name+"="+value)
 	}
 	return out
 }

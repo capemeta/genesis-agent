@@ -233,9 +233,6 @@ func detectApprovalOrTimeout(errMsg string) string {
 	if strings.Contains(errMsg, ErrCommandLogicalPrefix) {
 		return "command_logical_prefix_forbidden"
 	}
-	if strings.Contains(errMsg, ErrInputPathNamespaceMismatch) {
-		return "input_path_namespace_mismatch"
-	}
 	if strings.HasPrefix(msg, "approval ") || strings.Contains(msg, "approval denied") || strings.Contains(msg, "decisiondenied") {
 		return "approval_denied"
 	}
@@ -259,12 +256,6 @@ func detectArtifactFailure(out *scriptcontract.RunResult) string {
 	}
 	if strings.Contains(out.Error, "artifact gate failed") {
 		return "artifact_invalid"
-	}
-	for _, art := range out.Artifacts {
-		ext := strings.ToLower(filepath.Ext(art.Name))
-		if (ext == ".pptx" || ext == ".docx" || ext == ".xlsx" || ext == ".pdf") && !art.OK {
-			return "artifact_invalid"
-		}
 	}
 	return ""
 }

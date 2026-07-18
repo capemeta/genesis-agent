@@ -41,7 +41,7 @@ func newRootCmd(parent context.Context) *cobra.Command {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			c := NewContainer(&configDir, false)
+			c := NewContainer(ContainerOptions{ConfigDirRef: &configDir})
 
 			ctx, stop := signal.NotifyContext(parent, syscall.SIGINT, syscall.SIGTERM)
 			defer stop()

@@ -50,11 +50,11 @@ func New(deps toolkit.Deps) (tool.Tool, error) {
 func (t *Tool) GetInfo() *tool.Info {
 	return &tool.Info{
 		Name:        "glob",
-		Description: "在当前 workspace 内或经审批的目录中按 glob pattern 查找路径。支持 *, ?, **，返回结构化路径列表。",
+		Description: "仅在文件位置未知或需要通配符匹配时，按 glob pattern 查找路径。用户给出的裸文件名（如 report.md）也是 workspace 根下的精确相对路径，应直接调用 read_file，禁止改写成 **/report.md。支持 *, ?, **，返回结构化路径列表；无通配符时走精确路径快查。",
 		Parameters: &tool.ParameterSchema{
 			Type: "object",
 			Properties: map[string]*tool.ParameterSchema{
-				"pattern":      {Type: "string", Description: "glob pattern，例如 *.go 或 **/*.go"},
+				"pattern":      {Type: "string", Description: "位置未知时使用的 glob pattern，例如 *.go 或 **/*.go；已知精确路径时改用 read_file"},
 				"path":         {Type: "string", Description: "搜索根目录，默认当前 workspace"},
 				"max_depth":    {Type: "integer", Description: "最大搜索深度"},
 				"max_results":  {Type: "integer", Description: "最大返回结果数，默认200"},

@@ -3,13 +3,13 @@ package builtin
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"math/big"
 	"strings"
 	"unicode"
 
 	"genesis-agent/internal/capabilities/tool/contract"
+	toolparam "genesis-agent/internal/capabilities/tool/param"
 )
 
 const (
@@ -72,7 +72,7 @@ func (c *CalculatorTool) Execute(ctx context.Context, params string) (string, er
 	}
 
 	var input calculatorInput
-	if err := json.Unmarshal([]byte(params), &input); err != nil {
+	if err := toolparam.Decode(params, &input); err != nil {
 		return "", fmt.Errorf("参数解析失败: %w", err)
 	}
 

@@ -20,6 +20,7 @@ import (
 
 	connection "genesis-agent/internal/capabilities/connection/contract"
 	tool "genesis-agent/internal/capabilities/tool/contract"
+	toolparam "genesis-agent/internal/capabilities/tool/param"
 	platformhttp "genesis-agent/internal/platform/httpclient"
 )
 
@@ -145,7 +146,7 @@ func (t *HTTPRequestTool) Execute(ctx context.Context, params string) (string, e
 	}
 
 	var input httpRequestInput
-	if err := json.Unmarshal([]byte(params), &input); err != nil {
+	if err := toolparam.Decode(params, &input); err != nil {
 		return "", fmt.Errorf("参数解析失败: %w", err)
 	}
 

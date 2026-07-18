@@ -189,7 +189,7 @@ func (m Model) helpView() string {
 			// 推理中
 			items = []string{
 				styles.HelpKey.Render("Ctrl+C") + " " + styles.HelpBar.Render("取消推理"),
-				styles.HelpKey.Render("↑↓") + " " + styles.HelpBar.Render("滚动"),
+				styles.HelpKey.Render("↑↓/滚轮") + " " + styles.HelpBar.Render("滚动"),
 			}
 		}
 	} else {
@@ -199,7 +199,7 @@ func (m Model) helpView() string {
 			styles.HelpKey.Render("Ctrl+Y") + " " + styles.HelpBar.Render("复制"),
 			styles.HelpKey.Render("v") + " " + styles.HelpBar.Render("选择消息"),
 			styles.HelpKey.Render("/help") + " " + styles.HelpBar.Render("帮助"),
-			styles.HelpKey.Render("↑↓/PgUp/PgDn") + " " + styles.HelpBar.Render("滚动"),
+			styles.HelpKey.Render("↑↓/滚轮/PgUp/PgDn") + " " + styles.HelpBar.Render("滚动"),
 		}
 		// 有运行过程记录时显示 o 键提示
 		hasProgress := len(m.progressLog) > 0

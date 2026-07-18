@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -109,9 +110,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					Scope:  approvalmodel.GrantScopeOnce,
 					Reason: "用户在TUI终止任务",
 				}
-				m.activeApproval = nil
-				m.approvalFocus = false
-				m.textarea.Focus()
+				// approval decision 负责记录审计；Run context 取消负责立即打断正在进行或并发的工作。
+				m = m.cancelCurrentRound()
 				m.refreshViewportContent()
 				m.viewport.GotoBottom()
 				return m, nil
@@ -259,6 +259,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 
+		case tea.KeyPgUp:
+			// 翻页始终作用于消息区，不依赖 Composer 是否为空。
+			m.viewport.PageUp()
+			return m, nil
+
+		case tea.KeyPgDown:
+			m.viewport.PageDown()
+			return m, nil
+
 		case tea.KeyEnter:
 			if m.commandMenuOpen && msg.String() != "shift+enter" && msg.String() != "alt+enter" {
 				commands := m.commandMenuCommands()
@@ -319,6 +328,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if strings.TrimSpace(m.textarea.Value()) == "" {
 					m.progressExpanded = !m.progressExpanded
 					m.refreshViewportContent()
+					// 展开后内容变长，滚到底才能看全；折叠则保持当前位置。
+					if m.progressExpanded {
+						m.viewport.GotoBottom()
+					}
 					return m, nil
 				}
 			}
@@ -327,6 +340,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if strings.TrimSpace(m.textarea.Value()) == "" {
 					m.planExpanded = !m.planExpanded
 					m.refreshViewportContent()
+					if m.planExpanded {
+						m.viewport.GotoBottom()
+					}
 					return m, nil
 				}
 			}
@@ -717,6 +733,23 @@ func progressSummary(event progress.Event) string {
 	// 针对具体工具参数进行解析并人性化输出
 	if event.Kind == progress.KindTool && event.Name != "" {
 		detail := event.Detail
+		if event.Name == "run_skill_command" && (event.Phase == progress.PhaseComplete || event.Phase == progress.PhaseError) {
+			label := "工具执行完成: run_skill_command"
+			if event.Phase == progress.PhaseError {
+				label = "工具执行失败: run_skill_command"
+			}
+			parts := make([]string, 0, 2)
+			if cmd := extractJSONField(detail, "command"); cmd != "" {
+				parts = append(parts, "命令: "+truncateString(cmd, 40))
+			}
+			if timing := formatSkillTiming(event.Metadata); timing != "" {
+				parts = append(parts, timing)
+			}
+			if len(parts) > 0 {
+				return label + " (" + strings.Join(parts, "；") + ")"
+			}
+			return label
+		}
 		if detail != "" && strings.HasPrefix(detail, "{") {
 			if event.Name == "web_search" {
 				if event.Phase == progress.PhaseStart && strings.Contains(detail, `"query"`) {
@@ -768,6 +801,37 @@ func progressSummary(event progress.Event) string {
 	}
 
 	return summary
+}
+
+func formatSkillTiming(metadata map[string]string) string {
+	if len(metadata) == 0 {
+		return ""
+	}
+	labels := []struct {
+		key   string
+		label string
+	}{
+		{key: "duration_ms", label: "总计"},
+		{key: "approval_duration_ms", label: "审批"},
+		{key: "staging_duration_ms", label: "staging"},
+		{key: "execution_duration_ms", label: "执行"},
+	}
+	parts := make([]string, 0, len(labels))
+	for _, item := range labels {
+		value, err := strconv.ParseInt(metadata[item.key], 10, 64)
+		if err != nil || value < 0 {
+			continue
+		}
+		parts = append(parts, item.label+" "+formatMilliseconds(value))
+	}
+	return strings.Join(parts, "｜")
+}
+
+func formatMilliseconds(value int64) string {
+	if value < 1000 {
+		return fmt.Sprintf("%dms", value)
+	}
+	return fmt.Sprintf("%.1fs", float64(value)/1000)
 }
 
 func extractJSONField(jsonStr, field string) string {
@@ -935,7 +999,7 @@ func (m Model) handleSlashCmd(input string) (tea.Model, tea.Cmd) {
 
 func (m Model) currentSessionScope() app.SessionScope {
 	if m.session == nil {
-		return app.SessionScope{}
+		return app.SessionScope{AppID: "code"}
 	}
 	return app.SessionScope{
 		TenantID: m.session.TenantID,

@@ -37,6 +37,7 @@ type Run struct {
 
 // StartRunRequest 启动一次Run的请求参数
 type StartRunRequest struct {
+	RunID           string
 	SessionID       string
 	TenantID        string
 	UserInput       string

@@ -11,6 +11,7 @@ import (
 	marketcontract "genesis-agent/internal/capabilities/package/marketplace/contract"
 	marketmodel "genesis-agent/internal/capabilities/package/marketplace/model"
 	tool "genesis-agent/internal/capabilities/tool/contract"
+	toolparam "genesis-agent/internal/capabilities/tool/param"
 )
 
 const toolName = "install_skill_from_source"
@@ -110,7 +111,7 @@ func (t *Tool) GetInfo() *tool.Info {
 
 func (t *Tool) Execute(ctx context.Context, args string) (string, error) {
 	var in input
-	if err := json.Unmarshal([]byte(args), &in); err != nil {
+	if err := toolparam.Decode(args, &in); err != nil {
 		return "", fmt.Errorf("解析install_skill_from_source参数失败: %w", err)
 	}
 	in.Source = strings.TrimSpace(in.Source)

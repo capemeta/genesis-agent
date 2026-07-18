@@ -13,6 +13,7 @@ import (
 	subagentmodel "genesis-agent/internal/capabilities/subagent/model"
 	"genesis-agent/internal/capabilities/subagent/service"
 	tool "genesis-agent/internal/capabilities/tool/contract"
+	toolparam "genesis-agent/internal/capabilities/tool/param"
 	"genesis-agent/internal/domain"
 	"genesis-agent/internal/platform/contextutil"
 	"genesis-agent/internal/runtime/multiagent/contextsnapshot"
@@ -72,7 +73,7 @@ func (t *Tool) GetInfo() *tool.Info {
 
 func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 	var in input
-	if err := json.Unmarshal([]byte(params), &in); err != nil {
+	if err := toolparam.Decode(params, &in); err != nil {
 		return "", fmt.Errorf("解析 Task 参数失败: %w", err)
 	}
 	if err := validateInput(in); err != nil {
@@ -153,8 +154,6 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 			PromptOrigin:   "model",
 			Objective:      strings.TrimSpace(in.Prompt),
 			ExpectedOutput: "结论、已验证证据和已登记产物",
-			WorkspaceRoot:  ".",
-			PathFormat:     "workspace-relative",
 			Capabilities:   toolNames(agent.Tools),
 			MaxTurns:       agent.RuntimePolicy.MaxIterations,
 			MaxTokens:      agent.RuntimePolicy.MaxTokens,

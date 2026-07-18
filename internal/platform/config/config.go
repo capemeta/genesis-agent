@@ -69,7 +69,9 @@ type MCPServerConfig struct {
 	Command        string            `mapstructure:"command"`
 	Args           []string          `mapstructure:"args"`
 	Env            map[string]string `mapstructure:"env"`
+	InheritEnv     []string          `mapstructure:"inherit_env"`
 	Cwd            string            `mapstructure:"cwd"`
+	Placement      string            `mapstructure:"placement"`
 	URL            string            `mapstructure:"url"`
 	BearerToken    string            `mapstructure:"bearer_token"` // 禁止使用；校验时拒绝
 	BearerTokenEnv string            `mapstructure:"bearer_token_env"`

@@ -63,15 +63,53 @@ func (b *DefaultBuilder) BuildSystem(ctx context.Context, req BuildRequest) (str
 
 	sb.WriteString("## 行为规则\n")
 	sb.WriteString("- 思考时请清晰说明你的推理过程\n")
+	sb.WriteString("- 所有文件与目录路径必须使用工作区相对路径（例如 src/main.go、input/data.csv、output/report.pdf），禁止使用包含盘符、根斜杠或宿主机物理路径的绝对路径\n")
 	sb.WriteString("- 使用工具前先判断是否必要\n")
-	sb.WriteString("- 文件系统操作优先使用结构化工具：列直接子项用 list_dir，递归遍历用 walk_dir，按名称查找用 glob，搜索内容用 grep，读取文件用 read_file；只有结构化工具无法表达或用户明确要求命令时才使用 run_command\n")
-	sb.WriteString("- list_dir只需名称时使用detail=names；数量必须直接采用returned_count，不得手工计数；truncated=true时必须明确说明结果不完整\n")
-	sb.WriteString("- 用户只要求列出名称时，应原样使用工具返回的names，不要擅自补充用途、说明或其他推测信息\n")
-	sb.WriteString("- run_command 的 command 只填写当前默认 Shell 的脚本正文，不要再次嵌套 powershell、cmd /c、bash -lc 等 Shell 启动命令；不得使用 environment_context 未声明支持的 Shell\n")
+	writeToolBehaviorRules(&sb, req.AvailableTools)
 	sb.WriteString("- 工具结果需要结合上下文给出完整回答\n")
 	sb.WriteString("- 直接回答用户的问题，不要重复工具的原始输出\n")
 	sb.WriteString("- 收到 failure_kind=repeated_failure：禁止再次提交相同调用，必须改参、先完成 suggested_action，或向用户说明阻塞\n")
 	sb.WriteString("- 收到 failure_kind=no_progress：必须总结阻塞或询问用户，禁止继续微调无效调用\n")
 
 	return sb.String(), nil
+}
+
+func writeToolBehaviorRules(sb *strings.Builder, availableTools []string) {
+	available := make(map[string]struct{}, len(availableTools))
+	for _, name := range availableTools {
+		available[name] = struct{}{}
+	}
+	has := func(name string) bool {
+		_, ok := available[name]
+		return ok
+	}
+
+	if has("read_file") {
+		sb.WriteString("- 用户给出的裸文件名（如 report.md）按 workspace 根下的精确相对路径处理，直接 read_file，禁止擅自改写为通配路径\n")
+	}
+	discoveryRules := make([]string, 0, 4)
+	if has("glob") {
+		discoveryRules = append(discoveryRules, "位置确实未知或需要匹配路径时用 glob")
+	}
+	if has("list_dir") {
+		discoveryRules = append(discoveryRules, "列直接子项用 list_dir")
+	}
+	if has("walk_dir") {
+		discoveryRules = append(discoveryRules, "递归遍历用 walk_dir")
+	}
+	if has("grep") {
+		discoveryRules = append(discoveryRules, "搜索文件内容用 grep")
+	}
+	if len(discoveryRules) > 0 {
+		sb.WriteString("- 文件查找工具选择：")
+		sb.WriteString(strings.Join(discoveryRules, "；"))
+		sb.WriteString("\n")
+	}
+	if has("list_dir") {
+		sb.WriteString("- list_dir只需名称时使用detail=names；数量必须直接采用returned_count，不得手工计数；truncated=true时必须明确说明结果不完整\n")
+		sb.WriteString("- 用户只要求列出名称时，应原样使用工具返回的names，不要擅自补充用途、说明或其他推测信息\n")
+	}
+	if has("run_command") {
+		sb.WriteString("- run_command 仅用于结构化工具无法表达或用户明确要求命令的场景；command 只填写当前默认 Shell 的脚本正文，不要再次嵌套 powershell、cmd /c、bash -lc 等 Shell 启动命令；不得使用 environment_context 未声明支持的 Shell\n")
+	}
 }

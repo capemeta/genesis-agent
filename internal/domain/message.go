@@ -42,6 +42,7 @@ const (
 	MessageSourceCompactor     = "compactor"
 	MessageSourcePromptCompose = "prompt_composer"
 	MessageSourceRepeatGuard   = "repeat_guard"
+	MessageSourceRunEngine     = "run_engine" // Run 中断/失败标记等引擎诊断
 )
 
 // FunctionCall 工具调用的函数信息
@@ -296,7 +297,8 @@ func planReminderContent(p *Plan) string {
 //   - [1 : 1+historyLen]：已持久化历史（本轮不再重复 Append）
 //   - 其余：本 Run 新增（user_turn / skill_injection / assistant / tool_result / 诊断 system 等）
 //
-// historyLen 为 GetHistory 返回条数；若无前置基线 system，则从 historyLen 起截取。
+// historyLen 为装配后实际进入 messages 的已持久化历史条数（非 GetRecent 原始条数）；
+// 若无前置基线 system，则从 historyLen 起截取。
 func SessionMessagesFromRun(all []*Message, historyLen int) []*Message {
 	if len(all) == 0 {
 		return nil

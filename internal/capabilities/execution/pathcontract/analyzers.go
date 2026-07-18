@@ -1,6 +1,7 @@
 package pathcontract
 
 import (
+	"runtime"
 	"strings"
 
 	execmodel "genesis-agent/internal/capabilities/execution/model"
@@ -12,7 +13,82 @@ type ShellTextAnalyzer struct{}
 func (ShellTextAnalyzer) Name() string { return "shell_text" }
 
 func (ShellTextAnalyzer) Analyze(input AnalysisInput) ([]Violation, error) {
-	return violationsFromText("shell_text", "command", input.Command.Command), nil
+	violations := violationsFromText("shell_text", "command", input.Command.Command)
+	if !usesWindowsCommandSyntax(input) || len(violations) == 0 {
+		return violations, nil
+	}
+	filtered := violations[:0]
+	for _, violation := range violations {
+		if isRecognizedWindowsSwitch(input.Command.Command, violation.Fragment) {
+			continue
+		}
+		filtered = append(filtered, violation)
+	}
+	return filtered, nil
+}
+
+func usesWindowsCommandSyntax(input AnalysisInput) bool {
+	switch input.Command.Shell {
+	case execmodel.ShellPowerShell, execmodel.ShellCmd:
+		return true
+	case execmodel.ShellBash, execmodel.ShellSh, execmodel.ShellZsh:
+		return false
+	}
+	if platform := strings.ToLower(strings.TrimSpace(input.Options.Workspace.Metadata["os"])); platform != "" {
+		return platform == "windows"
+	}
+	provider := strings.ToLower(strings.TrimSpace(input.Options.Sandbox.Provider))
+	if strings.Contains(provider, "remote") || strings.Contains(provider, "genesis") || strings.Contains(provider, "docker") {
+		return false
+	}
+	return runtime.GOOS == "windows"
+}
+
+// Windows 的 /I、/b 等开关与 Unix 绝对路径词法相同。只对已知原生命令的
+// 已知开关放行，避免把任意 /etc 一类路径误当开关。
+func isRecognizedWindowsSwitch(command, fragment string) bool {
+	fragment = strings.ToLower(strings.TrimSpace(fragment))
+	if !strings.HasPrefix(fragment, "/") || strings.ContainsAny(fragment[1:], `/\\`) {
+		return false
+	}
+	prefix := command
+	if index := strings.Index(strings.ToLower(command), fragment); index >= 0 {
+		prefix = command[:index]
+	}
+	if cut := strings.LastIndexAny(prefix, "|&;\r\n"); cut >= 0 {
+		prefix = prefix[cut+1:]
+	}
+	fields := splitCommandFields(prefix)
+	if len(fields) == 0 {
+		return false
+	}
+	head := strings.ToLower(strings.Trim(fields[len(fields)-1], `"'`))
+	head = strings.TrimSuffix(head, ".exe")
+	switches := windowsCommandSwitches[head]
+	if len(switches) == 0 {
+		return false
+	}
+	key := fragment
+	if colon := strings.IndexByte(key, ':'); colon >= 0 {
+		key = key[:colon] + ":"
+	}
+	_, ok := switches[key]
+	return ok
+}
+
+var windowsCommandSwitches = map[string]map[string]struct{}{
+	"dir":     switchSet("/a", "/b", "/c", "/d", "/l", "/n", "/o", "/p", "/q", "/r", "/s", "/t", "/w", "/x", "/4"),
+	"findstr": switchSet("/b", "/e", "/l", "/r", "/s", "/i", "/x", "/v", "/n", "/m", "/o", "/p", "/off", "/c:", "/g:", "/f:", "/d:", "/a:"),
+	"where":   switchSet("/r", "/q", "/f", "/t"),
+	"copy":    switchSet("/a", "/b", "/d", "/l", "/n", "/v", "/y", "/-y", "/z"),
+}
+
+func switchSet(values ...string) map[string]struct{} {
+	out := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		out[value] = struct{}{}
+	}
+	return out
 }
 
 // PythonSourceAnalyzer 对能可靠取得源码的 Python 命令做更深一层扫描。

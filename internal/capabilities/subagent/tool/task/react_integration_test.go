@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	approvalmodel "genesis-agent/internal/capabilities/approval/model"
+	execmodel "genesis-agent/internal/capabilities/execution/model"
 	llmcontract "genesis-agent/internal/capabilities/llm/contract"
 	memoryinmemory "genesis-agent/internal/capabilities/memory/adapter/inmemory"
 	submodel "genesis-agent/internal/capabilities/subagent/model"
@@ -17,6 +18,8 @@ import (
 	toolregistry "genesis-agent/internal/capabilities/tool/adapter/registry"
 	toolcontract "genesis-agent/internal/capabilities/tool/contract"
 	traceadapter "genesis-agent/internal/capabilities/trace/adapter"
+	workcontract "genesis-agent/internal/capabilities/workspace/contract"
+	workmodel "genesis-agent/internal/capabilities/workspace/model"
 	"genesis-agent/internal/domain"
 	"genesis-agent/internal/platform/logger"
 	runtimecontext "genesis-agent/internal/runtime/context"
@@ -29,6 +32,32 @@ import (
 type scriptedLLM struct {
 	mu    sync.Mutex
 	calls int
+}
+
+type integrationRunPreparer struct{}
+
+func (integrationRunPreparer) PrepareRun(_ context.Context, req workcontract.PrepareRunRequest) (workmodel.PreparedRun, error) {
+	runID := "child-run"
+	binding := execmodel.ExecutionBinding{ID: "child-binding", Mode: execmodel.WorkspaceModeTask, Access: execmodel.WorkspaceAccessReadWrite, PathPolicy: execmodel.PathPolicyStrictWorkspace, Owner: execmodel.ExecutionOwnerRef{RunID: runID, ParentRunID: req.ParentRunID}}
+	execution := workmodel.PreparedExecutionSnapshot{Binding: binding, Workspace: execmodel.ExecutionWorkspace{WorkDir: "/workspace/work/child-binding"}}
+	manifest := workmodel.RunManifest{RunID: runID, Scope: req.Scope, Executions: []workmodel.PreparedExecutionSnapshot{execution}}
+	return workmodel.PreparedRun{Manifest: manifest, Execution: execution}, nil
+}
+func (integrationRunPreparer) PrepareExecution(context.Context, workcontract.PrepareExecutionRequest) (workmodel.PreparedExecutionSnapshot, error) {
+	return workmodel.PreparedExecutionSnapshot{}, nil
+}
+func (integrationRunPreparer) GetRunManifest(context.Context, string, string) (workmodel.RunManifest, error) {
+	return workmodel.RunManifest{}, nil
+}
+
+func integrationWorkspaceOption() controller.Option {
+	return controller.WithWorkspaceRuntime(controller.WorkspaceRuntime{Preparer: integrationRunPreparer{}, MaximumAccess: execmodel.WorkspaceAccessReadWrite})
+}
+
+func integrationParentContext() context.Context {
+	manifest := workmodel.RunManifest{RunID: "parent-run", Scope: workmodel.ResourceScope{TenantID: "tenant-a"}}
+	binding := execmodel.ExecutionBinding{ID: "parent-binding", Mode: execmodel.WorkspaceModeTask, Access: execmodel.WorkspaceAccessReadWrite, Owner: execmodel.ExecutionOwnerRef{RunID: "parent-run", SessionID: "parent-session"}}
+	return workcontract.WithPreparedRun(context.Background(), workmodel.PreparedRun{Manifest: manifest, Execution: workmodel.PreparedExecutionSnapshot{Binding: binding}})
 }
 
 func (m *scriptedLLM) GetModelName() string { return "scripted" }
@@ -161,7 +190,7 @@ func TestReactParentTaskReceivesSafeChildResult(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	childController, err := controller.New(engine, limiter, logger.NewNop())
+	childController, err := controller.New(engine, limiter, logger.NewNop(), integrationWorkspaceOption())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +207,7 @@ func TestReactParentTaskReceivesSafeChildResult(t *testing.T) {
 	}
 	registry.Register(taskTool)
 
-	run, err := engine.Start(context.Background(), domain.StartRunRequest{SessionID: "parent-session", TenantID: "tenant-a", UserInput: "请委派检查", Agent: parent})
+	run, err := engine.Start(integrationParentContext(), domain.StartRunRequest{RunID: "parent-run", SessionID: "parent-session", TenantID: "tenant-a", UserInput: "请委派检查", Agent: parent})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -209,7 +238,7 @@ func TestReactParentTaskOutputConsumesBackgroundResultOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	childController, err := controller.New(engine, limiter, logger.NewNop())
+	childController, err := controller.New(engine, limiter, logger.NewNop(), integrationWorkspaceOption())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -242,7 +271,7 @@ func TestReactParentTaskOutputConsumesBackgroundResultOnce(t *testing.T) {
 	registry.Register(taskTool)
 	registry.Register(outputTool)
 
-	run, err := engine.Start(context.Background(), domain.StartRunRequest{SessionID: "parent-session", TenantID: "tenant-a", UserInput: "请后台委派检查，然后读取两次结果", Agent: parent})
+	run, err := engine.Start(integrationParentContext(), domain.StartRunRequest{RunID: "parent-run", SessionID: "parent-session", TenantID: "tenant-a", UserInput: "请后台委派检查，然后读取两次结果", Agent: parent})
 	if err != nil {
 		t.Fatal(err)
 	}

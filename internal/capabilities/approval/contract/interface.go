@@ -3,9 +3,14 @@ package contract
 
 import (
 	"context"
+	"errors"
 
 	"genesis-agent/internal/capabilities/approval/model"
 )
+
+// ErrRunAborted 表示用户明确要求终止整个 Run，而不是仅拒绝当前操作。
+// 所有 Tool、Gateway 和 Run Engine 必须原样传播该终态，禁止包装成普通工具失败交回模型。
+var ErrRunAborted = errors.New("RUN_ABORTED: user aborted the run")
 
 // Service 是通用审批服务。
 type Service interface {

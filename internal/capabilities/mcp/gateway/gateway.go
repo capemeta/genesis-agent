@@ -2,7 +2,9 @@ package gateway
 
 import (
 	"context"
+	"fmt"
 	"sync"
+	"time"
 
 	"genesis-agent/internal/capabilities/mcp/contract"
 	"genesis-agent/internal/capabilities/mcp/model"
@@ -129,7 +131,14 @@ func (g *Gateway) projectServer(ctx context.Context, state model.ServerState) {
 	for _, snap := range state.Tools {
 		modelName := deduper.Unique(state.Name, snap.Name)
 		t := tooladapter.New(g.manager, state.Name, snap.Name, modelName, snap, exposure, timeout)
-		g.registry.Register(t)
+		if err := g.registry.Register(t); err != nil {
+			if g.onEvent != nil {
+				failed := state
+				failed.Error = fmt.Sprintf("注册 MCP tool %q 失败: %v", modelName, err)
+				g.onEvent(ctx, model.LifecycleEvent{Kind: model.EventServerFailed, Server: state.Name, State: failed, At: time.Now()})
+			}
+			continue
+		}
 		newNames = append(newNames, modelName)
 	}
 	g.mu.Lock()

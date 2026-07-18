@@ -15,6 +15,9 @@ import (
 	execcontract "genesis-agent/internal/capabilities/execution/contract"
 	execmodel "genesis-agent/internal/capabilities/execution/model"
 	toolcontract "genesis-agent/internal/capabilities/tool/contract"
+	workcontract "genesis-agent/internal/capabilities/workspace/contract"
+	workmodel "genesis-agent/internal/capabilities/workspace/model"
+	"genesis-agent/internal/platform/contextutil"
 	"genesis-agent/internal/platform/logger"
 	clisandbox "genesis-agent/products/cli/internal/sandbox"
 	windowssandbox "genesis-agent/shared/local/sandbox/windows"
@@ -140,7 +143,7 @@ func TestRunCommandRequiredSandboxFailsClosedOnUnsupportedWindowsPolicy(t *testi
 		t.Fatal(err)
 	}
 	tool := mustRunCommandTool(t, cfg)
-	_, err = tool.Execute(context.Background(), runCommandParams)
+	_, err = tool.Execute(cliTestRunContext(), runCommandParams)
 	if code := execcontract.CodeOf(err); code != execcontract.ErrCodeSandboxPolicyUnsupported {
 		t.Fatalf("CodeOf(err) = %s, want %s (%v)", code, execcontract.ErrCodeSandboxPolicyUnsupported, err)
 	}
@@ -282,7 +285,7 @@ func newTestWorkspace(t *testing.T, pattern string) string {
 }
 func executeRunCommand(t *testing.T, tool toolcontract.Tool) runCommandResult {
 	t.Helper()
-	out, err := tool.Execute(context.Background(), runCommandParams)
+	out, err := tool.Execute(cliTestRunContext(), runCommandParams)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -291,6 +294,13 @@ func executeRunCommand(t *testing.T, tool toolcontract.Tool) runCommandResult {
 		t.Fatalf("unmarshal result: %v\n%s", err, out)
 	}
 	return result
+}
+
+func cliTestRunContext() context.Context {
+	ctx := contextutil.WithRunID(context.Background(), "run-cli-sandbox-test")
+	ctx = contextutil.WithSessionID(ctx, "session-cli-sandbox-test")
+	binding := execmodel.ExecutionBinding{ID: "binding-cli-sandbox-test", Mode: execmodel.WorkspaceModeProject, Access: execmodel.WorkspaceAccessReadWrite, PathPolicy: execmodel.PathPolicyPermissionOnly, Owner: execmodel.ExecutionOwnerRef{RunID: "run-cli-sandbox-test", SessionID: "session-cli-sandbox-test"}}
+	return workcontract.WithPreparedRun(ctx, workmodel.PreparedRun{Execution: workmodel.PreparedExecutionSnapshot{Binding: binding, Workspace: execmodel.ExecutionWorkspace{WorkDir: "."}}})
 }
 
 func assertCommandSucceeded(t *testing.T, result runCommandResult) {

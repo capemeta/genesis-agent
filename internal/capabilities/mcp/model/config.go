@@ -15,6 +15,16 @@ const (
 	McpTransportStreamableHTTP McpTransportType = "streamable_http"
 )
 
+// McpPlacement 描述 MCP server 的实际放置位置。
+type McpPlacement string
+
+const (
+	McpPlacementLocalStdio         McpPlacement = "local_stdio"
+	McpPlacementLocalSandboxStdio  McpPlacement = "local_sandbox_stdio"
+	McpPlacementRemoteSandboxStdio McpPlacement = "remote_sandbox_stdio"
+	McpPlacementStreamableHTTP     McpPlacement = "streamable_http"
+)
+
 // ApprovalMode 描述 MCP server/tool 审批策略。
 type ApprovalMode string
 
@@ -36,7 +46,10 @@ type McpServerConfig struct {
 	Command string
 	Args    []string
 	Env     map[string]string
-	Cwd     string
+	// InheritEnv 是允许从宿主继承的环境变量名白名单。
+	InheritEnv []string
+	Cwd        string
+	Placement  McpPlacement
 
 	// streamable_http
 	URL            string

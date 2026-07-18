@@ -9,6 +9,7 @@ import (
 	"genesis-agent/internal/capabilities/mcp/contract"
 	"genesis-agent/internal/capabilities/mcp/model"
 	tool "genesis-agent/internal/capabilities/tool/contract"
+	toolparam "genesis-agent/internal/capabilities/tool/param"
 )
 
 // Tool 列出已连接 MCP server 的 resources（不进 LLM schema 时可设 hidden；默认 direct 供按需调用）。
@@ -46,10 +47,8 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 	var req struct {
 		Server string `json:"server"`
 	}
-	if strings.TrimSpace(params) != "" {
-		if err := json.Unmarshal([]byte(params), &req); err != nil {
-			return "", fmt.Errorf("参数不是合法 JSON: %w", err)
-		}
+	if err := toolparam.DecodeOptional(params, &req); err != nil {
+		return "", fmt.Errorf("参数不是合法 JSON: %w", err)
 	}
 	type item struct {
 		Server      string `json:"server"`

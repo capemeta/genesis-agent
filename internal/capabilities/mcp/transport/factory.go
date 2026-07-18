@@ -35,6 +35,9 @@ func (f *Factory) Build(ctx context.Context, cfg model.McpServerConfig) (contrac
 		if strings.TrimSpace(cfg.Command) == "" {
 			return nil, fmt.Errorf("mcp server %q: stdio 缺少 command", cfg.Name)
 		}
+		if cfg.Placement != model.McpPlacementLocalStdio {
+			return nil, fmt.Errorf("mcp server %q: placement %q 需要受治理 ExecutionRunner，当前 transport 不允许裸启动", cfg.Name, cfg.Placement)
+		}
 		return &stdioTransport{cfg: cfg}, nil
 	case model.McpTransportStreamableHTTP:
 		if strings.TrimSpace(cfg.URL) == "" {

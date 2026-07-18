@@ -86,8 +86,8 @@ python scripts/office/unpack.py presentation.pptx unpacked/
 1. **Read [pptxgenjs.md](pptxgenjs.md) completely** before writing any creation script (especially Common Pitfalls: `lineSpacing` is points, multi-line needs `breakLine`).
 2. **Read [design.md](design.md)** and pick one palette + one visual motif; apply them in the script (do not ship plain white slides with default gray tables).
 3. Write a **Node.js** script that `require("pptxgenjs")` (not Python). Default creation depends only on declared runtime (`pptxgenjs`); use shapes for icons — see [pptxgenjs.md](pptxgenjs.md).
-   - Keep every `write_file` payload below about 8,000 characters. For a larger deck, split the implementation into small modules such as `theme.js`, `components.js`, `slides.js`, and a short entry script, then pass every generated module through `run_skill_command.inputs`.
-   - Do not print the script as assistant prose or a Markdown code block. Transfer it only through file-editing tool calls.
+   - For a larger deck, plan module boundaries before implementation and split the code into complete, focused modules such as `theme.js`, `components.js`, `slides.js`, and a short entry script. Avoid repeatedly replacing a partial monolith with a larger one.
+   - For slide size, prefer a built-in layout such as `pres.layout = "LAYOUT_WIDE"`. For a custom size use `pres.defineLayout({ name, width, height })` followed by `pres.layout = name`; `defineSlideSize` is not a PptxGenJS API.
 4. Run it with `node your_script.js` (write the script to a file first; avoid long `node -e` one-liners).
 5. **Content QA:** `python -m markitdown your.pptx` and confirm text was extracted.
 6. **Visual QA (required):** `python scripts/thumbnail.py your.pptx` — open the thumbnail and check for overlapping text, cramped rows, and low contrast. `markitdown` cannot catch layout bugs.

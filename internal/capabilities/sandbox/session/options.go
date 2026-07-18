@@ -33,12 +33,10 @@ func DefaultOptions() Options {
 		Run: execcontract.RunOptions{
 			Timeout: DefaultTimeout,
 			Workspace: execmodel.ExecutionWorkspace{
-				Mode:       execmodel.WorkspaceModeSandboxSess,
-				PathPolicy: execmodel.PathPolicyStrictWorkspace,
-				WorkDir:    "/workspace",
-				InputDir:   "/workspace/input",
-				OutputDir:  "/workspace/output",
-				TmpDir:     "/workspace/tmp",
+				WorkDir:   "/workspace",
+				InputDir:  "/workspace/input",
+				OutputDir: "/workspace/output",
+				TmpDir:    "/workspace/tmp",
 			},
 		},
 	}

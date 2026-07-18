@@ -5,8 +5,8 @@ import (
 	"io"
 	"os"
 
-	"golang.org/x/term"
 	execcontract "genesis-agent/internal/capabilities/execution/contract"
+	"golang.org/x/term"
 )
 
 // SessionWriter 将 WriteStdin 包装为 io.Writer。
