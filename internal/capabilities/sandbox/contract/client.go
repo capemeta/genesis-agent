@@ -109,3 +109,18 @@ type LeasedSandboxSession interface {
 type SessionClient interface {
 	OpenSession(ctx context.Context, opts SessionOptions) (SandboxSession, error)
 }
+
+// ExecutionSessionStore 持久化“逻辑执行会话 -> durable workspace”的映射。
+// 实现只能保存 workspace_id 等稳定身份，禁止持久化短命的 session_id、sandbox_id 或凭据。
+type ExecutionSessionStore interface {
+	LoadExecutionSession(ctx context.Context, key string) (WorkspaceRef, bool, error)
+	SaveExecutionSession(ctx context.Context, key string, workspace WorkspaceRef) error
+	DeleteExecutionSession(ctx context.Context, key string) error
+}
+
+// RemoteSessionBinder 在远程 Session 可用后，将 execution binding 绑定到权威 Workspace 与租约。
+// ProducedResource 控制面依赖该绑定生成不泄漏物理路径的远程资源定位符。
+type RemoteSessionBinder interface {
+	ExecutionSessionStore
+	BindRemoteSession(ctx context.Context, tenantID, runID, bindingID string, workspace WorkspaceRef, expiresAt time.Time) error
+}

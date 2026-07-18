@@ -62,6 +62,22 @@ func TestRenderEnvironmentContextDoesNotGuessUnknownRemoteShell(t *testing.T) {
 	}
 }
 
+func TestRenderEnvironmentContextOnlyDescribesInstalledEnvironmentTools(t *testing.T) {
+	mixed := renderEnvironmentContext(context.Background(), EnvironmentContext{
+		OS: "windows", HostCommandTool: "run_command", SandboxMode: "required",
+		SandboxProvider: "genesis-sandbox", SandboxCommandTool: "sandbox_exec",
+	})
+	for _, want := range []string{`tool="run_command"`, `tool="sandbox_exec"`, "两个环境的文件不自动共享"} {
+		if !strings.Contains(mixed, want) {
+			t.Fatalf("mixed context=%q missing %q", mixed, want)
+		}
+	}
+	sandboxOnly := renderEnvironmentContext(context.Background(), EnvironmentContext{SandboxMode: "required", SandboxProvider: "genesis-sandbox"})
+	if strings.Contains(sandboxOnly, "run_command 始终") || strings.Contains(sandboxOnly, `tool="sandbox_exec"`) {
+		t.Fatalf("context must not advertise unavailable tools: %q", sandboxOnly)
+	}
+}
+
 func TestRenderEnvironmentContextUsesLogicalRunWorkspace(t *testing.T) {
 	binding := execmodel.ExecutionBinding{ID: "binding", Mode: execmodel.WorkspaceModeTask, Access: execmodel.WorkspaceAccessReadWrite, Owner: execmodel.ExecutionOwnerRef{RunID: "run"}}
 	view := workmodel.WorkspaceViewManifest{BindingID: "binding", Root: ".", Entries: []workmodel.WorkspaceViewEntry{{Path: "source.pptx", Access: workmodel.WorkspaceViewAccessReadWrite}}}

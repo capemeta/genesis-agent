@@ -3,8 +3,6 @@ package bootstrap
 import (
 	"context"
 	"encoding/json"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -12,7 +10,6 @@ import (
 	"testing"
 
 	approvalmodel "genesis-agent/internal/capabilities/approval/model"
-	execcontract "genesis-agent/internal/capabilities/execution/contract"
 	execmodel "genesis-agent/internal/capabilities/execution/model"
 	toolcontract "genesis-agent/internal/capabilities/tool/contract"
 	workcontract "genesis-agent/internal/capabilities/workspace/contract"
@@ -37,7 +34,7 @@ func TestRunCommandDefaultSandboxDisabled(t *testing.T) {
 	})
 }
 
-func TestRunCommandOptionalSandboxUsesPlatformProfile(t *testing.T) {
+func TestRunCommandAlwaysUsesHostWhenSandboxIsOptional(t *testing.T) {
 	cfg, err := clisandbox.ParseFlag("optional")
 	if err != nil {
 		t.Fatal(err)
@@ -45,68 +42,16 @@ func TestRunCommandOptionalSandboxUsesPlatformProfile(t *testing.T) {
 	tool := mustRunCommandTool(t, cfg)
 	result := executeRunCommand(t, tool)
 	assertCommandSucceeded(t, result)
-	if result.Environment != execmodel.EnvironmentLocal && result.Environment != execmodel.EnvironmentSandbox {
-		t.Fatalf("Environment = %s", result.Environment)
-	}
-	if result.Environment == execmodel.EnvironmentSandbox && result.SandboxProvider != clisandbox.ProviderLocalPlatform {
-		t.Fatalf("SandboxProvider = %q, want %q", result.SandboxProvider, clisandbox.ProviderLocalPlatform)
-	}
-	if result.Environment == execmodel.EnvironmentLocal && len(result.Warnings) == 0 {
-		t.Fatalf("local optional fallback should include warning: %+v", result)
+	if result.Environment != execmodel.EnvironmentLocal || result.SandboxProvider != "" {
+		t.Fatalf("run_command must stay on host: %+v", result)
 	}
 }
 
-func TestRunCommandRemoteSandboxUsesGenesisSandboxHTTP(t *testing.T) {
-	var gotLease map[string]any
-	var gotJob map[string]any
-	released := false
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") != "Bearer test-token" {
-			t.Fatalf("authorization=%q", r.Header.Get("Authorization"))
-		}
-		switch {
-		case r.URL.Path == "/v1/sandboxes:lease" && r.Method == http.MethodPost:
-			if err := json.NewDecoder(r.Body).Decode(&gotLease); err != nil {
-				t.Fatal(err)
-			}
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"sandbox_id":      "sandbox-test",
-				"lease_id":        "lease-test",
-				"runtime_profile": "code-polyglot-basic",
-				"status":          "leased",
-			})
-		case r.URL.Path == "/v1/jobs" && r.Method == http.MethodPost:
-			if err := json.NewDecoder(r.Body).Decode(&gotJob); err != nil {
-				t.Fatal(err)
-			}
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"job_id":     "job-test",
-				"sandbox_id": "sandbox-test",
-				"status":     "succeeded",
-			})
-		case r.URL.Path == "/v1/jobs/job-test" && r.Method == http.MethodGet:
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"job_id":      "job-test",
-				"sandbox_id":  "sandbox-test",
-				"status":      "succeeded",
-				"exit_code":   0,
-				"stdout":      "hello\r\n",
-				"stderr":      "",
-				"duration_ms": 7,
-			})
-		case r.URL.Path == "/v1/sandboxes/sandbox-test/release" && r.Method == http.MethodPost:
-			released = true
-			w.WriteHeader(http.StatusNoContent)
-		default:
-			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
-		}
-	}))
-	defer server.Close()
-
+func TestRunCommandStaysOnHostWhenRemoteSandboxIsConfigured(t *testing.T) {
 	cfg := clisandbox.Config{
 		Mode:                  clisandbox.ModeRemoteSandbox,
 		Execution:             execmodel.SandboxRequired,
-		Endpoint:              server.URL,
+		Endpoint:              "http://127.0.0.1:1",
 		APIKey:                "test-token",
 		WorkspaceID:           "ws-test",
 		DefaultRuntimeProfile: execmodel.RuntimeProfileCodePolyglotBasic,
@@ -114,38 +59,20 @@ func TestRunCommandRemoteSandboxUsesGenesisSandboxHTTP(t *testing.T) {
 	tool := mustRunCommandTool(t, cfg)
 	result := executeRunCommand(t, tool)
 	assertCommandSucceeded(t, result)
-	if result.Environment != execmodel.EnvironmentSandbox {
-		t.Fatalf("Environment=%s, want sandbox", result.Environment)
-	}
-	if result.SandboxProvider != clisandbox.ProviderGenesisSandbox {
-		t.Fatalf("SandboxProvider=%q, want %q", result.SandboxProvider, clisandbox.ProviderGenesisSandbox)
-	}
-	if gotLease["workspace_id"] != "ws-test" || gotLease["runtime_profile"] != "code-polyglot-basic" || gotLease["task_type"] != "shell" || gotLease["operation"] != "run_shell" {
-		t.Fatalf("lease=%+v", gotLease)
-	}
-	if gotJob["sandbox_id"] != "sandbox-test" || gotJob["workspace_id"] != "ws-test" || gotJob["runtime_profile"] != "code-polyglot-basic" {
-		t.Fatalf("job=%+v", gotJob)
-	}
-	if _, exists := gotJob["language"]; exists {
-		t.Fatalf("shell language should be omitted for sandbox API compatibility: %+v", gotJob)
-	}
-	if !released {
-		t.Fatal("sandbox was not released")
+	if result.Environment != execmodel.EnvironmentLocal || result.SandboxProvider != "" {
+		t.Fatalf("run_command must not call remote sandbox: %+v", result)
 	}
 }
 
-func TestRunCommandRequiredSandboxFailsClosedOnUnsupportedWindowsPolicy(t *testing.T) {
-	if runtime.GOOS != "windows" {
-		t.Skip("Windows process-constrained policy is the current unsupported required-sandbox case")
-	}
+func TestRunCommandAlwaysUsesHostWhenSandboxIsRequired(t *testing.T) {
 	cfg, err := clisandbox.ParseFlag("required")
 	if err != nil {
 		t.Fatal(err)
 	}
 	tool := mustRunCommandTool(t, cfg)
-	_, err = tool.Execute(cliTestRunContext(), runCommandParams)
-	if code := execcontract.CodeOf(err); code != execcontract.ErrCodeSandboxPolicyUnsupported {
-		t.Fatalf("CodeOf(err) = %s, want %s (%v)", code, execcontract.ErrCodeSandboxPolicyUnsupported, err)
+	result := executeRunCommand(t, tool)
+	if result.Environment != execmodel.EnvironmentLocal {
+		t.Fatalf("run_command must stay on host: %+v", result)
 	}
 }
 

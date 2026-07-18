@@ -55,7 +55,7 @@ func ensureRemoteReservationDirs(ctx context.Context, session *sandboxsession.Se
 	for _, reservation := range reservations {
 		physical := joinReservationPath(outputDir, string(reservation.LogicalTarget))
 		dir := path.Dir(normalizeSlash(physical))
-		if err := session.MkdirAll(ctx, remoteRelativePath(dir, ""), fscontract.MkdirOptions{}); err != nil {
+		if err := session.MkdirAll(ctx, sandboxsession.RelativePath(dir, ""), fscontract.MkdirOptions{}); err != nil {
 			return fmt.Errorf("创建远程 reservation 目录失败: %w", err)
 		}
 	}
@@ -122,7 +122,7 @@ func collectReservedHitsRemote(ctx context.Context, session *sandboxsession.Sess
 			}
 			continue
 		}
-		stat, err := session.Stat(ctx, remoteRelativePath(physical, ""))
+		stat, err := session.Stat(ctx, sandboxsession.RelativePath(physical, ""))
 		if err != nil || stat == nil || stat.Type != fsmodel.EntryTypeFile {
 			continue
 		}

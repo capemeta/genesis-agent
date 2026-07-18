@@ -14,13 +14,15 @@ import (
 // EnvironmentContext 是每轮对模型可见的有界运行环境快照。
 // 它只描述已经验证的能力，不应根据操作系统猜测远程沙箱能力。
 type EnvironmentContext struct {
-	OS               string
-	DefaultShell     string
-	DefaultShellPath string
-	SupportedShells  []string
-	SandboxMode      string
-	SandboxProvider  string
-	ExternalApproval bool
+	OS                 string
+	HostCommandTool    string
+	DefaultShell       string
+	DefaultShellPath   string
+	SupportedShells    []string
+	SandboxMode        string
+	SandboxProvider    string
+	SandboxCommandTool string
+	ExternalApproval   bool
 }
 
 // NewEnvironmentContextInjector 创建运行环境上下文注入器。
@@ -47,7 +49,10 @@ func renderEnvironmentContext(ctx context.Context, environment EnvironmentContex
 		}
 		lines = append(lines, fmt.Sprintf("<%s>%s</%s>", name, xmlEscape(value), name))
 	}
-	appendValue("os", environment.OS)
+	hostOS := strings.TrimSpace(environment.OS)
+	if hostOS != "" {
+		lines = append(lines, fmt.Sprintf("<host_environment%s os=\"%s\" />", toolAttribute(environment.HostCommandTool), xmlEscape(hostOS)))
+	}
 	if prepared, ok := workcontract.PreparedRunFromContext(ctx); ok {
 		lines = append(lines, renderWorkspaceContext(prepared)...)
 	}
@@ -76,16 +81,30 @@ func renderEnvironmentContext(ctx context.Context, environment EnvironmentContex
 		appendValue("supported_shells", strings.Join(clean, ","))
 	}
 	if strings.TrimSpace(environment.SandboxMode) != "" || strings.TrimSpace(environment.SandboxProvider) != "" {
+		available := strings.TrimSpace(environment.SandboxProvider) != "" && environment.SandboxMode != string(execmodel.SandboxDisabled)
 		lines = append(lines, fmt.Sprintf(
-			"<sandbox mode=\"%s\" provider=\"%s\" />",
+			"<sandbox_environment available=\"%t\"%s mode=\"%s\" provider=\"%s\" cwd=\"/workspace\" />",
+			available,
+			toolAttribute(environment.SandboxCommandTool),
 			xmlEscape(environment.SandboxMode),
 			xmlEscape(environment.SandboxProvider),
 		))
+		if available && strings.TrimSpace(environment.HostCommandTool) != "" && strings.TrimSpace(environment.SandboxCommandTool) != "" {
+			lines = append(lines, "<environment_rule>run_command 始终操作宿主项目工作区；sandbox_exec 始终操作远程 /workspace。两个环境的文件不自动共享，sandbox_exec 仅通过 inputs 接收宿主文件，并自动发布 OUTPUT_DIR 中的交付物。</environment_rule>")
+		}
 	}
 	if environment.ExternalApproval {
 		lines = append(lines, "<filesystem external_access_requires_approval=\"true\" />")
 	}
 	return strings.Join(lines, "\n")
+}
+
+func toolAttribute(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	return fmt.Sprintf(" tool=\"%s\"", xmlEscape(name))
 }
 
 func renderWorkspaceContext(prepared workmodel.PreparedRun) []string {

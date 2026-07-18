@@ -28,12 +28,12 @@ func TestCLIEnvironmentContextUsesDeclaredLocalCapabilities(t *testing.T) {
 	}
 }
 
-func TestCLIEnvironmentContextDoesNotLeakHostIntoRemoteSandbox(t *testing.T) {
+func TestCLIEnvironmentContextKeepsHostAndRemoteSandboxDistinct(t *testing.T) {
 	environment := cliEnvironmentContext(context.Background(), execmodel.SandboxProfile{
 		Mode:     execmodel.SandboxRequired,
 		Provider: clisandbox.ProviderGenesisSandbox,
-	}, nil)
-	if environment.OS != "" || environment.DefaultShell != "" || len(environment.SupportedShells) != 0 {
+	}, fixedShellCapabilities{capabilities: execmodel.ShellCapabilities{Default: execmodel.ShellInfo{Kind: execmodel.ShellPowerShell}}})
+	if environment.OS == "" || environment.DefaultShell != "powershell" || environment.HostCommandTool != "run_command" || environment.SandboxProvider != clisandbox.ProviderGenesisSandbox || environment.SandboxCommandTool != "sandbox_exec" {
 		t.Fatalf("environment = %+v", environment)
 	}
 }

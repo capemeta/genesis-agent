@@ -17,6 +17,7 @@ import (
 	fscontract "genesis-agent/internal/capabilities/filesystem/contract"
 	fsmodel "genesis-agent/internal/capabilities/filesystem/model"
 	sandboxcontract "genesis-agent/internal/capabilities/sandbox/contract"
+	sandboxsession "genesis-agent/internal/capabilities/sandbox/session"
 	"genesis-agent/internal/capabilities/skill/adapter/embedded"
 	skillcontract "genesis-agent/internal/capabilities/skill/contract"
 	skillmodel "genesis-agent/internal/capabilities/skill/model"
@@ -108,7 +109,16 @@ func TestSkillCommandServiceRunsInRemoteTaskWorkspace(t *testing.T) {
 	}
 	skills := skillservice.New([]skillcontract.Source{source}, skillservice.Options{})
 	registrar := &collectingProducedRegistrar{}
-	svc, err := New(Deps{Skills: skills, Runner: nilRunner{}, Approval: allowAllApproval{}, SessionClient: client, FileClient: client, WorkspaceRef: sandboxcontract.WorkspaceRef{ID: "w1", Provider: "genesis-sandbox"}, Provisioner: testProvisioner{}, ProducedResources: registrar, RemoteSessions: noOpRemoteSessionBinder{}})
+	remoteStore := noOpRemoteSessionBinder{}
+	manager, err := sandboxsession.NewManager(sandboxsession.ManagerDeps{
+		Sessions: client, Files: client, Workspace: sandboxcontract.WorkspaceRef{ID: "w1", Provider: "genesis-sandbox"},
+		Store: remoteStore, IdleTTL: time.Millisecond, CacheTTL: time.Hour, CleanupInterval: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Close(context.Background()) })
+	svc, err := New(Deps{Skills: skills, Runner: nilRunner{}, Approval: allowAllApproval{}, SessionClient: client, FileClient: client, WorkspaceRef: sandboxcontract.WorkspaceRef{ID: "w1", Provider: "genesis-sandbox"}, Provisioner: testProvisioner{}, ProducedResources: registrar, RemoteSessions: remoteStore, SessionManager: manager})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,8 +154,8 @@ func TestSkillCommandServiceRunsInRemoteTaskWorkspace(t *testing.T) {
 		t.Fatalf("should not create separate -materialize run dir: %v", err)
 	}
 	svc.ReleaseRun(context.Background(), workmodel.PreparedRun{Manifest: workmodel.RunManifest{RunID: "remote-run"}})
-	if client.closeCount != 0 || len(svc.sessions) != 1 {
-		t.Fatalf("Run release should retain idle execution session: close=%d sessions=%d", client.closeCount, len(svc.sessions))
+	if client.closeCount != 0 {
+		t.Fatalf("Run release should retain execution session until idle cleanup: close=%d", client.closeCount)
 	}
 	second, err := svc.Run(context.Background(), scriptcontract.RunRequest{Catalog: skillcontract.CatalogRequest{}, Skill: "demo", Command: `./scripts/make_output.cmd`, Binding: testBinding("remote-run-2"), StateRoot: testStateRoot(root), ProjectDir: root, Sandbox: execmodel.SandboxProfile{Mode: execmodel.SandboxRequired, Provider: "genesis-sandbox"}})
 	if err != nil || !second.OK {
@@ -155,12 +165,10 @@ func TestSkillCommandServiceRunsInRemoteTaskWorkspace(t *testing.T) {
 		t.Fatalf("same Agent conversation opened %d containers, want 1", client.openCount)
 	}
 	svc.ReleaseRun(context.Background(), workmodel.PreparedRun{Manifest: workmodel.RunManifest{RunID: "remote-run-2"}})
-	svc.mu.Lock()
-	for _, item := range svc.sessions {
-		item.lastUsed = time.Now().Add(-sessionIdleTTL - time.Minute)
+	deadline := time.Now().Add(time.Second)
+	for client.closeCount != 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
 	}
-	svc.mu.Unlock()
-	svc.cleanupStaleSessions(context.Background())
 	if client.closeCount != 1 {
 		t.Fatalf("idle execution container close count=%d, want 1", client.closeCount)
 	}
@@ -188,23 +196,23 @@ func TestExecutionSessionKeyReusesConversationAndSeparatesUsers(t *testing.T) {
 	leftBinding := testBinding("run-1")
 	rightBinding := testBinding("run-2")
 	profile := execmodel.SandboxProfile{Provider: "genesis-sandbox", RuntimeProfile: execmodel.RuntimeProfileOfficeBasic}
-	left := executionSessionKey(ctx, leftBinding, profile, sandboxcontract.WorkspaceRef{})
-	right := executionSessionKey(ctx, rightBinding, profile, sandboxcontract.WorkspaceRef{})
+	left := sandboxsession.ExecutionKey(ctx, leftBinding, profile, sandboxcontract.WorkspaceRef{})
+	right := sandboxsession.ExecutionKey(ctx, rightBinding, profile, sandboxcontract.WorkspaceRef{})
 	if left != right {
 		t.Fatalf("同一 Agent 会话的不同 Run 应复用 execution session: left=%q right=%q", left, right)
 	}
 	rightBinding.Owner.UserID = "another-user"
-	if left == executionSessionKey(ctx, rightBinding, profile, sandboxcontract.WorkspaceRef{}) {
+	if left == sandboxsession.ExecutionKey(ctx, rightBinding, profile, sandboxcontract.WorkspaceRef{}) {
 		t.Fatal("不同用户不能复用有状态 execution session")
 	}
 	rightBinding = testBinding("run-2")
 	rightBinding.Access = execmodel.WorkspaceAccessReadOnly
-	if left == executionSessionKey(ctx, rightBinding, profile, sandboxcontract.WorkspaceRef{}) {
+	if left == sandboxsession.ExecutionKey(ctx, rightBinding, profile, sandboxcontract.WorkspaceRef{}) {
 		t.Fatal("不同 Workspace 访问策略不能复用 execution session")
 	}
 	rightBinding = testBinding("run-2")
 	profile.RiskLevel = execmodel.SandboxRiskHigh
-	if left == executionSessionKey(ctx, rightBinding, profile, sandboxcontract.WorkspaceRef{}) {
+	if left == sandboxsession.ExecutionKey(ctx, rightBinding, profile, sandboxcontract.WorkspaceRef{}) {
 		t.Fatal("不同风险策略不能复用 execution session")
 	}
 }

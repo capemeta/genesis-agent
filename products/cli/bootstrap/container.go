@@ -30,6 +30,7 @@ import (
 	execmodel "genesis-agent/internal/capabilities/execution/model"
 	execservice "genesis-agent/internal/capabilities/execution/service"
 	runcommand "genesis-agent/internal/capabilities/execution/tool/run_command"
+	sandboxexec "genesis-agent/internal/capabilities/execution/tool/sandbox_exec"
 	writestdin "genesis-agent/internal/capabilities/execution/tool/write_stdin"
 	"genesis-agent/internal/capabilities/filesystem/freshness"
 	fspermission "genesis-agent/internal/capabilities/filesystem/permission"
@@ -51,6 +52,7 @@ import (
 	profilemodel "genesis-agent/internal/capabilities/profile/model"
 	sandboxhttp "genesis-agent/internal/capabilities/sandbox/adapter/http"
 	sandboxcontract "genesis-agent/internal/capabilities/sandbox/contract"
+	sandboxsession "genesis-agent/internal/capabilities/sandbox/session"
 	skillembedded "genesis-agent/internal/capabilities/skill/adapter/embedded"
 	skillcollision "genesis-agent/internal/capabilities/skill/collision"
 	skillcontract "genesis-agent/internal/capabilities/skill/contract"
@@ -205,6 +207,9 @@ func (c *Container) Init(ctx context.Context) error {
 		sandboxCfg = clisandbox.MergeSessionOverride(sandboxCfg, c.sandbox)
 		c.sandbox = sandboxCfg
 		prof := profile.DefaultProfile(cfg.MCP.Enabled)
+		if sandboxCfg.Mode == clisandbox.ModeDockerSandbox || sandboxCfg.Mode == clisandbox.ModeRemoteSandbox {
+			prof.Tools.Enabled = append(prof.Tools.Enabled, "sandbox_exec")
+		}
 		runtime, log, err := buildProductRuntime(ctx, configDir, cfg, c.quiet, sandboxCfg, prof, workspaceRootOrDot(c.workspaceRoot))
 		if err != nil {
 			c.initErr = err
@@ -510,6 +515,24 @@ func buildProductRuntime(ctx context.Context, configDir string, cfg *platformcon
 		_ = runtimeLogging.Close()
 		return productRuntime{}, nil, err
 	}
+	var remoteSessionManager *sandboxsession.Manager
+	remoteSessionManagerOwned := false
+	if execStack.SessionClient != nil {
+		remoteSessionManager, err = sandboxsession.NewManager(sandboxsession.ManagerDeps{
+			Sessions: execStack.SessionClient, Files: execStack.FileClient, Workspace: execStack.WorkspaceRef,
+			Store: artifactControl.remoteSessions, Logger: log,
+		})
+		if err != nil {
+			_ = runtimeLogging.Close()
+			return productRuntime{}, nil, fmt.Errorf("初始化远程 sandbox session manager: %w", err)
+		}
+		remoteSessionManagerOwned = true
+	}
+	defer func() {
+		if remoteSessionManagerOwned {
+			_ = remoteSessionManager.Close(context.Background())
+		}
+	}()
 	viewProjector, err := localworkspace.NewViewProjector(inputStore)
 	if err != nil {
 		_ = runtimeLogging.Close()
@@ -555,6 +578,7 @@ func buildProductRuntime(ctx context.Context, configDir string, cfg *platformcon
 		SessionClient:         execStack.SessionClient,
 		FileClient:            execStack.FileClient,
 		WorkspaceRef:          execStack.WorkspaceRef,
+		SessionManager:        remoteSessionManager,
 		Logger:                log,
 		EnablePreflight:       cfg.Skills.EnablePreflight,
 		AutoRetryAfterInstall: cfg.Skills.AutoRetryAfterInstall,
@@ -568,6 +592,22 @@ func buildProductRuntime(ctx context.Context, configDir string, cfg *platformcon
 	if err != nil {
 		_ = runtimeLogging.Close()
 		return productRuntime{}, nil, err
+	}
+	if remoteSessionManager != nil {
+		sandboxCommandSvc, err := execservice.NewSandboxCommandService(remoteSessionManager, inputStore, artifactControl.produced)
+		if err != nil {
+			_ = runtimeLogging.Close()
+			return productRuntime{}, nil, err
+		}
+		sandboxTool, err := sandboxexec.New(sandboxexec.Deps{
+			Runner: sandboxCommandSvc, InputResolver: inputRegistry, InputStager: inputStager,
+			Approval: baseApprovalSvc, Finalizer: artifactControl.finalizer, Sandbox: sandboxCfg.ExecutionProfile(),
+		})
+		if err != nil {
+			_ = runtimeLogging.Close()
+			return productRuntime{}, nil, err
+		}
+		tools = append(tools, sandboxTool)
 	}
 	runSkillCommand, err := runskillcommand.New(runskillcommand.Deps{
 		Runner:         skillScriptSvc,
@@ -615,6 +655,7 @@ func buildProductRuntime(ctx context.Context, configDir string, cfg *platformcon
 			Contents: b.String(),
 		}, nil
 	})
+	remoteSessionManagerOwned = false
 	return productRuntime{
 		tools:                tools,
 		promptInjectors:      []promptbuilder.ContextInjector{environmentInjector, injector},
@@ -636,8 +677,8 @@ func buildProductRuntime(ctx context.Context, configDir string, cfg *platformcon
 		artifactRuns:         artifactControl.initializer,
 		completion:           artifactControl.completion,
 		qaEvidence:           artifactControl.qaEvidence,
-		runResources:         []workcontract.RunResourceReleaser{skillScriptSvc},
-		runtimeClosers:       []runtimeCloser{skillScriptSvc},
+		runResources:         runResourceReleasers(skillScriptSvc, remoteSessionManager),
+		runtimeClosers:       runtimeResourceClosers(skillScriptSvc, remoteSessionManager),
 	}, log, nil
 }
 
@@ -708,7 +749,7 @@ func buildBaseApprovalService(quiet bool, policyCfg platformconfig.PolicyConfig,
 	return baseApprovalSvc, nil
 }
 
-// productExecStack 是 CLI 执行栈，供 run_command 与 run_skill_command 复用。
+// productExecStack 是 CLI 执行栈。run_command 固定使用宿主；远程栈供显式 sandbox 工具和技能复用。
 type productExecStack struct {
 	Runner        execcontract.ExecutionRunner
 	Shells        execcontract.ShellCapabilityProvider
@@ -736,10 +777,6 @@ func buildProductTools(sandboxCfg clisandbox.Config, baseApprovalSvc approvalcon
 	}
 	directRunner := localexec.NewRunner()
 	var shellProvider execcontract.ShellCapabilityProvider = directRunner
-	if sandboxCfg.Mode == clisandbox.ModeDockerSandbox || sandboxCfg.Mode == clisandbox.ModeRemoteSandbox {
-		// 远程 sandbox 的 OS/Shell 不能从宿主机推断；服务端未返回能力前仅向模型暴露 auto。
-		shellProvider = nil
-	}
 	sandboxRunner, sessionClient, fileClient, workspaceRef, err := buildSandboxStack(directRunner, sandboxCfg, log, workspaceRoot)
 	if err != nil {
 		return nil, productExecStack{}, err
@@ -758,7 +795,7 @@ func buildProductTools(sandboxCfg clisandbox.Config, baseApprovalSvc approvalcon
 		Resolver:       resolver,
 		Approval:       approvalSvc,
 		Locker:         locker,
-		Sandbox:        sandboxCfg.ExecutionProfile(),
+		Sandbox:        execmodel.SandboxProfile{Mode: execmodel.SandboxDisabled},
 		BridgeTerminal: func(ctx context.Context, sessionID string) error {
 			return tui.BridgeSession(ctx, sessionID, sessionManager)
 		},
@@ -785,17 +822,37 @@ func buildProductTools(sandboxCfg clisandbox.Config, baseApprovalSvc approvalcon
 	}, nil
 }
 
+func runResourceReleasers(skill *scriptservice.Service, sessions *sandboxsession.Manager) []workcontract.RunResourceReleaser {
+	result := []workcontract.RunResourceReleaser{skill}
+	if sessions != nil {
+		result = append(result, sessions)
+	}
+	return result
+}
+
+func runtimeResourceClosers(skill *scriptservice.Service, sessions *sandboxsession.Manager) []runtimeCloser {
+	result := []runtimeCloser{skill}
+	if sessions != nil {
+		result = append(result, sessions)
+	}
+	return result
+}
+
 func cliEnvironmentContext(ctx context.Context, sandbox execmodel.SandboxProfile, shells execcontract.ShellCapabilityProvider) promptbuilder.EnvironmentContext {
 	environment := promptbuilder.EnvironmentContext{
-		OS:               runtime.GOOS,
-		SandboxMode:      string(sandbox.Mode),
-		SandboxProvider:  sandbox.Provider,
+		OS:              runtime.GOOS,
+		HostCommandTool: "run_command",
+		SandboxMode:     string(sandbox.Mode),
+		SandboxProvider: sandbox.Provider,
+		SandboxCommandTool: func() string {
+			if sandbox.Provider == clisandbox.ProviderGenesisSandbox && sandbox.Mode != execmodel.SandboxDisabled {
+				return "sandbox_exec"
+			}
+			return ""
+		}(),
 		ExternalApproval: true,
 	}
 	if shells == nil {
-		if sandbox.Provider == clisandbox.ProviderGenesisSandbox {
-			environment.OS = ""
-		}
 		return environment
 	}
 	capabilities := shells.ShellCapabilities(ctx)
