@@ -127,10 +127,12 @@ func ExpandLogicalPath(raw string, workspace execmodel.ExecutionWorkspace) (stri
 	for strings.HasPrefix(normalized, "./") {
 		normalized = strings.TrimPrefix(normalized, "./")
 	}
+	if normalized == "." || normalized == "" {
+		return workspace.WorkDir, true, nil
+	}
 	workspacePath := WorkspacePath(normalized)
 	if err := workspacePath.Validate(); err != nil {
 		return "", false, err
 	}
 	return filepath.Join(workspace.WorkDir, filepath.FromSlash(string(workspacePath))), true, nil
 }
-

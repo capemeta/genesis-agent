@@ -16,23 +16,24 @@ import (
 type ErrorCode string
 
 const (
-	ErrCodeStateRootUnavailable         ErrorCode = "STATE_ROOT_UNAVAILABLE"
-	ErrCodeWorkspaceNotAvailable        ErrorCode = "WORKSPACE_NOT_AVAILABLE"
-	ErrCodePathNamespaceMismatch        ErrorCode = "PATH_NAMESPACE_MISMATCH"
-	ErrCodeResourceVersionConflict           ErrorCode = "RESOURCE_VERSION_CONFLICT"
-	ErrCodeProducedResourceVersionConflict   ErrorCode = "PRODUCED_RESOURCE_VERSION_CONFLICT"
-	ErrCodeInputPermissionDenied             ErrorCode = "INPUT_PERMISSION_DENIED"
-	ErrCodeInputNameConflict            ErrorCode = "INPUT_NAME_CONFLICT"
-	ErrCodeInputReservedPathConflict    ErrorCode = "INPUT_RESERVED_PATH_CONFLICT"
-	ErrCodeInputTooLarge                ErrorCode = "INPUT_TOO_LARGE"
-	ErrCodeCrossExecutionResourceDenied ErrorCode = "CROSS_EXECUTION_RESOURCE_DENIED"
-	ErrCodeProducedResourceInvalid      ErrorCode = "PRODUCED_RESOURCE_INVALID"
-	ErrCodeProducedResourceConflict     ErrorCode = "PRODUCED_RESOURCE_CONFLICT"
-	ErrCodeProducedResourceNotFound          ErrorCode = "PRODUCED_RESOURCE_NOT_FOUND"
-	ErrCodeResourceBackendMismatch           ErrorCode = "RESOURCE_BACKEND_MISMATCH"
-	ErrCodeProducedResourceBackendMismatch   ErrorCode = "PRODUCED_RESOURCE_BACKEND_MISMATCH"
-	ErrCodeResourceReaderNotFound            ErrorCode = "RESOURCE_READER_NOT_FOUND"
-	ErrCodeProducedResourceExpired           ErrorCode = "PRODUCED_RESOURCE_EXPIRED"
+	ErrCodeStateRootUnavailable            ErrorCode = "STATE_ROOT_UNAVAILABLE"
+	ErrCodeWorkspaceNotAvailable           ErrorCode = "WORKSPACE_NOT_AVAILABLE"
+	ErrCodePathNamespaceMismatch           ErrorCode = "PATH_NAMESPACE_MISMATCH"
+	ErrCodeResourceVersionConflict         ErrorCode = "RESOURCE_VERSION_CONFLICT"
+	ErrCodeProducedResourceVersionConflict ErrorCode = "PRODUCED_RESOURCE_VERSION_CONFLICT"
+	ErrCodeInputPermissionDenied           ErrorCode = "INPUT_PERMISSION_DENIED"
+	ErrCodeInputNameConflict               ErrorCode = "INPUT_NAME_CONFLICT"
+	ErrCodeInputReservedPathConflict       ErrorCode = "INPUT_RESERVED_PATH_CONFLICT"
+	ErrCodeInputTooLarge                   ErrorCode = "INPUT_TOO_LARGE"
+	ErrCodeCrossExecutionResourceDenied    ErrorCode = "CROSS_EXECUTION_RESOURCE_DENIED"
+	ErrCodeProducedResourceInvalid         ErrorCode = "PRODUCED_RESOURCE_INVALID"
+	ErrCodeProducedResourceConflict        ErrorCode = "PRODUCED_RESOURCE_CONFLICT"
+	ErrCodeProducedResourceNotFound        ErrorCode = "PRODUCED_RESOURCE_NOT_FOUND"
+	ErrCodeResourceBackendMismatch         ErrorCode = "RESOURCE_BACKEND_MISMATCH"
+	ErrCodeProducedResourceBackendMismatch ErrorCode = "PRODUCED_RESOURCE_BACKEND_MISMATCH"
+	ErrCodeResourceReaderNotFound          ErrorCode = "RESOURCE_READER_NOT_FOUND"
+	ErrCodeProducedResourceExpired         ErrorCode = "PRODUCED_RESOURCE_EXPIRED"
+	ErrCodeRunCompletionRequired           ErrorCode = "RUN_COMPLETION_REQUIRED"
 )
 
 // Error 携带稳定分类和根因。
@@ -116,6 +117,33 @@ type InputStager interface {
 	Stage(ctx context.Context, req StageRequest) (workmodel.InputManifest, error)
 }
 
+// WorkspaceViewProjector 将不可变输入快照投影为 execution WorkDir 下的工作副本。
+// 实现必须拒绝符号链接、路径越界和覆盖既有文件。
+type WorkspaceViewProjector interface {
+	Project(ctx context.Context, execution workmodel.PreparedExecutionSnapshot, inputs workmodel.InputManifest) (workmodel.WorkspaceViewManifest, error)
+}
+
+// RunInputBinder 原子完成输入快照和根 execution 资源视图投影。
+type RunInputBinder interface {
+	Bind(ctx context.Context, execution workmodel.PreparedExecutionSnapshot, sources []workmodel.ResourceRef) (workmodel.InputManifest, workmodel.WorkspaceViewManifest, error)
+}
+
+// RunResourceReleaser 在 Run 任意终态释放 execution 级临时资源；实现必须幂等并自行记录清理失败。
+type RunResourceReleaser interface {
+	ReleaseRun(ctx context.Context, prepared workmodel.PreparedRun)
+}
+
+// RequestInputPlanner 只把请求中精确引用且已授权的资源解析为 ResourceRef。
+// 不允许模糊搜索、跨根回退或把不存在的交付目标当作输入。
+type RequestInputPlanner interface {
+	PlanRequestInputs(ctx context.Context, req RequestInputRequest) ([]workmodel.ResourceRef, error)
+}
+
+type RequestInputRequest struct {
+	Prompt string
+	Scope  workmodel.ResourceScope
+}
+
 // RunManifestStore 持久化 Run 工作空间控制面快照。
 // Create 必须是排他创建，禁止覆盖同 ID 的既有 manifest。
 type RunManifestStore interface {
@@ -178,6 +206,7 @@ type PrepareRunRequest struct {
 	BackendModes    []execmodel.WorkspaceMode
 	MaximumAccess   execmodel.WorkspaceAccess
 	RequestedAccess execmodel.WorkspaceAccess
+	Inputs          []workmodel.ResourceRef
 }
 
 // ExecutionIntent 是跨 app/workspace 契约传播的业务意图。

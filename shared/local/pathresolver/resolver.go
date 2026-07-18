@@ -9,19 +9,16 @@ import (
 	"runtime"
 	"strings"
 
+	execmodel "genesis-agent/internal/capabilities/execution/model"
 	fscontract "genesis-agent/internal/capabilities/filesystem/contract"
 	"genesis-agent/internal/capabilities/filesystem/model"
 	workcontract "genesis-agent/internal/capabilities/workspace/contract"
 	workmodel "genesis-agent/internal/capabilities/workspace/model"
 )
 
-const defaultWorkspaceID = "local"
-
 // Resolver 将用户路径解析为本地 backend 路径，并标记路径范围。
 type Resolver struct {
 	workspaceRoot string
-	workspaceReal string
-	workspaceID   string
 }
 
 // New 创建本地路径解析器。
@@ -39,7 +36,7 @@ func New(workspaceRoot string) (*Resolver, error) {
 	if err != nil {
 		return nil, fmt.Errorf("解析 workspace real path 失败: %w", err)
 	}
-	return &Resolver{workspaceRoot: abs, workspaceReal: filepath.Clean(real), workspaceID: defaultWorkspaceID}, nil
+	return &Resolver{workspaceRoot: filepath.Clean(real)}, nil
 }
 
 // WorkspaceRoot 返回本地 workspace 根目录。
@@ -58,14 +55,16 @@ func (r *Resolver) Resolve(ctx context.Context, ref model.PathRef, opts fscontra
 	if raw == "" {
 		return model.ResolvedPath{}, fscontract.NewError(fscontract.ErrCodeInvalidPath, "", fmt.Errorf("path不能为空"))
 	}
-
-	candidate := raw
-	if expanded, ok, err := r.expandLogicalDir(ctx, raw); err != nil {
+	prepared, ok := workcontract.PreparedRunFromContext(ctx)
+	if !ok {
+		return model.ResolvedPath{}, fscontract.NewError(fscontract.ErrCodeInvalidPath, raw, fmt.Errorf("路径解析缺少 PreparedRun；禁止回退到 bootstrap 静态根"))
+	}
+	candidate, _, err := workmodel.ExpandLogicalPath(raw, prepared.Execution.Workspace)
+	if err != nil {
 		return model.ResolvedPath{}, fscontract.NewError(fscontract.ErrCodeInvalidPath, raw, err)
-	} else if ok {
-		candidate = expanded
-	} else if !filepath.IsAbs(candidate) {
-		candidate = filepath.Join(r.workspaceRoot, candidate)
+	}
+	if filepath.IsAbs(raw) && prepared.Execution.Binding.Mode != execmodel.WorkspaceModeProject && !withinExecutionWorkspace(candidate, prepared.Execution.Workspace) {
+		return model.ResolvedPath{}, fscontract.NewError(fscontract.ErrCodePermissionDenied, raw, fmt.Errorf("%s 禁止访问 execution workspace 外的绝对路径", prepared.Execution.Binding.Mode))
 	}
 	abs, err := filepath.Abs(candidate)
 	if err != nil {
@@ -77,22 +76,14 @@ func (r *Resolver) Resolve(ctx context.Context, ref model.PathRef, opts fscontra
 	if err != nil {
 		return model.ResolvedPath{}, err
 	}
-	scope := r.scopeOf(real)
+	scope, display, rel := r.scopeOfExecution(real, prepared.Execution.Workspace)
+	if scope == model.PathScopeExternal && prepared.Execution.Binding.Mode != execmodel.WorkspaceModeProject {
+		return model.ResolvedPath{}, fscontract.NewError(fscontract.ErrCodePermissionDenied, raw, fmt.Errorf("%s 路径越过 execution workspace", prepared.Execution.Binding.Mode))
+	}
 	if err := validateKind(real, raw, opts); err != nil {
 		return model.ResolvedPath{}, err
 	}
 
-	rel := ""
-	if scope == model.PathScopeWorkspace {
-		workspaceRel, err := filepath.Rel(r.workspaceReal, real)
-		if err != nil {
-			return model.ResolvedPath{}, fscontract.NewError(fscontract.ErrCodeInvalidPath, raw, err)
-		}
-		if workspaceRel != "." {
-			rel = filepath.ToSlash(workspaceRel)
-		}
-	}
-	display := rel
 	if scope != model.PathScopeWorkspace {
 		display = filepath.ToSlash(real)
 	}
@@ -100,33 +91,63 @@ func (r *Resolver) Resolve(ctx context.Context, ref model.PathRef, opts fscontra
 		DisplayPath:  display,
 		BackendPath:  real,
 		WorkspaceRel: rel,
-		WorkspaceID:  r.workspaceID,
+		WorkspaceID:  prepared.Execution.Binding.ID,
 		Scope:        scope,
 		RawPath:      raw,
 	}, nil
 }
 
-// expandLogicalDir 将 $WORK_DIR/$OUTPUT_DIR 等展开到本 Run 的 .genesis/runs/<id>/…。
-// 中间产物应写逻辑目录，禁止落到仓库根。
-func (r *Resolver) expandLogicalDir(ctx context.Context, raw string) (string, bool, error) {
-	if _, ok := workmodel.StripLogicalDirPrefix(raw); !ok {
-		return "", false, nil
+func (r *Resolver) scopeOfExecution(real string, workspace execmodel.ExecutionWorkspace) (model.PathScope, string, string) {
+	if isProtectedPath(real) {
+		return model.PathScopeProtected, filepath.ToSlash(real), ""
 	}
-	prepared, ok := workcontract.PreparedRunFromContext(ctx)
-	if !ok {
-		return "", false, fmt.Errorf("%s 需要控制面 Run workspace 上下文", raw)
+	type rootAlias struct{ root, prefix string }
+	roots := []rootAlias{{workspace.WorkDir, ""}, {workspace.InputDir, "input"}, {workspace.OutputDir, "output"}, {workspace.TmpDir, "tmp"}, {workspace.SkillDir, "skills"}}
+	for _, item := range roots {
+		if strings.TrimSpace(item.root) == "" {
+			continue
+		}
+		rootReal, err := resolveRootReal(item.root)
+		if err != nil || !isWithin(real, rootReal) {
+			continue
+		}
+		rel, err := filepath.Rel(rootReal, real)
+		if err != nil {
+			continue
+		}
+		display := filepath.ToSlash(rel)
+		if display == "." {
+			display = "."
+		} else if item.prefix != "" {
+			display = filepath.ToSlash(filepath.Join(item.prefix, rel))
+		}
+		return model.PathScopeWorkspace, display, display
 	}
-	return workmodel.ExpandLogicalPath(raw, prepared.Execution.Workspace)
+	return model.PathScopeExternal, filepath.ToSlash(real), ""
 }
 
-func (r *Resolver) scopeOf(real string) model.PathScope {
-	if isProtectedPath(real) {
-		return model.PathScopeProtected
+func resolveRootReal(root string) (string, error) {
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return "", err
 	}
-	if isWithin(real, r.workspaceReal) {
-		return model.PathScopeWorkspace
+	real, err := filepath.EvalSymlinks(abs)
+	if err == nil {
+		return filepath.Clean(real), nil
 	}
-	return model.PathScopeExternal
+	if os.IsNotExist(err) {
+		return filepath.Clean(abs), nil
+	}
+	return "", err
+}
+
+func withinExecutionWorkspace(candidate string, workspace execmodel.ExecutionWorkspace) bool {
+	for _, root := range []string{workspace.WorkDir, workspace.InputDir, workspace.OutputDir, workspace.TmpDir, workspace.SkillDir} {
+		if strings.TrimSpace(root) != "" && isWithin(candidate, root) {
+			return true
+		}
+	}
+	return false
 }
 
 func validateKind(real string, raw string, opts fscontract.ResolveOptions) error {

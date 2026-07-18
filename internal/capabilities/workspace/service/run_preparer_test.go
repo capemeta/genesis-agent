@@ -82,7 +82,7 @@ func TestRunPreparerFreezesIdentityBindingAndManifestBeforeEngine(t *testing.T) 
 		t.Fatal(err)
 	}
 	store := &captureManifestStore{}
-	preparer, err := NewRunPreparer(ids, resolver, fixedStateRoot{}, fixedProvisioner{}, store)
+	preparer, err := NewRunPreparer(RunPreparerDeps{IDs: ids, Resolver: resolver, StateRoots: fixedStateRoot{}, Provisioner: fixedProvisioner{}, Manifests: store})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,7 +94,7 @@ func TestRunPreparerFreezesIdentityBindingAndManifestBeforeEngine(t *testing.T) 
 	if prepared.Manifest.RunID != "run-run-id" || prepared.Execution.Binding.ID != "binding-binding-id" {
 		t.Fatalf("prepared identity = %+v", prepared)
 	}
-	if prepared.Manifest.SchemaVersion != "2" || prepared.Execution.Backend.Authority != "test" {
+	if prepared.Manifest.SchemaVersion != workmodel.RunManifestSchemaVersion || prepared.Execution.Backend.Authority != "test" {
 		t.Fatalf("manifest/backend snapshot = %+v", prepared)
 	}
 	if prepared.Execution.Binding.Owner.ParentRunID != "parent-a" || prepared.Execution.Binding.Owner.AgentAppID != "doc-review" {
@@ -108,7 +108,7 @@ func TestRunPreparerFreezesIdentityBindingAndManifestBeforeEngine(t *testing.T) 
 func TestRunPreparerRejectsProvisionerBindingMutation(t *testing.T) {
 	ids := &fixedIDs{values: []string{"run-id", "binding-id"}}
 	resolver, _ := NewWorkspaceResolver(ids)
-	preparer, _ := NewRunPreparer(ids, resolver, fixedStateRoot{}, bindingMutatingProvisioner{}, &captureManifestStore{})
+	preparer, _ := NewRunPreparer(RunPreparerDeps{IDs: ids, Resolver: resolver, StateRoots: fixedStateRoot{}, Provisioner: bindingMutatingProvisioner{}, Manifests: &captureManifestStore{}})
 	profile := agentappmodel.EffectiveProfile{ID: "app", Version: "1", Workspace: agentappmodel.WorkspaceSpec{DefaultMode: execmodel.WorkspaceModeTask, AllowedModes: []execmodel.WorkspaceMode{execmodel.WorkspaceModeTask}, DefaultAccess: execmodel.WorkspaceAccessReadWrite}}
 	_, err := preparer.PrepareRun(context.Background(), workcontract.PrepareRunRequest{App: profile, Intent: workcontract.ExecutionIntent{RequiredMode: execmodel.WorkspaceModeTask}, MaximumAccess: execmodel.WorkspaceAccessReadWrite})
 	if err == nil {
@@ -120,7 +120,7 @@ func TestRunPreparerReusesStableDerivedExecutionAndAppendsManifest(t *testing.T)
 	ids := &fixedIDs{values: []string{"run-id", "root-binding", "skill-binding"}}
 	resolver, _ := NewWorkspaceResolver(ids)
 	store := workmemory.NewManifestStore()
-	preparer, _ := NewRunPreparer(ids, resolver, fixedStateRoot{}, fixedProvisioner{}, store)
+	preparer, _ := NewRunPreparer(RunPreparerDeps{IDs: ids, Resolver: resolver, StateRoots: fixedStateRoot{}, Provisioner: fixedProvisioner{}, Manifests: store})
 	profile := agentappmodel.EffectiveProfile{ID: "app", Version: "1", Workspace: agentappmodel.WorkspaceSpec{DefaultMode: execmodel.WorkspaceModeTask, AllowedModes: []execmodel.WorkspaceMode{execmodel.WorkspaceModeTask, execmodel.WorkspaceModeSession}, DefaultAccess: execmodel.WorkspaceAccessReadWrite}}
 	root, err := preparer.PrepareRun(context.Background(), workcontract.PrepareRunRequest{App: profile, Intent: workcontract.ExecutionIntent{BoundedInputs: true, BoundedOutputs: true}, ProductModes: profile.Workspace.AllowedModes, BackendModes: profile.Workspace.AllowedModes, MaximumAccess: execmodel.WorkspaceAccessReadWrite})
 	if err != nil {
@@ -149,7 +149,7 @@ func TestRunPreparerRetriesCASForDifferentConcurrentSubject(t *testing.T) {
 	ids := &fixedIDs{values: []string{"run-id", "root-binding", "skill-binding"}}
 	resolver, _ := NewWorkspaceResolver(ids)
 	store := &conflictOnceManifestStore{delegate: workmemory.NewManifestStore(), conflict: true}
-	preparer, _ := NewRunPreparer(ids, resolver, fixedStateRoot{}, fixedProvisioner{}, store)
+	preparer, _ := NewRunPreparer(RunPreparerDeps{IDs: ids, Resolver: resolver, StateRoots: fixedStateRoot{}, Provisioner: fixedProvisioner{}, Manifests: store})
 	profile := agentappmodel.EffectiveProfile{ID: "app", Version: "1", Workspace: agentappmodel.WorkspaceSpec{DefaultMode: execmodel.WorkspaceModeTask, AllowedModes: []execmodel.WorkspaceMode{execmodel.WorkspaceModeTask, execmodel.WorkspaceModeSession}, DefaultAccess: execmodel.WorkspaceAccessReadWrite}}
 	root, err := preparer.PrepareRun(context.Background(), workcontract.PrepareRunRequest{Scope: workmodel.ResourceScope{TenantID: "tenant"}, App: profile, Intent: workcontract.ExecutionIntent{BoundedInputs: true, BoundedOutputs: true}, ProductModes: profile.Workspace.AllowedModes, BackendModes: profile.Workspace.AllowedModes, MaximumAccess: execmodel.WorkspaceAccessReadWrite})
 	if err != nil {
@@ -176,7 +176,7 @@ func TestRunPreparerRejectsReuseThatWouldBroadenCurrentRequest(t *testing.T) {
 	ids := &fixedIDs{values: []string{"run-id", "root-binding", "skill-binding"}}
 	resolver, _ := NewWorkspaceResolver(ids)
 	store := workmemory.NewManifestStore()
-	preparer, _ := NewRunPreparer(ids, resolver, fixedStateRoot{}, fixedProvisioner{}, store)
+	preparer, _ := NewRunPreparer(RunPreparerDeps{IDs: ids, Resolver: resolver, StateRoots: fixedStateRoot{}, Provisioner: fixedProvisioner{}, Manifests: store})
 	profile := agentappmodel.EffectiveProfile{ID: "app", Version: "1", Workspace: agentappmodel.WorkspaceSpec{DefaultMode: execmodel.WorkspaceModeTask, AllowedModes: []execmodel.WorkspaceMode{execmodel.WorkspaceModeTask, execmodel.WorkspaceModeSession}, DefaultAccess: execmodel.WorkspaceAccessReadWrite}}
 	root, err := preparer.PrepareRun(context.Background(), workcontract.PrepareRunRequest{App: profile, Intent: workcontract.ExecutionIntent{BoundedInputs: true, BoundedOutputs: true}, ProductModes: profile.Workspace.AllowedModes, BackendModes: profile.Workspace.AllowedModes, MaximumAccess: execmodel.WorkspaceAccessReadWrite})
 	if err != nil {
@@ -197,7 +197,7 @@ func TestRunPreparerUsesAuthoritativeBaseExecution(t *testing.T) {
 	ids := &fixedIDs{values: []string{"run-id", "root-binding", "step-binding"}}
 	resolver, _ := NewWorkspaceResolver(ids)
 	store := workmemory.NewManifestStore()
-	preparer, _ := NewRunPreparer(ids, resolver, fixedStateRoot{}, fixedProvisioner{}, store)
+	preparer, _ := NewRunPreparer(RunPreparerDeps{IDs: ids, Resolver: resolver, StateRoots: fixedStateRoot{}, Provisioner: fixedProvisioner{}, Manifests: store})
 	profile := agentappmodel.EffectiveProfile{ID: "app", Version: "1", Workspace: agentappmodel.WorkspaceSpec{DefaultMode: execmodel.WorkspaceModeTask, AllowedModes: []execmodel.WorkspaceMode{execmodel.WorkspaceModeTask}, DefaultAccess: execmodel.WorkspaceAccessReadWrite}}
 	root, err := preparer.PrepareRun(context.Background(), workcontract.PrepareRunRequest{Scope: workmodel.ResourceScope{TenantID: "tenant"}, SessionID: "trusted-session", App: profile, Intent: workcontract.ExecutionIntent{RequiredMode: execmodel.WorkspaceModeTask}, ProductModes: profile.Workspace.AllowedModes, BackendModes: profile.Workspace.AllowedModes, MaximumAccess: execmodel.WorkspaceAccessReadWrite})
 	if err != nil {
@@ -225,7 +225,7 @@ func TestRunPreparerDerivedExecutionInheritsProjectAuthorization(t *testing.T) {
 	ids := &fixedIDs{values: []string{"run-id", "root-binding", "skill-binding"}}
 	resolver, _ := NewWorkspaceResolver(ids)
 	store := workmemory.NewManifestStore()
-	preparer, _ := NewRunPreparer(ids, resolver, fixedStateRoot{}, fixedProvisioner{}, store)
+	preparer, _ := NewRunPreparer(RunPreparerDeps{IDs: ids, Resolver: resolver, StateRoots: fixedStateRoot{}, Provisioner: fixedProvisioner{}, Manifests: store})
 	modes := []execmodel.WorkspaceMode{execmodel.WorkspaceModeProject, execmodel.WorkspaceModeTask}
 	profile := agentappmodel.EffectiveProfile{ID: "app", Version: "1", Workspace: agentappmodel.WorkspaceSpec{DefaultMode: execmodel.WorkspaceModeProject, AllowedModes: modes, RequiresProject: true, DefaultAccess: execmodel.WorkspaceAccessReadWrite}}
 	scope := workmodel.ResourceScope{ProjectID: "project"}

@@ -105,22 +105,27 @@ type RunRequest struct {
 	OnProgress      progress.Sink                // 可选：接收结构化运行进度事件
 	// Deliverables 可选显式交付声明（API / App Template / CLI）；非空时优先于 prompt 启发式。
 	Deliverables []artifactcontract.DeclaredDeliverable
+	// Inputs 是产品入口已经鉴权并版本化的显式输入；普通 CLI 请求由 RequestInputPlanner 自动补齐精确文件引用。
+	Inputs []workmodel.ResourceRef
 }
 
 // RunWorkspaceRuntime 是产品装配后交给 app 层的工作空间控制面配置。
 type RunWorkspaceRuntime struct {
-	Preparer       workcontract.ControlPlane
-	AgentApps      agentappcontract.Resolver
-	IntentResolver workcontract.IntentResolver
-	ProjectRoot    *workmodel.ResourceRef
-	ProjectDir     string
-	ProductModes   []execmodel.WorkspaceMode
-	PolicyModes    []execmodel.WorkspaceMode
-	BackendModes   []execmodel.WorkspaceMode
-	MaximumAccess  execmodel.WorkspaceAccess
-	ArtifactRuns   artifactcontract.RunInitializer
-	Completion     artifactcontract.CompletionPolicy
-	QAEvidence     artifactcontract.QAEvidenceRecorder
+	Preparer            workcontract.ControlPlane
+	AgentApps           agentappcontract.Resolver
+	IntentResolver      workcontract.IntentResolver
+	RequestInputs       workcontract.RequestInputPlanner
+	ProjectRoot         *workmodel.ResourceRef
+	ProjectDir          string
+	ProductModes        []execmodel.WorkspaceMode
+	PolicyModes         []execmodel.WorkspaceMode
+	BackendModes        []execmodel.WorkspaceMode
+	MaximumAccess       execmodel.WorkspaceAccess
+	ArtifactRuns        artifactcontract.RunInitializer
+	Completion          artifactcontract.CompletionPolicy
+	QAEvidence          artifactcontract.QAEvidenceRecorder
+	WorkspaceCompletion workcontract.RunCompletionGuard
+	RunResources        []workcontract.RunResourceReleaser
 }
 
 // RunResult RunOnce 的执行结果

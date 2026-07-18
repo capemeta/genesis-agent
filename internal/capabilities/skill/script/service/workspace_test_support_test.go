@@ -36,12 +36,12 @@ func (r testSnapshotReader) OpenSnapshot(_ context.Context, path workmodel.Works
 func testInputManifest(binding execmodel.ExecutionBinding, name string, content []byte) (workmodel.InputManifest, testSnapshotReader) {
 	path := workmodel.WorkspacePath("runs/" + binding.Owner.RunID + "/input/input-test/" + name)
 	digest := sha256.Sum256(content)
-	manifest := workmodel.InputManifest{RunID: binding.Owner.RunID, BindingID: binding.ID, Inputs: []workmodel.InputRef{{ID: "input-test", Name: name, Size: int64(len(content)), SHA256: hex.EncodeToString(digest[:]), StagedPath: path}}}
+	manifest := workmodel.InputManifest{RunID: binding.Owner.RunID, BindingID: binding.ID, Inputs: []workmodel.InputRef{{ID: "input-test", Name: name, Alias: workmodel.WorkspacePath(name), Size: int64(len(content)), SHA256: hex.EncodeToString(digest[:]), StagedPath: path}}}
 	return manifest, testSnapshotReader{path: append([]byte(nil), content...)}
 }
 
 func testBinding(runID string) execmodel.ExecutionBinding {
-	return execmodel.ExecutionBinding{ID: runID + "-skill-demo", Mode: execmodel.WorkspaceModeSession, Access: execmodel.WorkspaceAccessReadWrite, PathPolicy: execmodel.PathPolicyStrictWorkspace, Owner: execmodel.ExecutionOwnerRef{RunID: runID}}
+	return execmodel.ExecutionBinding{ID: runID + "-skill-demo", Mode: execmodel.WorkspaceModeTask, Access: execmodel.WorkspaceAccessReadWrite, PathPolicy: execmodel.PathPolicyStrictWorkspace, Owner: execmodel.ExecutionOwnerRef{RunID: runID}}
 }
 
 func testStateRoot(root string) workmodel.StateRoot {

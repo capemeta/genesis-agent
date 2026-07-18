@@ -406,7 +406,7 @@ func buildEnterpriseRunWorkspace(workspaceID string, manifests workspacecontract
 		rootID = "enterprise-workspace:" + workspaceID
 	}
 	stateRoots := workspaceadapter.StateRootResolver{Root: workmodel.StateRoot{ID: rootID, Authority: "executor"}}
-	preparer, err := workservice.NewRunPreparer(ids, resolver, stateRoots, workspaceadapter.NewProvisioner(), manifests)
+	preparer, err := workservice.NewRunPreparer(workservice.RunPreparerDeps{IDs: ids, Resolver: resolver, StateRoots: stateRoots, Provisioner: workspaceadapter.NewProvisioner(), Manifests: manifests})
 	if err != nil {
 		return app.RunWorkspaceRuntime{}, err
 	}
@@ -492,10 +492,8 @@ func (enterpriseDeniedRunner) Run(context.Context, execmodel.Command, execcontra
 }
 
 func enterpriseEnvironmentContext(ctx context.Context, stack skillstack.ExecStack) promptbuilder.EnvironmentContext {
-	cwd, _ := os.Getwd()
 	environment := promptbuilder.EnvironmentContext{
 		OS:               runtime.GOOS,
-		Cwd:              cwd,
 		SandboxMode:      string(stack.Sandbox.Mode),
 		SandboxProvider:  stack.Sandbox.Provider,
 		ExternalApproval: true,
@@ -503,7 +501,6 @@ func enterpriseEnvironmentContext(ctx context.Context, stack skillstack.ExecStac
 	if stack.Shells == nil {
 		if stack.Sandbox.Provider == "genesis-sandbox" {
 			environment.OS = ""
-			environment.Cwd = "/workspace"
 		}
 		return environment
 	}

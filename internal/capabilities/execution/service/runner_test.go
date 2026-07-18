@@ -119,6 +119,18 @@ func TestRunnerStrictRemoteRejectsHostAbsolutePath(t *testing.T) {
 	}
 }
 
+func TestRunnerUsesDirectForTaskWhenSandboxExplicitlyDisabled(t *testing.T) {
+	direct := &fakeDirectRunner{}
+	runner, err := NewRunner(direct, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = runner.Run(context.Background(), execmodel.Command{Command: "echo hi"}, taskRunOptions())
+	if err != nil || !direct.called {
+		t.Fatalf("explicit disabled sandbox should use audited direct runner: called=%t err=%v", direct.called, err)
+	}
+}
+
 func TestRunnerUsesInjectedPathValidator(t *testing.T) {
 	direct := &fakeDirectRunner{}
 	validator := &fakePathValidator{err: execcontract.NewError(execcontract.ErrCodeInvalidInput, nil)}

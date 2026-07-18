@@ -3,8 +3,6 @@ package run_skill_command
 import (
 	"context"
 	"encoding/json"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -34,15 +32,15 @@ func (s skillTestControl) GetRunManifest(context.Context, string, string) (workm
 }
 
 func skillTestContext() context.Context {
-	binding := execmodel.ExecutionBinding{ID: "skill-binding", Mode: execmodel.WorkspaceModeSession, Access: execmodel.WorkspaceAccessReadWrite, PathPolicy: execmodel.PathPolicyStrictWorkspace, Owner: execmodel.ExecutionOwnerRef{RunID: "run-1", TaskID: "skill:demo"}}
+	binding := execmodel.ExecutionBinding{ID: "skill-binding", Mode: execmodel.WorkspaceModeTask, Access: execmodel.WorkspaceAccessReadWrite, PathPolicy: execmodel.PathPolicyStrictWorkspace, Owner: execmodel.ExecutionOwnerRef{RunID: "run-1", TaskID: "skill:demo"}}
 	execution := workmodel.PreparedExecutionSnapshot{Binding: binding, Workspace: execmodel.ExecutionWorkspace{WorkDir: "/workspace/work/skill-binding"}}
 	manifest := workmodel.RunManifest{RunID: "run-1", StateRoot: workmodel.StateRoot{ID: "state", Authority: "test"}, Executions: []workmodel.PreparedExecutionSnapshot{execution}}
 	ctx := workcontract.WithPreparedRun(context.Background(), workmodel.PreparedRun{Manifest: manifest, Execution: execution})
 	return workcontract.WithControlPlane(ctx, &skillTestControl{execution: execution, manifest: manifest})
 }
 
-func TestExecuteRequestsSessionWorkspaceBinding(t *testing.T) {
-	binding := execmodel.ExecutionBinding{ID: "skill-binding", Mode: execmodel.WorkspaceModeSession, Access: execmodel.WorkspaceAccessReadWrite, PathPolicy: execmodel.PathPolicyStrictWorkspace, Owner: execmodel.ExecutionOwnerRef{RunID: "run-1", TaskID: "skill:demo"}}
+func TestExecuteRequestsTaskWorkspaceBinding(t *testing.T) {
+	binding := execmodel.ExecutionBinding{ID: "skill-binding", Mode: execmodel.WorkspaceModeTask, Access: execmodel.WorkspaceAccessReadWrite, PathPolicy: execmodel.PathPolicyStrictWorkspace, Owner: execmodel.ExecutionOwnerRef{RunID: "run-1", TaskID: "skill:demo"}}
 	execution := workmodel.PreparedExecutionSnapshot{Binding: binding, Workspace: execmodel.ExecutionWorkspace{WorkDir: "/workspace/work/skill-binding"}}
 	manifest := workmodel.RunManifest{RunID: "run-1", StateRoot: workmodel.StateRoot{ID: "state", Authority: "test"}, Executions: []workmodel.PreparedExecutionSnapshot{execution}}
 	control := &skillTestControl{execution: execution, manifest: manifest}
@@ -61,7 +59,7 @@ func TestExecuteRequestsSessionWorkspaceBinding(t *testing.T) {
 			t.Fatalf("零值分阶段耗时不得省略 %s: %s", field, result)
 		}
 	}
-	if control.request.Intent.RequiredMode != execmodel.WorkspaceModeSession || control.request.Intent.NeedsPersistentRun {
+	if control.request.Intent.RequiredMode != execmodel.WorkspaceModeTask || control.request.Intent.NeedsPersistentRun {
 		t.Fatalf("derived intent = %+v", control.request.Intent)
 	}
 }
@@ -74,12 +72,18 @@ func (r *captureRunner) Run(_ context.Context, req scriptcontract.RunRequest) (*
 }
 
 type fakeInputResolver struct {
-	refs   []workmodel.ResourceRef
-	inputs []string
+	refs           []workmodel.ResourceRef
+	inputs         []string
+	optionalInputs []string
 }
 
 func (r *fakeInputResolver) ResolveInputs(_ context.Context, inputs []string) ([]workmodel.ResourceRef, error) {
 	r.inputs = append([]string(nil), inputs...)
+	return append([]workmodel.ResourceRef(nil), r.refs...), nil
+}
+
+func (r *fakeInputResolver) ResolveAvailableInputs(_ context.Context, inputs []string) ([]workmodel.ResourceRef, error) {
+	r.optionalInputs = append([]string(nil), inputs...)
 	return append([]workmodel.ResourceRef(nil), r.refs...), nil
 }
 
@@ -93,7 +97,7 @@ func (s *fakeInputStager) Stage(_ context.Context, req workcontract.StageRequest
 	if s.delay > 0 {
 		time.Sleep(s.delay)
 	}
-	return workmodel.InputManifest{RunID: req.Binding.Owner.RunID, BindingID: req.Binding.ID, Inputs: []workmodel.InputRef{{ID: "input-1", Name: "report.pdf", Size: 1, SHA256: strings.Repeat("0", 64), Source: req.Sources[0], StagedPath: "runs/run-1/input/input-1/report.pdf"}}}, nil
+	return workmodel.InputManifest{RunID: req.Binding.Owner.RunID, BindingID: req.Binding.ID, Inputs: []workmodel.InputRef{{ID: "input-1", Name: "report.pdf", Alias: "report.pdf", Size: 1, SHA256: strings.Repeat("0", 64), Source: req.Sources[0], StagedPath: "runs/run-1/input/input-1/report.pdf"}}}, nil
 }
 
 func TestExecuteReportsWholeHarnessAndControlPlaneStagingTime(t *testing.T) {
@@ -148,7 +152,7 @@ func TestExecuteExpandsCallerWorkDirBeforeResolvingInput(t *testing.T) {
 		t.Fatal(err)
 	}
 	rootBinding := execmodel.ExecutionBinding{ID: "root-binding", Mode: execmodel.WorkspaceModeTask, Access: execmodel.WorkspaceAccessReadWrite, Owner: execmodel.ExecutionOwnerRef{RunID: "run-1"}}
-	skillBinding := execmodel.ExecutionBinding{ID: "skill-binding", Mode: execmodel.WorkspaceModeSession, Access: execmodel.WorkspaceAccessReadWrite, Owner: execmodel.ExecutionOwnerRef{RunID: "run-1", TaskID: "skill:demo"}}
+	skillBinding := execmodel.ExecutionBinding{ID: "skill-binding", Mode: execmodel.WorkspaceModeTask, Access: execmodel.WorkspaceAccessReadWrite, Owner: execmodel.ExecutionOwnerRef{RunID: "run-1", TaskID: "skill:demo"}}
 	rootExecution := workmodel.PreparedExecutionSnapshot{Binding: rootBinding, Workspace: execmodel.ExecutionWorkspace{WorkDir: `D:\state\runs\run-1\work\root`}}
 	skillExecution := workmodel.PreparedExecutionSnapshot{Binding: skillBinding, Workspace: execmodel.ExecutionWorkspace{WorkDir: `D:\state\runs\run-1\work\skill`}}
 	manifest := workmodel.RunManifest{RunID: "run-1", StateRoot: workmodel.StateRoot{ID: "state", Authority: "test"}, Executions: []workmodel.PreparedExecutionSnapshot{rootExecution, skillExecution}}
@@ -191,17 +195,14 @@ func TestApplyFinalizationKeepsOKOnDeliveryConflict(t *testing.T) {
 	}
 }
 
-func TestAutoDetectReferencedInputs(t *testing.T) {
-	tmpDir := t.TempDir()
-	sampleFile := filepath.Join(tmpDir, "2026笔记本选型比较.pptx")
-	if err := os.WriteFile(sampleFile, []byte("fake pptx"), 0o600); err != nil {
-		t.Fatal(err)
+func TestCollectWorkspaceInputsIncludesBoundInputAndCommandEntry(t *testing.T) {
+	view := workmodel.WorkspaceViewManifest{Entries: []workmodel.WorkspaceViewEntry{{Path: "2026笔记本选型比较.pptx"}}}
+	required, optional := collectWorkspaceInputs(`node create.js "2026笔记本选型比较.pptx"`, []string{"notes.json"}, view)
+	wantRequired := []string{"2026笔记本选型比较.pptx", "notes.json"}
+	if strings.Join(required, "|") != strings.Join(wantRequired, "|") {
+		t.Fatalf("collectWorkspaceInputs() required = %v, want %v", required, wantRequired)
 	}
-
-	ws := execmodel.ExecutionWorkspace{WorkDir: tmpDir}
-	cmd := `cp "2026笔记本选型比较.pptx" "2026笔记本选型比较-编辑版.pptx"`
-	inputs := autoDetectReferencedInputs(cmd, nil, ws)
-	if len(inputs) != 1 || inputs[0] != "2026笔记本选型比较.pptx" {
-		t.Fatalf("autoDetectReferencedInputs() = %v, want [2026笔记本选型比较.pptx]", inputs)
+	if len(optional) != 1 || optional[0] != "create.js" {
+		t.Fatalf("collectWorkspaceInputs() optional = %v", optional)
 	}
 }

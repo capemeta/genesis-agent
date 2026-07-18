@@ -4,6 +4,10 @@ import (
 	"context"
 	"strings"
 	"testing"
+
+	execmodel "genesis-agent/internal/capabilities/execution/model"
+	workcontract "genesis-agent/internal/capabilities/workspace/contract"
+	workmodel "genesis-agent/internal/capabilities/workspace/model"
 )
 
 func TestDefaultPromptUsesReadFileForKnownExactPath(t *testing.T) {
@@ -31,9 +35,8 @@ func TestDefaultPromptDoesNotReferenceUnavailableTools(t *testing.T) {
 }
 
 func TestRenderEnvironmentContextEscapesAndDeduplicates(t *testing.T) {
-	got := renderEnvironmentContext(EnvironmentContext{
+	got := renderEnvironmentContext(context.Background(), EnvironmentContext{
 		OS:               "windows",
-		Cwd:              `D:\work&space`,
 		DefaultShell:     "powershell",
 		DefaultShellPath: `C:\Program Files\PowerShell\pwsh.exe`,
 		SupportedShells:  []string{"powershell", "PowerShell", "cmd"},
@@ -41,7 +44,6 @@ func TestRenderEnvironmentContextEscapesAndDeduplicates(t *testing.T) {
 		ExternalApproval: true,
 	})
 	checks := []string{
-		`<cwd>D:\work&amp;space</cwd>`,
 		`<default_shell name="powershell" path="C:\Program Files\PowerShell\pwsh.exe" />`,
 		`<supported_shells>powershell,cmd</supported_shells>`,
 		`<filesystem external_access_requires_approval="true" />`,
@@ -54,8 +56,23 @@ func TestRenderEnvironmentContextEscapesAndDeduplicates(t *testing.T) {
 }
 
 func TestRenderEnvironmentContextDoesNotGuessUnknownRemoteShell(t *testing.T) {
-	got := renderEnvironmentContext(EnvironmentContext{Cwd: "/workspace", SandboxProvider: "genesis-sandbox"})
+	got := renderEnvironmentContext(context.Background(), EnvironmentContext{SandboxProvider: "genesis-sandbox"})
 	if strings.Contains(got, "default_shell") || strings.Contains(got, "supported_shells") {
 		t.Fatalf("renderEnvironmentContext() = %q", got)
+	}
+}
+
+func TestRenderEnvironmentContextUsesLogicalRunWorkspace(t *testing.T) {
+	binding := execmodel.ExecutionBinding{ID: "binding", Mode: execmodel.WorkspaceModeTask, Access: execmodel.WorkspaceAccessReadWrite, Owner: execmodel.ExecutionOwnerRef{RunID: "run"}}
+	view := workmodel.WorkspaceViewManifest{BindingID: "binding", Root: ".", Entries: []workmodel.WorkspaceViewEntry{{Path: "source.pptx", Access: workmodel.WorkspaceViewAccessReadWrite}}}
+	ctx := workcontract.WithPreparedRun(context.Background(), workmodel.PreparedRun{Manifest: workmodel.RunManifest{View: view}, Execution: workmodel.PreparedExecutionSnapshot{Binding: binding, Workspace: execmodel.ExecutionWorkspace{WorkDir: `D:\secret\run`}}})
+	got := renderEnvironmentContext(ctx, EnvironmentContext{OS: "windows"})
+	for _, want := range []string{`mode="task_job"`, `root="."`, `project_changes_persist="false"`, `path="source.pptx"`} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("workspace context=%q missing %q", got, want)
+		}
+	}
+	if strings.Contains(got, `D:\secret`) {
+		t.Fatalf("workspace context 泄漏物理路径: %s", got)
 	}
 }

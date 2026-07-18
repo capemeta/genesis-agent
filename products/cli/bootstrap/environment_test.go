@@ -17,23 +17,23 @@ func (f fixedShellCapabilities) ShellCapabilities(context.Context) execmodel.She
 }
 
 func TestCLIEnvironmentContextUsesDeclaredLocalCapabilities(t *testing.T) {
-	environment := cliEnvironmentContext(context.Background(), `D:\workspace`, execmodel.SandboxProfile{Mode: execmodel.SandboxDisabled}, fixedShellCapabilities{
+	environment := cliEnvironmentContext(context.Background(), execmodel.SandboxProfile{Mode: execmodel.SandboxDisabled}, fixedShellCapabilities{
 		capabilities: execmodel.ShellCapabilities{
 			Default:   execmodel.ShellInfo{Kind: execmodel.ShellPowerShell, Path: `C:\pwsh.exe`},
 			Supported: []execmodel.ShellInfo{{Kind: execmodel.ShellPowerShell}, {Kind: execmodel.ShellCmd}},
 		},
 	})
-	if environment.Cwd != `D:\workspace` || environment.DefaultShell != "powershell" || len(environment.SupportedShells) != 2 {
+	if environment.DefaultShell != "powershell" || len(environment.SupportedShells) != 2 {
 		t.Fatalf("environment = %+v", environment)
 	}
 }
 
 func TestCLIEnvironmentContextDoesNotLeakHostIntoRemoteSandbox(t *testing.T) {
-	environment := cliEnvironmentContext(context.Background(), `D:\host\workspace`, execmodel.SandboxProfile{
+	environment := cliEnvironmentContext(context.Background(), execmodel.SandboxProfile{
 		Mode:     execmodel.SandboxRequired,
 		Provider: clisandbox.ProviderGenesisSandbox,
 	}, nil)
-	if environment.OS != "" || environment.Cwd != "/workspace" || environment.DefaultShell != "" || len(environment.SupportedShells) != 0 {
+	if environment.OS != "" || environment.DefaultShell != "" || len(environment.SupportedShells) != 0 {
 		t.Fatalf("environment = %+v", environment)
 	}
 }

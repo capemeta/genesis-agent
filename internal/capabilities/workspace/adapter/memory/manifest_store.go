@@ -93,6 +93,8 @@ func cloneManifest(manifest workmodel.RunManifest) workmodel.RunManifest {
 		manifest.ProjectRoot = &copied
 	}
 	manifest.Executions = append([]workmodel.PreparedExecutionSnapshot(nil), manifest.Executions...)
+	manifest.Inputs.Inputs = append([]workmodel.InputRef(nil), manifest.Inputs.Inputs...)
+	manifest.View.Entries = append([]workmodel.WorkspaceViewEntry(nil), manifest.View.Entries...)
 	for i := range manifest.Executions {
 		metadata := manifest.Executions[i].Workspace.Metadata
 		if metadata == nil {

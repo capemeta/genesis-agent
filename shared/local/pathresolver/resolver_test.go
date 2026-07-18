@@ -20,7 +20,7 @@ func TestResolverMarksEscapeAsExternal(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := resolver.Resolve(context.Background(), model.PathRef{Raw: filepath.Join(root, "..", "outside.txt")}, fscontract.ResolveOptions{})
+	got, err := resolver.Resolve(projectContext(root), model.PathRef{Raw: filepath.Join(root, "..", "outside.txt")}, fscontract.ResolveOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -39,7 +39,7 @@ func TestResolverResolvesRelativePath(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := resolver.Resolve(context.Background(), model.PathRef{Raw: "a.txt"}, fscontract.ResolveOptions{MustExist: true})
+	got, err := resolver.Resolve(projectContext(root), model.PathRef{Raw: "a.txt"}, fscontract.ResolveOptions{MustExist: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,7 +76,7 @@ func TestResolverRejectsDirectoryWhenFileExpected(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = resolver.Resolve(context.Background(), model.PathRef{Raw: "dir"}, fscontract.ResolveOptions{MustExist: true})
+	_, err = resolver.Resolve(projectContext(root), model.PathRef{Raw: "dir"}, fscontract.ResolveOptions{MustExist: true})
 	if fscontract.CodeOf(err) != fscontract.ErrCodeInvalidInput {
 		t.Fatalf("Resolve error code = %q, want invalid_input", fscontract.CodeOf(err))
 	}
@@ -92,7 +92,7 @@ func TestResolverRequiresDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = resolver.Resolve(context.Background(), model.PathRef{Raw: "a.txt"}, fscontract.ResolveOptions{
+	_, err = resolver.Resolve(projectContext(root), model.PathRef{Raw: "a.txt"}, fscontract.ResolveOptions{
 		MustExist:        true,
 		AllowDirectory:   true,
 		RequireDirectory: true,
@@ -109,7 +109,7 @@ func TestResolverMarksProtectedPath(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := resolver.Resolve(context.Background(), model.PathRef{Raw: `C:\Windows\System32\config\missing.txt`}, fscontract.ResolveOptions{})
+	got, err := resolver.Resolve(projectContext(root), model.PathRef{Raw: `C:\Windows\System32\config\missing.txt`}, fscontract.ResolveOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +125,7 @@ func TestResolverMarksSSHDirectoryItselfProtected(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := resolver.Resolve(context.Background(), model.PathRef{Raw: `C:\Users\dev\.ssh`}, fscontract.ResolveOptions{})
+	got, err := resolver.Resolve(projectContext(root), model.PathRef{Raw: `C:\Users\dev\.ssh`}, fscontract.ResolveOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +147,7 @@ func TestResolverCanPreserveFinalSymlink(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := resolver.Resolve(context.Background(), model.PathRef{Raw: "link.txt"}, fscontract.ResolveOptions{MustExist: true, PreserveFinalSymlink: true})
+	got, err := resolver.Resolve(projectContext(root), model.PathRef{Raw: "link.txt"}, fscontract.ResolveOptions{MustExist: true, PreserveFinalSymlink: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,12 +166,13 @@ func TestResolverExpandsWorkDirLogicalPath(t *testing.T) {
 	if err := os.MkdirAll(workDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	ctx := workcontract.WithPreparedRun(context.Background(), workmodel.PreparedRun{Execution: workmodel.PreparedExecutionSnapshot{Workspace: execmodel.ExecutionWorkspace{WorkDir: workDir}}})
+	binding := execmodel.ExecutionBinding{ID: "binding-root", Mode: execmodel.WorkspaceModeTask, Access: execmodel.WorkspaceAccessReadWrite, Owner: execmodel.ExecutionOwnerRef{RunID: "run-test-1"}}
+	ctx := workcontract.WithPreparedRun(context.Background(), workmodel.PreparedRun{Execution: workmodel.PreparedExecutionSnapshot{Binding: binding, Workspace: execmodel.ExecutionWorkspace{WorkDir: workDir, InputDir: filepath.Join(root, "input"), OutputDir: filepath.Join(root, "output"), TmpDir: filepath.Join(root, "tmp")}}})
 	got, err := resolver.Resolve(ctx, model.PathRef{Raw: "$WORK_DIR/deck_gen.js"}, fscontract.ResolveOptions{MustExist: false})
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantRel := ".genesis/runtime/runs/run-test-1/work/binding-root/deck_gen.js"
+	wantRel := "deck_gen.js"
 	if got.WorkspaceRel != wantRel {
 		t.Fatalf("WorkspaceRel=%q, want %q", got.WorkspaceRel, wantRel)
 	}
@@ -184,6 +185,12 @@ func TestResolverExpandsWorkDirLogicalPath(t *testing.T) {
 	}
 }
 
+func projectContext(root string) context.Context {
+	binding := execmodel.ExecutionBinding{ID: "project-binding", Mode: execmodel.WorkspaceModeProject, Access: execmodel.WorkspaceAccessReadWrite, Owner: execmodel.ExecutionOwnerRef{RunID: "run-project"}}
+	prepared := workmodel.PreparedRun{Execution: workmodel.PreparedExecutionSnapshot{Binding: binding, Workspace: execmodel.ExecutionWorkspace{WorkDir: root}}}
+	return workcontract.WithPreparedRun(context.Background(), prepared)
+}
+
 func TestResolverLogicalPathRequiresRunID(t *testing.T) {
 	root := tempWorkspace(t)
 	resolver, err := New(root)
@@ -193,5 +200,27 @@ func TestResolverLogicalPathRequiresRunID(t *testing.T) {
 	_, err = resolver.Resolve(context.Background(), model.PathRef{Raw: "$WORK_DIR/deck_gen.js"}, fscontract.ResolveOptions{})
 	if err == nil {
 		t.Fatal("expected error without run_id")
+	}
+}
+
+func TestTaskResolverUsesRunWorkDirAndRejectsProjectEscape(t *testing.T) {
+	project := tempWorkspace(t)
+	workDir := filepath.Join(project, ".genesis", "runtime", "runs", "run", "work", "binding")
+	if err := os.MkdirAll(workDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(project, "project-only.txt"), []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resolver, _ := New(project)
+	binding := execmodel.ExecutionBinding{ID: "binding", Mode: execmodel.WorkspaceModeTask, Access: execmodel.WorkspaceAccessReadWrite, Owner: execmodel.ExecutionOwnerRef{RunID: "run"}}
+	workspace := execmodel.ExecutionWorkspace{WorkDir: workDir, InputDir: filepath.Join(project, ".genesis", "runtime", "runs", "run", "input", "binding"), OutputDir: filepath.Join(project, ".genesis", "runtime", "runs", "run", "output", "binding"), TmpDir: filepath.Join(project, ".genesis", "runtime", "runs", "run", "tmp", "binding")}
+	ctx := workcontract.WithPreparedRun(context.Background(), workmodel.PreparedRun{Execution: workmodel.PreparedExecutionSnapshot{Binding: binding, Workspace: workspace}})
+	resolved, err := resolver.Resolve(ctx, model.PathRef{Raw: "new.txt"}, fscontract.ResolveOptions{})
+	if err != nil || resolved.BackendPath != filepath.Join(workDir, "new.txt") || resolved.WorkspaceRel != "new.txt" {
+		t.Fatalf("task relative resolve=%+v err=%v", resolved, err)
+	}
+	if _, err := resolver.Resolve(ctx, model.PathRef{Raw: filepath.Join(project, "project-only.txt")}, fscontract.ResolveOptions{MustExist: true}); fscontract.CodeOf(err) != fscontract.ErrCodePermissionDenied {
+		t.Fatalf("task absolute project escape must fail: %v", err)
 	}
 }

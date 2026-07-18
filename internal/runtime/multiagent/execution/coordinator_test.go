@@ -44,7 +44,7 @@ func TestCoordinatorIsolatesWorkflowStepsAndCollaborationMember(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	control, err := workservice.NewRunPreparer(ids, resolver, testStateRoot{}, testProvisioner{}, workmemory.NewManifestStore())
+	control, err := workservice.NewRunPreparer(workservice.RunPreparerDeps{IDs: ids, Resolver: resolver, StateRoots: testStateRoot{}, Provisioner: testProvisioner{}, Manifests: workmemory.NewManifestStore()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,7 +109,7 @@ func TestCoordinatorRejectsImplicitMemberAppAndFabricatedProject(t *testing.T) {
 	ctx := context.Background()
 	ids := &sequenceIDs{}
 	resolver, _ := workservice.NewWorkspaceResolver(ids)
-	control, _ := workservice.NewRunPreparer(ids, resolver, testStateRoot{}, testProvisioner{}, workmemory.NewManifestStore())
+	control, _ := workservice.NewRunPreparer(workservice.RunPreparerDeps{IDs: ids, Resolver: resolver, StateRoots: testStateRoot{}, Provisioner: testProvisioner{}, Manifests: workmemory.NewManifestStore()})
 	modes := []execmodel.WorkspaceMode{execmodel.WorkspaceModeProject, execmodel.WorkspaceModeTask}
 	app := testApp("app", modes)
 	apps, _ := agentappmemory.NewResolver(app.ID, []agentappmodel.EffectiveProfile{app})
@@ -131,7 +131,7 @@ func TestCoordinatorMemberInheritsOnlyParentProject(t *testing.T) {
 	ctx := context.Background()
 	ids := &sequenceIDs{}
 	resolver, _ := workservice.NewWorkspaceResolver(ids)
-	control, _ := workservice.NewRunPreparer(ids, resolver, testStateRoot{}, testProvisioner{}, workmemory.NewManifestStore())
+	control, _ := workservice.NewRunPreparer(workservice.RunPreparerDeps{IDs: ids, Resolver: resolver, StateRoots: testStateRoot{}, Provisioner: testProvisioner{}, Manifests: workmemory.NewManifestStore()})
 	modes := []execmodel.WorkspaceMode{execmodel.WorkspaceModeProject, execmodel.WorkspaceModeTask}
 	app := testApp("app", modes)
 	apps, _ := agentappmemory.NewResolver(app.ID, []agentappmodel.EffectiveProfile{app})
@@ -156,7 +156,7 @@ func testCoordinator(t *testing.T) (context.Context, *Coordinator, workmodel.Pre
 	ctx := context.Background()
 	ids := &sequenceIDs{}
 	resolver, _ := workservice.NewWorkspaceResolver(ids)
-	control, _ := workservice.NewRunPreparer(ids, resolver, testStateRoot{}, testProvisioner{}, workmemory.NewManifestStore())
+	control, _ := workservice.NewRunPreparer(workservice.RunPreparerDeps{IDs: ids, Resolver: resolver, StateRoots: testStateRoot{}, Provisioner: testProvisioner{}, Manifests: workmemory.NewManifestStore()})
 	modes := []execmodel.WorkspaceMode{execmodel.WorkspaceModeTask}
 	app := testApp("app", modes)
 	apps, _ := agentappmemory.NewResolver(app.ID, []agentappmodel.EffectiveProfile{app})

@@ -186,7 +186,8 @@ func TestFileDiscoveryUsesWorkspaceRootAndSkipsNoiseDirs(t *testing.T) {
 	if walkTool == nil {
 		t.Fatal("walk_dir tool not found")
 	}
-	out, err := globTool.Execute(context.Background(), `{"pattern":"ultra5-comparison-summary.md"}`)
+	fileCtx := fileToolContext(workspace)
+	out, err := globTool.Execute(fileCtx, `{"pattern":"ultra5-comparison-summary.md"}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -204,7 +205,7 @@ func TestFileDiscoveryUsesWorkspaceRootAndSkipsNoiseDirs(t *testing.T) {
 		t.Fatalf("exact glob should not be truncated by noise: %s", out)
 	}
 
-	walkOut, err := walkTool.Execute(context.Background(), `{"path":".","max_depth":1}`)
+	walkOut, err := walkTool.Execute(fileCtx, `{"path":".","max_depth":1}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -301,6 +302,11 @@ func cliTestRunContext() context.Context {
 	ctx = contextutil.WithSessionID(ctx, "session-cli-sandbox-test")
 	binding := execmodel.ExecutionBinding{ID: "binding-cli-sandbox-test", Mode: execmodel.WorkspaceModeProject, Access: execmodel.WorkspaceAccessReadWrite, PathPolicy: execmodel.PathPolicyPermissionOnly, Owner: execmodel.ExecutionOwnerRef{RunID: "run-cli-sandbox-test", SessionID: "session-cli-sandbox-test"}}
 	return workcontract.WithPreparedRun(ctx, workmodel.PreparedRun{Execution: workmodel.PreparedExecutionSnapshot{Binding: binding, Workspace: execmodel.ExecutionWorkspace{WorkDir: "."}}})
+}
+
+func fileToolContext(workspace string) context.Context {
+	binding := execmodel.ExecutionBinding{ID: "binding-cli-file-test", Mode: execmodel.WorkspaceModeProject, Access: execmodel.WorkspaceAccessReadWrite, PathPolicy: execmodel.PathPolicyPermissionOnly, Owner: execmodel.ExecutionOwnerRef{RunID: "run-cli-file-test"}}
+	return workcontract.WithPreparedRun(context.Background(), workmodel.PreparedRun{Execution: workmodel.PreparedExecutionSnapshot{Binding: binding, Workspace: execmodel.ExecutionWorkspace{WorkDir: workspace}}})
 }
 
 func assertCommandSucceeded(t *testing.T, result runCommandResult) {

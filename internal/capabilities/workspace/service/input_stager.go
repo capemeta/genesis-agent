@@ -61,11 +61,15 @@ func (s *InputStager) Stage(ctx context.Context, req workcontract.StageRequest) 
 			_ = s.store.Remove(context.Background(), stagedPath)
 		}
 	}()
-	usedNames := map[string]int{}
+	usedAliases := map[string]int{}
 	var total int64
 	for _, source := range req.Sources {
 		if err := validateResourceRef(source); err != nil {
 			return workmodel.InputManifest{}, workcontract.NewError(workcontract.ErrCodeInputPermissionDenied, err)
+		}
+		owner := req.Binding.Owner
+		if source.Scope.TenantID != owner.TenantID || source.Scope.ProjectID != owner.ProjectID || source.Scope.UserID != owner.UserID {
+			return workmodel.InputManifest{}, workcontract.NewError(workcontract.ErrCodeInputPermissionDenied, fmt.Errorf("资源 %s scope 与 execution binding 不一致", source.ID))
 		}
 		handle, err := s.reader.Open(ctx, source)
 		if err != nil {
@@ -82,11 +86,12 @@ func (s *InputStager) Stage(ctx context.Context, req workcontract.StageRequest) 
 			_ = handle.Reader.Close()
 			return workmodel.InputManifest{}, workcontract.NewError(workcontract.ErrCodeInputTooLarge, fmt.Errorf("输入 %s 超过限额", source.ID))
 		}
-		name, err := stagedName(source, usedNames)
+		alias, err := stagedAlias(source, usedAliases)
 		if err != nil {
 			_ = handle.Reader.Close()
 			return workmodel.InputManifest{}, err
 		}
+		name := path.Base(string(alias))
 		inputID := "input-" + s.ids.Generate()
 		hash := sha256.New()
 		limited := &io.LimitedReader{R: handle.Reader, N: maxFile + 1}
@@ -116,7 +121,7 @@ func (s *InputStager) Stage(ctx context.Context, req workcontract.StageRequest) 
 		if mediaType == "" {
 			mediaType = mime.TypeByExtension(path.Ext(name))
 		}
-		manifest.Inputs = append(manifest.Inputs, workmodel.InputRef{ID: inputID, Name: name, Size: readSize, SHA256: digest, MIME: mediaType, Source: source, StagedPath: stagedPath})
+		manifest.Inputs = append(manifest.Inputs, workmodel.InputRef{ID: inputID, Name: name, Alias: alias, Size: readSize, SHA256: digest, MIME: mediaType, Source: source, StagedPath: stagedPath})
 		total += readSize
 	}
 	committed = true
@@ -130,20 +135,26 @@ func validateResourceRef(ref workmodel.ResourceRef) error {
 	return nil
 }
 
-func stagedName(ref workmodel.ResourceRef, used map[string]int) (string, error) {
-	name := path.Base(strings.ReplaceAll(strings.TrimSpace(ref.Path), `\`, "/"))
-	if name == "." || name == "/" || name == "" {
-		name = strings.TrimSpace(ref.ID)
+func stagedAlias(ref workmodel.ResourceRef, used map[string]int) (workmodel.WorkspacePath, error) {
+	raw := strings.TrimSpace(strings.ReplaceAll(ref.Path, `\`, "/"))
+	alias := workmodel.WorkspacePath(raw)
+	if err := alias.Validate(); err != nil {
+		fallback := path.Base(raw)
+		if fallback == "." || fallback == "/" || fallback == "" {
+			fallback = strings.TrimSpace(ref.ID)
+		}
+		alias = workmodel.WorkspacePath(fallback)
+		if fallbackErr := alias.Validate(); fallbackErr != nil {
+			return "", workcontract.NewError(workcontract.ErrCodeInputReservedPathConflict, fmt.Errorf("非法输入别名 %q: %w", raw, fallbackErr))
+		}
 	}
-	if name == "." || name == ".." || strings.ContainsAny(name, "/\\\x00") {
-		return "", workcontract.NewError(workcontract.ErrCodeInputReservedPathConflict, fmt.Errorf("非法输入名称 %q", name))
-	}
-	key := strings.ToLower(name)
+	key := strings.ToLower(string(alias))
 	used[key]++
 	if used[key] == 1 {
-		return name, nil
+		return alias, nil
 	}
+	dir, name := path.Split(string(alias))
 	ext := path.Ext(name)
 	stem := strings.TrimSuffix(name, ext)
-	return fmt.Sprintf("%s-%d%s", stem, used[key], ext), nil
+	return workmodel.WorkspacePath(path.Join(dir, fmt.Sprintf("%s-%d%s", stem, used[key], ext))), nil
 }

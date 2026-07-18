@@ -31,6 +31,7 @@ type fakeRemoteClient struct {
 	files       map[string][]byte
 	lastCommand execmodel.Command
 	runCount    int
+	closeCount  int
 }
 
 func newFakeRemoteClient() *fakeRemoteClient { return &fakeRemoteClient{files: map[string][]byte{}} }
@@ -86,10 +87,13 @@ func (s *fakeRemoteSession) Run(_ context.Context, req sandboxcontract.CommandRe
 	s.client.files[path.Join(normalizeSlash(req.Command.Cwd), "output.txt")] = []byte("done")
 	return &execmodel.Result{ExitCode: 0, Stdout: "ok"}, nil
 }
-func (s *fakeRemoteSession) Close(context.Context) error { return nil }
-func (s *fakeRemoteSession) ExpiresAt() time.Time        { return time.Now().Add(time.Hour) }
+func (s *fakeRemoteSession) Close(context.Context) error {
+	s.client.closeCount++
+	return nil
+}
+func (s *fakeRemoteSession) ExpiresAt() time.Time { return time.Now().Add(time.Hour) }
 
-func TestSkillCommandServiceRunsInRemoteSessionWorkspace(t *testing.T) {
+func TestSkillCommandServiceRunsInRemoteTaskWorkspace(t *testing.T) {
 	client := newFakeRemoteClient()
 	source, err := embedded.NewSource(skillmodel.Authority{Kind: skillmodel.SourceKindEmbedded, ID: "test"}, skillmodel.ScopeSystem, fstest.MapFS{
 		"demo/SKILL.md":                {Data: []byte("---\nname: demo\ndescription: demo skill\nallowed-tools:\n  - run_skill_command\ndependencies:\n  runtime:\n    system:\n      - name: libreoffice\n        command: soffice\n---\nDemo")},
@@ -115,7 +119,7 @@ func TestSkillCommandServiceRunsInRemoteSessionWorkspace(t *testing.T) {
 	if client.lastCommand.Cwd != "/workspace/work/remote-run-skill-demo/skills/demo" {
 		t.Fatalf("cwd=%q", client.lastCommand.Cwd)
 	}
-	if client.lastCommand.Env["INPUT_DIR"] != client.lastCommand.Cwd || client.lastCommand.Env["OUTPUT_DIR"] != client.lastCommand.Cwd || client.lastCommand.Env["TMPDIR"] != "/workspace/tmp/remote-run-skill-demo" {
+	if client.lastCommand.Env["INPUT_DIR"] != "/workspace/input/remote-run-skill-demo" || client.lastCommand.Env["OUTPUT_DIR"] != "/workspace/output/remote-run-skill-demo" || client.lastCommand.Env["TMPDIR"] != "/workspace/tmp/remote-run-skill-demo" {
 		t.Fatalf("remote task env=%v", client.lastCommand.Env)
 	}
 	if !strings.Contains(client.lastCommand.Command, "scripts") {
@@ -133,6 +137,10 @@ func TestSkillCommandServiceRunsInRemoteSessionWorkspace(t *testing.T) {
 	matDir := filepath.Join(root, ".genesis", "runtime", "runs", "remote-run-materialize")
 	if _, err := os.Stat(matDir); !os.IsNotExist(err) {
 		t.Fatalf("should not create separate -materialize run dir: %v", err)
+	}
+	svc.ReleaseRun(context.Background(), workmodel.PreparedRun{Manifest: workmodel.RunManifest{RunID: "remote-run"}})
+	if client.closeCount != 1 || len(svc.sessions) != 0 {
+		t.Fatalf("Run release did not close remote session: close=%d sessions=%d", client.closeCount, len(svc.sessions))
 	}
 }
 

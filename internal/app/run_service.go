@@ -58,15 +58,36 @@ func (s *agentServiceImpl) RunOnce(ctx context.Context, req RunRequest) (*RunRes
 	if err != nil {
 		return nil, fmt.Errorf("解析 Run 任务意图失败: %w", err)
 	}
+	inputs := append([]workmodel.ResourceRef(nil), req.Inputs...)
+	if intent.BoundedInputs && s.workspace.RequestInputs != nil {
+		planned, planErr := s.workspace.RequestInputs.PlanRequestInputs(ctx, workcontract.RequestInputRequest{Prompt: req.Input, Scope: scope})
+		if planErr != nil {
+			return nil, fmt.Errorf("解析 Run 请求输入失败: %w", planErr)
+		}
+		inputs = mergeResourceRefs(inputs, planned)
+	}
 	prepared, err := s.workspace.Preparer.PrepareRun(ctx, workcontract.PrepareRunRequest{
 		Scope:     scope,
 		SessionID: req.SessionID, ParentRunID: req.ParentRunID, AgentID: agent.ID,
 		App: effectiveApp, Intent: intent, ProjectRoot: projectRoot, ProjectDir: s.workspace.ProjectDir,
 		ProductModes: s.workspace.ProductModes, PolicyModes: s.workspace.PolicyModes, BackendModes: s.workspace.BackendModes,
 		MaximumAccess: s.workspace.MaximumAccess,
+		Inputs:        inputs,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("准备 Run 工作空间失败: %w", err)
+	}
+	for _, resource := range s.workspace.RunResources {
+		if resource == nil {
+			continue
+		}
+		defer resource.ReleaseRun(context.WithoutCancel(ctx), prepared)
+	}
+	if s.workspace.WorkspaceCompletion != nil {
+		if err := s.workspace.WorkspaceCompletion.InitializeRun(ctx, prepared); err != nil {
+			return nil, fmt.Errorf("初始化 workspace 完成门禁失败: %w", err)
+		}
+		defer s.workspace.WorkspaceCompletion.ReleaseRun(prepared)
 	}
 	if s.workspace.ArtifactRuns != nil {
 		if err := s.workspace.ArtifactRuns.InitializeRun(ctx, artifactcontract.RunInitializationRequest{
@@ -80,6 +101,7 @@ func (s *agentServiceImpl) RunOnce(ctx context.Context, req RunRequest) (*RunRes
 	ctx = workcontract.WithPreparedRun(ctx, prepared)
 	ctx = workcontract.WithControlPlane(ctx, s.workspace.Preparer)
 	ctx = artifactcontract.WithCompletionPolicy(ctx, s.workspace.Completion)
+	ctx = workcontract.WithCompletionGuard(ctx, s.workspace.WorkspaceCompletion)
 	ctx = artifactcontract.WithQAEvidenceRecorder(ctx, s.workspace.QAEvidence)
 	if req.OnProgress != nil {
 		ctx = progress.WithSink(ctx, req.OnProgress)
@@ -143,6 +165,22 @@ func (s *agentServiceImpl) RunOnce(ctx context.Context, req RunRequest) (*RunRes
 		Run:     run,
 		Elapsed: time.Since(startTime),
 	}, nil
+}
+
+func mergeResourceRefs(groups ...[]workmodel.ResourceRef) []workmodel.ResourceRef {
+	seen := make(map[string]struct{})
+	var merged []workmodel.ResourceRef
+	for _, group := range groups {
+		for _, ref := range group {
+			key := ref.Authority + "\x00" + ref.Scheme + "\x00" + ref.ID + "\x00" + ref.Version
+			if _, exists := seen[key]; exists {
+				continue
+			}
+			seen[key] = struct{}{}
+			merged = append(merged, ref)
+		}
+	}
+	return merged
 }
 
 // bindProjectRootScope 把产品入口已授权、但装配时尚未知调用者的项目引用绑定到本次 Run。

@@ -51,7 +51,7 @@ func TestInputStagerRenamesDuplicatesAndHashes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(manifest.Inputs) != 2 || manifest.Inputs[0].Name != "report.pdf" || manifest.Inputs[1].Name != "report-2.pdf" {
+	if len(manifest.Inputs) != 2 || manifest.Inputs[0].Alias != "folder/report.pdf" || manifest.Inputs[1].Alias != "other/report.pdf" {
 		t.Fatalf("unexpected manifest: %+v", manifest)
 	}
 	if manifest.Inputs[0].SHA256 == "" || manifest.Inputs[0].StagedPath == manifest.Inputs[1].StagedPath {

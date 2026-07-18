@@ -17,7 +17,11 @@ import (
 type LocalResource struct {
 	Path      string
 	Version   string
+	SHA256    string
+	Size      int64
 	MediaType string
+	Scope     workmodel.ResourceScope
+	Identity  hostFileIdentity
 }
 
 // ResourceReader 只读取产品预先注册的资源 ID，不解析用户提交的裸路径。

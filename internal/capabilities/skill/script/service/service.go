@@ -165,6 +165,33 @@ func (s *Service) Close(ctx context.Context) error {
 	return firstErr
 }
 
+// ReleaseRun 立即释放指定 Run 缓存的远端 session，避免等待空闲 TTL 占用租户配额。
+// 同一 Run 内的多条 Skill 命令仍通过 binding key 复用同一 session。
+func (s *Service) ReleaseRun(ctx context.Context, prepared workmodel.PreparedRun) {
+	if s == nil || strings.TrimSpace(prepared.Manifest.RunID) == "" {
+		return
+	}
+	prefix := prepared.Manifest.RunID + "::"
+	var sessions []*sandboxsession.Session
+	s.mu.Lock()
+	for key, item := range s.sessions {
+		if !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		if item != nil && item.session != nil {
+			sessions = append(sessions, item.session)
+		}
+		delete(s.sessions, key)
+		delete(s.entries, key)
+	}
+	s.mu.Unlock()
+	for _, sess := range sessions {
+		if err := sess.Close(ctx); err != nil {
+			s.log.Warn("释放 Run 远端 Skill session 失败", "run_id", prepared.Manifest.RunID, "error", err)
+		}
+	}
+}
+
 func (s *Service) Run(ctx context.Context, req scriptcontract.RunRequest) (*scriptcontract.RunResult, error) {
 	started := time.Now()
 	skillName := strings.TrimSpace(req.Skill)
@@ -651,13 +678,16 @@ func (s *Service) cleanupStaleSessions(ctx context.Context) {
 	}
 }
 
+var _ workcontract.RunResourceReleaser = (*Service)(nil)
+
 func (s *Service) commandEntryAvailable(ctx context.Context, req scriptcontract.RunRequest, meta skillmodel.Metadata, runID, entry string) (bool, error) {
 	entry = normalizeCommandEntry(entry)
 	if entry == "" {
 		return true, nil
 	}
 	for _, input := range req.Inputs.Inputs {
-		if normalizeCommandEntry(input.Name) == entry || (path.Dir(entry) == "." && path.Base(entry) == path.Base(normalizeCommandEntry(input.Name))) {
+		alias := inputAlias(input)
+		if normalizeCommandEntry(alias) == entry || (path.Dir(entry) == "." && path.Base(entry) == path.Base(normalizeCommandEntry(alias))) {
 			return true, nil
 		}
 	}
@@ -1055,10 +1085,11 @@ func stageInputManifestRemote(ctx context.Context, reader workcontract.InputSnap
 		if err != nil {
 			return nil, err
 		}
-		if err := session.WriteFile(ctx, remoteRelativePath(skillDir, input.Name), content, fscontract.WriteOptions{CreateParents: true, Overwrite: true}); err != nil {
+		alias := inputAlias(input)
+		if err := session.WriteFile(ctx, remoteRelativePath(skillDir, alias), content, fscontract.WriteOptions{CreateParents: true, Overwrite: true}); err != nil {
 			return nil, fmt.Errorf("上传输入快照 %s 失败: %w", input.ID, err)
 		}
-		staged = append(staged, input.Name)
+		staged = append(staged, alias)
 	}
 	return staged, nil
 }
@@ -1092,8 +1123,12 @@ func stageInputManifestLocal(ctx context.Context, reader workcontract.InputSnaps
 		if err != nil {
 			return nil, err
 		}
-		target := filepath.Join(destDir, input.Name)
-		tmp, err := os.CreateTemp(destDir, ".input-view-*")
+		alias := inputAlias(input)
+		target := filepath.Join(destDir, filepath.FromSlash(alias))
+		if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+			return nil, err
+		}
+		tmp, err := os.CreateTemp(filepath.Dir(target), ".input-view-*")
 		if err != nil {
 			return nil, err
 		}
@@ -1123,16 +1158,31 @@ func stageInputManifestLocal(ctx context.Context, reader workcontract.InputSnaps
 		}
 		if err != nil {
 			_ = os.Remove(tmpName)
-			return nil, fmt.Errorf("建立输入只读视图 %s 失败: %w", input.Name, err)
+			return nil, fmt.Errorf("建立输入只读视图 %s 失败: %w", alias, err)
 		}
-		staged = append(staged, input.Name)
+		staged = append(staged, alias)
 	}
 	return staged, nil
+}
+
+func inputAlias(input workmodel.InputRef) string {
+	return string(input.Alias)
 }
 
 func validateInputManifest(binding execmodel.ExecutionBinding, manifest workmodel.InputManifest) error {
 	if manifest.RunID != binding.Owner.RunID || manifest.BindingID != binding.ID {
 		return workcontract.NewError(workcontract.ErrCodeWorkspaceNotAvailable, fmt.Errorf("InputManifest 与 ExecutionBinding 不匹配"))
+	}
+	seen := make(map[string]struct{}, len(manifest.Inputs))
+	for _, input := range manifest.Inputs {
+		if err := input.Alias.Validate(); err != nil {
+			return workcontract.NewError(workcontract.ErrCodePathNamespaceMismatch, fmt.Errorf("InputRef %s alias 无效: %w", input.ID, err))
+		}
+		key := strings.ToLower(string(input.Alias))
+		if _, exists := seen[key]; exists {
+			return workcontract.NewError(workcontract.ErrCodeInputNameConflict, fmt.Errorf("InputManifest alias 重复: %s", input.Alias))
+		}
+		seen[key] = struct{}{}
 	}
 	return nil
 }

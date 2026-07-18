@@ -5,13 +5,16 @@ import (
 	"encoding/xml"
 	"fmt"
 	"strings"
+
+	execmodel "genesis-agent/internal/capabilities/execution/model"
+	workcontract "genesis-agent/internal/capabilities/workspace/contract"
+	workmodel "genesis-agent/internal/capabilities/workspace/model"
 )
 
 // EnvironmentContext 是每轮对模型可见的有界运行环境快照。
 // 它只描述已经验证的能力，不应根据操作系统猜测远程沙箱能力。
 type EnvironmentContext struct {
 	OS               string
-	Cwd              string
 	DefaultShell     string
 	DefaultShellPath string
 	SupportedShells  []string
@@ -27,7 +30,7 @@ func NewEnvironmentContextInjector(environment EnvironmentContext) ContextInject
 			return Fragment{}, err
 		}
 		_ = req
-		contents := renderEnvironmentContext(environment)
+		contents := renderEnvironmentContext(ctx, environment)
 		if contents == "" {
 			return Fragment{}, nil
 		}
@@ -35,7 +38,7 @@ func NewEnvironmentContextInjector(environment EnvironmentContext) ContextInject
 	})
 }
 
-func renderEnvironmentContext(environment EnvironmentContext) string {
+func renderEnvironmentContext(ctx context.Context, environment EnvironmentContext) string {
 	var lines []string
 	appendValue := func(name, value string) {
 		value = strings.TrimSpace(value)
@@ -45,7 +48,9 @@ func renderEnvironmentContext(environment EnvironmentContext) string {
 		lines = append(lines, fmt.Sprintf("<%s>%s</%s>", name, xmlEscape(value), name))
 	}
 	appendValue("os", environment.OS)
-	appendValue("cwd", environment.Cwd)
+	if prepared, ok := workcontract.PreparedRunFromContext(ctx); ok {
+		lines = append(lines, renderWorkspaceContext(prepared)...)
+	}
 	if strings.TrimSpace(environment.DefaultShell) != "" {
 		attrs := fmt.Sprintf(" name=\"%s\"", xmlEscape(environment.DefaultShell))
 		if path := strings.TrimSpace(environment.DefaultShellPath); path != "" {
@@ -81,6 +86,38 @@ func renderEnvironmentContext(environment EnvironmentContext) string {
 		lines = append(lines, "<filesystem external_access_requires_approval=\"true\" />")
 	}
 	return strings.Join(lines, "\n")
+}
+
+func renderWorkspaceContext(prepared workmodel.PreparedRun) []string {
+	binding := prepared.Execution.Binding
+	persistence := "run_isolated"
+	projectChangesPersist := false
+	switch binding.Mode {
+	case execmodel.WorkspaceModeProject:
+		persistence = "project"
+		projectChangesPersist = true
+	case execmodel.WorkspaceModeSession:
+		persistence = "session"
+	}
+	lines := []string{fmt.Sprintf(
+		"<workspace mode=\"%s\" access=\"%s\" root=\".\" persistence=\"%s\" project_changes_persist=\"%t\" />",
+		xmlEscape(string(binding.Mode)), xmlEscape(string(binding.Access)), persistence, projectChangesPersist,
+	)}
+	if len(prepared.Manifest.View.Entries) > 0 {
+		lines = append(lines, "<bound_inputs>")
+		for _, entry := range prepared.Manifest.View.Entries {
+			lines = append(lines, fmt.Sprintf("<file path=\"%s\" access=\"%s\" />", xmlEscape(string(entry.Path)), xmlEscape(entry.Access)))
+		}
+		lines = append(lines, "</bound_inputs>")
+	}
+	if binding.Mode == execmodel.WorkspaceModeTask {
+		lines = append(lines, "<workspace_rule>当前为隔离任务；相对路径只解析到本 Run 根，写入不会修改项目。仅 bound_inputs 中列出的项目资源已投影为工作副本。</workspace_rule>")
+	} else if binding.Mode == execmodel.WorkspaceModeProject {
+		lines = append(lines, "<workspace_rule>当前为项目开发；相对路径根就是已授权项目根，修改会直接持久化到项目。</workspace_rule>")
+	} else {
+		lines = append(lines, "<workspace_rule>当前为会话工作区；相对路径在会话范围持久化，不会直接修改项目。</workspace_rule>")
+	}
+	return lines
 }
 
 func xmlEscape(value string) string {

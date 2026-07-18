@@ -1,7 +1,7 @@
 # 统一执行工作空间实现对齐审查
 
 > 基准：`docs/统一执行工作空间、文件权限与产物规范.md`  
-> 日期：2026-07-17  
+> 日期：2026-07-18
 > 结论：核心安全纵切、L1/L2/L3 执行隔离与显式 Handoff 已形成通用控制面；跨产品持久治理、资源投影和产品编排接入仍未完成，不能把整份规范标记为“全部完成”。
 
 ## 对齐矩阵
@@ -11,7 +11,10 @@
 | 三种 WorkspaceMode 与 backend 正交 | 已实现 | `internal/capabilities/execution/model`、`execution/service`、`sandbox/session` | 旧 mode 常量、字符串和 adapter 改写逻辑已删除 |
 | ExecutionBinding/owner/path policy | 已实现 | `execution/model/binding.go`、`execution/pathcontract` | runner 缺少或冲突 binding 时稳定失败 |
 | StateRoot、Run manifest 与 execution namespace | 已实现（Enterprise adapter 待接） | `workspace/service/run_preparer.go`、`shared/local/workspace/manifest_store.go`、`workspace/adapter/sandbox`、`products/enterprise/bootstrap/container.go` | Run ID/binding/state root/path map 在 Engine 前固化；Store 查询强制 tenant_id 并用 expected revision CAS；Enterprise 未注入外部 Store 时拒绝启动，不再使用内存 adapter |
-| InputRef/InputStager | 部分实现 | `workspace/service/input_stager.go`、`shared/local/workspace/resource_registry.go`、Skill harness | CLI Skill 已接入版本、hash、限额、重名和只读快照；Enterprise 租户 InputStore 未实现 |
+| InputRef/InputStager/WorkspaceView | 本地闭环已实现；Enterprise adapter 待接 | `workspace/service/input_stager.go`、`workspace/service/workspace_view.go`、`shared/local/workspace/resource_registry.go`、`view_projector.go`、Skill harness | CLI 请求精确文件在 LLM 前完成 scope/version/hash/快照/相对别名工作副本；Skill 自动投影；Enterprise 租户 InputStore/Projector 未实现 |
+| 模型相对路径与工具一致性 | 已实现 | `workspace/model/logical.go`、`shared/local/pathresolver/resolver.go`、`runtime/prompt/environment.go` | 文件工具、command cwd 与 Skill 输入均消费 PreparedRun；静态项目根回退和物理 cwd 提示已删除 |
+| 项目变更完成门禁 | CLI 已实现 | `shared/local/workspace/git_change_guard.go`、`runtime/strategy/react/react_loop.go` | 比较 RunStartBaseline 与当前 Git 状态，兼容用户原有 dirty worktree；Sandbox optional/required 不静默回退 Host attempt |
+| Run 资源释放 | CLI 已实现 | `workspace/contract.RunResourceReleaser`、`skill/script/service.ReleaseRun`、`app.RunOnce` | 远程 Skill session 在 Run 内复用，任意终态立即关闭，idle TTL 仅兜底 |
 | produced 与 Artifact 分离 | 已实现 | `skill/script/contract`、`skill/script/service`、`artifact/tool/publish_artifact` | Skill 旧 Artifact 字段和自动回收链已删除 |
 | Artifact 两阶段发布与结构门禁 | 已实现 | `artifact/service/publisher.go`、`artifact/service/gate.go`、`shared/local/artifact/store.go` | ZIP/Office 条目、展开量、压缩比和必要结构已校验 |
 | DeliveryTarget 默认策略 | 部分实现 | `artifact/service/delivery.go`、`shared/local/artifact/default_delivery.go`、Desktop/Enterprise bootstrap | CLI 支持源平级→项目根；Desktop 无项目时投影到可见 Inbox；Enterprise 已强制注入 publisher/source/delivery，具体租户对象存储与下载入口未实现 |

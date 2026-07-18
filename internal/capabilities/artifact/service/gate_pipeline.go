@@ -173,7 +173,6 @@ func (FormatIntegrityGate) Validate(ctx context.Context, state *gateValidationSt
 		state.detectedMIME = firstNonEmpty(mime.TypeByExtension(state.ext), "text/plain; charset=utf-8")
 	default:
 		state.kind = strings.TrimPrefix(state.ext, ".")
-		state.detectedMIME = state.detectedMIME
 	}
 	return ctx.Err()
 }

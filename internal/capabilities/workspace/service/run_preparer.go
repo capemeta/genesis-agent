@@ -19,14 +19,24 @@ type RunPreparer struct {
 	stateRoots  workcontract.StateRootResolver
 	provisioner workcontract.Provisioner
 	manifests   workcontract.RunManifestStore
+	inputs      workcontract.RunInputBinder
 	now         func() time.Time
 }
 
-func NewRunPreparer(ids IDGenerator, resolver *WorkspaceResolver, stateRoots workcontract.StateRootResolver, provisioner workcontract.Provisioner, manifests workcontract.RunManifestStore) (*RunPreparer, error) {
-	if ids == nil || resolver == nil || stateRoots == nil || provisioner == nil || manifests == nil {
+type RunPreparerDeps struct {
+	IDs         IDGenerator
+	Resolver    *WorkspaceResolver
+	StateRoots  workcontract.StateRootResolver
+	Provisioner workcontract.Provisioner
+	Manifests   workcontract.RunManifestStore
+	Inputs      workcontract.RunInputBinder
+}
+
+func NewRunPreparer(deps RunPreparerDeps) (*RunPreparer, error) {
+	if deps.IDs == nil || deps.Resolver == nil || deps.StateRoots == nil || deps.Provisioner == nil || deps.Manifests == nil {
 		return nil, fmt.Errorf("run preparer 缺少 ids/resolver/stateRoots/provisioner/manifests")
 	}
-	return &RunPreparer{ids: ids, resolver: resolver, stateRoots: stateRoots, provisioner: provisioner, manifests: manifests, now: time.Now}, nil
+	return &RunPreparer{ids: deps.IDs, resolver: deps.Resolver, stateRoots: deps.StateRoots, provisioner: deps.Provisioner, manifests: deps.Manifests, inputs: deps.Inputs, now: time.Now}, nil
 }
 
 func (p *RunPreparer) PrepareRun(ctx context.Context, req workcontract.PrepareRunRequest) (workmodel.PreparedRun, error) {
@@ -61,7 +71,18 @@ func (p *RunPreparer) PrepareRun(ctx context.Context, req workcontract.PrepareRu
 		return workmodel.PreparedRun{}, fmt.Errorf("准备 Run workspace: %w", err)
 	}
 	execution := workmodel.PreparedExecutionSnapshot{Binding: physical.Binding, Backend: physical.Backend, Workspace: physical.Workspace}
-	manifest := workmodel.RunManifest{SchemaVersion: workmodel.RunManifestSchemaVersion, Revision: 1, RunID: runID, ParentRunID: owner.ParentRunID, Scope: req.Scope, AgentApp: req.App, ArtifactRequired: req.Intent.ArtifactRequired, StateRoot: stateRoot, ProjectRoot: req.ProjectRoot, ProjectDir: strings.TrimSpace(req.ProjectDir), Limits: workmodel.WorkspaceLimits{ProductModes: req.ProductModes, PolicyModes: req.PolicyModes, BackendModes: req.BackendModes, MaximumAccess: req.MaximumAccess}, Executions: []workmodel.PreparedExecutionSnapshot{execution}, CreatedAt: p.now().UTC()}
+	inputs := workmodel.InputManifest{RunID: runID, BindingID: binding.ID, CreatedAt: p.now().UTC()}
+	view := workmodel.WorkspaceViewManifest{BindingID: binding.ID, Root: "."}
+	if len(req.Inputs) > 0 {
+		if p.inputs == nil {
+			return workmodel.PreparedRun{}, fmt.Errorf("准备 Run workspace: 请求包含输入但未配置 RunInputBinder")
+		}
+		inputs, view, err = p.inputs.Bind(ctx, execution, req.Inputs)
+		if err != nil {
+			return workmodel.PreparedRun{}, err
+		}
+	}
+	manifest := workmodel.RunManifest{SchemaVersion: workmodel.RunManifestSchemaVersion, Revision: 1, RunID: runID, ParentRunID: owner.ParentRunID, Scope: req.Scope, AgentApp: req.App, ArtifactRequired: req.Intent.ArtifactRequired, ProjectChangeRequired: req.Intent.ModifyProject, StateRoot: stateRoot, ProjectRoot: req.ProjectRoot, ProjectDir: strings.TrimSpace(req.ProjectDir), Limits: workmodel.WorkspaceLimits{ProductModes: req.ProductModes, PolicyModes: req.PolicyModes, BackendModes: req.BackendModes, MaximumAccess: req.MaximumAccess}, Executions: []workmodel.PreparedExecutionSnapshot{execution}, Inputs: inputs, View: view, CreatedAt: p.now().UTC()}
 	if err := p.manifests.Create(ctx, manifest); err != nil {
 		return workmodel.PreparedRun{}, fmt.Errorf("持久化 Run manifest: %w", err)
 	}

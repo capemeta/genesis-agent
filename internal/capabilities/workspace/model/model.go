@@ -11,7 +11,7 @@ import (
 	execmodel "genesis-agent/internal/capabilities/execution/model"
 )
 
-const RunManifestSchemaVersion = "2"
+const RunManifestSchemaVersion = "3"
 
 // ResourceScope 描述资源的授权域。
 type ResourceScope struct {
@@ -76,11 +76,34 @@ type StateRoot struct {
 type InputRef struct {
 	ID         string        `json:"id"`
 	Name       string        `json:"name"`
+	Alias      WorkspacePath `json:"alias"`
 	Size       int64         `json:"size"`
 	SHA256     string        `json:"sha256"`
 	MIME       string        `json:"mime,omitempty"`
 	Source     ResourceRef   `json:"source"`
 	StagedPath WorkspacePath `json:"staged_path"`
+}
+
+// WorkspaceViewEntry 把稳定资源映射成当前 execution 内唯一、相对的模型可见别名。
+// Source 是资源身份，Path 是模型与所有工具共同使用的路径；两者不得互相替代。
+type WorkspaceViewEntry struct {
+	Path    WorkspacePath `json:"path"`
+	InputID string        `json:"input_id"`
+	Source  ResourceRef   `json:"source"`
+	Access  string        `json:"access"`
+}
+
+const (
+	WorkspaceViewAccessReadOnly  = "read_only"
+	WorkspaceViewAccessReadWrite = "read_write"
+)
+
+// WorkspaceViewManifest 固化一次 execution 的模型可见资源视图。
+// Root 永远是 "."；物理根只存在于 ExecutionWorkspace，由 backend adapter 解释。
+type WorkspaceViewManifest struct {
+	BindingID string               `json:"binding_id"`
+	Root      string               `json:"root"`
+	Entries   []WorkspaceViewEntry `json:"entries,omitempty"`
 }
 
 // InputManifest 固化一次 execution 的输入映射。
@@ -101,19 +124,22 @@ type PreparedExecutionSnapshot struct {
 // RunManifest 是 Run 创建时原子写入的工作空间控制面快照。
 // 物理路径只允许由对应产品的受信 adapter 持久化和读取，不进入跨产品业务协议。
 type RunManifest struct {
-	SchemaVersion    string                         `json:"schema_version"`
-	Revision         uint64                         `json:"revision"`
-	RunID            string                         `json:"run_id"`
-	ParentRunID      string                         `json:"parent_run_id,omitempty"`
-	Scope            ResourceScope                  `json:"scope"`
-	AgentApp         agentappmodel.EffectiveProfile `json:"agent_app"`
-	ArtifactRequired bool                           `json:"artifact_required,omitempty"`
-	StateRoot        StateRoot                      `json:"state_root"`
-	ProjectRoot      *ResourceRef                   `json:"project_root,omitempty"`
-	ProjectDir       string                         `json:"project_dir,omitempty"`
-	Limits           WorkspaceLimits                `json:"limits"`
-	Executions       []PreparedExecutionSnapshot    `json:"executions"`
-	CreatedAt        time.Time                      `json:"created_at"`
+	SchemaVersion         string                         `json:"schema_version"`
+	Revision              uint64                         `json:"revision"`
+	RunID                 string                         `json:"run_id"`
+	ParentRunID           string                         `json:"parent_run_id,omitempty"`
+	Scope                 ResourceScope                  `json:"scope"`
+	AgentApp              agentappmodel.EffectiveProfile `json:"agent_app"`
+	ArtifactRequired      bool                           `json:"artifact_required,omitempty"`
+	ProjectChangeRequired bool                           `json:"project_change_required,omitempty"`
+	StateRoot             StateRoot                      `json:"state_root"`
+	ProjectRoot           *ResourceRef                   `json:"project_root,omitempty"`
+	ProjectDir            string                         `json:"project_dir,omitempty"`
+	Limits                WorkspaceLimits                `json:"limits"`
+	Executions            []PreparedExecutionSnapshot    `json:"executions"`
+	Inputs                InputManifest                  `json:"inputs"`
+	View                  WorkspaceViewManifest          `json:"workspace_view"`
+	CreatedAt             time.Time                      `json:"created_at"`
 }
 
 // WorkspaceLimits 是 Run 创建时固化的产品、策略、backend 与访问上界交集输入。
@@ -152,6 +178,65 @@ func (m RunManifest) Validate() error {
 	}
 	if len(m.Executions) == 0 {
 		return fmt.Errorf("Run manifest 缺少 execution")
+	}
+	rootBindingID := m.Executions[0].Binding.ID
+	if m.ProjectChangeRequired {
+		root := m.Executions[0]
+		if root.Binding.Mode != execmodel.WorkspaceModeProject || m.ProjectRoot == nil || strings.TrimSpace(m.ProjectDir) == "" {
+			return fmt.Errorf("Run manifest 声明项目变更但根 execution 未完整绑定 project workspace")
+		}
+	}
+	if m.Inputs.RunID != m.RunID || m.Inputs.BindingID != rootBindingID {
+		return fmt.Errorf("Run manifest input manifest 与根 execution 不一致")
+	}
+	if m.View.BindingID != rootBindingID || m.View.Root != "." {
+		return fmt.Errorf("Run manifest workspace view 与根 execution 不一致")
+	}
+	inputsByID := make(map[string]InputRef, len(m.Inputs.Inputs))
+	aliases := make(map[string]struct{}, len(m.Inputs.Inputs))
+	for _, input := range m.Inputs.Inputs {
+		if strings.TrimSpace(input.ID) == "" || strings.TrimSpace(input.Name) == "" || input.Size < 0 || strings.TrimSpace(input.SHA256) == "" {
+			return fmt.Errorf("Run manifest input ref 无效")
+		}
+		if err := input.Alias.Validate(); err != nil {
+			return fmt.Errorf("Run manifest input alias 无效: %w", err)
+		}
+		if err := input.StagedPath.Validate(); err != nil {
+			return fmt.Errorf("Run manifest staged input path 无效: %w", err)
+		}
+		if input.Source.Scope != m.Scope {
+			return fmt.Errorf("Run manifest input source scope 不一致")
+		}
+		if _, exists := inputsByID[input.ID]; exists {
+			return fmt.Errorf("Run manifest input id %s 重复", input.ID)
+		}
+		aliasKey := strings.ToLower(string(input.Alias))
+		if _, exists := aliases[aliasKey]; exists {
+			return fmt.Errorf("Run manifest input alias %s 重复", input.Alias)
+		}
+		inputsByID[input.ID] = input
+		aliases[aliasKey] = struct{}{}
+	}
+	viewAliases := make(map[string]struct{}, len(m.View.Entries))
+	for _, entry := range m.View.Entries {
+		if err := entry.Path.Validate(); err != nil {
+			return fmt.Errorf("Run manifest workspace view path 无效: %w", err)
+		}
+		input, exists := inputsByID[entry.InputID]
+		if !exists || input.Source != entry.Source || input.Alias != entry.Path {
+			return fmt.Errorf("Run manifest workspace view entry 未绑定到唯一 input")
+		}
+		if entry.Access != WorkspaceViewAccessReadOnly && entry.Access != WorkspaceViewAccessReadWrite {
+			return fmt.Errorf("Run manifest workspace view access 无效")
+		}
+		key := strings.ToLower(string(entry.Path))
+		if _, exists := viewAliases[key]; exists {
+			return fmt.Errorf("Run manifest workspace view path %s 重复", entry.Path)
+		}
+		viewAliases[key] = struct{}{}
+	}
+	if len(viewAliases) != len(inputsByID) {
+		return fmt.Errorf("Run manifest workspace view 未完整覆盖 inputs")
 	}
 	seen := make(map[string]struct{}, len(m.Executions))
 	seenSubjects := make(map[string]struct{}, len(m.Executions))

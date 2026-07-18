@@ -418,7 +418,7 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 
 	// ── 步骤3: 主循环 ─────────────────────────────────────────
 	stopBlocks := 0
-	deliveryBlocks := 0
+	completionBlocks := 0
 	for rc.Iteration = 0; rc.Iteration < maxIter; rc.Iteration++ {
 		if additions := hookcontract.DrainAdditionalContext(ctx); len(additions) > 0 {
 			rc.Messages = append(rc.Messages, domain.NewSystemMessage(strings.Join(additions, "\n")))
@@ -650,14 +650,14 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 		} else if llmResp.Content != "" {
 			// ── 路径B: 最终回答 ──────────────────────────────
 			step.ActionType = domain.ActionTypeFinalAnswer
-			pending, reminder, completionErr := artifactCompletionPending(ctx)
+			pending, reminder, completionErr := runCompletionPending(ctx)
 			if completionErr != nil {
-				return fmt.Errorf("评估 Artifact 完成门禁: %w", completionErr)
+				return fmt.Errorf("评估 Run 完成门禁: %w", completionErr)
 			}
 			if pending {
-				deliveryBlocks++
-				if deliveryBlocks > 1 {
-					return artifactcontract.NewError(artifactcontract.ErrCodeArtifactDeliveryRequired, fmt.Errorf("required Deliverable 尚未满足持久化完成门禁；%s", reminder))
+				completionBlocks++
+				if completionBlocks > 1 {
+					return workcontract.NewError(workcontract.ErrCodeRunCompletionRequired, fmt.Errorf("Run 尚未满足持久化完成门禁；%s", reminder))
 				}
 				rc.Messages = append(rc.Messages, llmResp, domain.NewSystemMessage(reminder))
 				now := time.Now()
@@ -773,24 +773,36 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 	return fmt.Errorf("超过最大迭代次数 %d，Loop未能得出最终答案", maxIter)
 }
 
-func artifactCompletionPending(ctx context.Context) (bool, string, error) {
+func runCompletionPending(ctx context.Context) (bool, string, error) {
+	prepared, hasPrepared := workcontract.PreparedRunFromContext(ctx)
+	var reminders []string
 	policy, ok := artifactcontract.CompletionPolicyFromContext(ctx)
-	if !ok {
-		return false, "", nil
+	if ok {
+		if !hasPrepared {
+			return false, "", fmt.Errorf("artifact completion policy 已配置但缺少 prepared run")
+		}
+		decision, err := policy.EvaluateCompletion(ctx, prepared.Manifest.Scope.TenantID, prepared.Manifest.RunID)
+		if err != nil {
+			return false, "", err
+		}
+		if !decision.Complete {
+			data, _ := json.Marshal(decision)
+			reminders = append(reminders, "Harness 根据持久化 Deliverable/Publication/Delivery/QA 事实判定尚未完成。若 run_skill_command 返回多个候选，只能调用 select_deliverable_candidate 选择 candidate_id；不得提交路径或自行复制文件。decision="+string(data))
+		}
 	}
-	prepared, ok := workcontract.PreparedRunFromContext(ctx)
-	if !ok {
-		return false, "", fmt.Errorf("completion policy 已配置但缺少 prepared run")
+	if guard, ok := workcontract.CompletionGuardFromContext(ctx); ok {
+		if !hasPrepared {
+			return false, "", fmt.Errorf("workspace completion guard 已配置但缺少 prepared run")
+		}
+		decision, err := guard.EvaluateCompletion(ctx, prepared)
+		if err != nil {
+			return false, "", err
+		}
+		if !decision.Complete {
+			reminders = append(reminders, decision.Reminder)
+		}
 	}
-	decision, err := policy.EvaluateCompletion(ctx, prepared.Manifest.Scope.TenantID, prepared.Manifest.RunID)
-	if err != nil {
-		return false, "", err
-	}
-	if decision.Complete {
-		return false, "", nil
-	}
-	data, _ := json.Marshal(decision)
-	return true, "Harness 根据持久化 Deliverable/Publication/Delivery/QA 事实判定尚未完成。若 run_skill_command 返回多个候选，只能调用 select_deliverable_candidate 选择 candidate_id；不得提交路径或自行复制文件。decision=" + string(data), nil
+	return len(reminders) > 0, strings.Join(reminders, "\n"), nil
 }
 
 type toolExecutionResult struct {

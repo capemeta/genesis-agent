@@ -175,7 +175,7 @@ func handoffExecutions(t *testing.T) (context.Context, workcontract.ControlPlane
 	ctx := context.Background()
 	ids := &handoffIDs{}
 	resolver, _ := workservice.NewWorkspaceResolver(ids)
-	control, _ := workservice.NewRunPreparer(ids, resolver, handoffStateRoot{}, handoffProvisioner{}, workmemory.NewManifestStore())
+	control, _ := workservice.NewRunPreparer(workservice.RunPreparerDeps{IDs: ids, Resolver: resolver, StateRoots: handoffStateRoot{}, Provisioner: handoffProvisioner{}, Manifests: workmemory.NewManifestStore()})
 	modes := []execmodel.WorkspaceMode{execmodel.WorkspaceModeTask}
 	appA := handoffApp("app-a", modes)
 	appB := handoffApp("app-b", modes)

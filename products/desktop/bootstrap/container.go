@@ -115,7 +115,6 @@ func (c *Container) Init(ctx context.Context) error {
 			return
 		}
 
-		cwd, _ := os.Getwd()
 		shellCapabilities := hostRunner.ShellCapabilities(ctx)
 		supportedShells := make([]string, 0, len(shellCapabilities.Supported))
 		for _, shell := range shellCapabilities.Supported {
@@ -125,7 +124,6 @@ func (c *Container) Init(ctx context.Context) error {
 		}
 		environmentInjector := promptbuilder.NewEnvironmentContextInjector(promptbuilder.EnvironmentContext{
 			OS:               runtime.GOOS,
-			Cwd:              cwd,
 			DefaultShell:     string(shellCapabilities.Default.Kind),
 			DefaultShellPath: shellCapabilities.Default.Path,
 			SupportedShells:  supportedShells,
@@ -320,7 +318,7 @@ func buildDesktopRunWorkspace() (app.RunWorkspaceRuntime, error) {
 	if err != nil {
 		return app.RunWorkspaceRuntime{}, err
 	}
-	preparer, err := workservice.NewRunPreparer(ids, resolver, localworkspace.StateRootResolver{UserStateDir: stateRoot}, localworkspace.NewProvisioner(), manifests)
+	preparer, err := workservice.NewRunPreparer(workservice.RunPreparerDeps{IDs: ids, Resolver: resolver, StateRoots: localworkspace.StateRootResolver{UserStateDir: stateRoot}, Provisioner: localworkspace.NewProvisioner(), Manifests: manifests})
 	if err != nil {
 		return app.RunWorkspaceRuntime{}, err
 	}

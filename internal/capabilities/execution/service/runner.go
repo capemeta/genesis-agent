@@ -88,7 +88,6 @@ func (r *Runner) Run(ctx context.Context, cmd execmodel.Command, opts execcontra
 	if mode == "" {
 		mode = execmodel.SandboxDisabled
 	}
-
 	l := correl.AttachLogger(ctx, r.logger).With("command", cmd.Command, "cwd", cmd.Cwd, "mode", string(mode))
 
 	switch mode {

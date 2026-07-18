@@ -142,10 +142,13 @@ type productRuntime struct {
 	approvalService      approvalcontract.Service
 	hookExecutionRunner  execcontract.ExecutionRunner
 	config               *platformconfig.Config
+	requestInputs        workcontract.RequestInputPlanner
+	runInputs            workcontract.RunInputBinder
 	workspaceRoot        string
 	artifactRuns         artifactcontract.RunInitializer
 	completion           artifactcontract.CompletionPolicy
 	qaEvidence           artifactcontract.QAEvidenceRecorder
+	runResources         []workcontract.RunResourceReleaser
 }
 
 // Execute 执行 CLI 产品命令树。
@@ -230,7 +233,7 @@ func (c *Container) Init(ctx context.Context) error {
 			c.initErr = err
 			return
 		}
-		runWorkspace, err := buildLocalRunWorkspace(runtime.workspaceRoot, runtime.artifactRuns, runtime.completion, runtime.qaEvidence)
+		runWorkspace, err := buildLocalRunWorkspace(runtime.workspaceRoot, runtime.requestInputs, runtime.runInputs, runtime.artifactRuns, runtime.completion, runtime.qaEvidence, runtime.runResources)
 		if err != nil {
 			_ = c.logging.Close()
 			c.logging = nil
@@ -451,7 +454,7 @@ func buildProductRuntime(ctx context.Context, configDir string, cfg *platformcon
 		_ = runtimeLogging.Close()
 		return productRuntime{}, nil, fmt.Errorf("初始化 Artifact 控制面失败: %w", err)
 	}
-	environmentInjector := promptbuilder.NewEnvironmentContextInjector(cliEnvironmentContext(ctx, workspaceRoot, sandboxCfg.ExecutionProfile(), execStack.Shells))
+	environmentInjector := promptbuilder.NewEnvironmentContextInjector(cliEnvironmentContext(ctx, sandboxCfg.ExecutionProfile(), execStack.Shells))
 	tools := productTools
 	adapterRegistry := capservice.NewAdapterRegistry()
 	marketSvc, _, err := cliskill.NewMarketplaceServiceWith(cliskill.MarketplaceOptions{
@@ -488,6 +491,16 @@ func buildProductRuntime(ctx context.Context, configDir string, cfg *platformcon
 		return productRuntime{}, nil, err
 	}
 	inputStager, err := workservice.NewInputStager(inputRegistry, inputStore, idgen.NewUUIDGenerator())
+	if err != nil {
+		_ = runtimeLogging.Close()
+		return productRuntime{}, nil, err
+	}
+	viewProjector, err := localworkspace.NewViewProjector(inputStore)
+	if err != nil {
+		_ = runtimeLogging.Close()
+		return productRuntime{}, nil, err
+	}
+	viewBuilder, err := workservice.NewWorkspaceViewBuilder(inputStager, viewProjector, inputStore)
 	if err != nil {
 		_ = runtimeLogging.Close()
 		return productRuntime{}, nil, err
@@ -580,8 +593,8 @@ func buildProductRuntime(ctx context.Context, configDir string, cfg *platformcon
 	// system 仅短硬规则；完整 catalog 挂在 Skill 工具 DescriptionFunc。
 	injector := promptbuilder.ContextInjectorFunc(func(ctx context.Context, req promptbuilder.BuildRequest) (promptbuilder.Fragment, error) {
 		var b strings.Builder
-		b.WriteString("Skills 是任务流程包，不是可执行工具。加载技能必须调用 Skill(skill=...)；禁止把 office-ppt 等技能名当作独立工具调用。用户输入中的 $skill 或 skill:// 引用会在回合开始自动注入。用户指定的宿主机文件应直接作为 run_skill_command.inputs，由运行时在审批后 stage，禁止 run_command / Copy-Item 手动搬运。可用技能列表见 Skill 工具描述中的 <available_skills>。用户给出 Skill 的 GitHub/URL 地址要求安装时：调用 install_skill_from_source（须审批），禁止 run_command/curl/git clone 旁路。若 run_skill_command 返回 failure_kind=dependency_missing：调用 install_skill_dependencies（须审批，仅装 runtime 白名单包）后，用相同参数再跑命令（安装成功会清零重复失败计数）；sandbox_violation 勿当成缺包。收到 failure_kind=repeated_failure：禁止再次提交相同调用，必须改参或改策略。收到 failure_kind=no_progress：必须总结阻塞或询问用户，禁止继续空转。")
-		b.WriteString("\n\nRun 文件落点：中间脚本/临时文件用 write_file(\"$WORK_DIR/...\")。run_skill_command 返回不透明 candidate_id；required 交付物唯一匹配时 Harness 自动 Gate、发布与交付，多个匹配时只能用 select_deliverable_candidate 选择返回的 candidate_id。禁止提交路径或 locator，也禁止复制到仓库根或内部 runs 目录。")
+		b.WriteString("Skills 是任务流程包，不是可执行工具。加载技能必须调用 Skill(skill=...)；禁止把 office-ppt 等技能名当作独立工具调用。用户输入中的 $skill 或 skill:// 引用会在回合开始自动注入。请求里精确引用的已有文件由 Harness 自动绑定到当前 Run；run_skill_command 会自动 stage 已绑定输入和 command 入口脚本，禁止 run_command / Copy-Item 手动搬运。可用技能列表见 Skill 工具描述中的 <available_skills>。用户给出 Skill 的 GitHub/URL 地址要求安装时：调用 install_skill_from_source（须审批），禁止 run_command/curl/git clone 旁路。若 run_skill_command 返回 failure_kind=dependency_missing：调用 install_skill_dependencies（须审批，仅装 runtime 白名单包）后，用相同参数再跑命令（安装成功会清零重复失败计数）；sandbox_violation 勿当成缺包。收到 failure_kind=repeated_failure：禁止再次提交相同调用，必须改参或改策略。收到 failure_kind=no_progress：必须总结阻塞或询问用户，禁止继续空转。")
+		b.WriteString("\n\nRun 文件落点：中间脚本/临时文件直接使用当前根下相对路径，例如 write_file(\"create_ppt.js\")。run_skill_command 返回不透明 candidate_id；required 交付物唯一匹配时 Harness 自动 Gate、发布与交付，多个匹配时只能用 select_deliverable_candidate 选择返回的 candidate_id。禁止提交物理路径或 locator，也禁止复制到仓库根或内部 runs 目录。")
 		return promptbuilder.Fragment{
 			Name:     "skills_instructions",
 			Contents: b.String(),
@@ -602,10 +615,13 @@ func buildProductRuntime(ctx context.Context, configDir string, cfg *platformcon
 		approvalService:      baseApprovalSvc,
 		hookExecutionRunner:  execStack.Runner,
 		config:               cfg,
+		requestInputs:        inputRegistry,
+		runInputs:            viewBuilder,
 		workspaceRoot:        workspaceRoot,
 		artifactRuns:         artifactControl.initializer,
 		completion:           artifactControl.completion,
 		qaEvidence:           artifactControl.qaEvidence,
+		runResources:         []workcontract.RunResourceReleaser{skillScriptSvc},
 	}, log, nil
 }
 
@@ -753,10 +769,9 @@ func buildProductTools(sandboxCfg clisandbox.Config, baseApprovalSvc approvalcon
 	}, nil
 }
 
-func cliEnvironmentContext(ctx context.Context, cwd string, sandbox execmodel.SandboxProfile, shells execcontract.ShellCapabilityProvider) promptbuilder.EnvironmentContext {
+func cliEnvironmentContext(ctx context.Context, sandbox execmodel.SandboxProfile, shells execcontract.ShellCapabilityProvider) promptbuilder.EnvironmentContext {
 	environment := promptbuilder.EnvironmentContext{
 		OS:               runtime.GOOS,
-		Cwd:              cwd,
 		SandboxMode:      string(sandbox.Mode),
 		SandboxProvider:  sandbox.Provider,
 		ExternalApproval: true,
@@ -764,7 +779,6 @@ func cliEnvironmentContext(ctx context.Context, cwd string, sandbox execmodel.Sa
 	if shells == nil {
 		if sandbox.Provider == clisandbox.ProviderGenesisSandbox {
 			environment.OS = ""
-			environment.Cwd = "/workspace"
 		}
 		return environment
 	}
@@ -1053,7 +1067,7 @@ func buildCLIArtifactControl(stateRoot, workspaceRoot string, execStack productE
 	}, nil
 }
 
-func buildLocalRunWorkspace(projectDir string, artifactRuns artifactcontract.RunInitializer, completion artifactcontract.CompletionPolicy, qaEvidence artifactcontract.QAEvidenceRecorder) (app.RunWorkspaceRuntime, error) {
+func buildLocalRunWorkspace(projectDir string, requestInputs workcontract.RequestInputPlanner, runInputs workcontract.RunInputBinder, artifactRuns artifactcontract.RunInitializer, completion artifactcontract.CompletionPolicy, qaEvidence artifactcontract.QAEvidenceRecorder, runResources []workcontract.RunResourceReleaser) (app.RunWorkspaceRuntime, error) {
 	stateRoot := filepath.Join(projectDir, ".genesis")
 	manifests, err := localworkspace.NewManifestStore(stateRoot)
 	if err != nil {
@@ -1069,7 +1083,7 @@ func buildLocalRunWorkspace(projectDir string, artifactRuns artifactcontract.Run
 	if err != nil {
 		return app.RunWorkspaceRuntime{}, err
 	}
-	preparer, err := workservice.NewRunPreparer(ids, resolver, localworkspace.StateRootResolver{ProjectStateDir: stateRoot, UserStateDir: stateRoot}, provisioner, manifests)
+	preparer, err := workservice.NewRunPreparer(workservice.RunPreparerDeps{IDs: ids, Resolver: resolver, StateRoots: localworkspace.StateRootResolver{ProjectStateDir: stateRoot, UserStateDir: stateRoot}, Provisioner: provisioner, Manifests: manifests, Inputs: runInputs})
 	if err != nil {
 		return app.RunWorkspaceRuntime{}, err
 	}
@@ -1080,7 +1094,7 @@ func buildLocalRunWorkspace(projectDir string, artifactRuns artifactcontract.Run
 		return app.RunWorkspaceRuntime{}, err
 	}
 	projectRef := &workmodel.ResourceRef{Authority: "host", Scheme: "project", ID: filepath.ToSlash(projectDir), Path: "."}
-	return app.RunWorkspaceRuntime{Preparer: preparer, AgentApps: appResolver, IntentResolver: workservice.NewTaskIntentResolver(), ProjectRoot: projectRef, ProjectDir: projectDir, ProductModes: modes, BackendModes: modes, MaximumAccess: execmodel.WorkspaceAccessReadWrite, ArtifactRuns: artifactRuns, Completion: completion, QAEvidence: qaEvidence}, nil
+	return app.RunWorkspaceRuntime{Preparer: preparer, AgentApps: appResolver, IntentResolver: workservice.NewTaskIntentResolver(), RequestInputs: requestInputs, ProjectRoot: projectRef, ProjectDir: projectDir, ProductModes: modes, BackendModes: modes, MaximumAccess: execmodel.WorkspaceAccessReadWrite, ArtifactRuns: artifactRuns, Completion: completion, QAEvidence: qaEvidence, WorkspaceCompletion: localworkspace.NewGitChangeGuard(), RunResources: append([]workcontract.RunResourceReleaser(nil), runResources...)}, nil
 }
 
 func buildWebOptions(cfg *platformconfig.Config, log logger.Logger) (shared.WebBuildOptions, error) {

@@ -96,12 +96,18 @@
 - [x] 统一 InputRef/InputStager：hash、重名、只读视图、版本冲突；CLI Skill 已接入。
 - [x] `work/<execution_binding_id>` 隔离根 Run 与 Skill execution。
 - [x] 清理 Skill 裸路径 staging、input/output/work 同目录和 basename 覆盖逻辑。
+- [x] `RunManifest v3` 固化根 execution 的 `InputManifest + WorkspaceViewManifest`；请求中的精确已有文件在 LLM 启动前完成版本冻结、不可变快照和同路径工作副本投影。
+- [x] 所有本地文件工具的裸相对路径只按当前 PreparedRun WorkDir 解析，删除 bootstrap 项目根回退；Skill 自动收集 Run bound inputs 与 command 入口脚本。
 
 **当前剩余：** Enterprise 持久化租户 RunManifest/InputStore 的具体数据库/对象存储 adapter；Workflow/CollaborationSpace 产品编排接入。L2/L3 通用 binding 控制面已经完成；`RunManifestStore` 已要求 tenant_id 查询与 expected revision CAS，部署实现必须满足该契约。
 
 **2026-07-17 阶段记录：** 删除 Enterprise 生产内存 Store 默认；容器必须注入租户 RunManifestStore。Get/AddExecution 强制 tenant_id，追加使用 expected revision CAS；RunPreparer 对版本冲突进行最多三次有界重读重试。Manifest 同时校验 StateRoot、ProjectRoot、execution owner 与顶层 scope 一致。
 
-**明确删除：** 默认当前进程 cwd 的 WorkspaceRoot；不同 execution 共享可写 work；直接 `filepath.Base` 覆盖输入；只靠约定实现只读输入。
+**2026-07-18 阶段记录：** 修复文件工具静态项目根与 Skill 当前 WorkDir 的 split-brain。模型只看 `root="."`、mode/access/persistence 和 WorkspaceView 相对别名；物理 cwd 不进入提示。`project_workspace` 增加 RunStart Git 基线增量门禁；remote optional/required 不再创建 Host 降级 attempt。显式 `SandboxDisabled` 仍可使用受审计 Host direct，此时隔离工作目录是路径命名空间而非 OS 安全边界。
+
+远程 Skill session 改为 Run 生命周期资源：Run 内复用，Run 任意终态立即关闭；10 分钟 idle TTL 只保留为异常退出兜底，避免连续对话因旧 session 占用租户内存配额而产生重复失败。
+
+**明确删除：** 默认当前进程 cwd 或 bootstrap 项目根的路径回退；不同 execution 共享可写 work；无条件 `filepath.Base` 扁平化输入；模型提交宿主绝对输入；remote optional 的 Host 执行降级；只靠约定实现只读输入。
 
 **验收：** 改变 cwd/UI 目录不迁移既有 Run；并发 execution 不共享可写目录；本地/远程 Input manifest 一致。
 
