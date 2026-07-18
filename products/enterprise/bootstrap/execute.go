@@ -42,6 +42,7 @@ func newRootCmd(parent context.Context) *cobra.Command {
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c := NewContainer(ContainerOptions{ConfigDirRef: &configDir})
+			defer c.Close()
 
 			ctx, stop := signal.NotifyContext(parent, syscall.SIGINT, syscall.SIGTERM)
 			defer stop()
@@ -63,9 +64,7 @@ func newRootCmd(parent context.Context) *cobra.Command {
 			fmt.Printf("Genesis Agent Enterprise HTTP API 已启动: %s\n", server.Addr())
 			fmt.Println("按 Ctrl+C 优雅停止服务...")
 
-			err := server.Start(ctx)
-			_ = c.Close()
-			return err
+			return server.Start(ctx)
 		},
 	}
 

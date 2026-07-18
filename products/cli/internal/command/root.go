@@ -26,8 +26,15 @@ type ServiceOptions struct {
 	WorkspaceRoot string
 }
 
-// ServiceFactory 由产品分发层注入 AgentService 构建方式。
-type ServiceFactory func(ctx context.Context, opts ServiceOptions) (app.AgentService, error)
+// ServiceHandle 显式绑定 AgentService 与其运行时生命周期。
+// 命令结束必须 Close，避免后台续租、MCP 连接和日志句柄泄漏。
+type ServiceHandle interface {
+	Service() app.AgentService
+	Close() error
+}
+
+// ServiceFactory 由产品分发层注入可关闭的 AgentService 运行时。
+type ServiceFactory func(ctx context.Context, opts ServiceOptions) (ServiceHandle, error)
 
 // ExecuteWithFactory 使用产品分发层注入的 service factory 执行 CLI。
 func ExecuteWithFactory(factory ServiceFactory) error {
@@ -42,7 +49,7 @@ func ExecuteWithFactories(factory ServiceFactory, mcpFactory MCPAdminFactory) er
 	return newRootCmd(factory, mcpFactory).Execute()
 }
 
-func initService(ctx context.Context, factory ServiceFactory, configDirRef *string, quiet bool, sandboxModeRef *string) (app.AgentService, error) {
+func initService(ctx context.Context, factory ServiceFactory, configDirRef *string, quiet bool, sandboxModeRef *string) (ServiceHandle, error) {
 	var sandboxCfg clisandbox.Config
 	var err error
 	if sandboxModeRef != nil && strings.TrimSpace(*sandboxModeRef) != "" {
@@ -51,14 +58,26 @@ func initService(ctx context.Context, factory ServiceFactory, configDirRef *stri
 			return nil, err
 		}
 	}
-	svc, err := factory(ctx, ServiceOptions{ConfigDirRef: configDirRef, Quiet: quiet, Sandbox: sandboxCfg, WorkspaceRoot: currentWorkspaceRoot()})
+	handle, err := factory(ctx, ServiceOptions{ConfigDirRef: configDirRef, Quiet: quiet, Sandbox: sandboxCfg, WorkspaceRoot: currentWorkspaceRoot()})
 	if err != nil {
 		return nil, err
 	}
-	if svc == nil {
-		return nil, fmt.Errorf("CLI service factory 返回了空 AgentService")
+	if handle == nil || handle.Service() == nil {
+		if handle != nil {
+			_ = handle.Close()
+		}
+		return nil, fmt.Errorf("CLI service factory 返回了空 ServiceHandle")
 	}
-	return svc, nil
+	return handle, nil
+}
+
+func closeServiceHandle(handle ServiceHandle, runErr *error) {
+	if handle == nil {
+		return
+	}
+	if err := handle.Close(); err != nil && runErr != nil && *runErr == nil {
+		*runErr = fmt.Errorf("关闭 CLI 运行时失败: %w", err)
+	}
 }
 
 func currentWorkspaceRoot() string {

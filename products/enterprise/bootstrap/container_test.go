@@ -25,6 +25,13 @@ func (testArtifactControl) RegisterProducedResource(context.Context, workcontrac
 func (testArtifactControl) BindRemoteSession(context.Context, string, string, string, sandboxcontract.WorkspaceRef, time.Time) error {
 	return nil
 }
+func (testArtifactControl) LoadExecutionSession(context.Context, string) (sandboxcontract.WorkspaceRef, bool, error) {
+	return sandboxcontract.WorkspaceRef{}, false, nil
+}
+func (testArtifactControl) SaveExecutionSession(context.Context, string, sandboxcontract.WorkspaceRef) error {
+	return nil
+}
+func (testArtifactControl) DeleteExecutionSession(context.Context, string) error { return nil }
 func (testArtifactControl) InitializeRun(context.Context, artifactcontract.RunInitializationRequest) error {
 	return nil
 }

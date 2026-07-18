@@ -33,7 +33,7 @@ const (
 type Deps struct {
 	Runner         execcontract.ExecutionRunner
 	Shells         execcontract.ShellCapabilityProvider
-	SessionManager execcontract.InteractiveSessionRunner // 注入会话管理器端口（可选，向后兼容）
+	SessionManager execcontract.InteractiveSessionRunner // PTY/后台命令会话管理器（可选）
 	Resolver       fscontract.PathResolver
 	Approval       approvalcontract.Service
 	Locker         scheduler.ResourceLocker
@@ -97,7 +97,7 @@ func (t *Tool) GetInfo() *tool.Info {
 	}
 	return &tool.Info{
 		Name:        "run_command",
-		Description: "在当前 workspace 内或经审批目录下执行平台Shell命令。仅用于运行程序、构建、测试或结构化文件工具无法表达的操作；列目录、遍历、查找、搜索和读取文件应优先使用list_dir、walk_dir、glob、grep、read_file。command只填写脚本正文，不要嵌套Shell启动命令。支持后台异步运行与PTY交互会话。",
+		Description: "在当前 workspace 内或经审批目录下执行一条原子平台 Shell 命令。远程 sandbox 的普通同步调用不承诺保留容器内临时状态：不得在一次调用写脚本、下一次调用再执行；多步骤必须合并为一条命令，Skill 脚本必须使用 run_skill_command 及 inputs。仅用于运行程序、构建、测试或结构化文件工具无法表达的操作；列目录、遍历、查找、搜索和读取文件应优先使用 list_dir、walk_dir、glob、grep、read_file。command 只填写脚本正文，不要嵌套 Shell 启动命令。后台或 PTY 使用显式交互会话。",
 		Parameters: &tool.ParameterSchema{
 			Type: "object",
 			Properties: map[string]*tool.ParameterSchema{

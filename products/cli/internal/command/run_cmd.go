@@ -52,7 +52,7 @@ func newRunCmd(configDirRef *string, sandboxModeRef *string, factory ServiceFact
   agent run --quiet "北京现在几点？" > out.txt  仅输出最终回答（适合重定向）
   agent run --deliverable deck.pptx "按 brief 做演示文稿"  显式声明交付物（优先于 prompt 猜测）`,
 		Args: cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
+		RunE: func(cmd *cobra.Command, args []string) (runErr error) {
 			ctx := context.Background()
 
 			input := strings.TrimSpace(args[0])
@@ -65,10 +65,12 @@ func newRunCmd(configDirRef *string, sandboxModeRef *string, factory ServiceFact
 
 			// JSON/quiet 模式不能出现交互式审批提示，避免污染机器可读输出。
 			serviceQuiet := quiet || jsonOutput
-			svc, err := initService(ctx, factory, configDirRef, serviceQuiet, sandboxModeRef)
+			handle, err := initService(ctx, factory, configDirRef, serviceQuiet, sandboxModeRef)
 			if err != nil {
 				return fmt.Errorf("初始化失败: %w", err)
 			}
+			defer closeServiceHandle(handle, &runErr)
+			svc := handle.Service()
 
 			var session *domain.Session
 			if id := strings.TrimSpace(resumeID); id != "" {

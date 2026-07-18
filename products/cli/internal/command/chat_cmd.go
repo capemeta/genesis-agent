@@ -51,14 +51,16 @@ func newChatCmd(configDirRef *string, sandboxModeRef *string, factory ServiceFac
   /resume ID 恢复指定会话
   /help      显示帮助信息
   /quit      退出程序`,
-		RunE: func(cmd *cobra.Command, args []string) error {
+		RunE: func(cmd *cobra.Command, args []string) (runErr error) {
 			ctx := context.Background()
 
 			// TUI 模式：禁用 stdout 日志/Trace，避免污染 Bubble Tea 画面
-			svc, err := initService(ctx, factory, configDirRef, true, sandboxModeRef)
+			handle, err := initService(ctx, factory, configDirRef, true, sandboxModeRef)
 			if err != nil {
 				return fmt.Errorf("初始化失败: %w\n\n请检查配置文件或 API Key 是否正确", err)
 			}
+			defer closeServiceHandle(handle, &runErr)
+			svc := handle.Service()
 
 			var session *domain.Session
 			switch {

@@ -32,10 +32,15 @@ import (
 	"genesis-agent/internal/capabilities/skill/script/materialize"
 	workcontract "genesis-agent/internal/capabilities/workspace/contract"
 	workmodel "genesis-agent/internal/capabilities/workspace/model"
+	"genesis-agent/internal/platform/contextutil"
 	"genesis-agent/internal/platform/logger"
 )
 
-const sessionIdleTTL = 10 * time.Minute
+const (
+	sessionIdleTTL         = 10 * time.Minute
+	sessionCleanupInterval = time.Minute
+	sessionCacheTTL        = 24 * time.Hour
+)
 
 // Service 编排 Skill 命令 materialize、工作空间与执行。
 type Service struct {
@@ -58,16 +63,27 @@ type Service struct {
 	reservations          artifactcontract.OutputReservationAllocator
 	deliverables          artifactcontract.DeliverableSpecStore
 
-	mu       sync.Mutex
-	sessions map[string]*remoteSession
-	entries  map[string]map[string]struct{}
+	mu               sync.Mutex
+	sessions         map[string]*remoteSession
+	entries          map[string]map[string]struct{}
+	runSessions      map[string]map[string]struct{}
+	closed           bool
+	activeExecutions sync.WaitGroup
+	closeOnce        sync.Once
+	closeErr         error
+	backgroundCancel context.CancelFunc
+	backgroundWG     sync.WaitGroup
 }
 
 type remoteSession struct {
-	session      *sandboxsession.Session
-	skillDir     string
-	materialized bool
-	lastUsed     time.Time
+	execMu         sync.Mutex
+	session        *sandboxsession.Session
+	workspace      sandboxcontract.WorkspaceRef
+	materialized   map[string]bool
+	lastUsed       time.Time
+	inUse          int
+	stateLoaded    bool
+	statePersisted bool
 }
 
 // Deps 是 Skill Service 依赖。
@@ -93,6 +109,15 @@ type Deps struct {
 // RemoteSessionBinder 在远程 session 创建后持久绑定纯数据 WorkspaceRef 与权威 lease。
 type RemoteSessionBinder interface {
 	BindRemoteSession(ctx context.Context, tenantID, runID, bindingID string, workspace sandboxcontract.WorkspaceRef, expiresAt time.Time) error
+	ExecutionSessionStore
+}
+
+// ExecutionSessionStore 持久化逻辑执行会话到 durable workspace 的映射。
+// 它只保存 workspace_id，不保存短命的容器/session_id，因此进程重启后可挂载新容器恢复状态。
+type ExecutionSessionStore interface {
+	LoadExecutionSession(ctx context.Context, key string) (sandboxcontract.WorkspaceRef, bool, error)
+	SaveExecutionSession(ctx context.Context, key string, workspace sandboxcontract.WorkspaceRef) error
+	DeleteExecutionSession(ctx context.Context, key string) error
 }
 
 // DependencyInstaller 是可选的同回合安装端口。
@@ -117,7 +142,8 @@ func New(deps Deps) (*Service, error) {
 	if log == nil {
 		log = logger.NewNop()
 	}
-	return &Service{
+	backgroundCtx, backgroundCancel := context.WithCancel(context.Background())
+	service := &Service{
 		skills:                deps.Skills,
 		runner:                deps.Runner,
 		approval:              deps.Approval,
@@ -138,7 +164,14 @@ func New(deps Deps) (*Service, error) {
 		deliverables:          deps.Deliverables,
 		sessions:              make(map[string]*remoteSession),
 		entries:               make(map[string]map[string]struct{}),
-	}, nil
+		runSessions:           make(map[string]map[string]struct{}),
+		backgroundCancel:      backgroundCancel,
+	}
+	if deps.SessionClient != nil {
+		service.backgroundWG.Add(1)
+		go service.runSessionCleanup(backgroundCtx)
+	}
+	return service, nil
 }
 
 // Close 释放 Service 缓存的远端 sandbox session。
@@ -146,50 +179,54 @@ func (s *Service) Close(ctx context.Context) error {
 	if s == nil {
 		return nil
 	}
-	s.mu.Lock()
-	sessions := make([]*sandboxsession.Session, 0, len(s.sessions))
-	for key, item := range s.sessions {
-		if item != nil && item.session != nil {
-			sessions = append(sessions, item.session)
+	s.closeOnce.Do(func() {
+		// 先阻止新执行进入，再等待已经登记的执行完成；Wait 与 Add 由 closed+mu
+		// 建立顺序，避免关闭 Session 时仍有命令使用它。
+		s.mu.Lock()
+		s.closed = true
+		s.mu.Unlock()
+		if s.backgroundCancel != nil {
+			s.backgroundCancel()
+			s.backgroundWG.Wait()
 		}
-		delete(s.sessions, key)
-	}
-	s.entries = make(map[string]map[string]struct{})
-	s.mu.Unlock()
-	var firstErr error
-	for _, sess := range sessions {
-		if err := sess.Close(ctx); err != nil && firstErr == nil {
-			firstErr = err
+		s.activeExecutions.Wait()
+
+		s.mu.Lock()
+		sessions := make([]*sandboxsession.Session, 0, len(s.sessions))
+		for key, item := range s.sessions {
+			if item != nil && item.session != nil {
+				sessions = append(sessions, item.session)
+				item.session = nil
+			}
+			delete(s.sessions, key)
 		}
-	}
-	return firstErr
+		s.entries = make(map[string]map[string]struct{})
+		s.runSessions = make(map[string]map[string]struct{})
+		s.mu.Unlock()
+		for _, sess := range sessions {
+			if err := sess.Close(ctx); err != nil && s.closeErr == nil {
+				s.closeErr = err
+			}
+		}
+	})
+	return s.closeErr
 }
 
-// ReleaseRun 立即释放指定 Run 缓存的远端 session，避免等待空闲 TTL 占用租户配额。
-// 同一 Run 内的多条 Skill 命令仍通过 binding key 复用同一 session。
+// ReleaseRun 只释放 Run 对逻辑执行会话的活跃引用。
+// 容器保留到空闲 TTL，Workspace 则独立持久化，保证连续对话不会在每轮结束时丢失路径和文件状态。
 func (s *Service) ReleaseRun(ctx context.Context, prepared workmodel.PreparedRun) {
 	if s == nil || strings.TrimSpace(prepared.Manifest.RunID) == "" {
 		return
 	}
-	prefix := prepared.Manifest.RunID + "::"
-	var sessions []*sandboxsession.Session
 	s.mu.Lock()
-	for key, item := range s.sessions {
-		if !strings.HasPrefix(key, prefix) {
-			continue
+	delete(s.runSessions, prepared.Manifest.RunID)
+	prefix := prepared.Manifest.RunID + "::"
+	for key := range s.entries {
+		if strings.HasPrefix(key, prefix) {
+			delete(s.entries, key)
 		}
-		if item != nil && item.session != nil {
-			sessions = append(sessions, item.session)
-		}
-		delete(s.sessions, key)
-		delete(s.entries, key)
 	}
 	s.mu.Unlock()
-	for _, sess := range sessions {
-		if err := sess.Close(ctx); err != nil {
-			s.log.Warn("释放 Run 远端 Skill session 失败", "run_id", prepared.Manifest.RunID, "error", err)
-		}
-	}
 }
 
 func (s *Service) Run(ctx context.Context, req scriptcontract.RunRequest) (*scriptcontract.RunResult, error) {
@@ -412,7 +449,7 @@ func (s *Service) Run(ctx context.Context, req scriptcontract.RunRequest) (*scri
 		} else {
 			execution = s.runLocal(ctx, meta, runID, req, timeout, sandbox)
 		}
-		s.noteKnownEntries(sessionKey(runID, req.Binding.ID, meta.Name), execution.Staged, execution.Produced)
+		s.noteKnownEntries(entryKey(runID, req.Binding.ID, meta.Name), execution.Staged, execution.Produced)
 		result, err := execution.Result, execution.Err
 		out.StagingDurationMS += execution.StagingDurationMS
 		if result != nil {
@@ -568,60 +605,44 @@ func (s *Service) runRemote(ctx context.Context, meta skillmodel.Metadata, runID
 	if s.sessionClient == nil || s.fileClient == nil {
 		return skillExecutionAttempt{Workspace: remoteWorkspace, Err: fmt.Errorf("sandbox_unavailable: genesis-sandbox session/file client未配置")}
 	}
-	s.cleanupStaleSessions(context.Background())
-	key := sessionKey(runID, req.Binding.ID, meta.Name)
-	s.mu.Lock()
-	cached := s.sessions[key]
-	s.mu.Unlock()
-	if cached == nil {
-		sess, err := sandboxsession.Open(ctx, sandboxsession.Deps{Sessions: s.sessionClient, Files: s.fileClient}, sandboxsession.Options{
-			Workspace: s.workspaceRef,
-			Sandbox:   sandbox,
-			Run: execcontract.RunOptions{
-				Binding:   req.Binding,
-				Workspace: remoteWorkspace,
-			},
-		})
-		if err != nil {
-			return skillExecutionAttempt{Workspace: remoteWorkspace, Err: fmt.Errorf("sandbox_unavailable: genesis-sandbox session打开失败: %w", err)}
-		}
-		cached = &remoteSession{session: sess, skillDir: remoteWorkspace.SkillDir, lastUsed: time.Now()}
-		if s.remoteSessions == nil {
-			_ = sess.Close(context.Background())
-			return skillExecutionAttempt{Workspace: remoteWorkspace, Err: fmt.Errorf("远程 execution 未装配持久 SessionBindingStore")}
-		}
-		expiresAt := sess.ExpiresAt()
-		if expiresAt.IsZero() || !expiresAt.After(time.Now()) {
-			_ = sess.Close(context.Background())
-			return skillExecutionAttempt{Workspace: remoteWorkspace, Err: fmt.Errorf("sandbox_unavailable: 远程 session 未返回有效 lease")}
-		}
-		if err := s.remoteSessions.BindRemoteSession(ctx, req.Binding.Owner.TenantID, runID, req.Binding.ID, sess.Workspace(), expiresAt); err != nil {
-			_ = sess.Close(context.Background())
-			return skillExecutionAttempt{Workspace: remoteWorkspace, Err: err}
-		}
-		s.mu.Lock()
-		s.sessions[key] = cached
-		s.mu.Unlock()
+	if s.remoteSessions == nil {
+		return skillExecutionAttempt{Workspace: remoteWorkspace, Err: fmt.Errorf("远程 execution 未装配持久 SessionBindingStore")}
 	}
-	cached.lastUsed = time.Now()
-	if err := ensureRemoteWorkspace(ctx, cached.session, remoteWorkspace); err != nil {
-		return skillExecutionAttempt{WorkDir: cached.skillDir, Workspace: remoteWorkspace, Err: err}
+	key := executionSessionKey(ctx, req.Binding, sandbox, s.workspaceRef)
+	cached, err := s.acquireExecutionSession(key, runID)
+	if err != nil {
+		return skillExecutionAttempt{Workspace: remoteWorkspace, Err: err}
 	}
-	if !cached.materialized {
+	defer s.releaseExecutionSession(cached)
+	cached.execMu.Lock()
+	defer cached.execMu.Unlock()
+
+	if err := s.ensureExecutionSession(ctx, key, cached, req.Binding, remoteWorkspace, sandbox); err != nil {
+		return skillExecutionAttempt{WorkDir: remoteWorkspace.SkillDir, Workspace: remoteWorkspace, Err: err}
+	}
+	materializationKey := remoteWorkspace.SkillDir + "\x00" + string(meta.PackageID)
+	if !cached.materialized[materializationKey] {
 		if err := s.materializePackageRemote(ctx, req.Catalog, meta, cached.session, remoteWorkspace.SkillDir); err != nil {
-			return skillExecutionAttempt{WorkDir: cached.skillDir, Workspace: remoteWorkspace, Err: err}
+			return skillExecutionAttempt{WorkDir: remoteWorkspace.SkillDir, Workspace: remoteWorkspace, Err: err}
 		}
-		cached.materialized = true
+		cached.materialized[materializationKey] = true
+	}
+	expiresAt := cached.session.ExpiresAt()
+	if expiresAt.IsZero() || !expiresAt.After(time.Now()) {
+		return skillExecutionAttempt{WorkDir: remoteWorkspace.SkillDir, Workspace: remoteWorkspace, Err: fmt.Errorf("sandbox_unavailable: 远程 session 未返回有效 lease")}
+	}
+	if err := s.remoteSessions.BindRemoteSession(ctx, req.Binding.Owner.TenantID, runID, req.Binding.ID, cached.session.Workspace(), expiresAt); err != nil {
+		return skillExecutionAttempt{WorkDir: remoteWorkspace.SkillDir, Workspace: remoteWorkspace, Err: err}
 	}
 	stagingStarted := time.Now()
 	staged, err := stageInputManifestRemote(ctx, s.inputSnapshots, req.Binding, req.Inputs, cached.session, remoteWorkspace.SkillDir)
 	stagingDurationMS := time.Since(stagingStarted).Milliseconds()
 	if err != nil {
-		return skillExecutionAttempt{WorkDir: cached.skillDir, Workspace: remoteWorkspace, StagingDurationMS: stagingDurationMS, Err: err}
+		return skillExecutionAttempt{WorkDir: remoteWorkspace.SkillDir, Workspace: remoteWorkspace, StagingDurationMS: stagingDurationMS, Err: err}
 	}
 	before, err := snapshotRemoteFiles(ctx, cached.session, remoteWorkspace.SkillDir)
 	if err != nil {
-		return skillExecutionAttempt{WorkDir: cached.skillDir, Staged: staged, Workspace: remoteWorkspace, StagingDurationMS: stagingDurationMS, Err: err}
+		return skillExecutionAttempt{WorkDir: remoteWorkspace.SkillDir, Staged: staged, Workspace: remoteWorkspace, StagingDurationMS: stagingDurationMS, Err: err}
 	}
 	outputDir := remoteWorkspace.OutputDir
 	if strings.TrimSpace(outputDir) == "" {
@@ -629,53 +650,250 @@ func (s *Service) runRemote(ctx context.Context, meta skillmodel.Metadata, runID
 	}
 	reserveResult, reservedEnv, err := s.prepareOutputReservations(ctx, req.Binding, runID, outputDir)
 	if err != nil {
-		return skillExecutionAttempt{WorkDir: cached.skillDir, Staged: staged, Workspace: remoteWorkspace, StagingDurationMS: stagingDurationMS, Err: err}
+		return skillExecutionAttempt{WorkDir: remoteWorkspace.SkillDir, Staged: staged, Workspace: remoteWorkspace, StagingDurationMS: stagingDurationMS, Err: err}
 	}
 	if err := ensureRemoteReservationDirs(ctx, cached.session, outputDir, reserveResult.Reservations); err != nil {
-		return skillExecutionAttempt{WorkDir: cached.skillDir, Staged: staged, Workspace: remoteWorkspace, StagingDurationMS: stagingDurationMS, Err: err}
+		return skillExecutionAttempt{WorkDir: remoteWorkspace.SkillDir, Staged: staged, Workspace: remoteWorkspace, StagingDurationMS: stagingDurationMS, Err: err}
 	}
 	result, err := cached.session.Run(ctx, execmodel.Command{Command: req.Command, Cwd: remoteWorkspace.SkillDir, Shell: "auto", Env: mergeReservedEnv(remoteSkillEnv(remoteWorkspace), reservedEnv)}, execcontract.RunOptions{Timeout: timeout, Sandbox: sandbox, Binding: req.Binding, Workspace: remoteWorkspace})
 	if err != nil {
-		return skillExecutionAttempt{WorkDir: cached.skillDir, Staged: staged, Workspace: remoteWorkspace, StagingDurationMS: stagingDurationMS, Err: err}
+		return skillExecutionAttempt{WorkDir: remoteWorkspace.SkillDir, Staged: staged, Workspace: remoteWorkspace, StagingDurationMS: stagingDurationMS, Err: err}
 	}
 	after, err := snapshotRemoteFiles(ctx, cached.session, remoteWorkspace.SkillDir)
 	if err != nil {
-		return skillExecutionAttempt{Result: result, WorkDir: cached.skillDir, Staged: staged, Workspace: remoteWorkspace, StagingDurationMS: stagingDurationMS, Err: err}
+		return skillExecutionAttempt{Result: result, WorkDir: remoteWorkspace.SkillDir, Staged: staged, Workspace: remoteWorkspace, StagingDurationMS: stagingDurationMS, Err: err}
 	}
 	discovered := diffSnapshots(before, after)
 	reservedHits := collectReservedHitsRemote(ctx, cached.session, outputDir, remoteWorkspace.SkillDir, reserveResult.Reservations, after)
 	produced := mergeProducedCandidates(reservedHits, discovered)
 	produced, err = s.filterProducedByDeliverables(ctx, req.Binding.Owner.TenantID, runID, reservedHits, produced)
 	if err != nil {
-		return skillExecutionAttempt{Result: result, WorkDir: cached.skillDir, Staged: staged, Workspace: remoteWorkspace, StagingDurationMS: stagingDurationMS, Err: err}
+		return skillExecutionAttempt{Result: result, WorkDir: remoteWorkspace.SkillDir, Staged: staged, Workspace: remoteWorkspace, StagingDurationMS: stagingDurationMS, Err: err}
 	}
 	// 登记前用 live Session.ExpiresAt 刷新 binding，避免心跳滑动后 produced > binding 快照。
-	expiresAt := cached.session.ExpiresAt()
+	expiresAt = cached.session.ExpiresAt()
 	if expiresAt.IsZero() || !expiresAt.After(time.Now()) {
-		return skillExecutionAttempt{Result: result, WorkDir: cached.skillDir, Staged: staged, Workspace: remoteWorkspace, StagingDurationMS: stagingDurationMS, Err: fmt.Errorf("sandbox_unavailable: 远程 session lease 已失效")}
+		return skillExecutionAttempt{Result: result, WorkDir: remoteWorkspace.SkillDir, Staged: staged, Workspace: remoteWorkspace, StagingDurationMS: stagingDurationMS, Err: fmt.Errorf("sandbox_unavailable: 远程 session lease 已失效")}
 	}
 	if err := s.remoteSessions.BindRemoteSession(ctx, req.Binding.Owner.TenantID, runID, req.Binding.ID, cached.session.Workspace(), expiresAt); err != nil {
-		return skillExecutionAttempt{Result: result, WorkDir: cached.skillDir, Staged: staged, Workspace: remoteWorkspace, StagingDurationMS: stagingDurationMS, Err: err}
+		return skillExecutionAttempt{Result: result, WorkDir: remoteWorkspace.SkillDir, Staged: staged, Workspace: remoteWorkspace, StagingDurationMS: stagingDurationMS, Err: err}
 	}
 	descriptors, err := s.registerProducedResources(ctx, runID, req.Binding, meta, produced, after, workmodel.ResourceAvailabilityLeased, &expiresAt)
-	return skillExecutionAttempt{Result: result, Produced: produced, Descriptors: descriptors, WorkDir: cached.skillDir, Staged: staged, Workspace: remoteWorkspace, StagingDurationMS: stagingDurationMS, Err: err}
+	return skillExecutionAttempt{Result: result, Produced: produced, Descriptors: descriptors, WorkDir: remoteWorkspace.SkillDir, Staged: staged, Workspace: remoteWorkspace, StagingDurationMS: stagingDurationMS, Err: err}
 }
 
 func (s *Service) cleanupStaleSessions(ctx context.Context) {
 	now := time.Now()
-	var stale []*sandboxsession.Session
+	type candidate struct {
+		key  string
+		item *remoteSession
+	}
+	var candidates []candidate
 	s.mu.Lock()
 	for key, item := range s.sessions {
-		if item == nil || item.session == nil || now.Sub(item.lastUsed) <= sessionIdleTTL {
+		if item == nil || item.session == nil || item.inUse > 0 || s.sessionReferencedLocked(key) || now.Sub(item.lastUsed) <= sessionIdleTTL {
 			continue
 		}
-		stale = append(stale, item.session)
-		delete(s.sessions, key)
+		candidates = append(candidates, candidate{key: key, item: item})
 	}
 	s.mu.Unlock()
-	for _, sess := range stale {
-		_ = sess.Close(ctx)
+	for _, candidate := range candidates {
+		candidate.item.execMu.Lock()
+		s.mu.Lock()
+		if candidate.item.session == nil || candidate.item.inUse > 0 || s.sessionReferencedLocked(candidate.key) || time.Since(candidate.item.lastUsed) <= sessionIdleTTL {
+			s.mu.Unlock()
+			candidate.item.execMu.Unlock()
+			continue
+		}
+		sess := candidate.item.session
+		candidate.item.session = nil
+		s.mu.Unlock()
+		if err := sess.Close(ctx); err != nil {
+			s.log.Warn("关闭空闲远端执行 session 失败", "execution_session", candidate.key, "error", err)
+		}
+		candidate.item.execMu.Unlock()
 	}
+
+	s.mu.Lock()
+	for key, item := range s.sessions {
+		if item != nil && item.session == nil && item.inUse == 0 && !s.sessionReferencedLocked(key) && now.Sub(item.lastUsed) > sessionCacheTTL {
+			delete(s.sessions, key)
+		}
+	}
+	s.mu.Unlock()
+}
+
+func (s *Service) runSessionCleanup(ctx context.Context) {
+	defer s.backgroundWG.Done()
+	ticker := time.NewTicker(sessionCleanupInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.cleanupStaleSessions(ctx)
+		}
+	}
+}
+
+func (s *Service) acquireExecutionSession(key, runID string) (*remoteSession, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil, fmt.Errorf("sandbox_unavailable: skill script service 已关闭")
+	}
+	item := s.sessions[key]
+	if item == nil {
+		item = &remoteSession{materialized: make(map[string]bool), lastUsed: time.Now()}
+		s.sessions[key] = item
+	}
+	s.activeExecutions.Add(1)
+	item.inUse++
+	item.lastUsed = time.Now()
+	if s.runSessions[runID] == nil {
+		s.runSessions[runID] = make(map[string]struct{})
+	}
+	s.runSessions[runID][key] = struct{}{}
+	return item, nil
+}
+
+func (s *Service) releaseExecutionSession(item *remoteSession) {
+	if item == nil {
+		return
+	}
+	s.mu.Lock()
+	if item.inUse > 0 {
+		item.inUse--
+	}
+	item.lastUsed = time.Now()
+	s.mu.Unlock()
+	s.activeExecutions.Done()
+}
+
+func (s *Service) sessionReferencedLocked(key string) bool {
+	for _, keys := range s.runSessions {
+		if _, ok := keys[key]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Service) ensureExecutionSession(ctx context.Context, key string, cached *remoteSession, binding execmodel.ExecutionBinding, workspace execmodel.ExecutionWorkspace, sandbox execmodel.SandboxProfile) error {
+	if cached.session == nil {
+		if err := s.openExecutionSession(ctx, key, cached, binding, workspace, sandbox); err != nil {
+			return err
+		}
+	}
+	if err := ensureRemoteWorkspace(ctx, cached.session, workspace); err == nil {
+		return nil
+	} else if !isRemoteSessionUnavailable(err) {
+		return err
+	}
+
+	// 容器是可替换执行载体。仅在执行命令前的目录探测阶段自动重建，
+	// 避免对可能已经产生副作用的业务命令做不安全重试。
+	broken := cached.session
+	cached.session = nil
+	if closeErr := broken.Close(context.Background()); closeErr != nil {
+		s.log.Warn("关闭失效远端 session 失败", "execution_session", key, "error", closeErr)
+	}
+	if err := s.openExecutionSession(ctx, key, cached, binding, workspace, sandbox); err != nil {
+		return fmt.Errorf("sandbox_unavailable: 重建远端执行 session 失败: %w", err)
+	}
+	if err := ensureRemoteWorkspace(ctx, cached.session, workspace); err != nil {
+		return fmt.Errorf("sandbox_unavailable: 重建后初始化远端执行目录失败: %w", err)
+	}
+	return nil
+}
+
+func (s *Service) openExecutionSession(ctx context.Context, key string, cached *remoteSession, binding execmodel.ExecutionBinding, workspace execmodel.ExecutionWorkspace, sandbox execmodel.SandboxProfile) error {
+	if !cached.stateLoaded {
+		persisted, ok, err := s.remoteSessions.LoadExecutionSession(ctx, key)
+		if err != nil {
+			return fmt.Errorf("加载 execution session workspace 失败: %w", err)
+		}
+		if ok {
+			cached.workspace = persisted
+			cached.statePersisted = true
+		} else {
+			cached.workspace = s.workspaceRef
+		}
+		cached.stateLoaded = true
+	}
+	sess, err := sandboxsession.Open(ctx, sandboxsession.Deps{Sessions: s.sessionClient, Files: s.fileClient}, sandboxsession.Options{
+		Workspace: cached.workspace,
+		Sandbox:   sandbox,
+		Run: execcontract.RunOptions{
+			Binding:   binding,
+			Workspace: workspace,
+		},
+	})
+	if err != nil {
+		if cached.statePersisted && isDurableWorkspaceUnavailable(err) {
+			if deleteErr := s.remoteSessions.DeleteExecutionSession(context.Background(), key); deleteErr != nil {
+				s.log.Warn("删除失效 execution session workspace 映射失败", "execution_session", key, "error", deleteErr)
+			}
+			cached.workspace = s.workspaceRef
+			cached.statePersisted = false
+			cached.materialized = make(map[string]bool)
+			return fmt.Errorf("sandbox_unavailable: durable workspace 已不存在，旧映射已清除；请重试以创建干净 workspace: %w", err)
+		}
+		return fmt.Errorf("sandbox_unavailable: genesis-sandbox session打开失败: %w", err)
+	}
+	durable, err := durableWorkspaceRef(sess.Workspace(), cached.workspace)
+	if err != nil {
+		_ = sess.Close(context.Background())
+		return err
+	}
+	if err := s.remoteSessions.SaveExecutionSession(ctx, key, durable); err != nil {
+		_ = sess.Close(context.Background())
+		return fmt.Errorf("保存 execution session workspace 失败: %w", err)
+	}
+	cached.workspace = durable
+	cached.session = sess
+	cached.statePersisted = true
+	return nil
+}
+
+func durableWorkspaceRef(live, fallback sandboxcontract.WorkspaceRef) (sandboxcontract.WorkspaceRef, error) {
+	workspaceID := strings.TrimSpace(live.Metadata["workspace_id"])
+	if workspaceID == "" {
+		workspaceID = strings.TrimSpace(fallback.ID)
+	}
+	if workspaceID == "" {
+		return sandboxcontract.WorkspaceRef{}, fmt.Errorf("sandbox_unavailable: session 未返回 durable workspace_id")
+	}
+	provider := strings.TrimSpace(live.Provider)
+	if provider == "" {
+		provider = strings.TrimSpace(fallback.Provider)
+	}
+	if provider == "" {
+		provider = "genesis-sandbox"
+	}
+	return sandboxcontract.WorkspaceRef{ID: workspaceID, Provider: provider, Metadata: map[string]string{"workspace_id": workspaceID}}, nil
+}
+
+func isRemoteSessionUnavailable(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	for _, marker := range []string{"sandbox_unavailable", "not_found", "not found", "no such file", "no such container", "session expired", "workspace unavailable", "connection refused", "connection reset"} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func isDurableWorkspaceUnavailable(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "workspace") && (strings.Contains(message, "not_found") || strings.Contains(message, "not found") || strings.Contains(message, "unavailable"))
 }
 
 var _ workcontract.RunResourceReleaser = (*Service)(nil)
@@ -691,7 +909,7 @@ func (s *Service) commandEntryAvailable(ctx context.Context, req scriptcontract.
 			return true, nil
 		}
 	}
-	key := sessionKey(runID, req.Binding.ID, meta.Name)
+	key := entryKey(runID, req.Binding.ID, meta.Name)
 	s.mu.Lock()
 	_, known := s.entries[key][entry]
 	s.mu.Unlock()
@@ -884,8 +1102,50 @@ func commandScriptHint(command string) string {
 	return ""
 }
 
-func sessionKey(runID, bindingID, skill string) string {
+func entryKey(runID, bindingID, skill string) string {
 	return runID + "::" + strings.TrimSpace(bindingID) + "::" + strings.ToLower(strings.TrimSpace(skill))
+}
+
+func executionSessionKey(ctx context.Context, binding execmodel.ExecutionBinding, sandbox execmodel.SandboxProfile, workspace sandboxcontract.WorkspaceRef) string {
+	owner := binding.Owner
+	tenantID := strings.TrimSpace(owner.TenantID)
+	if tenantID == "" {
+		tenantID, _ = contextutil.GetTenantID(ctx)
+	}
+	userID := strings.TrimSpace(owner.UserID)
+	if userID == "" {
+		userID, _ = contextutil.GetUserID(ctx)
+	}
+	sessionID := strings.TrimSpace(owner.SessionID)
+	if sessionID == "" {
+		sessionID, _ = contextutil.GetSessionID(ctx)
+	}
+	if sessionID == "" {
+		// 缺少可信会话身份时 fail-safe 为 Run 级隔离，不能把不同请求意外合并。
+		sessionID = "run:" + strings.TrimSpace(owner.RunID)
+	}
+	parts := []string{
+		tenantID,
+		userID,
+		sessionID,
+		strings.TrimSpace(owner.ProjectID),
+		strings.TrimSpace(owner.AgentAppID),
+		strings.TrimSpace(owner.AgentAppVersion),
+		strings.TrimSpace(owner.SubAgentInstanceID),
+		strings.TrimSpace(owner.MemberID),
+		string(binding.Mode),
+		string(binding.Access),
+		string(binding.PathPolicy),
+		strings.TrimSpace(sandbox.Provider),
+		string(sandbox.RuntimeProfile),
+		string(sandbox.TaskType),
+		string(sandbox.Operation),
+		string(sandbox.RiskLevel),
+		strings.TrimSpace(sandbox.Language),
+		strings.TrimSpace(workspace.ID),
+	}
+	digest := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
+	return hex.EncodeToString(digest[:])
 }
 
 // remoteRelativePath 把 executor 绝对业务路径转换成 session WorkspaceFS 相对路径。
@@ -1056,7 +1316,9 @@ func (s *Service) materializePackageRemote(ctx context.Context, catalog skillcon
 		if err != nil {
 			return fmt.Errorf("读取远程 skill 资源 %s 失败: %w", info.Resource, err)
 		}
-		if err := session.WriteFile(ctx, remoteRelativePath(skillDir, rel), []byte(content.Content), fscontract.WriteOptions{CreateParents: true, Overwrite: false}); err != nil {
+		// materialize 必须可重入：上一次上传可能只完成了部分文件，重试时以权威的
+		// 不可变 SkillPackage 覆盖同路径，不能因半成品 AlreadyExists 永久卡死。
+		if err := session.WriteFile(ctx, remoteRelativePath(skillDir, rel), []byte(content.Content), fscontract.WriteOptions{CreateParents: true, Overwrite: true}); err != nil {
 			return fmt.Errorf("写入远程 skill 资源 %s 失败: %w", info.Resource, err)
 		}
 		if info.Kind == skillmodel.ResourceKindScript && strings.HasPrefix(rel, "scripts/") {

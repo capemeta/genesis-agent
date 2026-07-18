@@ -200,6 +200,39 @@ func TestSessionBindingStoreIsExclusiveIdempotentAndResolverUsesBinding(t *testi
 	}
 }
 
+func TestExecutionSessionStorePersistsOnlyDurableWorkspace(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	store, err := NewFileSessionBindingStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	live := sandboxcontract.WorkspaceRef{ID: "session-1", Provider: "genesis-sandbox", Metadata: map[string]string{
+		"session_id": "session-1", "sandbox_id": "sandbox-1", "workspace_id": "workspace-1", "credential": "secret",
+	}}
+	if err := store.SaveExecutionSession(ctx, "stable-key", live); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, ok, err := store.LoadExecutionSession(ctx, "stable-key")
+	if err != nil || !ok {
+		t.Fatalf("LoadExecutionSession() workspace=%+v ok=%v err=%v", reopened, ok, err)
+	}
+	if reopened.ID != "workspace-1" || reopened.Metadata["workspace_id"] != "workspace-1" {
+		t.Fatalf("durable workspace identity=%+v", reopened)
+	}
+	if reopened.Metadata["session_id"] != "" || reopened.Metadata["sandbox_id"] != "" || reopened.Metadata["credential"] != "" {
+		t.Fatalf("ephemeral or secret metadata persisted: %+v", reopened.Metadata)
+	}
+
+	if err := store.DeleteExecutionSession(ctx, "stable-key"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := store.LoadExecutionSession(ctx, "stable-key"); err != nil || ok {
+		t.Fatalf("deleted execution session ok=%v err=%v", ok, err)
+	}
+}
+
 type fakeObjectClient struct{ content []byte }
 
 func (c fakeObjectClient) OpenObject(context.Context, string) (io.ReadCloser, error) {

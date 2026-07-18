@@ -41,7 +41,7 @@ func testInputManifest(binding execmodel.ExecutionBinding, name string, content 
 }
 
 func testBinding(runID string) execmodel.ExecutionBinding {
-	return execmodel.ExecutionBinding{ID: runID + "-skill-demo", Mode: execmodel.WorkspaceModeTask, Access: execmodel.WorkspaceAccessReadWrite, PathPolicy: execmodel.PathPolicyStrictWorkspace, Owner: execmodel.ExecutionOwnerRef{RunID: runID}}
+	return execmodel.ExecutionBinding{ID: runID + "-skill-demo", Mode: execmodel.WorkspaceModeTask, Access: execmodel.WorkspaceAccessReadWrite, PathPolicy: execmodel.PathPolicyStrictWorkspace, Owner: execmodel.ExecutionOwnerRef{TenantID: "tenant-test", UserID: "user-test", SessionID: "agent-session-test", RunID: runID}}
 }
 
 func testStateRoot(root string) workmodel.StateRoot {

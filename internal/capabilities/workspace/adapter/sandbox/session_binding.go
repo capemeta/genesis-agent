@@ -61,6 +61,12 @@ type FileSessionBindingStore struct {
 	mu   sync.RWMutex
 }
 
+type executionSessionState struct {
+	Key       string                       `json:"key"`
+	Workspace sandboxcontract.WorkspaceRef `json:"workspace"`
+	UpdatedAt time.Time                    `json:"updated_at"`
+}
+
 func NewFileSessionBindingStore(root string) (*FileSessionBindingStore, error) {
 	abs, err := filepath.Abs(strings.TrimSpace(root))
 	if err != nil || strings.TrimSpace(root) == "" {
@@ -158,6 +164,88 @@ func (s *FileSessionBindingStore) GetSessionExecution(ctx context.Context, tenan
 	return binding, nil
 }
 
+// LoadExecutionSession 读取“逻辑执行会话 -> durable workspace”映射。
+// live session_id/sandbox_id 不持久化，进程恢复时始终创建可替换的新容器。
+func (s *FileSessionBindingStore) LoadExecutionSession(ctx context.Context, key string) (sandboxcontract.WorkspaceRef, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return sandboxcontract.WorkspaceRef{}, false, err
+	}
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return sandboxcontract.WorkspaceRef{}, false, fmt.Errorf("execution session key 不能为空")
+	}
+	s.mu.RLock()
+	data, err := os.ReadFile(s.executionSessionFilename(key))
+	s.mu.RUnlock()
+	if os.IsNotExist(err) {
+		return sandboxcontract.WorkspaceRef{}, false, nil
+	}
+	if err != nil {
+		return sandboxcontract.WorkspaceRef{}, false, err
+	}
+	var state executionSessionState
+	if err := json.Unmarshal(data, &state); err != nil || state.Key != key || state.UpdatedAt.IsZero() {
+		return sandboxcontract.WorkspaceRef{}, false, workcontract.NewError(workcontract.ErrCodeWorkspaceNotAvailable, fmt.Errorf("execution session state 已损坏"))
+	}
+	workspace, err := durableExecutionWorkspace(state.Workspace)
+	if err != nil {
+		return sandboxcontract.WorkspaceRef{}, false, workcontract.NewError(workcontract.ErrCodeWorkspaceNotAvailable, err)
+	}
+	return workspace, true, nil
+}
+
+func (s *FileSessionBindingStore) SaveExecutionSession(ctx context.Context, key string, workspace sandboxcontract.WorkspaceRef) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return fmt.Errorf("execution session key 不能为空")
+	}
+	durable, err := durableExecutionWorkspace(workspace)
+	if err != nil {
+		return err
+	}
+	data, err := json.Marshal(executionSessionState{Key: key, Workspace: durable, UpdatedAt: time.Now().UTC()})
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return writeSessionBindingFile(s.executionSessionFilename(key), data)
+}
+
+func (s *FileSessionBindingStore) DeleteExecutionSession(ctx context.Context, key string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return fmt.Errorf("execution session key 不能为空")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := os.Remove(s.executionSessionFilename(key)); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+func durableExecutionWorkspace(workspace sandboxcontract.WorkspaceRef) (sandboxcontract.WorkspaceRef, error) {
+	workspaceID := strings.TrimSpace(workspace.Metadata["workspace_id"])
+	if workspaceID == "" {
+		workspaceID = strings.TrimSpace(workspace.ID)
+	}
+	if workspaceID == "" {
+		return sandboxcontract.WorkspaceRef{}, fmt.Errorf("execution session workspace_id 不能为空")
+	}
+	provider := strings.TrimSpace(workspace.Provider)
+	if provider == "" {
+		provider = "genesis-sandbox"
+	}
+	return sandboxcontract.WorkspaceRef{ID: workspaceID, Provider: provider, Metadata: map[string]string{"workspace_id": workspaceID}}, nil
+}
+
 func readSessionBinding(filename string) (SessionExecutionBinding, error) {
 	data, err := os.ReadFile(filename)
 	if err != nil {
@@ -181,4 +269,9 @@ func sameSessionWorkspace(left, right SessionExecutionBinding) bool {
 func (s *FileSessionBindingStore) filename(tenantID, runID, bindingID string) string {
 	sum := sha256.Sum256([]byte(strings.TrimSpace(tenantID) + "\x00" + strings.TrimSpace(runID) + "\x00" + strings.TrimSpace(bindingID)))
 	return filepath.Join(s.root, hex.EncodeToString(sum[:])+".json")
+}
+
+func (s *FileSessionBindingStore) executionSessionFilename(key string) string {
+	sum := sha256.Sum256([]byte(key))
+	return filepath.Join(s.root, "execution-"+hex.EncodeToString(sum[:])+".json")
 }

@@ -15,14 +15,16 @@ func newToolsCmd(configDirRef *string, sandboxModeRef *string, factory ServiceFa
 		Use:   "tools",
 		Short: "列出已注册的可用工具",
 		Long:  `显示 Agent 可调用的所有工具，包括工具名称和功能描述。`,
-		RunE: func(cmd *cobra.Command, args []string) error {
+		RunE: func(cmd *cobra.Command, args []string) (runErr error) {
 			ctx := context.Background()
 
 			// tools 命令不需要 TUI，保持 stdout 输出
-			svc, err := initService(ctx, factory, configDirRef, false, sandboxModeRef)
+			handle, err := initService(ctx, factory, configDirRef, false, sandboxModeRef)
 			if err != nil {
 				return fmt.Errorf("初始化失败: %w", err)
 			}
+			defer closeServiceHandle(handle, &runErr)
+			svc := handle.Service()
 
 			infos := svc.ListTools()
 

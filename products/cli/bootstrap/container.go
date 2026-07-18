@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 
 	"genesis-agent/internal/app"
 	shared "genesis-agent/internal/bootstrap"
@@ -119,12 +120,17 @@ type Container struct {
 	sandbox       clisandbox.Config
 	workspaceRoot string
 
-	once     sync.Once
-	initErr  error
-	bundle   *shared.RuntimeBundle
-	logging  *logger.RuntimeLogging
-	mcpStack *mcpstack.Stack
-	mcpStore contract.ApprovalStore
+	once           sync.Once
+	initErr        error
+	bundle         *shared.RuntimeBundle
+	logging        *logger.RuntimeLogging
+	mcpStack       *mcpstack.Stack
+	mcpStore       contract.ApprovalStore
+	runtimeClosers []runtimeCloser
+}
+
+type runtimeCloser interface {
+	Close(ctx context.Context) error
 }
 
 type productRuntime struct {
@@ -149,16 +155,17 @@ type productRuntime struct {
 	completion           artifactcontract.CompletionPolicy
 	qaEvidence           artifactcontract.QAEvidenceRecorder
 	runResources         []workcontract.RunResourceReleaser
+	runtimeClosers       []runtimeCloser
 }
 
 // Execute 执行 CLI 产品命令树。
 func Execute(ctx context.Context) error {
 	return command.ExecuteWithFactories(
-		func(runCtx context.Context, opts command.ServiceOptions) (app.AgentService, error) {
+		func(runCtx context.Context, opts command.ServiceOptions) (command.ServiceHandle, error) {
 			if runCtx == nil {
 				runCtx = ctx
 			}
-			return NewServiceWithOptions(runCtx, opts)
+			return openService(runCtx, opts)
 		},
 		func(runCtx context.Context, opts command.ServiceOptions) (command.MCPAdmin, error) {
 			if runCtx == nil {
@@ -203,6 +210,7 @@ func (c *Container) Init(ctx context.Context) error {
 			c.initErr = err
 			return
 		}
+		c.runtimeClosers = append([]runtimeCloser(nil), runtime.runtimeClosers...)
 		c.logging = runtime.logging
 		webOpts, err := buildWebOptions(cfg, log)
 		if err != nil {
@@ -304,8 +312,17 @@ func (c *Container) Init(ctx context.Context) error {
 // Close 释放 MCP 连接与运行日志。
 func (c *Container) Close() error {
 	var first error
+	for index := len(c.runtimeClosers) - 1; index >= 0; index-- {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		err := c.runtimeClosers[index].Close(closeCtx)
+		cancel()
+		if err != nil && first == nil {
+			first = err
+		}
+	}
+	c.runtimeClosers = nil
 	if c.mcpStack != nil {
-		if err := c.mcpStack.Close(context.Background()); err != nil {
+		if err := c.mcpStack.Close(context.Background()); err != nil && first == nil {
 			first = err
 		}
 		c.mcpStack = nil
@@ -353,16 +370,14 @@ func (c *Container) SubAgentProjectionReader() multicontract.ProjectionReader {
 	return reader
 }
 
-func NewService(ctx context.Context, configDirRef *string, quiet bool) (app.AgentService, error) {
-	return NewServiceWithOptions(ctx, command.ServiceOptions{ConfigDirRef: configDirRef, Quiet: quiet})
-}
-
-func NewServiceWithOptions(ctx context.Context, opts command.ServiceOptions) (app.AgentService, error) {
+// openService 初始化并返回必须关闭的 CLI 服务运行时。
+func openService(ctx context.Context, opts command.ServiceOptions) (command.ServiceHandle, error) {
 	c := &Container{configDirRef: opts.ConfigDirRef, quiet: opts.Quiet, sandbox: opts.Sandbox, workspaceRoot: workspaceRootOrDot(opts.WorkspaceRoot)}
 	if err := c.Init(ctx); err != nil {
+		_ = c.Close()
 		return nil, err
 	}
-	return c.Service(), nil
+	return c, nil
 }
 
 // OpenMCPAdmin 初始化 CLI 容器并返回 MCP 管理面句柄（list/approve/refresh）。
@@ -622,6 +637,7 @@ func buildProductRuntime(ctx context.Context, configDir string, cfg *platformcon
 		completion:           artifactControl.completion,
 		qaEvidence:           artifactControl.qaEvidence,
 		runResources:         []workcontract.RunResourceReleaser{skillScriptSvc},
+		runtimeClosers:       []runtimeCloser{skillScriptSvc},
 	}, log, nil
 }
 

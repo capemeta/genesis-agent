@@ -80,6 +80,15 @@ type Stack struct {
 	SkillExplicitLoader  react.SkillExplicitLoader
 	PromptInjector       promptbuilder.ContextInjector
 	CatalogRequest       skillcontract.CatalogRequest
+	scriptService        *scriptservice.Service
+}
+
+// Close 停止执行会话心跳并释放仍存活的远端 Session。
+func (s *Stack) Close(ctx context.Context) error {
+	if s == nil || s.scriptService == nil {
+		return nil
+	}
+	return s.scriptService.Close(ctx)
 }
 
 // BuildEmbedded 仅装配内置 embed Skills + run_skill_command。
@@ -231,5 +240,6 @@ func BuildEmbedded(opts Options) (*Stack, error) {
 		SkillExplicitLoader:  explicitLoader,
 		PromptInjector:       injector,
 		CatalogRequest:       catalogReq,
+		scriptService:        scriptSvc,
 	}, nil
 }

@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 
 	"genesis-agent/internal/app"
 	shared "genesis-agent/internal/bootstrap"
@@ -88,12 +89,13 @@ type Container struct {
 	configDirRef *string
 	quiet        bool
 
-	once     sync.Once
-	initErr  error
-	bundle   *shared.RuntimeBundle
-	logging  *logger.RuntimeLogging
-	mcpStack *mcpstack.Stack
-	deps     Dependencies
+	once       sync.Once
+	initErr    error
+	bundle     *shared.RuntimeBundle
+	logging    *logger.RuntimeLogging
+	mcpStack   *mcpstack.Stack
+	skillStack *skillstack.Stack
+	deps       Dependencies
 }
 
 // Dependencies 是 Enterprise 必须由部署层注入的租户级持久化依赖。
@@ -214,6 +216,7 @@ func (c *Container) Init(ctx context.Context) error {
 			c.initErr = fmt.Errorf("初始化Enterprise Skill栈失败: %w", err)
 			return
 		}
+		c.skillStack = skillStack
 		injectors := make([]promptbuilder.ContextInjector, 0, 2)
 		injectors = append(injectors, promptbuilder.NewEnvironmentContextInjector(enterpriseEnvironmentContext(ctx, execStack)))
 		if skillStack.PromptInjector != nil {
@@ -221,6 +224,7 @@ func (c *Container) Init(ctx context.Context) error {
 		}
 		runWorkspace, err := buildEnterpriseRunWorkspace(execStack.WorkspaceRef.ID, c.deps.RunManifests, c.deps.ArtifactRuns, c.deps.Completion, c.deps.QAEvidence)
 		if err != nil {
+			c.closeSkillStack()
 			_ = runtimeLogging.Close()
 			c.logging = nil
 			c.initErr = fmt.Errorf("初始化 Enterprise Run 工作空间失败: %w", err)
@@ -250,6 +254,7 @@ func (c *Container) Init(ctx context.Context) error {
 			HookApproval:               approvalSvc,
 		})
 		if c.initErr != nil {
+			c.closeSkillStack()
 			_ = runtimeLogging.Close()
 			c.logging = nil
 			return
@@ -257,6 +262,7 @@ func (c *Container) Init(ctx context.Context) error {
 		if cfg.MCP.Enabled && c.bundle != nil && c.bundle.ToolGateway != nil {
 			store, err := openEnterpriseApprovalStore()
 			if err != nil {
+				c.closeSkillStack()
 				_ = runtimeLogging.Close()
 				c.logging = nil
 				c.bundle = nil
@@ -286,6 +292,7 @@ func (c *Container) Init(ctx context.Context) error {
 				Tracer:             c.bundle.Tracer,
 			})
 			if err != nil {
+				c.closeSkillStack()
 				_ = runtimeLogging.Close()
 				c.logging = nil
 				c.bundle = nil
@@ -302,6 +309,7 @@ func (c *Container) Init(ctx context.Context) error {
 				_ = c.mcpStack.Close(context.Background())
 				c.mcpStack = nil
 			}
+			c.closeSkillStack()
 			_ = runtimeLogging.Close()
 			c.logging = nil
 			c.bundle = nil
@@ -332,14 +340,17 @@ func (c *Container) SubAgentProjectionReader() multicontract.ProjectionReader {
 	return reader
 }
 
-// Close 释放 MCP 连接与运行日志等资源。
+// Close 释放远端执行会话、MCP 连接与运行日志等资源。
 func (c *Container) Close() error {
 	if c == nil {
 		return nil
 	}
 	var first error
+	if err := c.closeSkillStack(); err != nil {
+		first = err
+	}
 	if c.mcpStack != nil {
-		if err := c.mcpStack.Close(context.Background()); err != nil {
+		if err := c.mcpStack.Close(context.Background()); err != nil && first == nil {
 			first = err
 		}
 		c.mcpStack = nil
@@ -353,13 +364,15 @@ func (c *Container) Close() error {
 	return first
 }
 
-// NewService 构建 Enterprise 产品 AgentService，保持与 CLI bootstrap 一致的接口形态。
-func NewService(ctx context.Context, opts ContainerOptions) (app.AgentService, error) {
-	c := NewContainer(opts)
-	if err := c.Init(ctx); err != nil {
-		return nil, err
+func (c *Container) closeSkillStack() error {
+	if c == nil || c.skillStack == nil {
+		return nil
 	}
-	return c.Service(), nil
+	closeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	err := c.skillStack.Close(closeCtx)
+	cancel()
+	c.skillStack = nil
+	return err
 }
 
 type headlessAskApprover struct{}
