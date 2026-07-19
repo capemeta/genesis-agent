@@ -17,6 +17,19 @@ import (
 	sandboxcontract "genesis-agent/internal/capabilities/sandbox/contract"
 )
 
+func TestNewClearsCustomHTTPClientTimeout(t *testing.T) {
+	client, err := New(Config{
+		BaseURL: "http://127.0.0.1:18010",
+		Client:  &http.Client{Timeout: 2 * time.Second},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if client.httpClient.Timeout != 0 {
+		t.Fatalf("Timeout=%s, want 0", client.httpClient.Timeout)
+	}
+}
+
 func TestRunCommandUsesLeaseLifecycleAndMapsResult(t *testing.T) {
 	var gotLease leaseRequest
 	var got execJobRequest
@@ -268,12 +281,13 @@ func TestSessionRunUsesNamedSessionExecAndClose(t *testing.T) {
 			if err := json.NewDecoder(r.Body).Decode(&created); err != nil {
 				t.Fatal(err)
 			}
-			_ = json.NewEncoder(w).Encode(sessionRecord{SessionID: "session-1", WorkspaceID: "ws-1", ActiveSandboxID: "sandbox-1", RuntimeProfile: "code-polyglot-basic", StatePolicy: "session", ExpiresAt: time.Now().Add(time.Hour)})
+			// 休眠创建：active_sandbox_id 为空
+			_ = json.NewEncoder(w).Encode(sessionRecord{SessionID: "session-1", WorkspaceID: "ws-1", RuntimeProfile: "code-polyglot-basic", StatePolicy: "session", ExpiresAt: time.Now().Add(time.Hour)})
 		case r.URL.Path == "/v1/sessions/session-1/exec" && r.Method == http.MethodPost:
 			if err := json.NewDecoder(r.Body).Decode(&execReq); err != nil {
 				t.Fatal(err)
 			}
-			_ = json.NewEncoder(w).Encode(execSessionResult{ExitCode: 0, Stdout: "ok"})
+			_ = json.NewEncoder(w).Encode(execSessionResult{ExitCode: 0, Stdout: "ok", Environment: "sandbox", SandboxID: "sandbox-1", SessionID: "session-1", WorkspaceID: "ws-1"})
 		case r.URL.Path == "/v1/sessions/session-1" && r.Method == http.MethodDelete:
 			deleted = true
 			w.WriteHeader(http.StatusNoContent)
@@ -295,8 +309,11 @@ func TestSessionRunUsesNamedSessionExecAndClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	workspace := session.Workspace()
-	if workspace.ID != "session-1" || workspace.Metadata["workspace_id"] != "ws-1" || workspace.Metadata["sandbox_id"] != "sandbox-1" {
+	if workspace.ID != "session-1" || workspace.Metadata["workspace_id"] != "ws-1" {
 		t.Fatalf("session workspace=%+v", workspace)
+	}
+	if workspace.Metadata["sandbox_id"] != "" {
+		t.Fatalf("dormant session should not have sandbox_id: %+v", workspace)
 	}
 	result, err := session.Run(context.Background(), sandboxcontract.CommandRequest{
 		Command: execmodel.Command{Command: "python process.py", Shell: execmodel.ShellSh},
@@ -304,10 +321,14 @@ func TestSessionRunUsesNamedSessionExecAndClose(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	workspace = session.Workspace()
+	if workspace.Metadata["sandbox_id"] != "sandbox-1" {
+		t.Fatalf("exec should backfill sandbox_id: %+v", workspace)
+	}
 	if err := session.Close(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if created.WorkspaceID != "ws-1" || created.StatePolicy != "session" || created.RuntimeProfile != "code-polyglot-basic" {
+	if created.WorkspaceID != "ws-1" || created.StatePolicy != "session" || created.RuntimeProfile != "code-polyglot-basic" || created.WorkspaceRetention != "explicit_delete" {
 		t.Fatalf("created session=%+v", created)
 	}
 	if !deleted {
@@ -322,6 +343,172 @@ func TestSessionRunUsesNamedSessionExecAndClose(t *testing.T) {
 	}
 	if result.Stdout != "ok" || result.Cwd != "/workspace" {
 		t.Fatalf("result=%+v", result)
+	}
+}
+
+func TestDormantSessionWriteExecSuspendAndReuse(t *testing.T) {
+	sandboxIDs := make([]string, 0)
+	suspended := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v1/sessions" && r.Method == http.MethodPost:
+			_ = json.NewEncoder(w).Encode(sessionRecord{
+				SessionID: "session-1", WorkspaceID: "ws-1", RuntimeProfile: "office-basic",
+				StatePolicy: "session", ExpiresAt: time.Now().Add(time.Hour),
+			})
+		case r.URL.Path == "/v1/sessions/session-1/files" && r.Method == http.MethodPut:
+			_ = json.NewEncoder(w).Encode(workspaceFileInfo{
+				Path: "hello.txt", SandboxPath: "/workspace/hello.txt", Environment: "workspace",
+				Name: "hello.txt", Kind: "file", Size: 5, SHA256: "abc",
+			})
+		case r.URL.Path == "/v1/sessions/session-1/exec" && r.Method == http.MethodPost:
+			id := fmt.Sprintf("sandbox-%d", len(sandboxIDs)+1)
+			sandboxIDs = append(sandboxIDs, id)
+			_ = json.NewEncoder(w).Encode(execSessionResult{
+				ExitCode: 0, Stdout: "ok", Environment: "sandbox",
+				SandboxID: id, SessionID: "session-1", WorkspaceID: "ws-1",
+			})
+		case r.URL.Path == "/v1/sessions/session-1/suspend" && r.Method == http.MethodPost:
+			suspended = true
+			_ = json.NewEncoder(w).Encode(sessionRecord{
+				SessionID: "session-1", WorkspaceID: "ws-1", ActiveSandboxID: "",
+				ExpiresAt: time.Now().Add(time.Hour),
+			})
+		case r.URL.Path == "/v1/sessions/session-1" && r.Method == http.MethodDelete:
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client, err := New(Config{BaseURL: server.URL, RenewInterval: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := client.OpenSession(context.Background(), sandboxcontract.SessionOptions{
+		Workspace: sandboxcontract.WorkspaceRef{ID: "ws-1"},
+		Sandbox:   execmodel.SandboxProfile{RuntimeProfile: execmodel.RuntimeProfileOfficeBasic},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.WriteFile(context.Background(), sandboxcontract.WriteFileRequest{
+		Workspace: session.Workspace(),
+		Path:      fsmodel.ResolvedPath{WorkspaceRel: "hello.txt"},
+		Content:   []byte("hello"),
+		Options:   fscontract.WriteOptions{Overwrite: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.Run(context.Background(), sandboxcontract.CommandRequest{
+		Command: execmodel.Command{Command: "echo ok", Shell: execmodel.ShellSh},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if session.Workspace().Metadata["sandbox_id"] != "sandbox-1" {
+		t.Fatalf("sandbox after first exec=%q", session.Workspace().Metadata["sandbox_id"])
+	}
+	suspendable, ok := session.(sandboxcontract.SuspendableSandboxSession)
+	if !ok {
+		t.Fatal("session must implement SuspendableSandboxSession")
+	}
+	if err := suspendable.Suspend(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !suspended {
+		t.Fatal("suspend not called")
+	}
+	if session.Workspace().Metadata["sandbox_id"] != "" {
+		t.Fatalf("sandbox_id should clear after suspend: %+v", session.Workspace())
+	}
+	if _, err := session.Run(context.Background(), sandboxcontract.CommandRequest{
+		Command: execmodel.Command{Command: "echo again", Shell: execmodel.ShellSh},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(sandboxIDs) != 2 || sandboxIDs[1] != "sandbox-2" {
+		t.Fatalf("sandboxIDs=%+v", sandboxIDs)
+	}
+	if session.Workspace().Metadata["sandbox_id"] != "sandbox-2" {
+		t.Fatalf("sandbox after second exec=%q", session.Workspace().Metadata["sandbox_id"])
+	}
+	_ = session.Close(context.Background())
+}
+
+func TestWriteFileCreateOnlyUsesIfNoneMatch(t *testing.T) {
+	var gotIfNoneMatch string
+	var gotIfMatch string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/sessions/session-1/files" || r.Method != http.MethodPut {
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+		gotIfNoneMatch = r.Header.Get("If-None-Match")
+		gotIfMatch = r.Header.Get("If-Match")
+		_ = json.NewEncoder(w).Encode(workspaceFileInfo{Path: "a.txt", Name: "a.txt", Kind: "file", Size: 1, Environment: "workspace"})
+	}))
+	defer server.Close()
+	client, err := New(Config{BaseURL: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.WriteFile(context.Background(), sandboxcontract.WriteFileRequest{
+		Workspace: sandboxcontract.WorkspaceRef{ID: "session-1"},
+		Path:      fsmodel.ResolvedPath{WorkspaceRel: "a.txt"},
+		Content:   []byte("x"),
+		Options:   fscontract.WriteOptions{Overwrite: false},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if gotIfNoneMatch != "*" || gotIfMatch != "" {
+		t.Fatalf("If-None-Match=%q If-Match=%q", gotIfNoneMatch, gotIfMatch)
+	}
+}
+
+func TestWriteFileExpectedHashUsesIfMatchOnly(t *testing.T) {
+	var gotIfNoneMatch string
+	var gotIfMatch string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotIfNoneMatch = r.Header.Get("If-None-Match")
+		gotIfMatch = r.Header.Get("If-Match")
+		_ = json.NewEncoder(w).Encode(workspaceFileInfo{Path: "a.txt", Name: "a.txt", Kind: "file", Size: 1})
+	}))
+	defer server.Close()
+	client, err := New(Config{BaseURL: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.WriteFile(context.Background(), sandboxcontract.WriteFileRequest{
+		Workspace: sandboxcontract.WorkspaceRef{ID: "session-1"},
+		Path:      fsmodel.ResolvedPath{WorkspaceRel: "a.txt"},
+		Content:   []byte("x"),
+		Options:   fscontract.WriteOptions{Overwrite: false, ExpectedHash: "sha256:abc123"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if gotIfMatch != "abc123" || gotIfNoneMatch != "" {
+		t.Fatalf("If-Match=%q If-None-Match=%q", gotIfMatch, gotIfNoneMatch)
+	}
+}
+
+func TestWriteFileMapsVersionConflictToModifiedExternally(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(errorResponse{Code: "CONFLICT", Message: "version changed"})
+	}))
+	defer server.Close()
+	client, err := New(Config{BaseURL: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = client.WriteFile(context.Background(), sandboxcontract.WriteFileRequest{
+		Workspace: sandboxcontract.WorkspaceRef{ID: "session-1"},
+		Path:      fsmodel.ResolvedPath{WorkspaceRel: "a.txt"},
+		Content:   []byte("x"),
+		Options:   fscontract.WriteOptions{Overwrite: true, ExpectedHash: "abc"},
+	})
+	if fscontract.CodeOf(err) != fscontract.ErrCodeModifiedExternally {
+		t.Fatalf("err=%v code=%s", err, fscontract.CodeOf(err))
 	}
 }
 

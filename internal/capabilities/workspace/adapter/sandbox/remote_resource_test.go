@@ -200,6 +200,45 @@ func TestSessionBindingStoreIsExclusiveIdempotentAndResolverUsesBinding(t *testi
 	}
 }
 
+func TestSessionBindingIgnoresEphemeralSandboxID(t *testing.T) {
+	ctx := context.Background()
+	sessions, err := NewFileSessionBindingStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	expires := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
+	dormant := SessionExecutionBinding{
+		TenantID: "tenant", RunID: "run", BindingID: "binding-a",
+		Workspace: sandboxcontract.WorkspaceRef{
+			ID: "session-a", Provider: "genesis-sandbox",
+			Metadata: map[string]string{"session_id": "session-a", "workspace_id": "ws-1"},
+		},
+		ExpiresAt: expires,
+	}
+	if err := sessions.BindSessionExecution(ctx, dormant); err != nil {
+		t.Fatal(err)
+	}
+	// Exec 回填 sandbox_id 后 RefreshBinding 必须仍视为同一 remote session。
+	afterExec := dormant
+	afterExec.Workspace.Metadata = map[string]string{
+		"session_id": "session-a", "workspace_id": "ws-1", "sandbox_id": "sandbox-new",
+	}
+	afterExec.ExpiresAt = expires.Add(30 * time.Second)
+	if err := sessions.BindSessionExecution(ctx, afterExec); err != nil {
+		t.Fatalf("sandbox_id 变化不应导致 binding 冲突: %v", err)
+	}
+	got, err := sessions.GetSessionExecution(ctx, "tenant", "run", "binding-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Workspace.Metadata["sandbox_id"] != "" {
+		t.Fatalf("binding 不得持久化 sandbox_id: %+v", got.Workspace.Metadata)
+	}
+	if !got.ExpiresAt.Equal(afterExec.ExpiresAt) {
+		t.Fatalf("expiresAt=%v want=%v", got.ExpiresAt, afterExec.ExpiresAt)
+	}
+}
+
 func TestExecutionSessionStorePersistsOnlyDurableWorkspace(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()

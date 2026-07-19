@@ -93,10 +93,21 @@ type SessionOptions struct {
 
 // SandboxSession 是多 job 共享同一 /workspace 根目录的长会话端口。
 // Workspace 返回可传给 FileSystemClient 的 session scoped workspace 引用。
+//
+// 生命周期与 genesis-sandbox Session+WorkspaceFS 对齐：
+// CreateSession 可为休眠态（active_sandbox_id 空）；文件 API 不依赖 Runtime；
+// 首次 Run/Exec 懒启 Runtime；Close 删除 Session（默认不删 Workspace）。
 type SandboxSession interface {
 	Workspace() WorkspaceRef
 	Run(ctx context.Context, req CommandRequest) (*execmodel.Result, error)
 	Close(ctx context.Context) error
+}
+
+// SuspendableSandboxSession 可释放 ephemeral Runtime 而保留 Session/Workspace。
+// Suspend 后心跳仍应续 Session TTL；再次 Run 会懒启新 Runtime。
+type SuspendableSandboxSession interface {
+	SandboxSession
+	Suspend(ctx context.Context) error
 }
 
 // LeasedSandboxSession 额外暴露服务端确认的 lease 到期时间；Harness 不得自行猜测 TTL。

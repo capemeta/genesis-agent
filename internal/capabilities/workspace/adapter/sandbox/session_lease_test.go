@@ -24,6 +24,22 @@ func (s *stubRenewer) RenewSession(context.Context, string) (time.Time, error) {
 	return s.at, nil
 }
 
+func TestSessionFileLocatorRejectsSandboxIDMetadata(t *testing.T) {
+	expires := time.Now().Add(time.Hour)
+	locator := RemoteLocator{
+		ID: "loc-bad", Authority: RemoteExecutorAuthority, Scheme: SessionFileScheme,
+		Workspace: sandboxcontract.WorkspaceRef{
+			ID: "session-1", Provider: "genesis-sandbox",
+			Metadata: map[string]string{"session_id": "session-1", "workspace_id": "ws-1", "sandbox_id": "sbx-1"},
+		},
+		Path: "work/out.pptx", Scope: workmodel.ResourceScope{TenantID: "tenant"},
+		Version: "sha256:abc", Size: 1, Availability: workmodel.ResourceAvailabilityLeased, ExpiresAt: &expires,
+	}
+	if err := locator.validate(); err == nil {
+		t.Fatal("expected sandbox_id metadata to be rejected")
+	}
+}
+
 func TestSessionLeaseKeeperRenewsSessionFile(t *testing.T) {
 	ctx := context.Background()
 	store, err := NewFileRemoteLocatorStore(t.TempDir())
@@ -35,7 +51,7 @@ func TestSessionLeaseKeeperRenewsSessionFile(t *testing.T) {
 		ID: "loc-1", Authority: RemoteExecutorAuthority, Scheme: SessionFileScheme,
 		Workspace: sandboxcontract.WorkspaceRef{
 			ID: "session-1", Provider: "genesis-sandbox",
-			Metadata: map[string]string{"session_id": "session-1", "sandbox_id": "sbx-1", "workspace_id": "ws-1"},
+			Metadata: map[string]string{"session_id": "session-1", "workspace_id": "ws-1"},
 		},
 		Path: "work/out.pptx", Scope: workmodel.ResourceScope{TenantID: "tenant"},
 		Version: "sha256:abc", Size: 1, Availability: workmodel.ResourceAvailabilityLeased, ExpiresAt: &expires,
@@ -72,7 +88,7 @@ func TestSessionLeaseKeeperFailsWhenRenewFails(t *testing.T) {
 		ID: "loc-2", Authority: RemoteExecutorAuthority, Scheme: SessionFileScheme,
 		Workspace: sandboxcontract.WorkspaceRef{
 			ID: "session-2", Provider: "genesis-sandbox",
-			Metadata: map[string]string{"session_id": "session-2", "sandbox_id": "sbx-2", "workspace_id": "ws-1"},
+			Metadata: map[string]string{"session_id": "session-2", "workspace_id": "ws-1"},
 		},
 		Path: "work/out.pptx", Scope: workmodel.ResourceScope{TenantID: "tenant"},
 		Version: "sha256:abc", Size: 1, Availability: workmodel.ResourceAvailabilityLeased, ExpiresAt: &expires,

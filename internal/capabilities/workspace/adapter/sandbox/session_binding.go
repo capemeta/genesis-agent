@@ -263,7 +263,16 @@ func equalSessionBinding(left, right SessionExecutionBinding) bool {
 }
 
 func sameSessionWorkspace(left, right SessionExecutionBinding) bool {
-	return left.TenantID == right.TenantID && left.RunID == right.RunID && left.BindingID == right.BindingID && reflect.DeepEqual(left.Workspace, right.Workspace)
+	if left.TenantID != right.TenantID || left.RunID != right.RunID || left.BindingID != right.BindingID {
+		return false
+	}
+	// 比较稳定身份：session scoped ID + workspace_id；忽略 ephemeral sandbox_id。
+	leftWS := cloneWorkspaceRef(left.Workspace)
+	rightWS := cloneWorkspaceRef(right.Workspace)
+	return leftWS.ID == rightWS.ID &&
+		leftWS.Provider == rightWS.Provider &&
+		leftWS.Metadata["session_id"] == rightWS.Metadata["session_id"] &&
+		leftWS.Metadata["workspace_id"] == rightWS.Metadata["workspace_id"]
 }
 
 func (s *FileSessionBindingStore) filename(tenantID, runID, bindingID string) string {

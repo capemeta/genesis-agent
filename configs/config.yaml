@@ -44,7 +44,6 @@ sandbox:
   api_key_env: GENESIS_SANDBOX_API_KEY
   workspace_id: ""
   default_runtime_profile: code-polyglot-basic
-  timeout: 60s
 
 policy:
   defaults:

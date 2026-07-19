@@ -107,9 +107,8 @@ type SandboxConfig struct {
 	BaseURL               string        `mapstructure:"base_url"`
 	APIKey                string        `mapstructure:"api_key"`
 	APIKeyEnv             string        `mapstructure:"api_key_env"`
-	WorkspaceID           string        `mapstructure:"workspace_id"`
-	DefaultRuntimeProfile string        `mapstructure:"default_runtime_profile"`
-	Timeout               time.Duration `mapstructure:"timeout"`
+	WorkspaceID           string `mapstructure:"workspace_id"`
+	DefaultRuntimeProfile string `mapstructure:"default_runtime_profile"`
 }
 
 // WebConfig 包含网络搜索和获取工具的常用密钥与端点配置
@@ -1028,9 +1027,6 @@ func applySandboxDefaults(cfg *SandboxConfig) {
 	}
 	if strings.TrimSpace(cfg.DefaultRuntimeProfile) == "" {
 		cfg.DefaultRuntimeProfile = "code-polyglot-basic"
-	}
-	if cfg.Timeout <= 0 {
-		cfg.Timeout = 60 * time.Second
 	}
 }
 

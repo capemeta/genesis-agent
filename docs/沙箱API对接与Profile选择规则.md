@@ -32,7 +32,6 @@ sandbox:
   api_key_env: GENESIS_SANDBOX_API_KEY
   workspace_id: ""
   default_runtime_profile: code-polyglot-basic
-  timeout: 60s
 ```
 
 字段语义：
@@ -47,7 +46,8 @@ sandbox:
 | `api_key` / `api_key_env` | Bearer Token 来源。生产优先 `api_key_env`，不把明文 key 写进仓库配置。 |
 | `workspace_id` | 外部 sandbox workspace 标识；为空时由产品 bootstrap 或 sandbox 服务分配。 |
 | `default_runtime_profile` | 普通代码/命令默认 profile，当前推荐 `code-polyglot-basic`。 |
-| `timeout` | sandbox API client 默认超时，不替代单次 job timeout。 |
+
+HTTP adapter 强制 `http.Client.Timeout=0`（自定义 Client 也会被克隆清零）；单次 Exec/Job 超时只认请求 context / `RunOptions.Timeout`。session-file locator / binding 只允许 `session_id` + `workspace_id`，禁止 `sandbox_id`。
 
 优先级从高到低：
 
@@ -66,14 +66,39 @@ sandbox:
 
 ## 4. SDK 与 HTTP 怎么选
 
-`genesis-agent` 是 Go 服务，默认优先使用 Go SDK 或基于同一 DTO 的 HTTP adapter：
+`genesis-sandbox` Go SDK（`sdks/go`）是协议金标准，但**未发布为可 `go get` 的独立模块**；`genesis-agent` 与之是两个独立仓库，正式依赖不使用 `go.mod replace`。
+
+本仓做法：在 `internal/capabilities/sandbox/adapter/http` 维护产品无关 HTTP adapter，语义与官方 SDK 的 Session+WorkspaceFS 最终形态对齐；`sandbox/contract` 不泄漏 SDK 类型。
 
 | 场景 | 推荐调用方式 | 说明 |
 | --- | --- | --- |
-| agent 后端长期集成 | Go SDK / HTTP adapter | 复用 context、timeout、错误包装、认证注入，适合产品 bootstrap 管理 |
+| agent 后端长期集成 | 本仓 HTTP adapter | 对齐 SDK DTO/路径；bootstrap 注入 endpoint/credential |
+| 对照/联调官方示例 | genesis-sandbox 仓内 `sdks/go` | 仅作协议参考，不引入 agent `go.mod` |
 | 跨语言外部系统调用 sandbox | HTTP API | 稳定边界，便于调试、网关治理和多语言接入 |
 | MCP 工具生态接入 sandbox | sandbox MCP server | 给外部 MCP client 用；`genesis-agent` 内部不应绕过自身 ToolGateway 直接靠 MCP 执行 |
-| Skill 脚本执行 | `SandboxRunner` 经 adapter 调用 SDK/HTTP | Skill 只负责触发说明和资源引用，执行仍走权限、审计、profile 选择；当前已实现 HTTP `CommandClient` 主路径 |
+| Skill 脚本执行 | `SandboxSession` / `CommandClient` 经 adapter | Skill 只负责触发说明和资源引用；多轮远程执行走 Session+WorkspaceFS，一次性 Job 走 lease |
+
+### 4.1 Session + WorkspaceFS 主路径
+
+```text
+CreateSession
+  → session_id（逻辑会话）+ workspace_id（持久文件）
+  → active_sandbox_id 可空（休眠，无 Runtime）
+Write/List/Stat
+  → Session WorkspaceFS，不依赖 sandbox_id
+首次 ExecNamedSession
+  → 懒启 Runtime，回填 sandbox_id，environment=sandbox
+后续 Exec（未 Suspend）
+  → 复用 active_sandbox_id
+Suspend / Runtime 回收
+  → 清空 active_sandbox_id；session/workspace 保留；心跳仍 RenewSession
+再次 Exec
+  → 懒启新 Runtime，挂同一 workspace_id
+Close / DeleteSession
+  → 删 Session、放 Runtime；默认 workspace_retention=explicit_delete 不删 Workspace
+```
+
+并行路径：一次性 `RunCommand` 仍为 lease → job → poll → release/destroy（Job+Artifact），与 Session 主路径分离。
 
 对 `genesis-agent` 内部代码，最佳实践是定义产品无关端口：
 
@@ -379,9 +404,12 @@ SDK 方式调用 Skill 时推荐链路：
 当前实现状态：
 
 - `internal/capabilities/sandbox/adapter/http` 已解析 `output_artifacts` 并支持下载 `/v1/artifacts/{id}`。
-- `internal/capabilities/sandbox/adapter/http` 按 `sdks/go/sandbox` 的生产模式实现 lease、后台 renew、job poll、GetJob 产物收集、release/destroy；不再保留裸 `/v1/jobs` 作为主执行路径。
+- Job 路径：lease、后台 renew、job poll、GetJob 产物收集、release/destroy。
+- Session 路径：休眠 `CreateSession`、Session WorkspaceFS（Read/Write/List/Stat/Mkdir/Remove）、`Exec` 懒启并回填 `sandbox_id`、`Suspend`、`RenewSession` 心跳、`DeleteSession`；默认 `workspace_retention=explicit_delete`。
+- 条件写：`Overwrite=false` → `If-None-Match: *`；`ExpectedHash` → `If-Match`。
+- Session Manager idle 优先 `Suspend` Runtime，超长 `cacheTTL` 后再 `Close` Session；store 只持久化 durable `workspace_id`。
 - CLI 外部 sandbox 模式默认把 artifact materialize 到 `.genesis/artifacts/...`。
-- genesis-sandbox SDK/HTTP 当前可用的是 `UploadJobFile`、`ListJobArtifacts`、`DownloadArtifact` 和 Workspace 生命周期；没有稳定 workspace 文件 CRUD 端点。因此 `FileSystemClient` 的 workspace 文件读写方法暂时返回明确 unsupported；不要伪造 `/v1/workspaces/{id}/files` 这类未公开 API。
+- 不要伪造已废弃的 `/v1/workspaces/{id}/files` 或依赖创建即非空的 `active_sandbox_id`。
 
 ## 9. 产品默认策略
 
@@ -396,7 +424,7 @@ SDK 方式调用 Skill 时推荐链路：
 已落地：
 
 1. `execmodel.SandboxProfile` 已承载 `runtime_profile`、`task_type`、`operation`、`language`、`risk_level`、`metadata`，作为工具到 sandbox adapter 的稳定执行意图。
-2. `internal/capabilities/sandbox/adapter/http` 已实现同步命令执行主路径：Bearer 认证、lease/renew/release 生命周期、绑定 sandbox 的 `POST /v1/jobs`、`GET /v1/jobs/{id}` 轮询和产物收集、超时、stdout/stderr/exit_code、错误码映射。
+2. `internal/capabilities/sandbox/adapter/http` 已实现 Job 主路径与 Session+WorkspaceFS 主路径：Bearer 认证、休眠 Session、懒启 Runtime、Suspend、WorkspaceFS CRUD、条件写、lease/job poll/release、错误码映射。
 3. CLI sandbox config 已支持 `mode=docker_sandbox|remote_sandbox`、`endpoint`、`api_key`、`workspace_id`、`default_runtime_profile`、会话级覆盖。
 4. CLI bootstrap 在外部 sandbox 模式下已注入 genesis-sandbox HTTP `CommandClient` 和 execution sandbox runner；本地平台模式继续使用 `shared/local` runner。
 5. 内置 Office Skills 已按 Anthropic verbatim 迁入（ppt/word/pdf/excel）；Excel 主 QA 为 `scripts/recalc.py`，不再使用旧 inspect/`recalc_xlsx`。
@@ -432,11 +460,11 @@ SDK 方式调用 Skill 时推荐链路：
 
 仍需继续：
 
-1. `FileSystemClient` 的 workspace 文件 CRUD 尚未接通，因为 genesis-sandbox OpenAPI 当前未暴露稳定 workspace 文件端点；已接通 artifact 下载/本地落盘主路径。
-2. Enterprise 租户/用户/RBAC/credential 与人工审批 requester 仍需产品化；headless ask 仅为过渡。
-3. Office/Browser 后续应沉淀能力专属 service（生成/编辑库封装），避免长期依赖模型临时拼 shell 或临时 Python 生成逻辑；`run_skill_command` 已覆盖脚本执行主路径。
-4. 启动或健康检查应调用 `GET /v1/runtime-profiles`，发现目标 profile 不可用时按 `SandboxRequired` / `SandboxOptional` 语义处理。
-5. 远程 StageInput 不再依赖服务端保留嵌套路径名；当前客户端以扁平 zip 输入规避 `/workspace/input/<safe_name>` 差异。后续若 sandbox 暴露稳定 workspace 文件 API，可替换 staging 实现但保持 `SKILL_DIR` 契约。
-6. Office OCR 升级（`office-ocr`）尚未由 SkillScript 自动判定，当前 Office 默认 `office-basic`。
-7. `auto_retry_after_install` 的 Installer 端口需产品注入真实 `install_skill_dependencies` 适配器后才生效。
+1. Enterprise 租户/用户/RBAC/credential 与人工审批 requester 仍需产品化；headless ask 仅为过渡。
+2. Office/Browser 后续应沉淀能力专属 service（生成/编辑库封装），避免长期依赖模型临时拼 shell 或临时 Python 生成逻辑；`run_skill_command` 已覆盖脚本执行主路径。
+3. 启动或健康检查应调用 `GET /v1/runtime-profiles`，发现目标 profile 不可用时按 `SandboxRequired` / `SandboxOptional` 语义处理。
+4. 远程 StageInput 以扁平 zip 输入规避 `/workspace/input/<safe_name>` 差异；可逐步改为 Session WorkspaceFS 直写并保持 `SKILL_DIR` 契约。
+5. Office OCR 升级（`office-ocr`）尚未由 SkillScript 自动判定，当前 Office 默认 `office-basic`。
+6. `auto_retry_after_install` 的 Installer 端口需产品注入真实 `install_skill_dependencies` 适配器后才生效。
+7. 若 genesis-sandbox 正式发布 Go module，可将 adapter 内部换为 `require` 薄包装，对外 `sandbox/contract` 保持不变。
 

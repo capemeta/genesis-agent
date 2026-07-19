@@ -54,7 +54,8 @@ func (l RemoteLocator) validate() error {
 			return fmt.Errorf("session-file locator 无效")
 		}
 		for key, value := range l.Workspace.Metadata {
-			if key != "session_id" && key != "workspace_id" && key != "sandbox_id" || strings.TrimSpace(value) == "" || value != strings.TrimSpace(value) {
+			// sandbox_id 是 ephemeral Runtime，禁止进入 locator 身份。
+			if key != "session_id" && key != "workspace_id" || strings.TrimSpace(value) == "" || value != strings.TrimSpace(value) {
 				return fmt.Errorf("session-file locator metadata 无效")
 			}
 		}

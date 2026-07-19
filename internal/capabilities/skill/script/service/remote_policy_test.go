@@ -29,12 +29,13 @@ import (
 )
 
 type fakeRemoteClient struct {
-	files       map[string][]byte
-	lastCommand execmodel.Command
-	lastOptions sandboxcontract.SessionOptions
-	openCount   int
-	runCount    int
-	closeCount  int
+	files        map[string][]byte
+	lastCommand  execmodel.Command
+	lastOptions  sandboxcontract.SessionOptions
+	openCount    int
+	runCount     int
+	closeCount   int
+	suspendCount int
 }
 
 func newFakeRemoteClient() *fakeRemoteClient { return &fakeRemoteClient{files: map[string][]byte{}} }
@@ -91,6 +92,10 @@ func (s *fakeRemoteSession) Run(_ context.Context, req sandboxcontract.CommandRe
 	s.client.runCount++
 	s.client.files[path.Join(normalizeSlash(req.Command.Cwd), "output.txt")] = []byte("done")
 	return &execmodel.Result{ExitCode: 0, Stdout: "ok"}, nil
+}
+func (s *fakeRemoteSession) Suspend(context.Context) error {
+	s.client.suspendCount++
+	return nil
 }
 func (s *fakeRemoteSession) Close(context.Context) error {
 	s.client.closeCount++
@@ -166,18 +171,22 @@ func TestSkillCommandServiceRunsInRemoteTaskWorkspace(t *testing.T) {
 	}
 	svc.ReleaseRun(context.Background(), workmodel.PreparedRun{Manifest: workmodel.RunManifest{RunID: "remote-run-2"}})
 	deadline := time.Now().Add(time.Second)
-	for client.closeCount != 1 && time.Now().Before(deadline) {
+	for client.suspendCount < 1 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
-	if client.closeCount != 1 {
-		t.Fatalf("idle execution container close count=%d, want 1", client.closeCount)
+	if client.suspendCount < 1 {
+		t.Fatalf("idle cleanup should Suspend Runtime, suspend=%d", client.suspendCount)
+	}
+	if client.closeCount != 0 {
+		t.Fatalf("idle cleanup must not Close Session early, close=%d", client.closeCount)
 	}
 	third, err := svc.Run(context.Background(), scriptcontract.RunRequest{Catalog: skillcontract.CatalogRequest{}, Skill: "demo", Command: `./scripts/make_output.cmd`, Binding: testBinding("remote-run-3"), StateRoot: testStateRoot(root), ProjectDir: root, Sandbox: execmodel.SandboxProfile{Mode: execmodel.SandboxRequired, Provider: "genesis-sandbox"}})
 	if err != nil || !third.OK {
 		t.Fatalf("third run result=%+v err=%v", third, err)
 	}
-	if client.openCount != 2 || client.lastOptions.Workspace.ID != "workspace-1" {
-		t.Fatalf("idle reopen did not attach durable workspace: opens=%d workspace=%+v", client.openCount, client.lastOptions.Workspace)
+	// Suspend 后 Session 仍在缓存中，再次 Run 应复用，不重新 OpenSession。
+	if client.openCount != 1 {
+		t.Fatalf("after Suspend should reuse session: opens=%d", client.openCount)
 	}
 	if err := svc.Close(context.Background()); err != nil {
 		t.Fatal(err)
@@ -186,7 +195,7 @@ func TestSkillCommandServiceRunsInRemoteTaskWorkspace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fourth.OK || !strings.Contains(fourth.Error, "service 已关闭") || client.openCount != 2 {
+	if fourth.OK || !strings.Contains(fourth.Error, "service 已关闭") || client.openCount != 1 {
 		t.Fatalf("closed service accepted a new remote execution: result=%+v opens=%d", fourth, client.openCount)
 	}
 }

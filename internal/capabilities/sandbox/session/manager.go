@@ -49,13 +49,14 @@ type Manager struct {
 }
 
 type managedEntry struct {
-	execMu         sync.Mutex
-	session        *Session
-	workspace      sandboxcontract.WorkspaceRef
-	lastUsed       time.Time
-	inUse          int
-	stateLoaded    bool
-	statePersisted bool
+	execMu           sync.Mutex
+	session          *Session
+	workspace        sandboxcontract.WorkspaceRef
+	lastUsed         time.Time
+	inUse            int
+	stateLoaded      bool
+	statePersisted   bool
+	runtimeSuspended bool // idle 后已 Suspend Runtime，Session 仍保留
 }
 
 // ManagerDeps 是远程 Session Manager 的产品无关依赖。
@@ -180,6 +181,7 @@ func (m *Manager) Acquire(ctx context.Context, req AcquireRequest) (*Handle, err
 		m.release(entry)
 		return nil, err
 	}
+	entry.runtimeSuspended = false
 	if err := m.bindExecution(ctx, entry.session, req.Binding); err != nil {
 		entry.execMu.Unlock()
 		m.release(entry)
@@ -220,7 +222,8 @@ func (h *Handle) Close() error {
 	return nil
 }
 
-// ReleaseRun 释放 Run 对逻辑会话的引用，容器在 idle TTL 后关闭，Workspace 保留。
+// ReleaseRun 释放 Run 对逻辑会话的引用；idle TTL 后 Suspend Runtime，更长 cacheTTL 后再 Close Session。
+// durable Workspace 映射始终保留在 store 中。
 func (m *Manager) ReleaseRun(_ context.Context, prepared workmodel.PreparedRun) {
 	m.ReleaseRunID(prepared.Manifest.RunID)
 }
@@ -391,38 +394,67 @@ func (m *Manager) cleanup(ctx context.Context) {
 	type candidate struct {
 		key   string
 		entry *managedEntry
+		close bool // true=Close+驱逐；false=Suspend Runtime
 	}
 	var candidates []candidate
 	m.mu.Lock()
 	for key, entry := range m.entries {
-		if entry != nil && entry.session != nil && entry.inUse == 0 && !m.referencedLocked(key) && now.Sub(entry.lastUsed) > m.idleTTL {
-			candidates = append(candidates, candidate{key: key, entry: entry})
+		if entry == nil || entry.inUse > 0 || m.referencedLocked(key) {
+			continue
+		}
+		idleFor := now.Sub(entry.lastUsed)
+		switch {
+		case entry.session != nil && idleFor > m.cacheTTL:
+			candidates = append(candidates, candidate{key: key, entry: entry, close: true})
+		case entry.session != nil && idleFor > m.idleTTL && !entry.runtimeSuspended:
+			candidates = append(candidates, candidate{key: key, entry: entry, close: false})
+		case entry.session == nil && idleFor > m.cacheTTL:
+			delete(m.entries, key)
 		}
 	}
 	m.mu.Unlock()
 	for _, candidate := range candidates {
 		candidate.entry.execMu.Lock()
 		m.mu.Lock()
-		if candidate.entry.session == nil || candidate.entry.inUse > 0 || m.referencedLocked(candidate.key) || time.Since(candidate.entry.lastUsed) <= m.idleTTL {
+		if candidate.entry.inUse > 0 || m.referencedLocked(candidate.key) {
+			m.mu.Unlock()
+			candidate.entry.execMu.Unlock()
+			continue
+		}
+		idleFor := time.Since(candidate.entry.lastUsed)
+		if candidate.close {
+			if candidate.entry.session == nil || idleFor <= m.cacheTTL {
+				m.mu.Unlock()
+				candidate.entry.execMu.Unlock()
+				continue
+			}
+			sess := candidate.entry.session
+			candidate.entry.session = nil
+			candidate.entry.runtimeSuspended = false
+			delete(m.entries, candidate.key)
+			m.mu.Unlock()
+			if err := sess.Close(ctx); err != nil {
+				m.log.Warn("关闭超长空闲远程 session 失败", "execution_session", candidate.key, "error", err)
+			}
+			candidate.entry.execMu.Unlock()
+			continue
+		}
+		if candidate.entry.session == nil || candidate.entry.runtimeSuspended || idleFor <= m.idleTTL {
 			m.mu.Unlock()
 			candidate.entry.execMu.Unlock()
 			continue
 		}
 		sess := candidate.entry.session
-		candidate.entry.session = nil
 		m.mu.Unlock()
-		if err := sess.Close(ctx); err != nil {
-			m.log.Warn("关闭空闲远程 session 失败", "execution_session", candidate.key, "error", err)
+		if err := sess.Suspend(ctx); err != nil {
+			m.log.Warn("Suspend 空闲远程 Runtime 失败", "execution_session", candidate.key, "error", err)
+		} else {
+			m.mu.Lock()
+			candidate.entry.runtimeSuspended = true
+			m.mu.Unlock()
 		}
 		candidate.entry.execMu.Unlock()
 	}
-	m.mu.Lock()
-	for key, entry := range m.entries {
-		if entry != nil && entry.session == nil && entry.inUse == 0 && !m.referencedLocked(key) && now.Sub(entry.lastUsed) > m.cacheTTL {
-			delete(m.entries, key)
-		}
-	}
-	m.mu.Unlock()
 }
 
 func (m *Manager) referencedLocked(key string) bool {

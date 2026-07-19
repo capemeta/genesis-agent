@@ -4,7 +4,6 @@ package sandbox
 import (
 	"fmt"
 	"strings"
-	"time"
 
 	execmodel "genesis-agent/internal/capabilities/execution/model"
 	platformconfig "genesis-agent/internal/platform/config"
@@ -32,7 +31,6 @@ type Config struct {
 	WorkspaceID           string                          `json:"workspace_id,omitempty"`
 	DefaultRuntimeProfile execmodel.SandboxRuntimeProfile `json:"default_runtime_profile,omitempty"`
 	AllowSessionOverride  bool                            `json:"allow_session_override,omitempty"`
-	Timeout               time.Duration                   `json:"timeout,omitempty"`
 }
 
 // DefaultConfig 返回 CLI 默认运行配置。默认不启用沙箱，保持现有行为。
@@ -61,7 +59,6 @@ func FromRuntimeConfig(cfg platformconfig.SandboxConfig) (Config, error) {
 		WorkspaceID:           strings.TrimSpace(cfg.WorkspaceID),
 		DefaultRuntimeProfile: execmodel.SandboxRuntimeProfile(strings.TrimSpace(cfg.DefaultRuntimeProfile)),
 		AllowSessionOverride:  cfg.AllowSessionOverride,
-		Timeout:               cfg.Timeout,
 	}
 	switch mode {
 	case ModeLocalHost, ModePlatform, ModeDockerSandbox, ModeRemoteSandbox:

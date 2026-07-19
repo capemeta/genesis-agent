@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	execcontract "genesis-agent/internal/capabilities/execution/contract"
 	execmodel "genesis-agent/internal/capabilities/execution/model"
@@ -34,7 +33,7 @@ func TestRemoteSkillCommandStagesWorkDirInputAndUsesImageNodeModules(t *testing.
 	if baseURL == "" {
 		baseURL = "http://127.0.0.1:18010"
 	}
-	client, err := sandboxhttp.New(sandboxhttp.Config{BaseURL: baseURL, APIKey: apiKey, Timeout: 90 * time.Second})
+	client, err := sandboxhttp.New(sandboxhttp.Config{BaseURL: baseURL, APIKey: apiKey})
 	if err != nil {
 		t.Fatal(err)
 	}

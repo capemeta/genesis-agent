@@ -247,13 +247,12 @@ func workspaceErrorCode(err error) workcontract.ErrorCode {
 
 func cloneWorkspaceRef(value sandboxcontract.WorkspaceRef) sandboxcontract.WorkspaceRef {
 	out := sandboxcontract.WorkspaceRef{ID: strings.TrimSpace(value.ID), Provider: strings.TrimSpace(value.Provider)}
-	// Persist only backend identity fields needed to reopen WorkspaceFS. Arbitrary
-	// metadata can contain credentials or request-local data and must not enter a
-	// durable locator.
-	for _, key := range []string{"session_id", "workspace_id", "sandbox_id"} {
+	// 只保留 WorkspaceFS 所需的稳定身份。sandbox_id 是 ephemeral Runtime，
+	// 随 Exec/Suspend 变化，不得进入 binding/locator 持久身份。
+	for _, key := range []string{"session_id", "workspace_id"} {
 		if item := strings.TrimSpace(value.Metadata[key]); item != "" {
 			if out.Metadata == nil {
-				out.Metadata = make(map[string]string, 3)
+				out.Metadata = make(map[string]string, 2)
 			}
 			out.Metadata[key] = item
 		}

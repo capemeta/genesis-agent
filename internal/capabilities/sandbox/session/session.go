@@ -58,9 +58,13 @@ func Open(ctx context.Context, deps Deps, opts Options) (*Session, error) {
 }
 
 // Workspace 返回 session scoped WorkspaceFS 引用。
+// 优先读底层 raw（Exec 回填 / Suspend 清空 sandbox_id 后可见）。
 func (s *Session) Workspace() sandboxcontract.WorkspaceRef {
 	if s == nil {
 		return sandboxcontract.WorkspaceRef{}
+	}
+	if s.raw != nil {
+		return s.raw.Workspace()
 	}
 	return s.workspace
 }
@@ -91,11 +95,24 @@ func (s *Session) Run(ctx context.Context, cmd execmodel.Command, opts execcontr
 	}
 	opts = mergeRunOptions(s.run, opts)
 	return s.raw.Run(ctx, sandboxcontract.CommandRequest{
-		Workspace: s.workspace,
+		Workspace: s.Workspace(),
 		Command:   cmd,
 		Sandbox:   s.sandbox,
 		Options:   opts,
 	})
+}
+
+// Suspend 释放 ephemeral Runtime，保留 Session/Workspace；心跳继续。
+// 底层未实现 SuspendableSandboxSession 时返回错误，避免 Manager 误标已 Suspend。
+func (s *Session) Suspend(ctx context.Context) error {
+	if s == nil || s.raw == nil {
+		return fmt.Errorf("sandbox session未打开")
+	}
+	suspendable, ok := s.raw.(sandboxcontract.SuspendableSandboxSession)
+	if !ok {
+		return fmt.Errorf("底层 sandbox session 不支持 Suspend")
+	}
+	return suspendable.Suspend(ctx)
 }
 
 // RunCommand 用 sh 执行 verbatim 命令字符串。
@@ -109,7 +126,7 @@ func (s *Session) WriteFile(ctx context.Context, path string, content []byte, op
 		return fmt.Errorf("sandbox filesystem client未配置")
 	}
 	return s.files.WriteFile(ctx, sandboxcontract.WriteFileRequest{
-		Workspace: s.workspace,
+		Workspace: s.Workspace(),
 		Path:      resolvedWorkspacePath(path),
 		Content:   content,
 		Options:   opts,
@@ -122,7 +139,7 @@ func (s *Session) ReadFile(ctx context.Context, path string, opts fscontract.Rea
 		return nil, fmt.Errorf("sandbox filesystem client未配置")
 	}
 	return s.files.ReadFile(ctx, sandboxcontract.FileRequest{
-		Workspace: s.workspace,
+		Workspace: s.Workspace(),
 		Path:      resolvedWorkspacePath(path),
 	}, opts)
 }
@@ -133,7 +150,7 @@ func (s *Session) ListDir(ctx context.Context, path string, opts fscontract.List
 		return nil, fmt.Errorf("sandbox filesystem client未配置")
 	}
 	return s.files.ListDir(ctx, sandboxcontract.ListDirRequest{
-		Workspace: s.workspace,
+		Workspace: s.Workspace(),
 		Path:      resolvedWorkspacePath(path),
 		Options:   opts,
 	})
@@ -145,7 +162,7 @@ func (s *Session) Walk(ctx context.Context, path string, opts fscontract.WalkOpt
 		return nil, fmt.Errorf("sandbox filesystem client未配置")
 	}
 	return s.files.Walk(ctx, sandboxcontract.WalkRequest{
-		Workspace: s.workspace,
+		Workspace: s.Workspace(),
 		Path:      resolvedWorkspacePath(path),
 		Options:   opts,
 	})
@@ -157,7 +174,7 @@ func (s *Session) Stat(ctx context.Context, path string) (*fsmodel.FileStat, err
 		return nil, fmt.Errorf("sandbox filesystem client未配置")
 	}
 	return s.files.Stat(ctx, sandboxcontract.FileRequest{
-		Workspace: s.workspace,
+		Workspace: s.Workspace(),
 		Path:      resolvedWorkspacePath(path),
 	})
 }
@@ -168,7 +185,7 @@ func (s *Session) MkdirAll(ctx context.Context, path string, opts fscontract.Mkd
 		return fmt.Errorf("sandbox filesystem client未配置")
 	}
 	return s.files.MkdirAll(ctx, sandboxcontract.MkdirRequest{
-		Workspace: s.workspace,
+		Workspace: s.Workspace(),
 		Path:      resolvedWorkspacePath(path),
 		Options:   opts,
 	})
@@ -180,7 +197,7 @@ func (s *Session) Remove(ctx context.Context, path string, opts fscontract.Remov
 		return fmt.Errorf("sandbox filesystem client未配置")
 	}
 	return s.files.Remove(ctx, sandboxcontract.RemoveRequest{
-		Workspace: s.workspace,
+		Workspace: s.Workspace(),
 		Path:      resolvedWorkspacePath(path),
 		Options:   opts,
 	})

@@ -872,7 +872,6 @@ func buildSandboxStack(directRunner *localexec.Runner, sandboxCfg clisandbox.Con
 		client, err := sandboxhttp.New(sandboxhttp.Config{
 			BaseURL: sandboxCfg.Endpoint,
 			APIKey:  sandboxCfg.APIKey,
-			Timeout: sandboxCfg.Timeout,
 		})
 		if err != nil {
 			return nil, nil, nil, sandboxcontract.WorkspaceRef{}, fmt.Errorf("初始化genesis-sandbox HTTP client失败: %w", err)

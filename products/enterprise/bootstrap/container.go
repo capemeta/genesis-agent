@@ -461,7 +461,6 @@ func buildEnterpriseExecStack(cfg platformconfig.SandboxConfig, log logger.Logge
 			client, err := sandboxhttp.New(sandboxhttp.Config{
 				BaseURL: cfg.BaseURL,
 				APIKey:  cfg.APIKey,
-				Timeout: cfg.Timeout,
 			})
 			if err != nil {
 				return skillstack.ExecStack{}, fmt.Errorf("初始化genesis-sandbox client失败: %w", err)
