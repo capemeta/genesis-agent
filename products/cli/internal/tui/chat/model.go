@@ -16,6 +16,7 @@ import (
 
 	"genesis-agent/internal/app"
 	"genesis-agent/internal/domain"
+	"genesis-agent/internal/runtime/collab"
 	"genesis-agent/internal/runtime/progress"
 	approval "genesis-agent/products/cli/internal/approval"
 	"genesis-agent/products/cli/internal/tui/clipboard"
@@ -70,8 +71,13 @@ type Model struct {
 	approvalFocus  bool                          // 当前是否为审批输入拦截状态
 
 	// ── 计划状态 ──────────────────────────────────────────────
-	currentPlan  *domain.Plan // 当前活跃计划（nil 表示无计划）
-	planExpanded bool         // 计划卡片是否展开（true=展开，false=折叠为单行摘要）
+	currentPlan  *domain.TaskList // 当前活跃任务清单（nil 表示无清单）
+	planExpanded bool             // 任务清单卡片是否展开
+
+	// ── 协作模式（规划模式）────────────────────────────────────
+	collabStore   collab.Store
+	workspaceRoot string
+	collabMode    collab.Mode
 
 	// ── Toast 状态 ────────────────────────────────────────────
 	toast          string    // 短时提示文本（空则不显示）
@@ -101,6 +107,28 @@ type Model struct {
 
 // NewModel 创建 TUI 对话界面 Model（Bubble Tea 入口）
 // 接入层只依赖 AgentService 接口，不感知 engine / memory 等领域细节
+// WithCollab 注入协作模式依赖（规划模式切换）；可链式调用。
+func (m Model) WithCollab(store collab.Store, workspaceRoot string) Model {
+	m.collabStore = store
+	m.workspaceRoot = workspaceRoot
+	if m.workspaceRoot == "" {
+		m.workspaceRoot = "."
+	}
+	m.collabMode = m.loadCollabMode()
+	return m
+}
+
+func (m Model) loadCollabMode() collab.Mode {
+	if m.collabStore == nil || m.session == nil || m.session.ID == "" {
+		return collab.ModeDefault
+	}
+	st, err := m.collabStore.Get(context.Background(), m.session.ID)
+	if err != nil {
+		return collab.ModeDefault
+	}
+	return collab.Normalize(st.Mode)
+}
+
 func NewModel(
 	ctx context.Context,
 	svc app.AgentService,
@@ -203,6 +231,7 @@ func (m *Model) hydrateFromSession() {
 	if m.currentPlan != nil {
 		m.planExpanded = true // 恢复后默认展开，让用户直观看到当前进度
 	}
+	m.collabMode = m.loadCollabMode()
 }
 
 // Init 返回 Bubble Tea 初始化命令（启动光标闪烁）
@@ -355,26 +384,26 @@ func (m *Model) renderPlanCard() string {
 	for _, item := range p.Items {
 		var icon, text string
 		switch item.Status {
-		case domain.PlanItemDone:
-			icon = styles.PlanItemDone.Render("✓")
-			text = styles.PlanItemDone.Render(item.Text)
+		case domain.TaskListItemDone:
+			icon = styles.TaskListItemDone.Render("✓")
+			text = styles.TaskListItemDone.Render(item.Text)
 			if item.Note != "" {
 				text += styles.PlanHint.Render(" (" + item.Note + ")")
 			}
-		case domain.PlanItemDoing:
-			icon = styles.PlanItemDoing.Render("▶")
-			text = styles.PlanItemDoing.Render(item.Text)
-		case domain.PlanItemFailed:
-			icon = styles.PlanItemFailed.Render("✗")
-			text = styles.PlanItemFailed.Render(item.Text)
+		case domain.TaskListItemDoing:
+			icon = styles.TaskListItemDoing.Render("▶")
+			text = styles.TaskListItemDoing.Render(item.Text)
+		case domain.TaskListItemFailed:
+			icon = styles.TaskListItemFailed.Render("✗")
+			text = styles.TaskListItemFailed.Render(item.Text)
 			if item.Note != "" {
 				text += styles.PlanHint.Render(" (" + item.Note + ")")
 			}
-		case domain.PlanItemSkipped:
-			icon = styles.PlanItemPending.Render("-")
-			text = styles.PlanItemPending.Render(item.Text)
+		case domain.TaskListItemSkipped:
+			icon = styles.TaskListItemPending.Render("-")
+			text = styles.TaskListItemPending.Render(item.Text)
 		default: // pending
-			icon = styles.PlanItemPending.Render("☐")
+			icon = styles.TaskListItemPending.Render("☐")
 			text = item.Text
 		}
 		sb.WriteString(fmt.Sprintf("  %s  %s\n", icon, text))
@@ -392,10 +421,10 @@ func (m *Model) renderPlanCard() string {
 }
 
 // loadPlanFromMessages 从消息列表中找最后一条 plan_snapshot 恢复计划
-func loadPlanFromMessages(msgs []*domain.Message) *domain.Plan {
+func loadPlanFromMessages(msgs []*domain.Message) *domain.TaskList {
 	for i := len(msgs) - 1; i >= 0; i-- {
-		if msgs[i].Kind == domain.MessageKindPlanSnapshot && msgs[i].Content != "" {
-			var plan domain.Plan
+		if msgs[i].Kind == domain.MessageKindTaskListSnapshot && msgs[i].Content != "" {
+			var plan domain.TaskList
 			if err := json.Unmarshal([]byte(msgs[i].Content), &plan); err == nil {
 				return &plan
 			}
@@ -614,8 +643,11 @@ var slashCommands = []slashCommand{
 	{value: "/copy", description: "复制最近回答"},
 	{value: "/copy all", description: "复制全部对话"},
 	{value: "/copy user", description: "复制最近输入"},
+	{value: "/execute", description: "批准实施方案并退出规划模式"},
 	{value: "/exit", description: "退出 TUI"},
 	{value: "/help", description: "打开帮助"},
+	{value: "/plan", description: "进入规划模式"},
+	{value: "/plan cancel", description: "放弃规划，回到执行中（无交接）"},
 	{value: "/quit", description: "退出 TUI"},
 	{value: "/remember", description: "保存长期记忆"},
 	{value: "/resume", description: "恢复指定会话"},
@@ -642,7 +674,7 @@ func (m Model) completeSlashCommand() Model {
 	}
 	m.commandSuggestionIndex = (m.commandSuggestionIndex + 1) % len(candidates)
 	completion := candidates[m.commandSuggestionIndex].value
-	if completion == "/copy" || completion == "/remember" || completion == "/resume" {
+	if completion == "/copy" || completion == "/remember" || completion == "/resume" || completion == "/plan" {
 		completion += " "
 	}
 	m.textarea.SetValue(completion)

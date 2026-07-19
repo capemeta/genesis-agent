@@ -54,6 +54,17 @@ func (c *Client) OpenSession(ctx context.Context, opts sandboxcontract.SessionOp
 	if workspace.Provider == "" {
 		workspace.Provider = "genesis-sandbox"
 	}
+	// 调用方 metadata 不得污染 ephemeral sandbox_id。
+	if len(workspace.Metadata) > 0 {
+		cleaned := make(map[string]string, len(workspace.Metadata))
+		for k, v := range workspace.Metadata {
+			if k == "sandbox_id" {
+				continue
+			}
+			cleaned[k] = v
+		}
+		workspace.Metadata = cleaned
+	}
 	// active_sandbox_id 可为空：休眠 Session，首次 Exec 懒启 Runtime。
 	session := &Session{
 		client:    c,
@@ -102,10 +113,14 @@ func (s *Session) Workspace() sandboxcontract.WorkspaceRef {
 		"session_id":   s.sessionID,
 		"workspace_id": s.workspace.ID,
 	}
+	// sandbox_id 只以本地权威字段为准；休眠/Suspend 后为空，禁止从输入 metadata 回灌。
 	if s.sandboxID != "" {
 		metadata["sandbox_id"] = s.sandboxID
 	}
 	for k, v := range s.workspace.Metadata {
+		if k == "sandbox_id" || k == "session_id" || k == "workspace_id" {
+			continue
+		}
 		if _, exists := metadata[k]; !exists {
 			metadata[k] = v
 		}
@@ -374,8 +389,6 @@ func (s *Session) applyRecord(record sessionRecord) {
 	s.mu.Unlock()
 }
 
-// RenewSandbox 续租指定 sandbox，返回服务端确认的新到期时间。
-
 type execSessionRequest struct {
 	Command  []string `json:"command,omitempty"`
 	Code     string   `json:"code,omitempty"`
@@ -436,6 +449,8 @@ func createSessionRequestFromOptions(opts sandboxcontract.SessionOptions) create
 	}
 	retention := firstNonEmpty(metadata["workspace_retention"], "explicit_delete")
 	delete(metadata, "workspace_retention")
+	delete(metadata, "sandbox_id")
+	delete(metadata, "session_id")
 	workspaceTTL := 0
 	if raw := strings.TrimSpace(metadata["workspace_ttl_seconds"]); raw != "" {
 		if n, err := strconv.Atoi(raw); err == nil && n > 0 {

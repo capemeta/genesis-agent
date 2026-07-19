@@ -12,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"genesis-agent/internal/app"
+	"genesis-agent/internal/runtime/collab"
 	clisandbox "genesis-agent/products/cli/internal/sandbox"
 )
 
@@ -31,6 +32,12 @@ type ServiceOptions struct {
 type ServiceHandle interface {
 	Service() app.AgentService
 	Close() error
+}
+
+// CollabHandle 可选扩展：规划模式 ModeStore 与工作区根（CLI TUI 使用）。
+type CollabHandle interface {
+	CollabStore() collab.Store
+	WorkspaceRoot() string
 }
 
 // ServiceFactory 由产品分发层注入可关闭的 AgentService 运行时。

@@ -5,8 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 
-	plancontract "genesis-agent/internal/capabilities/plan/contract"
-	planmodel "genesis-agent/internal/capabilities/plan/model"
+	tasklistcontract "genesis-agent/internal/capabilities/tasklist/contract"
+	tasklistmodel "genesis-agent/internal/capabilities/tasklist/model"
+	tasklistprompt "genesis-agent/internal/capabilities/tasklist/prompt"
 	"genesis-agent/internal/capabilities/tool/contract"
 	toolparam "genesis-agent/internal/capabilities/tool/param"
 	"genesis-agent/internal/platform/contextutil"
@@ -14,18 +15,18 @@ import (
 
 // TodoReadTool 读取当前待办计划的工具
 type TodoReadTool struct {
-	planSvc plancontract.Service
+	planSvc tasklistcontract.Service
 }
 
 // NewTodoReadTool 创建 TodoReadTool 实例
-func NewTodoReadTool(svc plancontract.Service) tool.Tool {
+func NewTodoReadTool(svc tasklistcontract.Service) tool.Tool {
 	return &TodoReadTool{planSvc: svc}
 }
 
 func (t *TodoReadTool) GetInfo() *tool.Info {
 	return &tool.Info{
 		Name:        "todo_read",
-		Description: "读取当前会话的待办任务清单 (TodoList)。自动过滤多余已完成的步骤以节约您的上下文 Token 空间。",
+		Description: tasklistprompt.ToolTodoReadDescription,
 		Parameters: &tool.ParameterSchema{
 			Type:       "object",
 			Properties: map[string]*tool.ParameterSchema{},
@@ -49,12 +50,12 @@ func (t *TodoReadTool) Execute(ctx context.Context, params string) (string, erro
 		return "", fmt.Errorf("context missing session_id")
 	}
 
-	plan, err := t.planSvc.GetPlan(ctx, sessionID)
+	plan, err := t.planSvc.GetTaskList(ctx, sessionID)
 	if err != nil {
 		return "", fmt.Errorf("fetch plan failed: %w", err)
 	}
 	if plan == nil || len(plan.Steps) == 0 {
-		return `{"steps":[],"message":"当前无计划，请使用 todo_write 规划步骤"}`, nil
+		return `{"steps":[],"message":"当前无任务清单，请使用 todo_write 创建步骤"}`, nil
 	}
 
 	// 1. 进行 Token 剪枝 (Token Pruning)
@@ -63,7 +64,7 @@ func (t *TodoReadTool) Execute(ctx context.Context, params string) (string, erro
 	for {
 		changed := false
 		for _, step := range plan.Steps {
-			if step.Status != planmodel.StepStatusCompleted && step.ParentID != "" {
+			if step.Status != tasklistmodel.StepStatusCompleted && step.ParentID != "" {
 				if !uncompletedParents[step.ParentID] {
 					uncompletedParents[step.ParentID] = true
 					changed = true
@@ -81,11 +82,11 @@ func (t *TodoReadTool) Execute(ctx context.Context, params string) (string, erro
 		}
 	}
 
-	var prunedSteps []planmodel.Step
-	var completedSteps []planmodel.Step
+	var prunedSteps []tasklistmodel.Step
+	var completedSteps []tasklistmodel.Step
 
 	for _, step := range plan.Steps {
-		if step.Status == planmodel.StepStatusCompleted {
+		if step.Status == tasklistmodel.StepStatusCompleted {
 			// 如果该已完成步骤含有未完成子孙，必须强制保留在主上下文列表中，不可归档
 			if uncompletedParents[step.ID] {
 				prunedSteps = append(prunedSteps, step)
@@ -112,7 +113,7 @@ func (t *TodoReadTool) Execute(ctx context.Context, params string) (string, erro
 	// 2. 格式化输出
 	type PrunedResponse struct {
 		SessionID         string           `json:"session_id"`
-		Steps             []planmodel.Step `json:"steps"`
+		Steps             []tasklistmodel.Step `json:"steps"`
 		LatestExplanation string           `json:"latest_explanation,omitempty"`
 		Version           int64            `json:"version"`
 		ArchivedCompleted int              `json:"archived_completed_count"`

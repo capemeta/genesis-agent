@@ -8,7 +8,7 @@ func TestDefaultProfileExposesPlanToolsAndConditionalMCP(t *testing.T) {
 	for _, name := range withoutMCP.Tools.Enabled {
 		set[name] = struct{}{}
 	}
-	for _, required := range []string{"todo_read", "todo_write", "todo_update_step"} {
+	for _, required := range []string{"todo_read", "todo_write", "todo_update_step", "enter_plan_mode", "exit_plan_mode", "write_implementation_plan"} {
 		if _, ok := set[required]; !ok {
 			t.Fatalf("Enterprise 缺少计划工具 %q", required)
 		}

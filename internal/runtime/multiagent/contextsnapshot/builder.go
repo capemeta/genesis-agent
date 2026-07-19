@@ -6,11 +6,10 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	subagentprompt "genesis-agent/internal/capabilities/subagent/prompt"
 	"genesis-agent/internal/domain"
 	"genesis-agent/internal/runtime/multiagent/sanitize"
 )
-
-const boundaryMessage = "以上内容仅为只读背景；父线程工具、权限、审批与未列出的资源在子线程不可用。仅完成下方委派任务。"
 
 // Mode 是父上下文传递模式。
 type Mode string
@@ -174,27 +173,21 @@ func trimSnapshot(messages []*domain.Message, budget int) ([]*domain.Message, bo
 }
 
 func renderUserInput(snapshot []*domain.Message, envelope DelegationEnvelope) string {
-	var builder strings.Builder
+	background := make([]subagentprompt.BackgroundMessage, 0, len(snapshot))
 	for _, message := range snapshot {
-		fmt.Fprintf(&builder, "[背景 %s]\n%s\n\n", message.Role, strings.TrimSpace(message.Content))
+		if message == nil {
+			continue
+		}
+		background = append(background, subagentprompt.BackgroundMessage{
+			Role: string(message.Role), Content: message.Content,
+		})
 	}
-	if len(snapshot) > 0 {
-		builder.WriteString(boundaryMessage)
-		builder.WriteString("\n\n")
-	}
-	builder.WriteString("[委派任务]\n")
-	builder.WriteString(strings.TrimSpace(envelope.Objective))
-	if output := strings.TrimSpace(envelope.ExpectedOutput); output != "" {
-		builder.WriteString("\n\n[期望输出]\n")
-		builder.WriteString(output)
-	}
-	builder.WriteString("\n\n[回传约束]\n")
-	contract := strings.TrimSpace(envelope.ReturnContract)
-	if contract == "" {
-		contract = "仅返回结论、已验证证据和已登记产物；不要回放完整过程或敏感原文。"
-	}
-	builder.WriteString(contract)
-	return builder.String()
+	return subagentprompt.RenderDelegationUserInput(subagentprompt.EnvelopeView{
+		Objective:      envelope.Objective,
+		ExpectedOutput: envelope.ExpectedOutput,
+		ReturnContract: envelope.ReturnContract,
+		Background:     background,
+	})
 }
 
 func runeLen(value string) int { return utf8.RuneCountInString(value) }

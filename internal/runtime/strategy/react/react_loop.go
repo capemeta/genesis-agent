@@ -31,6 +31,7 @@ import (
 	"genesis-agent/internal/platform/contextutil"
 	"genesis-agent/internal/platform/logger"
 	"genesis-agent/internal/runtime"
+	"genesis-agent/internal/runtime/collab"
 	runtimecontext "genesis-agent/internal/runtime/context"
 	"genesis-agent/internal/runtime/multiagent/contextsnapshot"
 	"genesis-agent/internal/runtime/multiagent/contract"
@@ -38,12 +39,16 @@ import (
 	"genesis-agent/internal/runtime/progress"
 	"genesis-agent/internal/runtime/prompt"
 	"genesis-agent/internal/runtime/repeatguard"
-	"genesis-agent/internal/runtime/transcript"
 )
 
 // SkillNameMatcher 识别「把 Skill 名当成 Tool 名」的误调用（由产品注入，Gateway 不依赖 skill）。
 type SkillNameMatcher interface {
 	Match(ctx context.Context, name string) (canonical string, ok bool, err error)
+}
+
+// TaskListReminderSource 按步数间隔生成任务清单进度提醒（注入 user 前缀，不进稳定 system）。
+type TaskListReminderSource interface {
+	GeneratePromptReminder(ctx context.Context, sessionID string, currentStep int) (string, bool, error)
 }
 
 // ReactLoopEngine ReAct Loop策略的RunEngine实现
@@ -58,6 +63,8 @@ type ReactLoopEngine struct {
 	skillMentionSelector      SkillMentionSelector
 	skillExplicitLoader       SkillExplicitLoader
 	autoRewriteSkillCollision *bool // nil 表示默认开启
+	taskListReminder          TaskListReminderSource
+	collabStore               collab.Store
 
 	// 新增：上下文窗口规划与 Token 估算
 	estimator             runtimecontext.TokenEstimator
@@ -109,6 +116,13 @@ func WithContextBudgetConfig(effectiveRatio float64, outputReserveTokens int) En
 func WithSkillNameMatcher(matcher SkillNameMatcher) EngineOption {
 	return func(e *ReactLoopEngine) {
 		e.skillNameMatcher = matcher
+	}
+}
+
+// WithTaskListReminder 注入任务清单步数提醒源（每轮 LLM 调用前以 reminder 叠加，不落盘）。
+func WithTaskListReminder(src TaskListReminderSource) EngineOption {
+	return func(e *ReactLoopEngine) {
+		e.taskListReminder = src
 	}
 }
 
@@ -253,16 +267,26 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 		}
 	}
 
+	var collabMode collab.Mode
+	var handoffPending bool
+	ctx, collabMode, handoffPending, err = e.prepareCollabContext(ctx, req.SessionID)
+	if err != nil {
+		return err
+	}
+
 	// ── 步骤1: 获取工具定义（tool.Info，与外部框架无关）─────────
-	toolInfos := e.getToolInfos(agent)
+	toolInfos := e.applyCollabToolFilter(ctx, e.getToolInfos(agent))
 	activeToolNames := namesOfToolInfos(toolInfos)
 
 	// ── 步骤2: 构建初始消息列表与弹性预算装配 ──────────────────
-	// System消息（Persona System Prompt）
+	// System消息（Persona System Prompt）；子 Run 跳过主侧委派纪律
 	systemPrompt, err := e.prompt.BuildSystem(ctx, prompt.BuildRequest{
-		Agent:          agent,
-		Run:            rc.Run,
-		AvailableTools: activeToolNames,
+		Agent:             agent,
+		Run:               rc.Run,
+		AvailableTools:    activeToolNames,
+		Audience:          promptAudience(ctx),
+		CollaborationMode: string(collabMode),
+		PlanDocumentPath:  collab.PlanDocumentRelPath(req.SessionID),
 	})
 	if err != nil {
 		return err
@@ -408,6 +432,8 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 
 	// mention 自动注入（在首轮 LLM 前；走 Skill 网关，含 Approval / 去重 / 收窄）
 	e.injectMentionedSkills(ctx, rc, req.UserInput, &activeToolNames, &toolInfos, log)
+	// @agent / @run-agent → L4 reminder，迫使经 Task 委派（不直接 Spawn）
+	e.injectAgentMentions(ctx, rc, req.UserInput)
 
 	// 打印已加载工具
 	toolNames := make([]string, 0, len(toolInfos))
@@ -540,7 +566,14 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 		// ForModel：完整链送给 LLM（含 skill_injection / tool）；UI 另走 ForUI，禁止双写存储
 		// 使用命名返回值 err，避免 := 遮蔽导致 defer 落盘读到错误的失败原因。
 		var llmResp *domain.Message
-		llmResp, err = e.llm.StreamGenerate(ctx, transcript.ProjectForModel(rc.Messages), toolInfos, onDelta)
+		modelMsgs := projectMessagesForModel(rc.Messages, collabMode == collab.ModePlan)
+		if collabMode != collab.ModePlan {
+			modelMsgs = e.withTaskListReminder(ctx, req.SessionID, rc, modelMsgs, iterLog)
+		}
+		// handoff：成功送达模型后再清除，避免失败丢失。进入确认由工具结果 + 重建 system 承担。
+		injectHandoff := handoffPending
+		modelMsgs = e.withPlanModeReminders(ctx, req.SessionID, modelMsgs, rc.Iteration, injectHandoff, collabMode)
+		llmResp, err = e.llm.StreamGenerate(ctx, modelMsgs, toolInfos, onDelta)
 		if err != nil {
 			e.tracer.EndSpan(ctx, stepSpan, err)
 			progress.Emit(ctx, progress.Event{
@@ -558,6 +591,10 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 				StopReason: "error",
 			})
 			return fmt.Errorf("第%d轮LLM调用失败: %w", rc.Iteration, err)
+		}
+		if injectHandoff {
+			e.clearHandoffPending(ctx, req.SessionID)
+			handoffPending = false
 		}
 		iterLog.Debug("LLM响应", "tool_calls", len(llmResp.ToolCalls), "content_len", len(llmResp.Content))
 		usage := domain.TokenUsage{CompletionTokens: int64(e.estimator.Estimate(ctx, llmResp.Content, req.Agent.DefaultModel))}
@@ -633,6 +670,12 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 					continue
 				}
 				rc.Messages = append(rc.Messages, domain.NewToolResultMessage(toolResult.ID, toolResult.Content))
+			}
+			var syncErr error
+			ctx, collabMode, handoffPending, syncErr = e.syncCollabAfterTools(ctx, req.SessionID, collabMode, rc, agent, &toolInfos, &activeToolNames, iterLog)
+			if syncErr != nil {
+				e.tracer.EndSpan(ctx, stepSpan, syncErr)
+				return syncErr
 			}
 
 			payload, _ := json.Marshal(llmResp.ToolCalls)
@@ -1274,6 +1317,41 @@ func (e *ReactLoopEngine) persistRunSessionMessages(ctx context.Context, session
 	log.Info("已保存本 Run 完整消息链", "message_count", len(toSave), "history_len", historyLen, "interrupted", runErr != nil && (rc.Run == nil || !rc.Run.Incomplete))
 }
 
+// withTaskListReminder 在送给 LLM 的消息链末尾叠加步数提醒（ephemeral，不写入 rc.Messages）。
+func (e *ReactLoopEngine) withTaskListReminder(
+	ctx context.Context,
+	sessionID string,
+	rc *runtime.RunContext,
+	modelMsgs []*domain.Message,
+	log logger.Logger,
+) []*domain.Message {
+	if e.taskListReminder == nil || rc == nil {
+		return modelMsgs
+	}
+	sid := strings.TrimSpace(sessionID)
+	if sid == "" && rc.Run != nil {
+		sid = strings.TrimSpace(rc.Run.SessionID)
+	}
+	if sid == "" && rc.Run != nil {
+		sid = strings.TrimSpace(rc.Run.ID)
+	}
+	if sid == "" {
+		return modelMsgs
+	}
+	reminder, needed, err := e.taskListReminder.GeneratePromptReminder(ctx, sid, rc.Iteration)
+	if err != nil {
+		log.Warn("生成任务清单提醒失败", "error", err)
+		return modelMsgs
+	}
+	if !needed || strings.TrimSpace(reminder) == "" {
+		return modelMsgs
+	}
+	out := make([]*domain.Message, 0, len(modelMsgs)+1)
+	out = append(out, modelMsgs...)
+	out = append(out, domain.NewReminderMessage(reminder))
+	return out
+}
+
 // appendRunInterruptMarker 在消息链末尾写入运行中断 reminder（ForModel 可见，ForUI 默认隐藏）。
 func (e *ReactLoopEngine) appendRunInterruptMarker(rc *runtime.RunContext, runErr error) {
 	if rc == nil || runErr == nil {
@@ -1559,7 +1637,7 @@ Skill Markdown 可移植，不必含 Genesis 工具名；适配由本 bridge 完
 执行：文档中的 shell/脚本命令（python/python3/node/python -m 等）一律 run_skill_command(skill=%q, command=原文)。解释器跟文档（.js/require→node；python/-m→python），勿把 Node 包装成 python -m。运行时会 materialize 完整 Skill 包到工作目录后再执行。
 写与 stage：刚 write_file("$WORK_DIR/...") 的下一跳 run_skill_command **必须**带 inputs=["$WORK_DIR/..."]（漏传会 input_binding_missing）；command 只用 stage 后相对名。用户指定的宿主路径可直接进 inputs（勿 run_command 搬运）。禁止把 /workspace 等执行面路径写入 inputs/write_file.path；禁止把 $WORK_DIR/$INPUT_DIR/$OUTPUT_DIR/$TMPDIR/$SKILL_DIR 写进 command（不会展开）。仅跑包内 scripts/ 或文件已在技能 cwd 时可省略 inputs。大脚本可拆分多次 write_file，或 append=true + expected_hash；工具参数截断后勿原样重试。
 禁止多行/长串 python -c、node -e/--eval（本地与远程 shell 引号均易失败）；仅极短单行探测。依赖：勿用 run_skill_command 跑 npm/pip install（含 SKILL 里的安装示例行）；靠 dependencies.runtime / profile，缺包看 dependency_missing 再用 install_skill_dependencies，勿先写探测脚本、勿全局装包绕过声明。
-产物与交付：produced[] 只有 Harness 的 candidate_id/name；唯一 required 候选自动发布，多候选只用 select_deliverable_candidate。禁止提交路径/locator，禁止 write_file 伪造办公二进制。最终以 Publication/Delivery 为准，勿把 runs 或 $OUTPUT_DIR 当作用户已交付。Skill 命令产出按 SKILL 写相对 cwd；元数据 execution_backend 标明执行面——remote_sandbox/remote_session 时宿主 glob/list_dir/walk_dir/read_file 看不到技能 cwd 文件；run_skill_command 刚列出的文件须继续用 run_skill_command 查看/QA，禁止改用宿主 read_file。
+产物与交付：produced[] 只有 Harness 的 candidate_id/name（视觉预览图可带 role=qa_asset，不表示已交付到项目根）；唯一 required 候选自动发布，多候选只用 select_deliverable_candidate。禁止提交路径/locator，禁止 write_file 伪造办公二进制。最终以 Publication/Delivery 为准，勿把 runs 或 $OUTPUT_DIR 当作用户已交付。Skill 命令产出按 SKILL 写相对 cwd；元数据 execution_backend 标明执行面——remote_sandbox/remote_session 时宿主 glob/list_dir/walk_dir/read_file 看不到技能 cwd 文件；run_skill_command 刚列出的 slide-*.jpg/thumbnails 等须继续用 run_skill_command 查看/文本 QA，禁止改用宿主 read_file（二进制也会省略 content）。
 SKILL 要求先 Read 的链接与 QA 命令须执行；用 grep/rg 检测「不应出现」的文本时，exit_code=1 且空 stderr 视为未命中/通过，勿当脚本崩溃反复重试。因 dependency_missing/sandbox_unavailable/unsupported_environment 失败时如实报告缺口，勿换绝对路径或搜用户目录硬扛。
 </skill_runtime_bridge>`, name)
 }

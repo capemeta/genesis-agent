@@ -71,39 +71,39 @@ func TestForModelKeepsSkillInjection(t *testing.T) {
 	}
 }
 
-func TestForModelConvertsLatestPlanSnapshotToReminder(t *testing.T) {
+func TestForModelConvertsLatestTaskListSnapshotToReminder(t *testing.T) {
 	now := time.Now()
-	oldPlan := Plan{
-		ID:        "plan-1",
+	oldList := TaskList{
+		ID:        "list-1",
 		SessionID: "sess-1",
-		Title:     "旧计划",
-		Items: []PlanItem{
-			{ID: "a", Text: "旧任务", Status: PlanItemPending},
+		Title:     "旧清单",
+		Items: []TaskListItem{
+			{ID: "a", Text: "旧任务", Status: TaskListItemPending},
 		},
 		Version:   1,
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
-	latestPlan := Plan{
-		ID:        "plan-1",
+	latestList := TaskList{
+		ID:        "list-1",
 		SessionID: "sess-1",
-		Title:     "新计划",
-		Items: []PlanItem{
-			{ID: "a", Text: "已完成任务", Status: PlanItemDone},
-			{ID: "b", Text: "进行中任务", Status: PlanItemDoing},
+		Title:     "新清单",
+		Items: []TaskListItem{
+			{ID: "a", Text: "已完成任务", Status: TaskListItemDone},
+			{ID: "b", Text: "进行中任务", Status: TaskListItemDoing},
 		},
 		Version:   2,
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
-	oldJSON, _ := json.Marshal(oldPlan)
-	latestJSON, _ := json.Marshal(latestPlan)
+	oldJSON, _ := json.Marshal(oldList)
+	latestJSON, _ := json.Marshal(latestList)
 
 	model := ForModel([]*Message{
 		NewUserMessage("开始"),
-		{Role: RoleAssistant, Content: string(oldJSON), Kind: MessageKindPlanSnapshot},
+		{Role: RoleAssistant, Content: string(oldJSON), Kind: MessageKindTaskListSnapshot},
 		NewAssistantMessage("处理中"),
-		{Role: RoleAssistant, Content: string(latestJSON), Kind: MessageKindPlanSnapshot},
+		{Role: RoleAssistant, Content: string(latestJSON), Kind: MessageKindTaskListSnapshot},
 	})
 
 	if len(model) != 3 {
@@ -113,15 +113,18 @@ func TestForModelConvertsLatestPlanSnapshotToReminder(t *testing.T) {
 	if last.Kind != MessageKindReminder || last.Role != RoleUser {
 		t.Fatalf("last=%+v", last)
 	}
-	if strings.Contains(last.Content, "旧计划") || strings.Contains(last.Content, "旧任务") {
-		t.Fatalf("reminder contains stale plan: %s", last.Content)
+	if strings.Contains(last.Content, "旧清单") || strings.Contains(last.Content, "旧任务") {
+		t.Fatalf("reminder contains stale task list: %s", last.Content)
 	}
-	if !strings.Contains(last.Content, "新计划") || !strings.Contains(last.Content, "进行中任务") {
-		t.Fatalf("reminder missing latest plan: %s", last.Content)
+	if !strings.Contains(last.Content, "新清单") || !strings.Contains(last.Content, "进行中任务") {
+		t.Fatalf("reminder missing latest task list: %s", last.Content)
+	}
+	if !strings.Contains(last.Content, "<system-reminder>") || !strings.Contains(last.Content, "</system-reminder>") {
+		t.Fatalf("snapshot reminder must use system-reminder wrapper: %s", last.Content)
 	}
 	for _, msg := range model {
-		if msg.Kind == MessageKindPlanSnapshot {
-			t.Fatalf("plan_snapshot leaked to model: %+v", msg)
+		if msg.Kind == MessageKindTaskListSnapshot {
+			t.Fatalf("task_list_snapshot leaked to model: %+v", msg)
 		}
 	}
 }

@@ -937,6 +937,7 @@ func producedObservation(binding execmodel.ExecutionBinding, _ skillmodel.Metada
 }
 
 // projectProducedCandidates 投影最小候选；能唯一匹配 DeliverableSpec 时填 deliverable_id。
+// 视觉 QA 预览图标记 role=qa_asset，便于模型识别且不暗示应 Delivery。
 func (s *Service) projectProducedCandidates(ctx context.Context, tenantID, runID string, descriptors []workmodel.ProducedResourceDescriptor) []scriptcontract.ProducedCandidate {
 	specs := s.listDeliverableSpecs(ctx, tenantID, runID)
 	result := make([]scriptcontract.ProducedCandidate, 0, len(descriptors))
@@ -944,6 +945,8 @@ func (s *Service) projectProducedCandidates(ctx context.Context, tenantID, runID
 		candidate := scriptcontract.ProducedCandidate{CandidateID: descriptor.ID, Name: descriptor.ObservedName, MediaType: descriptor.MediaType}
 		if id := uniqueMatchingDeliverableID(specs, descriptor); id != "" {
 			candidate.DeliverableID = id
+		} else if isQAPreviewAsset(descriptor.ObservedName) {
+			candidate.Role = "qa_asset"
 		}
 		result = append(result, candidate)
 	}

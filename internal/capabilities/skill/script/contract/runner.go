@@ -64,6 +64,8 @@ type ProducedCandidate struct {
 	Name          string `json:"name"`
 	MediaType     string `json:"media_type,omitempty"`
 	DeliverableID string `json:"deliverable_id,omitempty"`
+	// Role 可选：空/省略表示交付相关候选；qa_asset 表示视觉 QA 预览图（不触发 Delivery）。
+	Role string `json:"role,omitempty"`
 }
 
 // ToolCallSuggestion 是 Harness 返回的可直接执行纠错调用。

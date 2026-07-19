@@ -191,6 +191,8 @@ func Build(opts Options) (Control, error) {
 	if err != nil {
 		return Control{}, err
 	}
+	// "run-output" 是历史策略名：表示按产品默认交付，不是写入 runtime/runs/.../output。
+	// CLI 将其映射为项目根（DeliveryProjectRoot）；用户可见文件不落在 Run 内部 output 目录。
 	planner, err := localartifact.NewPolicyTargetPlanner(map[string]artifactmodel.DeliveryTarget{
 		"run-output": {Kind: artifactmodel.DeliveryProjectRoot, Resource: workmodel.ResourceRef{Authority: "host", Scheme: "delivery-root", ID: "workspace-root"}, Name: "$artifact_name"},
 	})

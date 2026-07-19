@@ -77,6 +77,9 @@ func newChatCmd(configDirRef *string, sandboxModeRef *string, factory ServiceFac
 
 			// 构建 Bubble Tea 初始 Model
 			m := chat.NewModel(ctx, svc, session)
+			if ch, ok := handle.(CollabHandle); ok {
+				m = m.WithCollab(ch.CollabStore(), ch.WorkspaceRoot())
+			}
 			restoreConsoleOutput := clitui.PrepareConsoleOutput()
 			defer restoreConsoleOutput()
 

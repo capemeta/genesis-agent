@@ -21,10 +21,16 @@ const (
 	KindHook Kind = "hook"
 	// KindSubAgent 表示父 Run 时间线中的子智能体生命周期事件。
 	KindSubAgent Kind = "subagent"
-	// KindPlan 规划技能计划事件。
+	// KindTaskList 任务清单进度事件。
 	// BlockType: "create"（新建）/ "tick"（勾选条目）/ "update"（整体更新）/ "hydrate"（会话恢复）
 	// Detail: Plan JSON 完整快照（非 delta，接收方直接替换本地状态）
-	KindPlan Kind = "plan"
+	KindTaskList Kind = "task_list"
+	// KindCollaborationMode 协作模式变更（规划模式 / 执行中）。
+	// Detail: mode 字符串（default / plan_mode）；Summary 为人读文案。
+	KindCollaborationMode Kind = "collaboration_mode"
+	// KindPlanDocument 实施方案文件更新。
+	// Detail: 工作区相对路径；Summary 为人读文案。
+	KindPlanDocument Kind = "plan_document"
 )
 
 // Phase 描述一个动作的生命周期。

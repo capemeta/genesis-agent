@@ -101,9 +101,22 @@ type ResourceReader interface {
 	Open(ctx context.Context, ref workmodel.ResourceRef) (ResourceHandle, error)
 }
 
+// PutCASResult 描述内容寻址写入结果；Reused=true 表示复用已有快照，回滚时不得删除。
+type PutCASResult struct {
+	Path    workmodel.WorkspacePath
+	InputID string
+	SHA256  string
+	Size    int64
+	Reused  bool
+}
+
 // InputSnapshotStore 写入不可变 Run 输入快照。
 type InputSnapshotStore interface {
 	Put(ctx context.Context, runID, inputID, name string, content io.Reader) (workmodel.WorkspacePath, error)
+	// PutCAS 按 sha256+文件名内容寻址；同 Run 内相同内容与名称复用物理快照。
+	PutCAS(ctx context.Context, runID, name string, content io.Reader, maxBytes int64) (PutCASResult, error)
+	// LookupCAS 按已知 sha256+文件名查询已有快照；未命中时 ok=false 且 error=nil。
+	LookupCAS(ctx context.Context, runID, sha256Hex, name string) (result PutCASResult, ok bool, err error)
 	Remove(ctx context.Context, stagedPath workmodel.WorkspacePath) error
 }
 

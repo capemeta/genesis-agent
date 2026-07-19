@@ -184,21 +184,21 @@ var PlanTitle = lipgloss.NewStyle().
 var PlanProgressBar = lipgloss.NewStyle().
 	Foreground(ColorGray)
 
-// PlanItemDone 已完成条目样式（绿色）
-var PlanItemDone = lipgloss.NewStyle().
+// TaskListItemDone 已完成条目样式（绿色）
+var TaskListItemDone = lipgloss.NewStyle().
 	Foreground(ColorGreen)
 
-// PlanItemDoing 进行中条目样式（黄色加粗）
-var PlanItemDoing = lipgloss.NewStyle().
+// TaskListItemDoing 进行中条目样式（黄色加粗）
+var TaskListItemDoing = lipgloss.NewStyle().
 	Foreground(ColorYellow).
 	Bold(true)
 
-// PlanItemPending 待开始条目样式（深灰）
-var PlanItemPending = lipgloss.NewStyle().
+// TaskListItemPending 待开始条目样式（深灰）
+var TaskListItemPending = lipgloss.NewStyle().
 	Foreground(ColorDarkGray)
 
-// PlanItemFailed 失败条目样式（红色）
-var PlanItemFailed = lipgloss.NewStyle().
+// TaskListItemFailed 失败条目样式（红色）
+var TaskListItemFailed = lipgloss.NewStyle().
 	Foreground(ColorRed)
 
 // PlanHint 计划卡片底部提示文字

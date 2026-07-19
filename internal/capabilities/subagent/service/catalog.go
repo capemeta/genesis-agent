@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"genesis-agent/internal/capabilities/subagent/model"
+	subagentprompt "genesis-agent/internal/capabilities/subagent/prompt"
 )
 
 // Catalog 是 Task 工具的定义查询端口。
@@ -53,16 +54,26 @@ func (c *MemoryCatalog) List() []model.Summary {
 	return items
 }
 
+// DescriptionOptions 控制 Task 动态 Description 的姿态与并行提示。
+type DescriptionOptions struct {
+	Posture       string
+	MaxConcurrent int
+}
+
 // RenderDescription 渲染动态工具描述，避免把 agent 名作为工具名暴露。
-func RenderDescription(catalog Catalog) (string, error) {
+func RenderDescription(catalog Catalog, opts DescriptionOptions) (string, error) {
 	if catalog == nil {
 		return "委派独立子智能体。", fmt.Errorf("subagent Catalog不能为空")
 	}
-	var b strings.Builder
-	b.WriteString("委派独立子智能体执行任务。必须调用 Task(subagent_type=...)，禁止把 agent 名当作工具名调用。\n\n<available_agents>\n")
-	for _, item := range catalog.List() {
-		fmt.Fprintf(&b, "<agent name=%q when_to_use=%q>%s</agent>\n", item.Name, item.WhenToUse, item.Description)
+	agents := catalog.List()
+	summaries := make([]subagentprompt.AgentSummary, 0, len(agents))
+	for _, item := range agents {
+		summaries = append(summaries, subagentprompt.AgentSummary{
+			Name: item.Name, Description: item.Description, WhenToUse: item.WhenToUse,
+		})
 	}
-	b.WriteString("</available_agents>")
-	return b.String(), nil
+	return subagentprompt.RenderToolDescription(summaries, subagentprompt.DescriptionOptions{
+		Posture:       subagentprompt.NormalizePosture(opts.Posture),
+		MaxConcurrent: opts.MaxConcurrent,
+	})
 }

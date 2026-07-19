@@ -81,6 +81,7 @@ import (
 	platformconfig "genesis-agent/internal/platform/config"
 	"genesis-agent/internal/platform/idgen"
 	"genesis-agent/internal/platform/logger"
+	runtimecollab "genesis-agent/internal/runtime/collab"
 	multicontract "genesis-agent/internal/runtime/multiagent/contract"
 	multiagentmodel "genesis-agent/internal/runtime/multiagent/model"
 	multiprojection "genesis-agent/internal/runtime/multiagent/projection"
@@ -94,12 +95,13 @@ import (
 	clisubagent "genesis-agent/products/cli/internal/subagent"
 	"genesis-agent/products/cli/internal/tui"
 	localartifactcontrol "genesis-agent/shared/local/artifactcontrol"
+	localcollab "genesis-agent/shared/local/collab"
 	localexec "genesis-agent/shared/local/execution"
 	localfs "genesis-agent/shared/local/filesystem"
 	localresolver "genesis-agent/shared/local/pathresolver"
-	localplan "genesis-agent/shared/local/plan"
 	windowssandbox "genesis-agent/shared/local/sandbox/windows"
 	localskill "genesis-agent/shared/local/skill"
+	localtasklist "genesis-agent/shared/local/tasklist"
 	localworkspace "genesis-agent/shared/local/workspace"
 
 	httpfetcher "genesis-agent/internal/capabilities/web/adapter/fetch/http"
@@ -225,11 +227,19 @@ func (c *Container) Init(ctx context.Context) error {
 			return
 		}
 		planRepoDir := filepath.Join(filepath.Dir(configDir), ".genesis", "runtime", "plans")
-		planRepo, err := localplan.NewFileRepository(planRepoDir)
+		planRepo, err := localtasklist.NewFileRepository(planRepoDir)
 		if err != nil {
 			_ = c.logging.Close()
 			c.logging = nil
 			c.initErr = fmt.Errorf("初始化CLI Plan本地存储失败: %w", err)
+			return
+		}
+		collabStoreDir := filepath.Join(runtime.workspaceRoot, ".genesis", "runtime", "collab")
+		collabStore, err := localcollab.NewFileStore(collabStoreDir)
+		if err != nil {
+			_ = c.logging.Close()
+			c.logging = nil
+			c.initErr = fmt.Errorf("初始化CLI协作模式存储失败: %w", err)
 			return
 		}
 		subAgentStore, err := clisubagent.NewFileStore(runtime.workspaceRoot)
@@ -268,11 +278,15 @@ func (c *Container) Init(ctx context.Context) error {
 			AuditSink:                      runtime.auditSink,
 			UsageSink:                      runtime.usageSink,
 			Web:                            webOpts,
-			PlanRepository:                 planRepo,
+			TaskListRepository:             planRepo,
+			CollabStore:                    collabStore,
+			PlanDocuments:                  localcollab.NewFilePlanDocuments(runtime.workspaceRoot),
+			WorkspaceRoot:                  runtime.workspaceRoot,
 			SkillNameMatcher:               runtime.skillNameMatcher,
 			SkillMentionSelector:           runtime.skillMentionSelector,
 			SkillExplicitLoader:            runtime.skillExplicitLoader,
 			SubAgentMaxConcurrent:          3,
+			SubAgentDelegationPosture:      "proactive",
 			SubAgentStore:                  subAgentStore,
 			SubAgentDelivery:               subAgentStore,
 			SubAgentProjection:             multiprojection.NewMemorySink(multiagentmodel.ProjectionChannelCLI),
@@ -358,6 +372,22 @@ func (c *Container) Service() app.AgentService {
 		return nil
 	}
 	return c.bundle.AgentService
+}
+
+// CollabStore 返回会话协作模式 Store（规划模式）。
+func (c *Container) CollabStore() runtimecollab.Store {
+	if c == nil || c.bundle == nil {
+		return nil
+	}
+	return c.bundle.CollabStore
+}
+
+// WorkspaceRoot 返回当前 CLI 工作区根路径。
+func (c *Container) WorkspaceRoot() string {
+	if c == nil {
+		return "."
+	}
+	return workspaceRootOrDot(c.workspaceRoot)
 }
 
 // MCPStack 返回已装配的 MCP 栈（可能为 nil 或空栈）。

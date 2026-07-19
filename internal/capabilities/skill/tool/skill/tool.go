@@ -13,6 +13,9 @@ import (
 	hookmodel "genesis-agent/internal/capabilities/hook/model"
 	skillcontract "genesis-agent/internal/capabilities/skill/contract"
 	"genesis-agent/internal/capabilities/skill/model"
+	subagentcontract "genesis-agent/internal/capabilities/subagent/contract"
+	subagentmodel "genesis-agent/internal/capabilities/subagent/model"
+	subagentprompt "genesis-agent/internal/capabilities/subagent/prompt"
 	tool "genesis-agent/internal/capabilities/tool/contract"
 	toolparam "genesis-agent/internal/capabilities/tool/param"
 )
@@ -37,7 +40,7 @@ type Tool struct {
 }
 
 // SetForkTask 由共享 bootstrap 在 Task 创建后注入唯一委派网关。
-// Skill 不直接依赖 Controller 或具体运行策略。
+// Skill 不直接依赖 Controller 或具体运行策略；fork 优先走 Delegator。
 func (t *Tool) SetForkTask(task tool.Tool) { t.forkTask = task }
 
 type input struct {
@@ -205,32 +208,51 @@ func (t *Tool) fork(ctx context.Context, meta model.Metadata, resolveReq skillco
 	if t.forkTask == nil {
 		return "", fmt.Errorf("skill %q 声明 context=fork，但 Task 委派网关未注入", meta.QualifiedName)
 	}
+	delegator, ok := t.forkTask.(subagentcontract.Delegator)
+	if !ok {
+		return "", fmt.Errorf("skill %q 的 Task 委派网关未实现 Delegator", meta.QualifiedName)
+	}
 	// fork 的参数由委派信封统一追加，避免 Skill.Load 与 Task.prompt 双重注入。
 	injection, err := t.deps.Service.Load(ctx, skillcontract.LoadRequest{ResolveRequest: resolveReq})
 	if err != nil {
 		return "", err
 	}
-	agent := strings.TrimSpace(meta.Agent)
-	if agent == "" {
-		agent = "general-purpose"
-	}
-	prompt := strings.TrimSpace(injection.Contents)
-	if prompt == "" {
+	body := strings.TrimSpace(injection.Contents)
+	if body == "" {
 		return "", fmt.Errorf("skill %q 的 fork 内容为空", meta.QualifiedName)
 	}
-	if strings.TrimSpace(args) != "" {
-		prompt += "\n\n任务参数：\n" + strings.TrimSpace(args)
+	args = strings.TrimSpace(args)
+	agentType := strings.TrimSpace(meta.Agent)
+	req := subagentcontract.DelegateRequest{
+		Description:  "执行 Skill " + meta.QualifiedName,
+		AllowedTools: cloneStrings(meta.AllowedTools),
+		PromptOrigin: "skill_fork",
 	}
-	payload, err := json.Marshal(map[string]any{
-		"subagent_type": agent,
-		"description":   "执行 Skill " + meta.QualifiedName,
-		"prompt":        prompt,
-		"allowed_tools": cloneStrings(meta.AllowedTools),
-	})
-	if err != nil {
-		return "", fmt.Errorf("编码 Skill fork 委派失败: %w", err)
+	// Skill fork 一律 skill_isolated：不复制父聊天；正文进 definition/prompt，不注入主线程。
+	req.SnapshotMode = subagentcontract.SnapshotModeSkillIsolated
+	if agentType != "" {
+		// 命名 agent 必须来自 Catalog；Skill 正文进入 prompt，不覆盖 Definition system。
+		req.SubagentType = agentType
+		req.Prompt = body
+		if args != "" {
+			req.Prompt += "\n\n任务参数：\n" + args
+		}
+	} else {
+		// 无 agent：合成临时 Definition（不进用户 Catalog），body 作 system，args 作委派输入。
+		req.Definition = &subagentmodel.Definition{
+			Name:         subagentprompt.SkillForkDefinitionName(meta.QualifiedName),
+			Description:  "Skill fork: " + meta.QualifiedName,
+			WhenToUse:    "由 Skill(context=fork) 硬编码 Spawn",
+			SystemPrompt: body,
+			Tools:        cloneStrings(meta.AllowedTools),
+		}
+		if args != "" {
+			req.Prompt = args
+		} else {
+			req.Prompt = "按技能说明完成被委派的任务。"
+		}
 	}
-	return t.forkTask.Execute(ctx, string(payload))
+	return delegator.Delegate(ctx, req)
 }
 
 type dependencyReport struct {

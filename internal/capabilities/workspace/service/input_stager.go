@@ -3,10 +3,7 @@ package service
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
-	"io"
 	"mime"
 	"path"
 	"strings"
@@ -18,26 +15,29 @@ import (
 
 const defaultMaxInputSize = int64(64 * 1024 * 1024)
 
-// IDGenerator 生成稳定对象 ID。
+// IDGenerator 生成稳定对象 ID（保留供装配兼容；CAS 路径使用内容哈希，不再依赖此生成器）。
 type IDGenerator interface{ Generate() string }
 
 // InputStager 实现受控输入 staging。
 type InputStager struct {
 	reader workcontract.ResourceReader
 	store  workcontract.InputSnapshotStore
-	ids    IDGenerator
 	now    func() time.Time
 }
 
-// NewInputStager 创建输入 staging 服务。
+// NewInputStager 创建输入 staging 服务。ids 可为 nil（历史参数，CAS 不再使用）。
 func NewInputStager(reader workcontract.ResourceReader, store workcontract.InputSnapshotStore, ids IDGenerator) (*InputStager, error) {
-	if reader == nil || store == nil || ids == nil {
-		return nil, fmt.Errorf("input stager 缺少 reader/store/id generator")
+	if reader == nil || store == nil {
+		return nil, fmt.Errorf("input stager 缺少 reader/store")
 	}
-	return &InputStager{reader: reader, store: store, ids: ids, now: time.Now}, nil
+	_ = ids
+	return &InputStager{reader: reader, store: store, now: time.Now}, nil
 }
 
 // Stage 写入不可变快照，并返回 source 到 staged name 的显式映射。
+// 同 Run 内相同内容与文件名通过 PutCAS 复用物理快照；每次 Stage 仍产生独立 Manifest 条目。
+// 当 ResourceRef/Handle 已带可信 sha256 Version 且 LookupCAS 命中时，仍 Open 做权限与变更校验，
+// 但跳过 PutCAS 二次读流与写 temp（无静默错复用副作用）。
 func (s *InputStager) Stage(ctx context.Context, req workcontract.StageRequest) (workmodel.InputManifest, error) {
 	if err := req.Binding.Validate(); err != nil {
 		return workmodel.InputManifest{}, workcontract.NewError(workcontract.ErrCodeWorkspaceNotAvailable, err)
@@ -51,13 +51,13 @@ func (s *InputStager) Stage(ctx context.Context, req workcontract.StageRequest) 
 		maxTotal = maxFile * 4
 	}
 	manifest := workmodel.InputManifest{RunID: req.Binding.Owner.RunID, BindingID: req.Binding.ID, CreatedAt: s.now().UTC()}
-	var stagedPaths []workmodel.WorkspacePath
+	var createdPaths []workmodel.WorkspacePath
 	committed := false
 	defer func() {
 		if committed {
 			return
 		}
-		for _, stagedPath := range stagedPaths {
+		for _, stagedPath := range createdPaths {
 			_ = s.store.Remove(context.Background(), stagedPath)
 		}
 	}()
@@ -71,6 +71,21 @@ func (s *InputStager) Stage(ctx context.Context, req workcontract.StageRequest) 
 		if source.Scope.TenantID != owner.TenantID || source.Scope.ProjectID != owner.ProjectID || source.Scope.UserID != owner.UserID {
 			return workmodel.InputManifest{}, workcontract.NewError(workcontract.ErrCodeInputPermissionDenied, fmt.Errorf("资源 %s scope 与 execution binding 不一致", source.ID))
 		}
+		alias, err := stagedAlias(source, usedAliases)
+		if err != nil {
+			return workmodel.InputManifest{}, err
+		}
+		name := path.Base(string(alias))
+		remainingTotal := maxTotal - total
+		limit := maxFile
+		if remainingTotal < limit {
+			limit = remainingTotal
+		}
+		if limit <= 0 {
+			return workmodel.InputManifest{}, workcontract.NewError(workcontract.ErrCodeInputTooLarge, fmt.Errorf("输入 %s 超过限额", source.ID))
+		}
+
+		// 先 Open：保留权限与宿主内容变更检测；再决定是否跳过 PutCAS。
 		handle, err := s.reader.Open(ctx, source)
 		if err != nil {
 			return workmodel.InputManifest{}, workcontract.NewError(workcontract.ErrCodeInputPermissionDenied, err)
@@ -86,46 +101,89 @@ func (s *InputStager) Stage(ctx context.Context, req workcontract.StageRequest) 
 			_ = handle.Reader.Close()
 			return workmodel.InputManifest{}, workcontract.NewError(workcontract.ErrCodeInputTooLarge, fmt.Errorf("输入 %s 超过限额", source.ID))
 		}
-		alias, err := stagedAlias(source, usedAliases)
-		if err != nil {
-			_ = handle.Reader.Close()
-			return workmodel.InputManifest{}, err
+
+		digest := trustedContentSHA256(source.Version, handle.Version)
+		if digest != "" {
+			if hit, ok, lookupErr := s.store.LookupCAS(ctx, req.Binding.Owner.RunID, digest, name); lookupErr != nil {
+				_ = handle.Reader.Close()
+				return workmodel.InputManifest{}, fmt.Errorf("查询输入快照失败: %w", lookupErr)
+			} else if ok {
+				_ = handle.Reader.Close()
+				if hit.Size > maxFile || total+hit.Size > maxTotal {
+					return workmodel.InputManifest{}, workcontract.NewError(workcontract.ErrCodeInputTooLarge, fmt.Errorf("输入 %s 超过限额", source.ID))
+				}
+				mediaType := handle.MediaType
+				if mediaType == "" {
+					mediaType = mime.TypeByExtension(path.Ext(name))
+				}
+				manifest.Inputs = append(manifest.Inputs, workmodel.InputRef{
+					ID: hit.InputID, Name: name, Alias: alias, Size: hit.Size,
+					SHA256: hit.SHA256, MIME: mediaType, Source: source, StagedPath: hit.Path,
+				})
+				total += hit.Size
+				continue
+			}
 		}
-		name := path.Base(string(alias))
-		inputID := "input-" + s.ids.Generate()
-		hash := sha256.New()
-		limited := &io.LimitedReader{R: handle.Reader, N: maxFile + 1}
-		stagedPath, putErr := s.store.Put(ctx, req.Binding.Owner.RunID, inputID, name, io.TeeReader(limited, hash))
+
+		casResult, putErr := s.store.PutCAS(ctx, req.Binding.Owner.RunID, name, handle.Reader, limit)
 		closeErr := handle.Reader.Close()
 		if putErr != nil {
 			return workmodel.InputManifest{}, fmt.Errorf("写入输入快照失败: %w", putErr)
 		}
-		stagedPaths = append(stagedPaths, stagedPath)
 		if closeErr != nil {
+			if !casResult.Reused {
+				_ = s.store.Remove(ctx, casResult.Path)
+			}
 			return workmodel.InputManifest{}, fmt.Errorf("关闭输入资源失败: %w", closeErr)
 		}
-		readSize := maxFile + 1 - limited.N
-		if readSize > maxFile || total+readSize > maxTotal {
-			_ = s.store.Remove(ctx, stagedPath)
-			return workmodel.InputManifest{}, workcontract.NewError(workcontract.ErrCodeInputTooLarge, fmt.Errorf("输入 %s 超过限额", source.ID))
+		if !casResult.Reused {
+			createdPaths = append(createdPaths, casResult.Path)
 		}
-		if err := stagedPath.Validate(); err != nil {
+		if err := casResult.Path.Validate(); err != nil {
 			return workmodel.InputManifest{}, workcontract.NewError(workcontract.ErrCodePathNamespaceMismatch, err)
 		}
-		digest := hex.EncodeToString(hash.Sum(nil))
-		if strings.HasPrefix(source.Version, "sha256:") && strings.TrimPrefix(source.Version, "sha256:") != digest {
-			_ = s.store.Remove(ctx, stagedPath)
+		if digest != "" && digest != casResult.SHA256 {
+			if !casResult.Reused {
+				_ = s.store.Remove(ctx, casResult.Path)
+			}
 			return workmodel.InputManifest{}, workcontract.NewError(workcontract.ErrCodeResourceVersionConflict, fmt.Errorf("资源 %s hash 已变化", source.ID))
 		}
 		mediaType := handle.MediaType
 		if mediaType == "" {
 			mediaType = mime.TypeByExtension(path.Ext(name))
 		}
-		manifest.Inputs = append(manifest.Inputs, workmodel.InputRef{ID: inputID, Name: name, Alias: alias, Size: readSize, SHA256: digest, MIME: mediaType, Source: source, StagedPath: stagedPath})
-		total += readSize
+		manifest.Inputs = append(manifest.Inputs, workmodel.InputRef{
+			ID: casResult.InputID, Name: name, Alias: alias, Size: casResult.Size,
+			SHA256: casResult.SHA256, MIME: mediaType, Source: source, StagedPath: casResult.Path,
+		})
+		total += casResult.Size
 	}
 	committed = true
 	return manifest, nil
+}
+
+func trustedContentSHA256(values ...string) string {
+	for _, raw := range values {
+		raw = strings.TrimSpace(strings.ToLower(raw))
+		if !strings.HasPrefix(raw, "sha256:") {
+			continue
+		}
+		digest := strings.TrimPrefix(raw, "sha256:")
+		if len(digest) == 64 {
+			ok := true
+			for _, r := range digest {
+				if r >= '0' && r <= '9' || r >= 'a' && r <= 'f' {
+					continue
+				}
+				ok = false
+				break
+			}
+			if ok {
+				return digest
+			}
+		}
+	}
+	return ""
 }
 
 func validateResourceRef(ref workmodel.ResourceRef) error {

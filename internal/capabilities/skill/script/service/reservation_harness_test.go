@@ -83,12 +83,41 @@ func TestFilterProducedByDeliverablesKeepsReservationAndMatchingDiff(t *testing.
 	svc := &Service{deliverables: store}
 	got, err := svc.filterProducedByDeliverables(context.Background(), "t", "r",
 		[]string{"reserved/d1/deck.pptx"},
-		[]string{"reserved/d1/deck.pptx", "notes.txt", "qa.png", "slide.pptx"},
+		[]string{"reserved/d1/deck.pptx", "notes.txt", "qa.png", "slide.pptx", "slide-1.jpg", "thumbnails.jpg"},
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 2 || got[0] != "reserved/d1/deck.pptx" || got[1] != "slide.pptx" {
+	want := map[string]struct{}{
+		"reserved/d1/deck.pptx": {},
+		"slide.pptx":            {},
+		"slide-1.jpg":           {},
+		"thumbnails.jpg":        {},
+	}
+	if len(got) != len(want) {
 		t.Fatalf("got=%v", got)
+	}
+	for _, item := range got {
+		if _, ok := want[item]; !ok {
+			t.Fatalf("unexpected candidate %q in %v", item, got)
+		}
+	}
+}
+
+func TestIsQAPreviewAsset(t *testing.T) {
+	cases := map[string]bool{
+		"slide-1.jpg":      true,
+		"slide-12.JPEG":    true,
+		"thumbnails.png":   true,
+		"thumbnail.webp":   true,
+		"qa.png":           false,
+		"deck.pptx":        false,
+		"notes.txt":        false,
+		"slide.pptx":       false,
+	}
+	for name, want := range cases {
+		if got := isQAPreviewAsset(name); got != want {
+			t.Fatalf("%s: got=%v want=%v", name, got, want)
+		}
 	}
 }

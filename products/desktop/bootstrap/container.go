@@ -39,6 +39,7 @@ import (
 	promptbuilder "genesis-agent/internal/runtime/prompt"
 	desktopprofile "genesis-agent/products/desktop/internal/profile"
 	localartifactcontrol "genesis-agent/shared/local/artifactcontrol"
+	localcollab "genesis-agent/shared/local/collab"
 	localexec "genesis-agent/shared/local/execution"
 	"genesis-agent/shared/local/skillmarket"
 	localworkspace "genesis-agent/shared/local/workspace"
@@ -138,6 +139,18 @@ func (c *Container) Init(ctx context.Context) error {
 			c.initErr = fmt.Errorf("初始化 Desktop Run 工作空间失败: %w", err)
 			return
 		}
+		workspaceRoot := "."
+		if wd, err := os.Getwd(); err == nil && strings.TrimSpace(wd) != "" {
+			workspaceRoot = wd
+		}
+		collabStoreDir := filepath.Join(workspaceRoot, ".genesis", "runtime", "collab")
+		collabStore, err := localcollab.NewFileStore(collabStoreDir)
+		if err != nil {
+			_ = runtimeLogging.Close()
+			c.logging = nil
+			c.initErr = fmt.Errorf("初始化 Desktop 协作模式存储失败: %w", err)
+			return
+		}
 		c.bundle, c.initErr = shared.BuildAgentService(ctx, shared.BuildOptions{
 			Product:                        "desktop",
 			ConfigDir:                      c.configDir,
@@ -150,7 +163,11 @@ func (c *Container) Init(ctx context.Context) error {
 			PromptInjectors:                []promptbuilder.ContextInjector{environmentInjector},
 			Logger:                         runtimeLogging.AgentLogger,
 			AuditSink:                      auditSink,
+			CollabStore:                    collabStore,
+			PlanDocuments:                  localcollab.NewFilePlanDocuments(workspaceRoot),
+			WorkspaceRoot:                  workspaceRoot,
 			SubAgentMaxConcurrent:          4,
+			SubAgentDelegationPosture:      "proactive",
 			SubAgentProjection:             multiprojection.NewMemorySink(multiagentmodel.ProjectionChannelDesktop),
 			SubAgentIncludeUserDefinitions: true,
 			SubAgentCapabilityRegistry:     capabilityRegistry,
@@ -282,7 +299,13 @@ func (desktopAskApprover) RequestApproval(ctx context.Context, req approvalmodel
 	if err := ctx.Err(); err != nil {
 		return approvalmodel.Decision{}, err
 	}
-	_ = req
+	// 退出规划必须经用户批准；UI 未接入前不得 headless 自动放行。
+	if req.Action == approvalmodel.ActionPlanExitApprove {
+		return approvalmodel.Decision{
+			Type:   approvalmodel.DecisionDenied,
+			Reason: "退出规划模式需要用户批准（Desktop 审批 UI 待接入）",
+		}, nil
+	}
 	switch result.Type {
 	case approvalmodel.PolicyDeny:
 		return approvalmodel.Decision{Type: approvalmodel.DecisionDenied, Reason: result.Reason}, nil

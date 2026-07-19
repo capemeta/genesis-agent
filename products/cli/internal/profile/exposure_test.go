@@ -8,7 +8,7 @@ func TestDefaultProfileExposesPlanAndInteractiveTools(t *testing.T) {
 	for _, name := range prof.Tools.Enabled {
 		set[name] = struct{}{}
 	}
-	for _, required := range []string{"todo_read", "todo_write", "todo_update_step", "write_stdin"} {
+	for _, required := range []string{"todo_read", "todo_write", "todo_update_step", "enter_plan_mode", "exit_plan_mode", "write_implementation_plan", "write_stdin"} {
 		if _, ok := set[required]; !ok {
 			t.Fatalf("CLI 缺少已注册工具 %q", required)
 		}

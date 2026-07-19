@@ -165,9 +165,16 @@ func mapHTTPError(resp *http.Response) error {
 		message = resp.Status
 	}
 	code := strings.TrimSpace(apiErr.Code)
+	upperCode := strings.ToUpper(code)
+	upperMessage := strings.ToUpper(message)
 	switch {
 	case resp.StatusCode == http.StatusBadRequest || code == "INVALID_ARGUMENT":
 		return execcontract.NewError(execcontract.ErrCodeInvalidInput, fmt.Errorf("%s", message))
+	case resp.StatusCode == http.StatusNotFound || strings.Contains(upperCode, "NOT_FOUND") ||
+		strings.HasPrefix(upperMessage, "NOT_FOUND"):
+		// 保留 code，供 fs 层识别 NOT_FOUND / SANDBOX_NOT_FOUND（含下划线形态）。
+		label := firstNonEmpty(code, "NOT_FOUND")
+		return execcontract.NewError(execcontract.ErrCodeInvalidInput, fmt.Errorf("%s: %s", label, message))
 	case resp.StatusCode == http.StatusConflict || resp.StatusCode == http.StatusPreconditionFailed ||
 		code == "ALREADY_EXISTS" || code == "PRECONDITION_FAILED" || code == "CONFLICT":
 		// 保留原始 code/message，供 fsErrorFromExec 区分 AlreadyExists / ModifiedExternally。

@@ -175,7 +175,8 @@ func mergeProducedCandidates(reserved, discovered []string) []string {
 }
 
 // filterProducedByDeliverables 在存在 DeliverableSpec 时过滤 diff 候选：
-// reservation 命中始终保留；其余候选须匹配任一交付契约的后缀/MIME。
+// reservation 命中始终保留；其余候选须匹配任一交付契约的后缀/MIME，
+// 或匹配视觉 QA 预览图白名单（登记为 leased supporting，不触发 Delivery）。
 // 无 DeliverableSpec 时保持原候选集（非交付任务不误伤诊断产出）。
 func (s *Service) filterProducedByDeliverables(ctx context.Context, tenantID, runID string, reservedHits, candidates []string) ([]string, error) {
 	if s.deliverables == nil || len(candidates) == 0 {
@@ -200,6 +201,10 @@ func (s *Service) filterProducedByDeliverables(ctx context.Context, tenantID, ru
 			continue
 		}
 		name := path.Base(candidate)
+		if isQAPreviewAsset(name) {
+			out = append(out, candidate)
+			continue
+		}
 		media := mime.TypeByExtension(path.Ext(candidate))
 		for _, spec := range specs {
 			if spec.MatchesObserved(name, media) {
@@ -209,4 +214,21 @@ func (s *Service) filterProducedByDeliverables(ctx context.Context, tenantID, ru
 		}
 	}
 	return out, nil
+}
+
+// isQAPreviewAsset 识别 Skill 视觉 QA 预览图（slide-/thumbnail* + 常见图片后缀）。
+// 这些文件登记为 ProducedResource，但不匹配 primary Deliverable，不会 FinalizeRequired 交付到项目根。
+func isQAPreviewAsset(name string) bool {
+	base := strings.ToLower(strings.TrimSpace(path.Base(name)))
+	ext := path.Ext(base)
+	switch ext {
+	case ".jpg", ".jpeg", ".png", ".webp":
+	default:
+		return false
+	}
+	stem := strings.TrimSuffix(base, ext)
+	if stem == "thumbnails" || stem == "thumbnail" {
+		return true
+	}
+	return strings.HasPrefix(stem, "slide-") || strings.HasPrefix(stem, "thumbnail")
 }

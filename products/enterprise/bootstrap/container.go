@@ -49,6 +49,7 @@ import (
 	platformconfig "genesis-agent/internal/platform/config"
 	"genesis-agent/internal/platform/idgen"
 	"genesis-agent/internal/platform/logger"
+	runtimecollab "genesis-agent/internal/runtime/collab"
 	multicontract "genesis-agent/internal/runtime/multiagent/contract"
 	multiagentmodel "genesis-agent/internal/runtime/multiagent/model"
 	multiprojection "genesis-agent/internal/runtime/multiagent/projection"
@@ -244,10 +245,14 @@ func (c *Container) Init(ctx context.Context) error {
 			Logger:                     runtimeLogging.AgentLogger,
 			AuditSink:                  auditSink,
 			UsageSink:                  usageSink,
+			// Enterprise 不落 shared/local；进程内 ModeStore / PlanDocuments，后续可换 DB。
+			CollabStore:                runtimecollab.NewMemoryStore(),
+			PlanDocuments:              runtimecollab.NewMemoryPlanDocuments(),
 			SkillNameMatcher:           skillStack.SkillNameMatcher,
 			SkillMentionSelector:       skillStack.SkillMentionSelector,
 			SkillExplicitLoader:        skillStack.SkillExplicitLoader,
 			SubAgentMaxConcurrent:      3,
+			SubAgentDelegationPosture:  "explicit_request_only",
 			SubAgentProjection:         multiprojection.NewMemorySink(multiagentmodel.ProjectionChannelEnterprise),
 			SubAgentCapabilityRegistry: capabilityRegistry,
 			SubAgentApproval:           approvalSvc,
@@ -382,6 +387,13 @@ type headlessAskApprover struct{}
 func (headlessAskApprover) RequestApproval(ctx context.Context, req approvalmodel.Request, result approvalmodel.PolicyResult) (approvalmodel.Decision, error) {
 	if err := ctx.Err(); err != nil {
 		return approvalmodel.Decision{}, err
+	}
+	// 退出规划必须经用户批准；无交互审批队列前不得自动放行。
+	if req.Action == approvalmodel.ActionPlanExitApprove {
+		return approvalmodel.Decision{
+			Type:   approvalmodel.DecisionDenied,
+			Reason: "退出规划模式需要用户批准（Enterprise 审批队列待接入）",
+		}, nil
 	}
 	switch result.Type {
 	case approvalmodel.PolicyDeny:

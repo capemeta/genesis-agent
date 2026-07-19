@@ -159,7 +159,7 @@ Catalog → Skill.description(<available_skills>)
 | G3 | 无 slash `/skill-name` 产品入口 | CLI 用户无法像 Kode 一样「只打命令不讲意图」 | 见 §5.2；可选，优先级低于 G1/G2 |
 | G4 | 无 T2 硬匹配 | 长 catalog 时模型漏选 | **本期不做**；若要做，见 §5.4（仅增强，不替代网关） |
 | G5 | Enterprise/Web mention picker UX | 结构化选择未产品化 | 产品层 `$`/`@` 弹窗 → `UserInput.Skill` 或文本 `$name` |
-| G6 | `context=fork` | 已明确拒绝 | 等子 Agent 设计，不在本触发文档范围 |
+| G6 | `context=fork` | 已经 `Delegator` 统一委派 | 细节见 `docs/子智能体设计.md` §4.4；不在本触发文档展开 |
 
 ---
 

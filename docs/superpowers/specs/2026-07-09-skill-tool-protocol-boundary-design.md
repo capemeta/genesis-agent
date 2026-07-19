@@ -1,6 +1,7 @@
 # Skill / Tool 协议边界设计
 
-> 状态：Phase 2 已实现（fork/subagent 延后）  
+> 状态：Phase 2 已实现；`context:fork` 已挂到统一 SubAgent `Delegator`（见 `docs/子智能体设计.md` §4.4）  
+
 > 日期：2026-07-09  
 > 触发问题：模型把 `office-ppt`（Skill）当成 Tool 直接调用，被 Profile 拒绝。  
 > 参考：Kode-CLI `SkillTool`、Codex `core-skills` / `ext/skills`、现有 `docs/Skills设计.md` / `docs/Office能力与Skills设计.md`（仅作参照，本文件以最佳实践为准）。  
@@ -254,17 +255,16 @@ Skill.call
 - `dependencies.tools` 缺失 → Load 失败并提示，不静默跳过。
 - 注入去重：同一 opaque resource 已注入则跳过 body，返回 `already_loaded`。
 
-#### Fork / Subagent（延后；仅保留语义挂点）
+#### Fork / Subagent（已接线：统一 Task / Delegator）
 
-`context: fork` → 目标是创建规范化子 agent / 子 Run：独立上下文、继承收窄后的 AllowedTools（以及后续允许的 skills/MCP 集）、主线程不注入 body、结果摘要回传。
+`context: fork` → 创建规范化子 agent / 子 Run：独立上下文、继承收窄后的 AllowedTools、主线程不注入 body、结果摘要回传。
 
-**当前实现**：解析字段并在 Load 时明确拒绝，提示改用 `inline`。  
-**不做半吊子子 Run**，避免与后续「主 agent 按需启子 agent / 多 agent」设计冲突。后续设计必须覆盖：
+**当前实现**（权威细节以 `docs/子智能体设计.md` §4.4 为准）：
 
-1. 给子 agent 的上下文裁剪（任务目标、必要文件/资源 id、禁止宿主机绝对路径）。
-2. 子 agent 可调用的 tools / skills / MCP 白名单（默认继承收窄集，不可扩权）。
-3. 结果回传契约（摘要、产物路径/resource id、错误）。
-4. 审批与审计边界（子调用仍走 Gateway/Approval）。
+1. Skill 完成 Resolve / 依赖 / Approval 后，调用注入的 `Task`（须实现 `Delegator`）。
+2. 无 `agent`：合成临时 Definition `skill-fork:<qualified_name>`；有 `agent`：Catalog resolve，失败不静默回退。
+3. 一律 `skill_isolated`；子侧 system 由 `ComposeChildSystem` 组装；下行信封由 `contextsnapshot` 渲染。
+4. 审批与审计仍走 Task / Gateway；禁止旁路 Spawn 或半吊子子 goroutine。
 
 #### Mention / SelectForTurn（Phase 2 已接线）
 
@@ -386,7 +386,7 @@ Model: tool_call(name="office-ppt", arguments={action:create,...})
 3. 注入去重 `InjectedSkillSet` / `already_loaded`。
 4. Approval 键对齐 `Skill(name)` / `Skill(name)+dependencies`。
 5. CollisionGuard **默认** `auto_rewrite`：同轮改写为 `Skill(skill=规范名)` 并执行（伪造业务 JSON 参数丢弃）。
-6. **`context:fork` 真执行延后**：字段语义保留，运行时继续明确拒绝；待「主 agent 按需启子 agent」设计完成后再实现。fork/subagent 需单独设计：子上下文裁剪、允许的 tools/skills/MCP、结果回传契约。
+6. **`context:fork`**：已挂统一 SubAgent 委派（见上「Fork / Subagent」）；后续增强项（子 Run 内 Skill 网关、model 路由、permission_mode 等）跟子智能体阶段计划，不再以「明确拒绝」为默认语义。
 
 ### Phase 3（远程/市场）
 

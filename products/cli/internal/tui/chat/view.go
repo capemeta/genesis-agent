@@ -8,6 +8,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 
+	"genesis-agent/internal/runtime/collab"
 	"genesis-agent/products/cli/internal/tui/styles"
 )
 
@@ -101,6 +102,7 @@ func (m Model) headerView() string {
 	if available > 0 {
 		parts := []string{
 			styles.HeaderChip.Render(truncateDisplay(m.modelName(), 24)),
+			styles.HeaderChip.Render(truncateDisplay("模式:"+collab.DisplayName(m.collabMode), 16)),
 			styles.HeaderChip.Render(truncateDisplay(m.sandboxLabel(), 18)),
 			styles.HeaderBarSub.Render("sess:" + truncateDisplay(m.shortSessionID(), 14)),
 		}

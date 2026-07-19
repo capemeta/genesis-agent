@@ -326,6 +326,8 @@ func isNotFoundExecError(err error) bool {
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "not found") ||
+		strings.Contains(msg, "not_found") ||
+		strings.Contains(msg, "sandbox_not_found") ||
 		strings.Contains(msg, "no such") ||
 		strings.Contains(msg, "could not find the file") ||
 		strings.Contains(msg, "cannot find the file") ||

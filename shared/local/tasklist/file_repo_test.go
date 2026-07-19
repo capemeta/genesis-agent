@@ -1,0 +1,139 @@
+package plan
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"genesis-agent/internal/capabilities/tasklist/model"
+)
+
+func TestFileRepository_SaveAndGetTaskList(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "genesis_plan_test")
+	if err != nil {
+		t.Fatalf("Create temp dir failed: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	repo, err := NewFileRepository(tempDir)
+	if err != nil {
+		t.Fatalf("Init repo failed: %v", err)
+	}
+
+	sessionID := "test_session_abc"
+
+	steps := []model.Step{
+		{ID: "task_1", Title: "Initialize project", Status: model.StepStatusPending},
+	}
+
+	plan := &model.TaskList{
+		SessionID:         sessionID,
+		Steps:             steps,
+		LatestExplanation: "Test save",
+		Version:           1,
+		UpdatedAt:         time.Now(),
+	}
+
+	revision := &model.RevisionLog{
+		Version:     1,
+		Explanation: "Test save",
+		Operator:    "agent",
+		Timestamp:   time.Now(),
+	}
+
+	// 1. 保存 Plan
+	err = repo.SaveTaskList(context.Background(), plan, revision)
+	if err != nil {
+		t.Fatalf("Save plan failed: %v", err)
+	}
+
+	// 2. 读取 Plan
+	retrieved, err := repo.GetTaskList(context.Background(), sessionID)
+	if err != nil {
+		t.Fatalf("Get plan failed: %v", err)
+	}
+
+	if retrieved == nil {
+		t.Fatal("Expected plan to exist, got nil")
+	}
+
+	if retrieved.SessionID != sessionID || len(retrieved.Steps) != 1 || retrieved.Version != 1 {
+		t.Errorf("Retrieved plan properties mismatch: %+v", retrieved)
+	}
+
+	// 3. 并发乐观锁冲突测试
+	// 尝试以相同或更小版本号 (<=1) 写入
+	err = repo.SaveTaskList(context.Background(), plan, revision)
+	if err == nil {
+		t.Fatal("Expected error due to concurrent lock version conflict, got nil")
+	}
+
+	// 4. 正确更新版本
+	plan.Version = 2
+	revision.Version = 2
+	err = repo.SaveTaskList(context.Background(), plan, revision)
+	if err != nil {
+		t.Fatalf("Save plan with next version failed: %v", err)
+	}
+
+	// 5. 校验变更历史记录是否成功追加
+	history, err := repo.GetHistory(context.Background(), sessionID)
+	if err != nil {
+		t.Fatalf("Get history failed: %v", err)
+	}
+
+	if len(history) != 2 {
+		t.Errorf("Expected 2 history revisions, got %d", len(history))
+	}
+	if history[0].Version != 1 || history[1].Version != 2 {
+		t.Errorf("History versions incorrect: %+v", history)
+	}
+}
+
+func TestFileRepository_CleanPathSafety(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "genesis_plan_test_safety")
+	if err != nil {
+		t.Fatalf("Create temp dir failed: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	repo, err := NewFileRepository(tempDir)
+	if err != nil {
+		t.Fatalf("Init repo failed: %v", err)
+	}
+
+	// 1. 验证被安全过滤的情况：/ 和 . 以及 \ 被自动剔除，仅保留安全字符
+	hackSessionID := "../../../hack_session"
+	safePath := repo.getPlanPath(hackSessionID)
+	if filepath.Base(safePath) != "hack_session_plan.json" {
+		t.Errorf("Expected filename to be cleaned to hack_session_plan.json, got path: %s", safePath)
+	}
+
+	backslashSessionID := `\\some_session`
+	safePath2 := repo.getPlanPath(backslashSessionID)
+	if filepath.Base(safePath2) != "some_session_plan.json" {
+		t.Errorf("Expected filename to be cleaned to some_session_plan.json, got path: %s", safePath2)
+	}
+
+	// 2. 验证报错的情况：仅传入 ../ 或 \\ 过滤后为空，应报错拒绝
+	_, err = repo.GetTaskList(context.Background(), "../")
+	if err == nil {
+		t.Error("Expected error when sessionID is empty after filtering (../), got nil")
+	}
+
+	_, err = repo.GetTaskList(context.Background(), `\\`)
+	if err == nil {
+		t.Error("Expected error when sessionID is empty after filtering (\\\\), got nil")
+	}
+
+	plan := &model.TaskList{
+		SessionID: "../",
+		Version:   1,
+	}
+	err = repo.SaveTaskList(context.Background(), plan, &model.RevisionLog{Version: 1})
+	if err == nil {
+		t.Error("Expected error when saving plan with invalid sessionID, got nil")
+	}
+}

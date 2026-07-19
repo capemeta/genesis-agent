@@ -5,7 +5,7 @@ import "testing"
 func TestDefaultProfileMatchesCurrentDesktopAssembly(t *testing.T) {
 	prof := DefaultProfile(false)
 	tools := toolSet(prof.Tools.Enabled)
-	for _, required := range []string{"current_time", "calculator", "http_request", "todo_read", "todo_write", "todo_update_step", "Task", "TaskOutput", "TaskStop"} {
+	for _, required := range []string{"current_time", "calculator", "http_request", "todo_read", "todo_write", "todo_update_step", "enter_plan_mode", "exit_plan_mode", "write_implementation_plan", "Task", "TaskOutput", "TaskStop"} {
 		if _, ok := tools[required]; !ok {
 			t.Fatalf("Desktop 缺少已装配工具 %q", required)
 		}

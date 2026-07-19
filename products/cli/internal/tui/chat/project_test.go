@@ -43,7 +43,7 @@ func TestProjectUIMessagesShowsSummaryAsSystem(t *testing.T) {
 
 func TestLoadPlanFromMessagesUsesLatestSnapshot(t *testing.T) {
 	now := time.Now()
-	oldPlan := domain.Plan{
+	oldPlan := domain.TaskList{
 		ID:        "plan-1",
 		SessionID: "sess-1",
 		Title:     "旧计划",
@@ -51,13 +51,13 @@ func TestLoadPlanFromMessagesUsesLatestSnapshot(t *testing.T) {
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
-	latestPlan := domain.Plan{
+	latestPlan := domain.TaskList{
 		ID:        "plan-1",
 		SessionID: "sess-1",
 		Title:     "最新计划",
 		Version:   2,
-		Items: []domain.PlanItem{
-			{ID: "a", Text: "继续执行", Status: domain.PlanItemDoing},
+		Items: []domain.TaskListItem{
+			{ID: "a", Text: "继续执行", Status: domain.TaskListItemDoing},
 		},
 		CreatedAt: now,
 		UpdatedAt: now,
@@ -67,9 +67,9 @@ func TestLoadPlanFromMessagesUsesLatestSnapshot(t *testing.T) {
 
 	got := loadPlanFromMessages([]*domain.Message{
 		domain.NewUserMessage("开始"),
-		{Role: domain.RoleAssistant, Content: string(oldJSON), Kind: domain.MessageKindPlanSnapshot},
+		{Role: domain.RoleAssistant, Content: string(oldJSON), Kind: domain.MessageKindTaskListSnapshot},
 		domain.NewAssistantMessage("中间回答"),
-		{Role: domain.RoleAssistant, Content: string(latestJSON), Kind: domain.MessageKindPlanSnapshot},
+		{Role: domain.RoleAssistant, Content: string(latestJSON), Kind: domain.MessageKindTaskListSnapshot},
 	})
 
 	if got == nil {
@@ -78,7 +78,7 @@ func TestLoadPlanFromMessagesUsesLatestSnapshot(t *testing.T) {
 	if got.Title != "最新计划" || got.Version != 2 {
 		t.Fatalf("got=%+v", got)
 	}
-	if len(got.Items) != 1 || got.Items[0].Status != domain.PlanItemDoing {
+	if len(got.Items) != 1 || got.Items[0].Status != domain.TaskListItemDoing {
 		t.Fatalf("items=%+v", got.Items)
 	}
 }

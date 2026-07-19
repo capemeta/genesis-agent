@@ -17,6 +17,8 @@ const (
 	ActionSkillResourceRead Action = "skill.resource.read"
 	ActionSkillInstall      Action = "skill.install"
 	ActionSubAgentDelegate  Action = "subagent.delegate"
+	// ActionPlanExitApprove 方案期退出规划模式批准（与任务清单 blocked_by_approval 语义分离）。
+	ActionPlanExitApprove Action = "plan.exit_approve"
 )
 
 // Resource 描述动作作用的资源。

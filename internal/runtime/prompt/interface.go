@@ -7,6 +7,16 @@ import (
 	"genesis-agent/internal/domain"
 )
 
+// Audience 区分主 Agent 与子智能体的提示词装配裁剪。
+type Audience string
+
+const (
+	// AudienceRoot 是根会话主 Agent（默认）。
+	AudienceRoot Audience = "root"
+	// AudienceSubAgent 是委派子 Run：跳过主侧委派纪律与冗长腔调。
+	AudienceSubAgent Audience = "subagent"
+)
+
 // BuildRequest 描述一次系统提示词构建请求。
 type BuildRequest struct {
 	Agent          *domain.Agent
@@ -15,6 +25,15 @@ type BuildRequest struct {
 	TurnID         string
 	Context        map[string]string
 	AvailableTools []string
+	// Audience 为空时按 AudienceRoot 处理。
+	Audience Audience
+	// DelegationPosture 控制 Task 可用时的委派纪律文案（proactive / explicit_request_only）。
+	// 空值由 Builder 默认姿态回落。
+	DelegationPosture string
+	// CollaborationMode 协作模式：plan_mode 时注入 plan_mode_rules 并跳过 task_management。
+	CollaborationMode string
+	// PlanDocumentPath 实施方案工作区相对路径（规划模式提示词锚点）；空则用占位模式串。
+	PlanDocumentPath string
 }
 
 // Fragment 是动态上下文片段。

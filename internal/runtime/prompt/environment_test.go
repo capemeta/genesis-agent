@@ -8,6 +8,7 @@ import (
 	execmodel "genesis-agent/internal/capabilities/execution/model"
 	workcontract "genesis-agent/internal/capabilities/workspace/contract"
 	workmodel "genesis-agent/internal/capabilities/workspace/model"
+	"genesis-agent/internal/domain"
 )
 
 func TestDefaultPromptUsesReadFileForKnownExactPath(t *testing.T) {
@@ -31,6 +32,111 @@ func TestDefaultPromptDoesNotReferenceUnavailableTools(t *testing.T) {
 		if strings.Contains(prompt, unavailable) {
 			t.Fatalf("提示词引用了不可用工具 %q: %s", unavailable, prompt)
 		}
+	}
+}
+
+func TestBuildSystemInjectsTaskManagementBlock(t *testing.T) {
+	withTodo, err := New().BuildSystem(context.Background(), BuildRequest{AvailableTools: []string{
+		"todo_write", "todo_update_step", "todo_read",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"<task_management>", "</task_management>", "任务清单纪律", "硬规则", "todo_update_step"} {
+		if !strings.Contains(withTodo, want) {
+			t.Fatalf("missing %q in system prompt:\n%s", want, withTodo)
+		}
+	}
+	if strings.Contains(withTodo, "## 工具分工") {
+		t.Fatalf("system 不应再堆工具分工（应在 Description）: %s", withTodo)
+	}
+	withoutTodo, err := New().BuildSystem(context.Background(), BuildRequest{AvailableTools: []string{"current_time"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(withoutTodo, "<task_management>") || strings.Contains(withoutTodo, "任务清单纪律") {
+		t.Fatalf("task_management must not inject without todo tools: %s", withoutTodo)
+	}
+}
+
+func TestBuildSystemPlanModeExcludesTaskManagement(t *testing.T) {
+	got, err := New().BuildSystem(context.Background(), BuildRequest{
+		AvailableTools:    []string{"todo_write", "todo_update_step", "write_implementation_plan", "exit_plan_mode"},
+		CollaborationMode: "plan_mode",
+		PlanDocumentPath:  ".genesis/plans/test-sess.md",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "<plan_mode_rules>") || !strings.Contains(got, "规划模式") {
+		t.Fatalf("missing plan_mode_rules: %s", got)
+	}
+	if !strings.Contains(got, ".genesis/plans/test-sess.md") {
+		t.Fatalf("plan_mode_rules missing plan path: %s", got)
+	}
+	if strings.Contains(got, "<task_management>") {
+		t.Fatalf("plan mode must not inject task_management: %s", got)
+	}
+}
+
+func TestBuildSystemInjectsDelegationBlock(t *testing.T) {
+	withTask, err := New().BuildSystem(context.Background(), BuildRequest{
+		AvailableTools:    []string{"Task", "read_file", "grep"},
+		DelegationPosture: "proactive",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"<delegation>", "</delegation>", "子智能体委派纪律", "Task(subagent_type=explore)"} {
+		if !strings.Contains(withTask, want) {
+			t.Fatalf("missing %q in system prompt:\n%s", want, withTask)
+		}
+	}
+	if !strings.Contains(withTask, "非 needle") && !strings.Contains(withTask, "广搜") && !strings.Contains(withTask, "优先 Task") {
+		// 文件查找规则应与 Task 消歧，避免只鼓励直接 grep
+		if strings.Contains(withTask, "文件查找工具选择：") && !strings.Contains(withTask, "Task") {
+			t.Fatalf("with Task available, discovery rules must mention Task:\n%s", withTask)
+		}
+	}
+	explicit, err := New().BuildSystem(context.Background(), BuildRequest{
+		AvailableTools:    []string{"Task"},
+		DelegationPosture: "explicit_request_only",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(explicit, "不算授权") {
+		t.Fatalf("explicit posture missing gate:\n%s", explicit)
+	}
+	withoutTask, err := New().BuildSystem(context.Background(), BuildRequest{AvailableTools: []string{"read_file"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(withoutTask, "<delegation>") || strings.Contains(withoutTask, "子智能体委派纪律") {
+		t.Fatalf("delegation must not inject without Task: %s", withoutTask)
+	}
+}
+
+func TestBuildSystemSubAgentAudienceSkipsDelegation(t *testing.T) {
+	got, err := New().BuildSystem(context.Background(), BuildRequest{
+		Agent: &domain.Agent{SystemPrompt: "子智能体契约"},
+		AvailableTools: []string{"Task", "read_file"},
+		Audience:       AudienceSubAgent,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(got, "<delegation>") || strings.Contains(got, "子智能体委派纪律") {
+		t.Fatalf("subagent audience must skip root delegation block:\n%s", got)
+	}
+	if strings.Contains(got, "思考时请清晰说明你的推理过程") {
+		t.Fatalf("subagent audience must skip root tone:\n%s", got)
+	}
+	if !strings.Contains(got, "子智能体契约") {
+		t.Fatalf("subagent system persona missing:\n%s", got)
+	}
+	if !strings.Contains(got, "failure_kind=repeated_failure") {
+		t.Fatalf("subagent must keep failure fuse rules:\n%s", got)
 	}
 }
 

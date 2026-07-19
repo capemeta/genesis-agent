@@ -14,8 +14,10 @@ import (
 	"genesis-agent/internal/app"
 	approvalmodel "genesis-agent/internal/capabilities/approval/model"
 	"genesis-agent/internal/domain"
+	"genesis-agent/internal/runtime/collab"
 	"genesis-agent/internal/runtime/progress"
 	approval "genesis-agent/products/cli/internal/approval"
+	localcollab "genesis-agent/shared/local/collab"
 )
 
 // Update 处理所有外部事件，返回新的 Model 状态和待执行的 Cmd
@@ -568,9 +570,9 @@ func (m Model) sendMessage(input string) (tea.Model, tea.Cmd) {
 func (m *Model) applyProgress(event progress.Event) {
 
 	// 处理计划事件：完整 Plan JSON 快照，直接替换 currentPlan
-	if event.Kind == progress.KindPlan {
+	if event.Kind == progress.KindTaskList {
 		if event.Detail != "" {
-			var plan domain.Plan
+			var plan domain.TaskList
 			if err := json.Unmarshal([]byte(event.Detail), &plan); err == nil {
 				m.currentPlan = &plan
 				// 新建计划时自动展开；更新/tick 时保持当前展开状态
@@ -580,6 +582,21 @@ func (m *Model) applyProgress(event progress.Event) {
 			}
 		}
 		return // 计划事件不写入 progressLog、不更新 status bar
+	}
+	if event.Kind == progress.KindCollaborationMode {
+		m.collabMode = collab.Normalize(collab.Mode(event.Detail))
+		if event.Summary != "" {
+			m.toast = event.Summary
+			m.toastExpiresAt = time.Now().Add(3 * time.Second)
+		}
+		return
+	}
+	if event.Kind == progress.KindPlanDocument {
+		if event.Summary != "" {
+			m.toast = event.Summary
+			m.toastExpiresAt = time.Now().Add(3 * time.Second)
+		}
+		return
 	}
 
 	if isLiveAssistantBlock(event.BlockType) {
@@ -968,6 +985,12 @@ func (m Model) handleSlashCmd(input string) (tea.Model, tea.Cmd) {
 		m.viewport.GotoBottom()
 		return m, nil
 
+	case "plan":
+		return m.handlePlanSlash(cmdArg)
+
+	case "execute":
+		return m.handleExecuteSlash()
+
 	case "help", "?", "h":
 		return m.showHelpOverlay()
 
@@ -995,6 +1018,66 @@ func (m Model) handleSlashCmd(input string) (tea.Model, tea.Cmd) {
 		m.viewport.GotoBottom()
 		return m, nil
 	}
+}
+
+func (m Model) handlePlanSlash(arg string) (tea.Model, tea.Cmd) {
+	arg = strings.ToLower(strings.TrimSpace(arg))
+	if m.collabStore == nil || m.session == nil {
+		return m.systemNotice("协作模式存储未就绪，无法切换规划模式。")
+	}
+	ctx := context.Background()
+	sessionID := m.session.ID
+	switch arg {
+	case "cancel", "off", "exit":
+		if err := m.collabStore.Set(ctx, sessionID, collab.SessionState{Mode: collab.ModeDefault, HandoffPending: false}); err != nil {
+			return m.systemNotice("退出规划模式失败: " + err.Error())
+		}
+		m.collabMode = collab.ModeDefault
+		return m.systemNotice("已放弃规划，回到执行中（未注入任务清单交接）。")
+	case "", "on", "enter":
+		if m.collabMode == collab.ModePlan {
+			return m.systemNotice("已处于规划模式。完成后用 /execute 批准退出，或 /plan cancel 放弃。")
+		}
+		if err := m.collabStore.Set(ctx, sessionID, collab.SessionState{Mode: collab.ModePlan, HandoffPending: false}); err != nil {
+			return m.systemNotice("进入规划模式失败: " + err.Error())
+		}
+		m.collabMode = collab.ModePlan
+		return m.systemNotice("已进入规划模式：只读调研 + 写实施方案；禁用任务清单与变更类工具。")
+	default:
+		return m.systemNotice("用法: /plan | /plan cancel")
+	}
+}
+
+func (m Model) handleExecuteSlash() (tea.Model, tea.Cmd) {
+	if m.collabStore == nil || m.session == nil {
+		return m.systemNotice("协作模式存储未就绪。")
+	}
+	if m.collabMode != collab.ModePlan {
+		return m.systemNotice("当前不在规划模式。请先 /plan，或让 Agent 调用 enter_plan_mode。")
+	}
+	rel, body, err := localcollab.ReadPlanDocument(m.workspaceRoot, m.session.ID)
+	if err != nil {
+		return m.systemNotice("读取实施方案失败: " + err.Error())
+	}
+	if strings.TrimSpace(body) == "" {
+		return m.systemNotice(fmt.Sprintf("尚未写入实施方案（期望路径 %s）。请先让 Agent 调用 write_implementation_plan。", rel))
+	}
+	ctx := context.Background()
+	if err := m.collabStore.Set(ctx, m.session.ID, collab.SessionState{Mode: collab.ModeDefault, HandoffPending: true}); err != nil {
+		return m.systemNotice("批准退出失败: " + err.Error())
+	}
+	m.collabMode = collab.ModeDefault
+	return m.systemNotice(fmt.Sprintf(
+		"已批准实施方案并退出规划模式（%s）。下一条消息将交接：先读方案 → todo_write → 再执行。",
+		rel,
+	))
+}
+
+func (m Model) systemNotice(text string) (tea.Model, tea.Cmd) {
+	m.messages = append(m.messages, uiMessage{role: "system", content: text})
+	m.refreshViewportContent()
+	m.viewport.GotoBottom()
+	return m, nil
 }
 
 func (m Model) currentSessionScope() app.SessionScope {

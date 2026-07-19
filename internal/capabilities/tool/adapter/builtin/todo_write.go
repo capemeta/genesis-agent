@@ -4,8 +4,9 @@ import (
 	"context"
 	"fmt"
 
-	plancontract "genesis-agent/internal/capabilities/plan/contract"
-	planmodel "genesis-agent/internal/capabilities/plan/model"
+	tasklistcontract "genesis-agent/internal/capabilities/tasklist/contract"
+	tasklistmodel "genesis-agent/internal/capabilities/tasklist/model"
+	tasklistprompt "genesis-agent/internal/capabilities/tasklist/prompt"
 	"genesis-agent/internal/capabilities/tool/contract"
 	toolparam "genesis-agent/internal/capabilities/tool/param"
 	"genesis-agent/internal/platform/contextutil"
@@ -13,18 +14,18 @@ import (
 
 // TodoWriteTool 全量更新待办计划的工具
 type TodoWriteTool struct {
-	planSvc plancontract.Service
+	planSvc tasklistcontract.Service
 }
 
 // NewTodoWriteTool 创建 TodoWriteTool 实例
-func NewTodoWriteTool(svc plancontract.Service) tool.Tool {
+func NewTodoWriteTool(svc tasklistcontract.Service) tool.Tool {
 	return &TodoWriteTool{planSvc: svc}
 }
 
 func (t *TodoWriteTool) GetInfo() *tool.Info {
 	return &tool.Info{
 		Name:        "todo_write",
-		Description: "创建或全量改写当前会话的待办任务计划大纲 (TodoList)。当需要新增、删除或调整步骤顺序时，必须调用此工具。",
+		Description: tasklistprompt.ToolTodoWriteDescription,
 		Parameters: &tool.ParameterSchema{
 			Type:     "object",
 			Required: []string{"steps"},
@@ -66,7 +67,7 @@ func (t *TodoWriteTool) Execute(ctx context.Context, params string) (string, err
 	}
 
 	var args struct {
-		Steps       []planmodel.Step `json:"steps"`
+		Steps       []tasklistmodel.Step `json:"steps"`
 		Explanation string           `json:"explanation"`
 	}
 
@@ -74,7 +75,7 @@ func (t *TodoWriteTool) Execute(ctx context.Context, params string) (string, err
 		return "", fmt.Errorf("unmarshal parameters failed: %w", err)
 	}
 
-	plan, err := t.planSvc.UpdatePlan(ctx, sessionID, args.Steps, args.Explanation, "agent")
+	plan, err := t.planSvc.UpdateTaskList(ctx, sessionID, args.Steps, args.Explanation, "agent")
 	if err != nil {
 		return "", fmt.Errorf("update plan failed: %w", err)
 	}
@@ -82,15 +83,15 @@ func (t *TodoWriteTool) Execute(ctx context.Context, params string) (string, err
 	// 检查是否有步骤因重构触发拦截审批
 	hasBlocked := false
 	for _, step := range plan.Steps {
-		if step.Status == planmodel.StepStatusBlockedByApproval {
+		if step.Status == tasklistmodel.StepStatusBlockedByApproval {
 			hasBlocked = true
 			break
 		}
 	}
 
 	if hasBlocked {
-		return fmt.Sprintf("计划覆写已成功提交。检测到属于【重大结构重构】，状态已锁定为 blocked_by_approval。系统已自动弹起人机审批流，请告知用户核准后再行执行。最新版本号：%d", plan.Version), nil
+		return fmt.Sprintf("任务清单覆写已成功提交。检测到属于【重大结构重构】，状态已锁定为 blocked_by_approval。系统已自动弹起人机审批流，请告知用户核准后再行执行。最新版本号：%d", plan.Version), nil
 	}
 
-	return fmt.Sprintf("计划大纲已成功覆写。最新版本号：%d，当前步骤均已准备完毕。", plan.Version), nil
+	return fmt.Sprintf("任务清单已成功覆写。最新版本号：%d，当前步骤均已准备完毕。", plan.Version), nil
 }

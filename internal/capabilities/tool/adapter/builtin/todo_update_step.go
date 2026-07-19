@@ -4,8 +4,9 @@ import (
 	"context"
 	"fmt"
 
-	plancontract "genesis-agent/internal/capabilities/plan/contract"
-	planmodel "genesis-agent/internal/capabilities/plan/model"
+	tasklistcontract "genesis-agent/internal/capabilities/tasklist/contract"
+	tasklistmodel "genesis-agent/internal/capabilities/tasklist/model"
+	tasklistprompt "genesis-agent/internal/capabilities/tasklist/prompt"
 	"genesis-agent/internal/capabilities/tool/contract"
 	toolparam "genesis-agent/internal/capabilities/tool/param"
 	"genesis-agent/internal/platform/contextutil"
@@ -13,18 +14,18 @@ import (
 
 // TodoUpdateStepTool 差量更新步骤状态的工具
 type TodoUpdateStepTool struct {
-	planSvc plancontract.Service
+	planSvc tasklistcontract.Service
 }
 
 // NewTodoUpdateStepTool 创建 TodoUpdateStepTool 实例
-func NewTodoUpdateStepTool(svc plancontract.Service) tool.Tool {
+func NewTodoUpdateStepTool(svc tasklistcontract.Service) tool.Tool {
 	return &TodoUpdateStepTool{planSvc: svc}
 }
 
 func (t *TodoUpdateStepTool) GetInfo() *tool.Info {
 	return &tool.Info{
 		Name:        "todo_update_step",
-		Description: "快速差量滚动单个步骤的状态。当您完成当前步骤或启动下一个步骤时，必须首选调用此工具（出站 Token 最小、延迟极低）。",
+		Description: tasklistprompt.ToolTodoUpdateStepDescription,
 		Parameters: &tool.ParameterSchema{
 			Type:     "object",
 			Required: []string{"id", "status"},
@@ -51,7 +52,7 @@ func (t *TodoUpdateStepTool) Execute(ctx context.Context, params string) (string
 
 	var args struct {
 		ID          string               `json:"id"`
-		Status      planmodel.StepStatus `json:"status"`
+		Status      tasklistmodel.StepStatus `json:"status"`
 		Explanation string               `json:"explanation"`
 	}
 

@@ -268,7 +268,7 @@ products:
 | `description` | 是 | 用于模型选择，最大 1024 字符 |
 | `short-description` | 否 | UI 和 prompt 简短展示 |
 | `allowed-tools` | 否 | 激活后的工具可见上限：空=不收窄；非空=与当前可见集及 Profile 求交，求交为空则加载失败；不得静默扩权 |
-| `context` | 否 | `inline/fork`，第一轮只实现 inline，fork 预留给多 Agent |
+| `context` | 否 | `inline/fork`；fork 走统一 SubAgent 委派（见 §4.7） |
 | `agent` | 否 | fork 时指定 agent 类型 |
 | `model` | 否 | `inherit/quick/task/main` 或具体 route |
 | `disable-model-invocation` | 否 | 禁止模型自动调用，只能 UI/用户显式触发 |
@@ -687,7 +687,11 @@ Service 不做：
 
 ### 4.7 Inline / Fork
 
-第一阶段实现 inline 注入。`context: fork` 预留字段，映射到多 Agent / 子 Run，不在第一阶段混入主路径。
+- **inline**（默认）：主线程短 ToolResult + 单份 `<skill_injection>`。
+- **fork**：经固定 `Task` 网关 `Delegator.Delegate` 创建子 Run（见 `docs/子智能体设计.md` §4.4）。
+  - 无 `agent`：合成临时 Definition `skill-fork:<qualified_name>`（body→system，args→prompt）。
+  - 有 `agent`：Catalog resolve；body 进入委派 prompt，不覆盖 Definition system。
+  - 一律 `skill_isolated`；主线程不注入 body；缺 Task 网关时失败，禁止旁路 Spawn。
 
 ## 五、多产品策略
 
@@ -1000,7 +1004,7 @@ Enterprise 第二轮：
 | Skill 是否默认加载完整内容 | 不能，必须 progressive disclosure；body 单份 injection |
 | `allowed-tools` 是否扩大权限 | 不能；空=不收窄，非空=求交收窄 |
 | Skill resource 是否可被解析为 path | 不能，必须通过 authority provider 读取 |
-| 是否第一轮实现 fork skill | 不建议，预留字段，后续接多 Agent |
+| 是否实现 fork skill | 已实现：统一走 SubAgent `Delegator`（见 §4.7 / 子智能体设计 §4.4） |
 | mention / SelectForTurn | Phase 2 已接线；「仅用户可触发」语义与 slash UX 见触发模式设计 |
 | 是否兼容 Kode/Codex skill 格式 | 兼容核心 `SKILL.md` frontmatter；Marketplace 采用精简且受治理的安装模型，不照搬全部插件 runtime |
 | 是否需要 watcher | CLI/Desktop 需要本地 watcher；Enterprise 用 DB/event 失效 |
@@ -1034,7 +1038,7 @@ Enterprise 第二轮：
 | **4.2 Source 接口** | 四、加载与注入链路 | [source.go](file:///d:/workspace/go/genesis-agent/internal/capabilities/skill/contract/source.go) | `Implemented` | 抽象了 `Source` 及可选的 `Watcher` 契约。 |
 | **4.3 Service 职责** | 四、加载与注入链路 | [service.go](file:///d:/workspace/go/genesis-agent/internal/capabilities/skill/service/service.go) | `Implemented` | 实现了多 Source 聚合、按 Scope/Product 过滤、 qualified_name 冲突解决、缓存及 Prompt 渲染等功能。 |
 | **4.4 Catalog / Prompt** | 四、加载与注入链路 | [skill/tool.go](file:///d:/workspace/go/genesis-agent/internal/capabilities/skill/tool/skill/tool.go) DescriptionFunc；[container.go](file:///d:/workspace/go/genesis-agent/products/cli/bootstrap/container.go) 短规则 injector | `Implemented` | Catalog 主通道在 `Skill` description；system 仅短硬规则。 |
-| **4.5 Skill 网关（`Skill`）** | 四、加载与注入链路 | [skill/tool.go](file:///d:/workspace/go/genesis-agent/internal/capabilities/skill/tool/skill/tool.go)；[react_loop.go](file:///d:/workspace/go/genesis-agent/internal/runtime/strategy/react/react_loop.go) | `Implemented` | 对外名 `Skill`；短 ToolResult + 单份 `<skill_injection>`；`context=fork` 明确拒绝。 |
+| **4.5 Skill 网关（`Skill`）** | 四、加载与注入链路 | [skill/tool.go](file:///d:/workspace/go/genesis-agent/internal/capabilities/skill/tool/skill/tool.go)；[react_loop.go](file:///d:/workspace/go/genesis-agent/internal/runtime/strategy/react/react_loop.go) | `Implemented` | 对外名 `Skill`；短 ToolResult + 单份 `<skill_injection>`；`context=fork` 经 `Delegator` 统一委派。 |
 | **4.6 CollisionGuard** | 四、加载与注入链路 | [collision/](file:///d:/workspace/go/genesis-agent/internal/capabilities/skill/collision/)；[react_loop.go](file:///d:/workspace/go/genesis-agent/internal/runtime/strategy/react/react_loop.go) | `Implemented` | 未注册且命中 catalog → `skill_tool_collision`；已注册但 Profile 禁用仍走 Profile 语义。 |
 | **辅助工具 (`list/read/search_skill_resources`)** | 四、加载与注入链路 | 对应 tool 包；[default_profile.go](file:///d:/workspace/go/genesis-agent/products/cli/internal/profile/default_profile.go) | `Implemented` | CLI 默认 Profile 已启用 `Skill`/`list_skill_resources` 等；Office skill `allowed-tools` 已对齐。 |
 | **5.1 CLI 产品适配 (本地 Roots, Watcher, Extra)** | 五、多产品策略 | [container.go:L233-298](file:///d:/workspace/go/genesis-agent/products/cli/bootstrap/container.go#L233-298), [source.go](file:///d:/workspace/go/genesis-agent/shared/local/skill/source.go) | `Implemented` | 扫描 `.genesis/skills`、`~/.genesis/skills` 及自定义 extra 目录；通过本地轮询 watcher 热重载缓存。 |
@@ -1046,9 +1050,8 @@ Enterprise 第二轮：
 
 ### 审计反思 (Gap Reflections)
 - **实现偏差 / 缺漏 (Implementation Gaps)**:
-  - Skill/Tool 协议边界 Phase 1+2（不含 fork）已落地：`Skill` 网关、DescriptionFunc catalog、CollisionGuard 默认 auto_rewrite、单份 injection、mention/`SelectForTurn`、注入去重 `already_loaded`、Approval 键 `Skill(name)`、catalog 字节+token 双预算。
-  - `context:fork` / 规范化 subagent 延后，待主 agent 按需启子 agent 设计完成后再做。
-  - Desktop / Enterprise 特色能力仍属后续阶段。
+  - Skill/Tool 协议边界 Phase 1+2 与 `context:fork` 统一委派已落地：`Skill` 网关、DescriptionFunc catalog、CollisionGuard 默认 auto_rewrite、单份 injection、mention/`SelectForTurn`、注入去重 `already_loaded`、Approval 键 `Skill(name)`、catalog 字节+token 双预算；fork 经 `Delegator` + Controller（详见子智能体设计 §1.4 / §4.4）。
+  - Desktop / Enterprise 特色技能管理能力仍属后续阶段。
 - **文档与设计偏差 (Design/Document Gaps)**:
   - 旧版“优先 `load_skill` 命名”建议已废止，以 `Skill` 网关 + 协议边界设计为准。
   - 包内类型命名简写（`Scope`/`Metadata`）属 Go 惯例，不视为偏差。
@@ -1056,15 +1059,11 @@ Enterprise 第二轮：
   - 宿主机逻辑仍在 `shared/local/skill`，未反向侵入 `internal/capabilities`；Gateway 不依赖 SkillService。
 
 ### 后续规划与行动项 (Actionable Next Steps)
-1. **规范化 Subagent / `context:fork`（Priority High，设计先行）**:
-   - **具体工作**: 设计子 agent 上下文裁剪、tools/skills/MCP 白名单、结果回传与审批边界；再实现 `context:fork`。
-   - **验收标准**: fork skill 可在独立上下文执行且不污染主线程；主 agent 可按需启子进程。
-   - **验证方式**: 设计评审 + 单测 + CLI 行为回放。
-2. **Desktop 技能对接 (Priority Medium)**:
+1. **Desktop 技能对接 (Priority Medium)**:
    - **具体工作**: 在 `products/desktop/internal/skill` 下装配本地 Source；结合 Wails GUI 暴露 Skills 管理。
    - **验收标准**: GUI 可正确扫描并列出 Skills，具备启用/禁用开关；本地文件变更时触发 GUI 列表热重载。
    - **验证方式**: Desktop App 本地编译及运行功能测试。
-3. **Enterprise 技能对接 (Priority High)**:
+2. **Enterprise 技能对接 (Priority High)**:
    - **具体工作**:
      - 在 `products/enterprise/internal/skill` 实现 PostgreSQL repository 以及 `Source` 契约。
      - 对接 RBAC；提供 Admin HTTP/SSE 管理接口。

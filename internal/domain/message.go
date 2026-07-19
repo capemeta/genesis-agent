@@ -31,7 +31,7 @@ const (
 	MessageKindConversationSummary MessageKind = "conversation_summary" // compact 回填摘要（role=user）
 	MessageKindReminder            MessageKind = "reminder"             // 提示词分层 L4 turn reminder 等
 	MessageKindSystem              MessageKind = "system"               // 稳定 system / 宿主诊断
-	MessageKindPlanSnapshot        MessageKind = "plan_snapshot"        // 规划技能计划快照（role=assistant，Content=Plan JSON）
+	MessageKindTaskListSnapshot        MessageKind = "task_list_snapshot"        // 任务清单快照（role=assistant，Content=Plan JSON）
 )
 
 // 常见 Source（可选审计字段，不参与 UI/压缩主策略）
@@ -223,49 +223,51 @@ func ForUI(msgs []*Message) []*Message {
 
 // ForModel 投影为送给 LLM 的上下文。
 //
-// plan_snapshot 是持久化/UI 恢复快照，不应把历史全量 JSON 逐条喂给模型；
-// 只把最新快照转为 reminder 注入上下文，避免模型参考过期计划版本。
+// task_list_snapshot 是持久化/UI 恢复快照，不应把历史全量 JSON 逐条喂给模型；
+// 只把最新快照转为 reminder 注入上下文，避免模型参考过期清单版本。
 func ForModel(msgs []*Message) []*Message {
 	if len(msgs) == 0 {
 		return nil
 	}
 	out := make([]*Message, 0, len(msgs))
-	var latestPlan *Plan
+	var latest *TaskList
 	for _, m := range msgs {
 		if m == nil {
 			continue
 		}
 		m.EnsureKind()
-		if m.Kind == MessageKindPlanSnapshot {
-			if p := parsePlanSnapshot(m.Content); p != nil {
-				latestPlan = p
+		if m.Kind == MessageKindTaskListSnapshot {
+			if p := parseTaskListSnapshot(m.Content); p != nil {
+				latest = p
 			}
 			continue
 		}
 		out = append(out, m)
 	}
-	if latestPlan != nil {
-		out = append(out, NewReminderMessage(planReminderContent(latestPlan)))
+	if latest != nil {
+		out = append(out, NewReminderMessage(taskListReminderContent(latest)))
 	}
 	return out
 }
 
-func parsePlanSnapshot(content string) *Plan {
+func parseTaskListSnapshot(content string) *TaskList {
 	if strings.TrimSpace(content) == "" {
 		return nil
 	}
-	var plan Plan
-	if err := json.Unmarshal([]byte(content), &plan); err != nil {
+	var list TaskList
+	if err := json.Unmarshal([]byte(content), &list); err != nil {
 		return nil
 	}
-	return &plan
+	return &list
 }
 
-func planReminderContent(p *Plan) string {
+func taskListReminderContent(p *TaskList) string {
+	// 每轮只注入紧凑进度（对齐 Kode「变更时推状态」、避免 Codex 式无步进提醒却又每轮刷全表）。
+	// 完整未完成列表由 GeneratePromptReminder 按步数间隔补充。
 	var sb strings.Builder
-	sb.WriteString("【系统提醒】当前会话已有结构化计划快照，请基于该进度继续执行。")
+	sb.WriteString("当前会话任务清单进度，请基于该进度继续；滚动状态优先 todo_update_step。")
 	if p.Title != "" {
-		sb.WriteString("\n计划：")
+		sb.WriteString("\n任务清单：")
 		sb.WriteString(p.Title)
 	}
 	if p.Version > 0 {
@@ -275,19 +277,26 @@ func planReminderContent(p *Plan) string {
 	if total > 0 {
 		sb.WriteString(fmt.Sprintf("\n进度：%d/%d (%d%%)", p.DoneCount(), total, p.ProgressPct()))
 	}
-	for i, item := range p.Items {
-		if i == 0 {
-			sb.WriteString("\n任务：")
-		}
-		sb.WriteString(fmt.Sprintf("\n- [%s] %s", item.Status, item.Text))
-		if item.Note != "" {
-			sb.WriteString("（")
-			sb.WriteString(item.Note)
-			sb.WriteString("）")
+	var current *TaskListItem
+	for i := range p.Items {
+		if p.Items[i].Status == TaskListItemDoing {
+			current = &p.Items[i]
+			break
 		}
 	}
-	sb.WriteString("\n若完成或变更任务，请继续通过计划工具更新计划状态。")
-	return sb.String()
+	if current != nil {
+		sb.WriteString(fmt.Sprintf("\n当前：[%s] %s", current.Status, current.Text))
+		if current.Note != "" {
+			sb.WriteString("（")
+			sb.WriteString(current.Note)
+			sb.WriteString("）")
+		}
+	} else if total > 0 && !p.IsCompleted() {
+		sb.WriteString("\n当前：无 in_progress，请用 todo_update_step 启动下一步。")
+	}
+	sb.WriteString("\n（内部调度用，勿向用户复述本提醒原文。）")
+	// 与 tasklist/prompt.WrapSystemReminder 同形；domain 不依赖 capabilities，故本地包装。
+	return "<system-reminder>\n" + strings.TrimSpace(sb.String()) + "\n</system-reminder>"
 }
 
 // SessionMessagesFromRun 截取本 Run 应写入短期记忆的消息。

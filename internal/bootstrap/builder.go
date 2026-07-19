@@ -29,14 +29,14 @@ import (
 	filememory "genesis-agent/internal/capabilities/memory/adapter/file"
 	memorycontract "genesis-agent/internal/capabilities/memory/contract"
 	memoryservice "genesis-agent/internal/capabilities/memory/service"
-	planmemory "genesis-agent/internal/capabilities/plan/adapter/memory"
-	plancontract "genesis-agent/internal/capabilities/plan/contract"
-	"genesis-agent/internal/capabilities/plan/service"
 	profilemodel "genesis-agent/internal/capabilities/profile/model"
 	subagentmodel "genesis-agent/internal/capabilities/subagent/model"
 	subagentservice "genesis-agent/internal/capabilities/subagent/service"
 	subagentlifecycle "genesis-agent/internal/capabilities/subagent/tool/lifecycle"
 	subagenttask "genesis-agent/internal/capabilities/subagent/tool/task"
+	tasklistmemory "genesis-agent/internal/capabilities/tasklist/adapter/memory"
+	tasklistcontract "genesis-agent/internal/capabilities/tasklist/contract"
+	"genesis-agent/internal/capabilities/tasklist/service"
 	"genesis-agent/internal/capabilities/tool/adapter/builtin"
 	"genesis-agent/internal/capabilities/tool/adapter/registry"
 	toolcontract "genesis-agent/internal/capabilities/tool/contract"
@@ -49,10 +49,10 @@ import (
 	usagecontract "genesis-agent/internal/capabilities/usage/contract"
 	"genesis-agent/internal/domain"
 	"genesis-agent/internal/platform/config"
-	"genesis-agent/internal/platform/contextutil"
 	platformhttp "genesis-agent/internal/platform/httpclient"
 	loggercontract "genesis-agent/internal/platform/logger"
 	sloglogger "genesis-agent/internal/platform/logger"
+	"genesis-agent/internal/runtime/collab"
 	runtimecontext "genesis-agent/internal/runtime/context"
 	multibackground "genesis-agent/internal/runtime/multiagent/background"
 	"genesis-agent/internal/runtime/multiagent/contextsnapshot"
@@ -62,7 +62,7 @@ import (
 	promptbuilder "genesis-agent/internal/runtime/prompt"
 	"genesis-agent/internal/runtime/strategy/react"
 
-	progressbc "genesis-agent/internal/capabilities/plan/adapter/progress"
+	progressbc "genesis-agent/internal/capabilities/tasklist/adapter/progress"
 	webcontract "genesis-agent/internal/capabilities/web/contract"
 	webfetchtool "genesis-agent/internal/capabilities/web/tool/web_fetch"
 	websearchtool "genesis-agent/internal/capabilities/web/tool/web_search"
@@ -97,11 +97,17 @@ type BuildOptions struct {
 	AdditionalTools  []toolcontract.Tool
 	PromptInjectors  []promptbuilder.ContextInjector
 	// Logger 由产品层注入；非 nil 时 builder 不再自建文件日志（禁止双 Writer）。
-	Logger                    loggercontract.Logger
-	AuditSink                 auditcontract.Sink
-	UsageSink                 usagecontract.Sink
-	Web                       WebBuildOptions
-	PlanRepository            plancontract.Repository
+	Logger             loggercontract.Logger
+	AuditSink          auditcontract.Sink
+	UsageSink          usagecontract.Sink
+	Web                WebBuildOptions
+	TaskListRepository tasklistcontract.Repository
+	// CollabStore 会话协作模式（规划模式）持久化；nil 时使用内存 Store。
+	CollabStore collab.Store
+	// PlanDocuments 实施方案读写 Port；nil 时使用内存实现（产品应注入文件/DB）。
+	PlanDocuments collab.PlanDocuments
+	// WorkspaceRoot 项目工作区根（供产品层拼装 PlanDocuments）；空则 "."。
+	WorkspaceRoot             string
 	SkillNameMatcher          react.SkillNameMatcher
 	SkillMentionSelector      react.SkillMentionSelector
 	SkillExplicitLoader       react.SkillExplicitLoader
@@ -112,14 +118,17 @@ type BuildOptions struct {
 	SubAgentApproval          approvalcontract.Service
 	// SubAgentMaxConcurrent 是根会话内的子智能体并发硬限；产品在 bootstrap 注入默认值。
 	SubAgentMaxConcurrent int
-	SubAgentStore         multicontract.InstanceStore
-	SubAgentDelivery      multicontract.ResultDeliveryStore
-	SubAgentLease         multicontract.LeaseStore
-	SubAgentHeartbeat     multicontract.HeartbeatStore
-	SubAgentCancellation  multicontract.CancellationStore
-	SubAgentProjection    multicontract.ProjectionSink
-	SubAgentEvidence      multiresult.EvidenceValidator
-	SubAgentResources     multiresult.ResourceProjector
+	// SubAgentDelegationPosture 控制主模型委派提示姿态：proactive / explicit_request_only。
+	// 空值回落 proactive。
+	SubAgentDelegationPosture string
+	SubAgentStore             multicontract.InstanceStore
+	SubAgentDelivery          multicontract.ResultDeliveryStore
+	SubAgentLease             multicontract.LeaseStore
+	SubAgentHeartbeat         multicontract.HeartbeatStore
+	SubAgentCancellation      multicontract.CancellationStore
+	SubAgentProjection        multicontract.ProjectionSink
+	SubAgentEvidence          multiresult.EvidenceValidator
+	SubAgentResources         multiresult.ResourceProjector
 	// SubAgentCapabilityRegistry 提供已安装且启用的 marketplace/plugin 子智能体定义。
 	SubAgentCapabilityRegistry capabilitycontract.Registry
 	// SubAgentIncludeUserDefinitions 仅由允许本机用户自定义 Agent 的产品显式开启。
@@ -143,6 +152,8 @@ type RuntimeBundle struct {
 	AgentService       app.AgentService
 	Credentials        credentialcontract.Service
 	Connections        connectioncontract.Service
+	// CollabStore 供产品 UI 切换规划模式 / 读取 handoff 状态。
+	CollabStore collab.Store
 }
 
 // BuildAgentService 构建产品无关的 Agent 运行时服务。
@@ -226,16 +237,25 @@ func BuildAgentService(ctx context.Context, opts BuildOptions) (*RuntimeBundle, 
 	}
 
 	// ── 初始化 Plan 应用服务 ───────────────────
-	planRepo := opts.PlanRepository
+	planRepo := opts.TaskListRepository
 	if planRepo == nil {
-		planRepo = planmemory.New()
+		planRepo = tasklistmemory.New()
 	}
-	// ProgressBroadcaster 把计划变更转为 progress.Event{Kind: KindPlan}，
+	// ProgressBroadcaster 把计划变更转为 progress.Event{Kind: KindTaskList}，
 	// CLI TUI / Desktop / Enterprise 各端均可通过订阅 progress 流实时渲染计划卡片。
 	planBroadcaster := progressbc.New()
-	planSvc := service.NewPlanService(planRepo, planBroadcaster, 3)
+	planSvc := service.NewTaskListService(planRepo, planBroadcaster, 3)
 
 	baseRegistry := registry.NewRegistry()
+	collabStore := opts.CollabStore
+	if collabStore == nil {
+		collabStore = collab.NewMemoryStore()
+	}
+	planDocs := opts.PlanDocuments
+	if planDocs == nil {
+		planDocs = collab.NewMemoryPlanDocuments()
+	}
+
 	for _, builtinTool := range []toolcontract.Tool{
 		builtin.NewCurrentTimeTool(),
 		builtin.NewCalculatorTool(),
@@ -243,6 +263,9 @@ func BuildAgentService(ctx context.Context, opts BuildOptions) (*RuntimeBundle, 
 		builtin.NewTodoReadTool(planSvc),
 		builtin.NewTodoWriteTool(planSvc),
 		builtin.NewTodoUpdateStepTool(planSvc),
+		builtin.NewEnterPlanModeTool(planDocs),
+		builtin.NewExitPlanModeTool(opts.HookApproval, planDocs),
+		builtin.NewWriteImplementationPlanTool(planDocs),
 	} {
 		if err := baseRegistry.Register(builtinTool); err != nil {
 			return nil, fmt.Errorf("注册内置工具失败: %w", err)
@@ -296,7 +319,7 @@ func BuildAgentService(ctx context.Context, opts BuildOptions) (*RuntimeBundle, 
 		Tracer:     tracer,
 		AuditSink:  auditSink,
 		UsageSink:  usageSink,
-		Authorizer: opts.Authorizer,
+		Authorizer: gateway.NewChainAuthorizer(collab.NewAuthorizer(), opts.Authorizer),
 		Approval:   opts.HookApproval,
 	})
 
@@ -310,35 +333,9 @@ func BuildAgentService(ctx context.Context, opts BuildOptions) (*RuntimeBundle, 
 		return nil, fmt.Errorf("初始化 LLM 客户端失败: %w", err)
 	}
 
-	// 动态注入 Plan 待办进度被动提醒
-	planReminderInjector := promptbuilder.ContextInjectorFunc(func(c context.Context, req promptbuilder.BuildRequest) (promptbuilder.Fragment, error) {
-		sessionID := req.Run.SessionID
-		if sessionID == "" {
-			sessionID = req.Run.ID
-		}
-		stepCount := len(req.Run.Steps)
-
-		c = contextutil.WithSessionID(c, sessionID)
-		c = contextutil.WithTenantID(c, req.Run.TenantID)
-
-		reminder, needed, err := planSvc.GeneratePromptReminder(c, sessionID, stepCount)
-		if err != nil {
-			return promptbuilder.Fragment{}, err
-		}
-		if !needed {
-			return promptbuilder.Fragment{}, nil
-		}
-
-		return promptbuilder.Fragment{
-			Name:     "plan_reminder",
-			Contents: reminder,
-		}, nil
-	})
-
+	// 任务清单动态提醒改由 ReactLoop 每轮以 user reminder 叠加（不进稳定 system，保护前缀缓存）
 	injectors := append([]promptbuilder.ContextInjector(nil), opts.PromptInjectors...)
-	if toolvalidation.PromptToolsAvailable(baseRegistry, toolSet.Enabled, []string{"todo_write", "todo_update_step"}) {
-		injectors = append([]promptbuilder.ContextInjector{planReminderInjector}, injectors...)
-	}
+	taskListReminderEnabled := toolvalidation.PromptToolsAvailable(baseRegistry, toolSet.Enabled, []string{"todo_write", "todo_update_step"})
 
 	// 会话历史与日志目录完全解耦，固定保存在项目级工作区的 .genesis/sessions 目录下
 	sessionDir := filepath.Join(".", ".genesis", "sessions")
@@ -392,7 +389,10 @@ func BuildAgentService(ctx context.Context, opts BuildOptions) (*RuntimeBundle, 
 		llmClient,
 		toolGateway,
 		memStore,
-		promptbuilder.New(injectors...),
+		promptbuilder.NewWithOptions(
+			[]promptbuilder.Option{promptbuilder.WithDelegationPosture(opts.SubAgentDelegationPosture)},
+			injectors...,
+		),
 		log,
 		tracer,
 		estimator,
@@ -406,6 +406,13 @@ func BuildAgentService(ctx context.Context, opts BuildOptions) (*RuntimeBundle, 
 		react.WithLongTermMemory(ltm),
 		react.WithUserProfileStore(userProfileStore),
 		react.WithContextBudgetConfig(effectiveContextRatio, resolvedLLM.OutputReserveTokens),
+		react.WithCollabStore(collabStore),
+		func() react.EngineOption {
+			if !taskListReminderEnabled {
+				return nil
+			}
+			return react.WithTaskListReminder(planSvc)
+		}(),
 		func() react.EngineOption {
 			if opts.AutoRewriteSkillCollision == nil {
 				return nil
@@ -514,13 +521,15 @@ func BuildAgentService(ctx context.Context, opts BuildOptions) (*RuntimeBundle, 
 		builtinDefinitions = append(builtinDefinitions, definition)
 	}
 	taskTool, err := subagenttask.New(subagenttask.Deps{
-		Catalog:        subagentservice.NewMergedCatalog(builtinDefinitions, capabilityDefinitions, projectDefinitions),
-		Controller:     subagentController,
-		BaseAgent:      defaultAgent,
-		AllowedTools:   append([]string(nil), toolSet.Enabled...),
-		Approval:       opts.SubAgentApproval,
-		SnapshotSource: contextsnapshot.NewPersistentSource(memStore),
-		Background:     subagentBackground,
+		Catalog:           subagentservice.NewMergedCatalog(builtinDefinitions, capabilityDefinitions, projectDefinitions),
+		Controller:        subagentController,
+		BaseAgent:         defaultAgent,
+		AllowedTools:      append([]string(nil), toolSet.Enabled...),
+		Approval:          opts.SubAgentApproval,
+		SnapshotSource:    contextsnapshot.NewPersistentSource(memStore),
+		Background:        subagentBackground,
+		DelegationPosture: opts.SubAgentDelegationPosture,
+		MaxConcurrent:     maxConcurrent,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("初始化 Task 工具失败: %w", err)
@@ -574,6 +583,7 @@ func BuildAgentService(ctx context.Context, opts BuildOptions) (*RuntimeBundle, 
 		AgentService:       svc,
 		Credentials:        credentialSvc,
 		Connections:        connectionSvc,
+		CollabStore:        collabStore,
 	}, nil
 }
 

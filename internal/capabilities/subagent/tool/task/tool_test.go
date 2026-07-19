@@ -74,7 +74,11 @@ func TestTaskCreatesReadOnlyChildWithoutOrchestrationTools(t *testing.T) {
 	if len(controller.request.Agent.Tools) != 1 || controller.request.Agent.Tools[0].Name != "read_file" {
 		t.Fatalf("unexpected child tools: %+v", controller.request.Agent.Tools)
 	}
-	if !strings.Contains(controller.request.Prompt, "[委派任务]") || !strings.Contains(controller.request.Agent.SystemPrompt, "独立子智能体") {
+	sys := controller.request.Agent.SystemPrompt
+	if !strings.Contains(controller.request.Prompt, "[委派任务]") ||
+		!strings.Contains(sys, "独立子智能体") ||
+		!strings.Contains(sys, "InheritedRuntimeContract") ||
+		!strings.Contains(sys, "角色说明") {
 		t.Fatalf("Task did not build the isolated child contract: %+v", controller.request)
 	}
 }
