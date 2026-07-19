@@ -1056,6 +1056,8 @@ onMessage((event) => {
 
 这些数据量经常超出 URL 长度限制（通常为 8KB）。**必须使用 `POST` Body 传递请求体，建立 SSE 连接。**
 
+> **输入契约不在本文展开。** `attachments` / 文本+图+文档分流 / CLI `@path` 与「仅文本点名文件」策略见 [`用户Turn输入与附件契约设计.md`](./用户Turn输入与附件契约设计.md)；视觉 Parts 与 `view_image` 见 [`多模态输入与视觉能力设计.md`](./多模态输入与视觉能力设计.md)。本文只规范 SSE **输出**事件与重试。
+
 #### 4.2 推荐选型：`@microsoft/fetch-event-source`
 
 ```typescript
@@ -1337,4 +1339,4 @@ func buildDesktopSink(ctx context.Context) progress.Sink {
 
 ##### 4. 重试退避的 SSE 可观测事件 (Retry error events)
 - **阶段**: Phase 2.5
-- **描述**: 当 LLM/工具调用触发 `RetryPolicy` 指数退避等待时，需向 SSE 通道广播 `error.retriable` 事件（包含 `retry_attempt` 和 `retry_after_ms`），使前台界面展示“正在进行第 X 次自动重试，等待 Y 秒后继续”的可观测提示。
+- **描述**: 当 LLM/工具调用触发 `RetryPolicy` 指数退避等待时，需向 SSE 通道广播 `error.retriable` 事件（包含 `retry_attempt` 和 `retry_after_ms`），使前台界面展示“正在进行第 X 次自动重试，等待 Y 秒后继续”的可观测提示。

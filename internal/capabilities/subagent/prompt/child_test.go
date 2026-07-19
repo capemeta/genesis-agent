@@ -54,6 +54,18 @@ func TestAgentMentionReminder(t *testing.T) {
 	}
 }
 
+func TestUnknownAgentMentionReminder(t *testing.T) {
+	got := UnknownAgentMentionReminder("nope", "run-agent-nope")
+	for _, want := range []string{"不存在", "不要调用 Task", `subagent_type="nope"`, "勿向用户复述"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "必须调用 Task") {
+		t.Fatalf("unknown reminder must not force Task:\n%s", got)
+	}
+}
+
 func TestSkillForkDefinitionName(t *testing.T) {
 	if SkillForkDefinitionName("office-ppt") != "skill-fork:office-ppt" {
 		t.Fatal(SkillForkDefinitionName("office-ppt"))

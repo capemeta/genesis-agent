@@ -218,6 +218,9 @@ func (g *Gateway) Execute(ctx context.Context, name, params string) (result stri
 		}
 	}
 
+	// Hook 可能改写 params；调度锁与授权使用入参级 traits（与 Queue 的 ResolveExecutionTraits 一致）。
+	traits = tool.ResolveExecutionTraits(ctx, t, params)
+
 	if g.authz != nil {
 		decision, authErr := g.authz.AuthorizeTool(ctx, AuthorizationRequest{ToolName: name, Params: params, Info: info, Traits: traits})
 		if authErr != nil {
@@ -347,8 +350,10 @@ func (g *Gateway) acquire(ctx context.Context, name string, traits tool.ToolTrai
 	if g.locker == nil {
 		return func() {}, nil
 	}
+	// 与 Queue 对齐：ConcurrencySafe 用共享读锁，避免 Task 等同名并发工具被工具名写锁误串行。
+	// ReadOnly 仍用于审计/授权语义，不单独决定锁模式。
 	mode := scheduler.LockWrite
-	if traits.ReadOnly && traits.ConcurrencySafe {
+	if traits.ConcurrencySafe {
 		mode = scheduler.LockRead
 	}
 	return g.locker.Acquire(ctx, []scheduler.ResourceLock{{Scope: "tool", Key: name, Mode: mode}})

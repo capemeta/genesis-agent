@@ -152,6 +152,23 @@ func AgentMentionReminder(agentType, originalMention string) string {
 	return wrapReminder(body)
 }
 
+// UnknownAgentMentionReminder 在 Catalog 无此类型时注入，禁止盲目 Task。
+func UnknownAgentMentionReminder(agentType, originalMention string) string {
+	agentType = strings.TrimSpace(agentType)
+	originalMention = strings.TrimSpace(originalMention)
+	if agentType == "" {
+		return ""
+	}
+	if originalMention == "" {
+		originalMention = "run-agent-" + agentType
+	}
+	body := fmt.Sprintf(
+		"用户提到了 @%s，但当前可见 Catalog 中不存在 subagent_type=%q。不要调用 Task(subagent_type=%q)；向用户说明该类型不可用，或改用 available_agents 中的已有类型。禁止把 agent 名当作工具名调用。",
+		originalMention, agentType, agentType,
+	)
+	return wrapReminder(body)
+}
+
 func wrapReminder(body string) string {
 	body = strings.TrimSpace(body)
 	if body == "" {

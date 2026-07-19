@@ -101,6 +101,48 @@ func TestRecoveryHintForNestedPowerShellDirectoryListing(t *testing.T) {
 		t.Fatalf("RecoveryHint() = %+v", hint)
 	}
 }
+
+func TestRecoveryHintForGlobListing(t *testing.T) {
+	hint := RecoveryHint(execmodel.Command{Command: "ls -la slide-*.jpeg", Shell: execmodel.ShellBash})
+	if hint == nil || hint.Tool != "glob" || hint.OperationFingerprint != "filesystem.glob" {
+		t.Fatalf("RecoveryHint() = %+v", hint)
+	}
+}
+
+func TestRecoveryHintIgnoreGlobOptionStaysListDir(t *testing.T) {
+	hint := RecoveryHint(execmodel.Command{Command: "ls -I '*.o'", Shell: execmodel.ShellBash})
+	if hint == nil || hint.Tool != "list_dir" || hint.OperationFingerprint != "filesystem.list" {
+		t.Fatalf("RecoveryHint() = %+v", hint)
+	}
+}
+
+func TestRecoveryHintForShellGrep(t *testing.T) {
+	hint := RecoveryHint(execmodel.Command{Command: `grep -iE "lorem|ipsum" notes.md`, Shell: execmodel.ShellBash})
+	if hint == nil || hint.Tool != "grep" || hint.OperationFingerprint != "filesystem.search" {
+		t.Fatalf("RecoveryHint() = %+v", hint)
+	}
+}
+
+func TestRecoveryHintRipgrepFilesSuggestsGlob(t *testing.T) {
+	hint := RecoveryHint(execmodel.Command{Command: "rg --files -g '*.md'", Shell: execmodel.ShellBash})
+	if hint == nil || hint.Tool != "glob" || hint.OperationFingerprint != "filesystem.glob" {
+		t.Fatalf("RecoveryHint() = %+v", hint)
+	}
+}
+
+func TestRecoveryHintRipgrepFilesWithMatchesSuggestsGrep(t *testing.T) {
+	hint := RecoveryHint(execmodel.Command{Command: "rg -l lorem notes.md", Shell: execmodel.ShellBash})
+	if hint == nil || hint.Tool != "grep" || hint.OperationFingerprint != "filesystem.search" {
+		t.Fatalf("RecoveryHint() = %+v", hint)
+	}
+}
+
+func TestRecoveryHintSkipsGrepPipeline(t *testing.T) {
+	hint := RecoveryHint(execmodel.Command{Command: `python -m markitdown deck.pptx | grep -iE "lorem"`, Shell: execmodel.ShellBash})
+	if hint != nil {
+		t.Fatalf("pipeline grep must not suggest filesystem grep, got %+v", hint)
+	}
+}
 func TestBuildApprovalRequestForExternalCommand(t *testing.T) {
 	cmd := execmodel.Command{Command: "echo hi", Shell: execmodel.ShellBash}
 	req := BuildApprovalRequest("run_command", cmd, fsmodel.ResolvedPath{

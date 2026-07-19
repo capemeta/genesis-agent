@@ -32,9 +32,11 @@ type input struct {
 }
 
 type output struct {
+	OK         bool     `json:"ok"`
 	Root       string   `json:"root"`
 	Pattern    string   `json:"pattern"`
 	Matches    []string `json:"matches"`
+	MatchCount int      `json:"match_count"`
 	Truncated  bool     `json:"truncated"`
 	LimitCause string   `json:"limit_cause,omitempty"`
 }
@@ -49,8 +51,11 @@ func New(deps toolkit.Deps) (tool.Tool, error) {
 
 func (t *Tool) GetInfo() *tool.Info {
 	return &tool.Info{
-		Name:        "glob",
-		Description: "仅在文件位置未知或需要通配符匹配时，按 glob pattern 查找路径。用户给出的裸文件名（如 report.md）也是 workspace 根下的精确相对路径，应直接调用 read_file，禁止改写成 **/report.md。支持 *, ?, **，返回结构化路径列表；无通配符时走精确路径快查。",
+		Name: "glob",
+		Description: "仅在文件位置未知或需要通配符匹配时，按 glob pattern 查找路径。" +
+			"用户给出的裸文件名（如 report.md）也是 workspace 根下的精确相对路径，应直接调用 read_file，禁止改写成 **/report.md。" +
+			"支持 *, ?, **；返回 matches 路径数组与 match_count。matches=[] 表示无匹配，仍 ok=true，不是失败。" +
+			"禁止用 run_command 执行 ls/dir 通配来枚举文件。无通配符时走精确路径快查。",
 		Parameters: &tool.ParameterSchema{
 			Type: "object",
 			Properties: map[string]*tool.ParameterSchema{
@@ -123,17 +128,17 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 		if matcher.Match(candidate) || matcher.Match(entry.Path) {
 			matches = append(matches, entry.Path)
 			if len(matches) >= maxResults {
-				return toolkit.ToJSON(output{Root: root.DisplayPath, Pattern: in.Pattern, Matches: matches, Truncated: true, LimitCause: "max_results"})
+				return toolkit.ToJSON(globResult(root.DisplayPath, in.Pattern, matches, true, "max_results"))
 			}
 		}
 	}
-	return toolkit.ToJSON(output{Root: root.DisplayPath, Pattern: in.Pattern, Matches: matches, Truncated: walk.Truncated, LimitCause: walk.LimitCause})
+	return toolkit.ToJSON(globResult(root.DisplayPath, in.Pattern, matches, walk.Truncated, walk.LimitCause))
 }
 
 func (t *Tool) executeExact(ctx context.Context, in input, rootRaw string) (string, error) {
 	raw := strings.TrimSpace(in.Pattern)
 	if raw == "" {
-		return toolkit.ToJSON(output{Root: "", Pattern: in.Pattern, Matches: nil})
+		return toolkit.ToJSON(globResult("", in.Pattern, nil, false, ""))
 	}
 	if !filepath.IsAbs(raw) && strings.TrimSpace(rootRaw) != "" && strings.TrimSpace(rootRaw) != "." {
 		raw = filepath.Join(rootRaw, raw)
@@ -145,21 +150,36 @@ func (t *Tool) executeExact(ctx context.Context, in input, rootRaw string) (stri
 	})
 	if err != nil {
 		if fscontract.CodeOf(err) == fscontract.ErrCodeNotFound {
-			return toolkit.ToJSON(output{Root: "", Pattern: in.Pattern, Matches: []string{}})
+			return toolkit.ToJSON(globResult("", in.Pattern, nil, false, ""))
 		}
 		return "", err
 	}
 	stat, err := t.deps.Backend.Stat(ctx, resolved)
 	if err != nil {
 		if fscontract.CodeOf(err) == fscontract.ErrCodeNotFound {
-			return toolkit.ToJSON(output{Root: "", Pattern: in.Pattern, Matches: []string{}})
+			return toolkit.ToJSON(globResult("", in.Pattern, nil, false, ""))
 		}
 		return "", err
 	}
 	if !in.IncludeDirs && stat.Type == model.EntryTypeDir {
-		return toolkit.ToJSON(output{Root: "", Pattern: in.Pattern, Matches: []string{}})
+		return toolkit.ToJSON(globResult("", in.Pattern, nil, false, ""))
 	}
-	return toolkit.ToJSON(output{Root: "", Pattern: in.Pattern, Matches: []string{resolved.DisplayPath}})
+	return toolkit.ToJSON(globResult("", in.Pattern, []string{resolved.DisplayPath}, false, ""))
+}
+
+func globResult(root, pattern string, matches []string, truncated bool, limitCause string) output {
+	if matches == nil {
+		matches = []string{}
+	}
+	return output{
+		OK:         true,
+		Root:       root,
+		Pattern:    pattern,
+		Matches:    matches,
+		MatchCount: len(matches),
+		Truncated:  truncated,
+		LimitCause: limitCause,
+	}
 }
 
 func isExactGlobPattern(pattern string) bool {

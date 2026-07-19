@@ -44,9 +44,11 @@ type match struct {
 }
 
 type output struct {
+	OK         bool    `json:"ok"`
 	Root       string  `json:"root"`
 	Pattern    string  `json:"pattern"`
 	Matches    []match `json:"matches"`
+	MatchCount int     `json:"match_count"`
 	FilesSeen  int     `json:"files_seen"`
 	Truncated  bool    `json:"truncated"`
 	LimitCause string  `json:"limit_cause,omitempty"`
@@ -62,8 +64,11 @@ func New(deps toolkit.Deps) (tool.Tool, error) {
 
 func (t *Tool) GetInfo() *tool.Info {
 	return &tool.Info{
-		Name:        "grep",
-		Description: "在当前 workspace 内或经审批的目录中按正则搜索文本内容。默认跳过二进制文件并限制结果数量。",
+		Name: "grep",
+		Description: "在当前 workspace 内或经审批的目录中按正则搜索文本内容。" +
+			"返回 matches 数组（path/line_number/line）与 match_count；matches=[] 表示无命中，仍 ok=true，不是失败。" +
+			"默认跳过二进制文件并限制结果数量。workspace 文本搜索应使用本工具，不要改用 shell grep/rg。" +
+			"Office/PDF 等二进制内容不在本工具范围内，需先抽取为文本后再搜索。",
 		Parameters: &tool.ParameterSchema{
 			Type: "object",
 			Properties: map[string]*tool.ParameterSchema{
@@ -132,7 +137,14 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	out := output{Root: root.DisplayPath, Pattern: in.Pattern, Matches: make([]match, 0), Truncated: walk.Truncated, LimitCause: walk.LimitCause}
+	out := output{
+		OK:         true,
+		Root:       root.DisplayPath,
+		Pattern:    in.Pattern,
+		Matches:    make([]match, 0),
+		Truncated:  walk.Truncated,
+		LimitCause: walk.LimitCause,
+	}
 	for _, entry := range walk.Entries {
 		if entry.Type != model.EntryTypeFile {
 			continue
@@ -164,6 +176,7 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 			break
 		}
 	}
+	out.MatchCount = len(out.Matches)
 	return toolkit.ToJSON(out)
 }
 

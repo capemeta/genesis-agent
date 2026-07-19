@@ -10,8 +10,15 @@ import (
 	multicontract "genesis-agent/internal/runtime/multiagent/contract"
 )
 
+type mapSubAgentLookup map[string]struct{}
+
+func (m mapSubAgentLookup) Has(name string) bool {
+	_, ok := m[name]
+	return ok
+}
+
 func TestInjectAgentMentions(t *testing.T) {
-	e := &ReactLoopEngine{}
+	e := &ReactLoopEngine{subAgentTypeLookup: mapSubAgentLookup{"explore": {}, "plan": {}}}
 	rc := &runtime.RunContext{Messages: []*domain.Message{domain.NewUserMessage("请 @run-agent-explore 查一下")}}
 	e.injectAgentMentions(context.Background(), rc, "请 @run-agent-explore 查一下，也可 @agent-plan")
 	if len(rc.Messages) != 3 {
@@ -33,6 +40,22 @@ func TestInjectAgentMentions(t *testing.T) {
 	}
 }
 
+func TestInjectAgentMentionsUnknownType(t *testing.T) {
+	e := &ReactLoopEngine{subAgentTypeLookup: mapSubAgentLookup{"explore": {}}}
+	rc := &runtime.RunContext{Messages: []*domain.Message{domain.NewUserMessage("请 @run-agent-nope")}}
+	e.injectAgentMentions(context.Background(), rc, "请 @run-agent-nope")
+	if len(rc.Messages) != 2 {
+		t.Fatalf("want user + unknown reminder, got %d", len(rc.Messages))
+	}
+	got := rc.Messages[1].Content
+	if !strings.Contains(got, "不存在") || !strings.Contains(got, "不要调用 Task") {
+		t.Fatalf("unknown mention reminder missing: %s", got)
+	}
+	if strings.Contains(got, "必须调用 Task") {
+		t.Fatalf("unknown type must not force Task: %s", got)
+	}
+}
+
 func TestInjectAgentMentionsEmpty(t *testing.T) {
 	e := &ReactLoopEngine{}
 	rc := &runtime.RunContext{Messages: []*domain.Message{domain.NewUserMessage("普通问题")}}
@@ -43,7 +66,7 @@ func TestInjectAgentMentionsEmpty(t *testing.T) {
 }
 
 func TestInjectAgentMentionsSkippedOnSubRun(t *testing.T) {
-	e := &ReactLoopEngine{}
+	e := &ReactLoopEngine{subAgentTypeLookup: mapSubAgentLookup{"explore": {}}}
 	rc := &runtime.RunContext{Messages: []*domain.Message{domain.NewUserMessage("请 @run-agent-explore")}}
 	ctx := multicontract.WithDelegationDepth(context.Background(), 1)
 	e.injectAgentMentions(ctx, rc, "请 @run-agent-explore")

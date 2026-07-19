@@ -95,9 +95,14 @@ func (t *Tool) GetInfo() *tool.Info {
 			}
 		}
 	}
-	return &tool.Info{
-		Name:        "run_command",
-		Description: "在当前 workspace 内或经审批目录下执行一条原子平台 Shell 命令。远程 sandbox 的普通同步调用不承诺保留容器内临时状态：不得在一次调用写脚本、下一次调用再执行；多步骤必须合并为一条命令，Skill 脚本必须使用 run_skill_command 及 inputs。仅用于运行程序、构建、测试或结构化文件工具无法表达的操作；列目录、遍历、查找、搜索和读取文件应优先使用 list_dir、walk_dir、glob、grep、read_file。command 只填写脚本正文，不要嵌套 Shell 启动命令。后台或 PTY 使用显式交互会话。",
+	return tool.WithTraits(&tool.Info{
+		Name: "run_command",
+		Description: "在当前 workspace 内或经审批目录下执行一条原子平台 Shell 命令。" +
+			"远程 sandbox 的普通同步调用不承诺保留容器内临时状态：不得在一次调用写脚本、下一次调用再执行；多步骤必须合并为一条命令，Skill 脚本必须使用 run_skill_command 及 inputs。" +
+			"仅用于运行程序、构建、测试或结构化文件工具无法表达的操作；列目录、遍历、通配查找、文本搜索和读取文件应优先使用当前已暴露的 list_dir/walk_dir/glob/grep/read_file，不要用 ls/grep 通配或管道代替。" +
+			"exit_code 原样返回：非零表示进程状态，不等于工具崩溃；若结果含 suggested_tool 且该工具可用，应立即换用。" +
+			"对「无匹配即成功」的存在性检查，必须在脚本内显式定义业务退出码。" +
+			"command 只填写脚本正文，不要嵌套 Shell 启动命令。后台或 PTY 使用显式交互会话。",
 		Parameters: &tool.ParameterSchema{
 			Type: "object",
 			Properties: map[string]*tool.ParameterSchema{
@@ -112,7 +117,35 @@ func (t *Tool) GetInfo() *tool.Info {
 			},
 			Required: []string{"command"},
 		},
+	}, tool.ToolTraits{
+		Exposure:        tool.ToolExposureDirect,
+		ReadOnly:        false,
+		ConcurrencySafe: false, // 默认 barrier；只读命令由 AssessConcurrency 升级
+		NeedsPermission: true,
+	})
+}
+
+// AssessConcurrency 按命令分类判断本轮是否可与 sibling 并行（对齐 Kode/文档：只读命令可并行）。
+// 解析失败、ShellAuto、后台/PTY、自定义 env 或非只读命令一律降级为不安全。
+func (t *Tool) AssessConcurrency(ctx context.Context, params string) tool.ConcurrencyAssessment {
+	var in input
+	if err := decodeParams(params, &in); err != nil {
+		return tool.ConcurrencyAssessment{}
 	}
+	in.Command = strings.TrimSpace(in.Command)
+	if in.Command == "" || in.Background || in.UsePTY || len(in.Env) > 0 {
+		return tool.ConcurrencyAssessment{}
+	}
+	shell, err := t.resolveShell(in.Shell)
+	if err != nil || shell == execmodel.ShellAuto {
+		return tool.ConcurrencyAssessment{}
+	}
+	_ = ctx
+	cls := policy.ClassifyCommand(execmodel.Command{Command: in.Command, Shell: shell, Env: in.Env})
+	if cls.ReadOnly && !cls.Dangerous && !cls.Destructive && !cls.Critical {
+		return tool.ConcurrencyAssessment{ConcurrencySafe: true, ReadOnly: true}
+	}
+	return tool.ConcurrencyAssessment{}
 }
 
 func (t *Tool) Execute(ctx context.Context, params string) (string, error) {

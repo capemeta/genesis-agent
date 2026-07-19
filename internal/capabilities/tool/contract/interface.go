@@ -123,16 +123,54 @@ func DefaultTraits(name string) ToolTraits {
 		return ToolTraits{Exposure: ToolExposureDirect, ReadOnly: true, ConcurrencySafe: true, NeedsPermission: true}
 	case "run_command", "run_skill_command", "http_request":
 		return ToolTraits{Exposure: ToolExposureDirect, ReadOnly: false, ConcurrencySafe: false, NeedsPermission: true}
+	case "Task":
+		// 同轮多 Task 可并行；槽位由 SlotLimiter 硬限。ReadOnly=false：父侧会变更子智能体状态。
+		return ToolTraits{Exposure: ToolExposureDirect, ReadOnly: false, ConcurrencySafe: true, NeedsPermission: true}
 	case "list_mcp_resources", "read_mcp_resource":
 		return ToolTraits{Exposure: ToolExposureDirect, ReadOnly: true, ConcurrencySafe: true, NeedsPermission: true}
 	case "search_mcp_tools":
-		return ToolTraits{Exposure: ToolExposureDirect, ReadOnly: false, ConcurrencySafe: true, NeedsPermission: true}
+		// 静态默认不安全；无 promote 的只读检索可由 ConcurrencyAssessor 升级。
+		return ToolTraits{Exposure: ToolExposureDirect, ReadOnly: false, ConcurrencySafe: false, NeedsPermission: true}
 	default:
 		if strings.HasPrefix(name, "mcp__") {
 			return ToolTraits{Exposure: ToolExposureDirect, ReadOnly: false, ConcurrencySafe: false, NeedsPermission: true}
 		}
 		return ToolTraits{Exposure: ToolExposureDirect, ReadOnly: false, ConcurrencySafe: false}
 	}
+}
+
+// ConcurrencyAssessment 是按调用入参评估的调度 traits 覆盖。
+// 解析失败或无法判断时必须返回零值（ConcurrencySafe=false），对齐 Kode 校验失败降级。
+type ConcurrencyAssessment struct {
+	ConcurrencySafe bool
+	ReadOnly        bool // 为 true 时覆盖本轮 ReadOnly（用于锁模式）；为 false 不强制改写
+}
+
+// ConcurrencyAssessor 可选接口：按 params 判定本轮是否可与 sibling 并行。
+// 未实现时调度器仅使用 GetInfo/DefaultTraits 的静态 ConcurrencySafe。
+type ConcurrencyAssessor interface {
+	AssessConcurrency(ctx context.Context, params string) ConcurrencyAssessment
+}
+
+// ResolveExecutionTraits 解析本轮调度用 traits：静态 traits + 可选入参级评估。
+func ResolveExecutionTraits(ctx context.Context, registered Tool, params string) ToolTraits {
+	traits := TraitsOf(nil)
+	if registered != nil {
+		traits = TraitsOf(registered.GetInfo())
+	}
+	if registered == nil {
+		return traits
+	}
+	assessor, ok := registered.(ConcurrencyAssessor)
+	if !ok {
+		return traits
+	}
+	assessed := assessor.AssessConcurrency(ctx, params)
+	traits.ConcurrencySafe = assessed.ConcurrencySafe
+	if assessed.ReadOnly {
+		traits.ReadOnly = true
+	}
+	return traits
 }
 
 // Tool 工具接口，所有内置和外部工具必须实现此接口

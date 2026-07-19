@@ -36,6 +36,20 @@ func TestRejectsUnknownField(t *testing.T) {
 	}
 }
 
+func TestAssessConcurrencySafeWithoutPromote(t *testing.T) {
+	got := New(registry.NewRegistry()).AssessConcurrency(context.Background(), `{"query":"search"}`)
+	if !got.ConcurrencySafe || !got.ReadOnly {
+		t.Fatalf("got=%+v, want safe read-only search", got)
+	}
+}
+
+func TestAssessConcurrencyUnsafeWithPromote(t *testing.T) {
+	got := New(registry.NewRegistry()).AssessConcurrency(context.Background(), `{"promote":true}`)
+	if got.ConcurrencySafe {
+		t.Fatalf("got=%+v, want unsafe when promote", got)
+	}
+}
+
 func TestMCPToolInfoIsSnapshot(t *testing.T) {
 	mcpTool := tooladapter.New(nil, "files", "search", "mcp__files__search", model.ToolSnapshot{Name: "search"}, tool.ToolExposureDeferred, 0)
 	info := mcpTool.GetInfo()

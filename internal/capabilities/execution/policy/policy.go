@@ -168,9 +168,31 @@ type RecoveryAdvice struct {
 func RecoveryHint(command execmodel.Command) *RecoveryAdvice {
 	lower := strings.ToLower(strings.TrimSpace(command.Command))
 	first := firstCommandWord(lower)
-	if first == "ls" || first == "dir" || first == "get-childitem" || first == "gci" ||
-		((strings.HasPrefix(first, "powershell") || strings.HasPrefix(first, "pwsh")) && strings.Contains(lower, "get-childitem")) ||
-		(strings.HasPrefix(first, "cmd") && strings.Contains(lower, " dir ")) {
+	if isShellPathListingSearch(first, lower) {
+		return &RecoveryAdvice{
+			Action:               "use_glob_for_path_pattern",
+			Tool:                 "glob",
+			Reason:               "路径发现应使用结构化 glob 工具，避免 Shell 路径枚举差异与非零退出误导",
+			OperationFingerprint: "filesystem.glob",
+		}
+	}
+	if isShellContentSearch(first, lower) {
+		return &RecoveryAdvice{
+			Action:               "use_grep_for_content_search",
+			Tool:                 "grep",
+			Reason:               "workspace 文本搜索应使用结构化 grep 工具，避免 Shell 搜索差异与退出码语义干扰",
+			OperationFingerprint: "filesystem.search",
+		}
+	}
+	if isShellPathEnumeration(first, lower) {
+		if hasPathGlobOperand(lower) {
+			return &RecoveryAdvice{
+				Action:               "use_glob_for_path_pattern",
+				Tool:                 "glob",
+				Reason:               "通配路径查找应使用结构化 glob 工具，避免 Shell 通配差异与非零退出误导",
+				OperationFingerprint: "filesystem.glob",
+			}
+		}
 		return &RecoveryAdvice{
 			Action:               "use_list_dir_for_directory_enumeration",
 			Tool:                 "list_dir",
@@ -179,6 +201,94 @@ func RecoveryHint(command execmodel.Command) *RecoveryAdvice {
 		}
 	}
 	return nil
+}
+
+func isShellPathEnumeration(first, lower string) bool {
+	switch first {
+	case "ls", "dir", "get-childitem", "gci":
+		return true
+	}
+	if (strings.HasPrefix(first, "powershell") || strings.HasPrefix(first, "pwsh")) && strings.Contains(lower, "get-childitem") {
+		return true
+	}
+	if strings.HasPrefix(first, "cmd") && strings.Contains(lower, " dir ") {
+		return true
+	}
+	return false
+}
+
+func isShellContentSearch(first, lower string) bool {
+	switch first {
+	case "grep", "findstr", "select-string", "sls":
+		return true
+	case "rg":
+		// rg --files / -l 等偏路径发现，不应导向内容 grep。
+		return !isRipgrepPathListing(lower)
+	}
+	// 管道中的 grep 常用于二次过滤抽取结果，不能简单改写成 filesystem grep（例如 markitdown|grep）。
+	return false
+}
+
+func isShellPathListingSearch(first, lower string) bool {
+	return first == "rg" && isRipgrepPathListing(lower)
+}
+
+func isRipgrepPathListing(lower string) bool {
+	fields := strings.Fields(lower)
+	for _, f := range fields[1:] {
+		// 仅纯路径枚举；-l/--files-with-matches 仍是内容搜索（只是输出文件名），应走 grep。
+		switch f {
+		case "--files":
+			return true
+		}
+		if strings.HasPrefix(f, "--files=") {
+			return true
+		}
+	}
+	return false
+}
+
+// hasPathGlobOperand 仅在位置参数/路径操作数含通配时返回 true。
+// 避免把 ls -I '*.o' 这类选项过滤误判为 path glob；也不把 -la 误当成吞参选项。
+func hasPathGlobOperand(command string) bool {
+	fields := strings.Fields(command)
+	if len(fields) == 0 {
+		return false
+	}
+	for i := 1; i < len(fields); i++ {
+		f := fields[i]
+		if strings.HasPrefix(f, "-") {
+			if optionTakesSeparateValue(f) && i+1 < len(fields) && !strings.HasPrefix(fields[i+1], "-") {
+				i++
+			}
+			continue
+		}
+		if strings.ContainsAny(f, "*?[") {
+			return true
+		}
+	}
+	return false
+}
+
+func optionTakesSeparateValue(flag string) bool {
+	if strings.HasPrefix(flag, "--") {
+		name := strings.TrimPrefix(flag, "--")
+		if strings.Contains(name, "=") {
+			return false
+		}
+		switch name {
+		case "ignore", "exclude", "include", "hide", "block-size":
+			return true
+		default:
+			return false
+		}
+	}
+	// 仅识别单字母且明确吞下一参数的短选项（如 ls -I）。
+	// RecoveryHint 入参可能已被 ToLower，故同时接受 i/I。
+	if len(flag) == 2 && flag[0] == '-' {
+		return flag[1] == 'i' || flag[1] == 'I'
+	}
+	return false
 }
 
 // BuildApprovalRequest 将命令上下文转换成通用审批请求。

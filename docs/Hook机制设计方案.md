@@ -532,7 +532,7 @@ gateway.Execute(ctx, name, params):
 
 对齐 Kode `drainHookSystemPromptAdditions`（`message-pipeline.ts:273-276`）：Hook 产出的 `additionalContext` 不直接改对话，而是**入队**，下一轮构建 system prompt 时经 `prompt.ContextInjector`（`internal/runtime/prompt/interface.go:25-28`）注入。队列可挂在 `RunContext`（`internal/runtime/context.go`）。
 
-> **并发安全**：ReAct 对只读且 `ConcurrencySafe` 的同级工具会并行执行（`scheduler.Queue`，`react_loop.go:467-478`），因此多个 `PreToolUse`/`PostToolUse` 的 Hook 可能并发向该队列写入。注入队列必须并发安全（加锁或 channel 收敛到主循环），且下一轮消费顺序需确定（按入队序）。改写 `tool_input`（`updatedInput`）只作用于当前工具调用，天然隔离，不入共享队列。
+> **并发安全**：ReAct 对 `ConcurrencySafe=true` 的同级工具会并行执行（见 [`同轮工具并行调度设计.md`](同轮工具并行调度设计.md)，`scheduler.Queue` + `react_loop.executeToolCalls`），因此多个 `PreToolUse`/`PostToolUse` 的 Hook 可能并发向该队列写入。注入队列必须并发安全（加锁或 channel 收敛到主循环），且下一轮消费顺序需确定（按入队序）。改写 `tool_input`（`updatedInput`）只作用于当前工具调用，天然隔离，不入共享队列。
 
 ### 7.6 观测复用
 

@@ -385,6 +385,35 @@ func BuildAgentService(ctx context.Context, opts BuildOptions) (*RuntimeBundle, 
 	if resolvedLLM.EffectiveContextRatio != nil {
 		effectiveContextRatio = *resolvedLLM.EffectiveContextRatio
 	}
+
+	// SubAgent Catalog 先于 RunEngine / Task 构建，供 mention 预校验与 Task 共用同一快照。
+	workspace, err := os.Getwd()
+	if err != nil {
+		return nil, fmt.Errorf("读取工作区失败: %w", err)
+	}
+	userHomeDir := ""
+	if opts.SubAgentIncludeUserDefinitions {
+		userHomeDir, err = os.UserHomeDir()
+		if err != nil {
+			return nil, fmt.Errorf("读取用户目录失败: %w", err)
+		}
+	}
+	projectDefinitions, err := subagentservice.LoadLocalDefinitions(workspace, userHomeDir)
+	if err != nil {
+		return nil, err
+	}
+	capabilityDefinitions, err := subagentservice.LoadCapabilityDefinitions(ctx, opts.SubAgentCapabilityRegistry, product)
+	if err != nil {
+		return nil, fmt.Errorf("加载 marketplace subagent definitions: %w", err)
+	}
+	builtinCatalog := subagentservice.NewBuiltinCatalog()
+	builtinDefinitions := make([]subagentmodel.Definition, 0, len(builtinCatalog.List()))
+	for _, summary := range builtinCatalog.List() {
+		definition, _ := builtinCatalog.Get(summary.Name)
+		builtinDefinitions = append(builtinDefinitions, definition)
+	}
+	subAgentCatalog := subagentservice.NewMergedCatalog(builtinDefinitions, capabilityDefinitions, projectDefinitions)
+
 	runEngine := react.NewReactLoopEngine(
 		llmClient,
 		toolGateway,
@@ -402,6 +431,7 @@ func BuildAgentService(ctx context.Context, opts BuildOptions) (*RuntimeBundle, 
 		react.WithSkillNameMatcher(opts.SkillNameMatcher),
 		react.WithSkillMentionSelector(opts.SkillMentionSelector),
 		react.WithSkillExplicitLoader(opts.SkillExplicitLoader),
+		react.WithSubAgentTypeLookup(subAgentCatalogLookup{catalog: subAgentCatalog}),
 		react.WithCompactor(compactor),
 		react.WithLongTermMemory(ltm),
 		react.WithUserProfileStore(userProfileStore),
@@ -495,33 +525,8 @@ func BuildAgentService(ctx context.Context, opts BuildOptions) (*RuntimeBundle, 
 	if err != nil {
 		return nil, fmt.Errorf("初始化 subagent 后台管理器失败: %w", err)
 	}
-	workspace, err := os.Getwd()
-	if err != nil {
-		return nil, fmt.Errorf("读取工作区失败: %w", err)
-	}
-	userHomeDir := ""
-	if opts.SubAgentIncludeUserDefinitions {
-		userHomeDir, err = os.UserHomeDir()
-		if err != nil {
-			return nil, fmt.Errorf("读取用户目录失败: %w", err)
-		}
-	}
-	projectDefinitions, err := subagentservice.LoadLocalDefinitions(workspace, userHomeDir)
-	if err != nil {
-		return nil, err
-	}
-	capabilityDefinitions, err := subagentservice.LoadCapabilityDefinitions(ctx, opts.SubAgentCapabilityRegistry, product)
-	if err != nil {
-		return nil, fmt.Errorf("加载 marketplace subagent definitions: %w", err)
-	}
-	builtinCatalog := subagentservice.NewBuiltinCatalog()
-	builtinDefinitions := make([]subagentmodel.Definition, 0, len(builtinCatalog.List()))
-	for _, summary := range builtinCatalog.List() {
-		definition, _ := builtinCatalog.Get(summary.Name)
-		builtinDefinitions = append(builtinDefinitions, definition)
-	}
 	taskTool, err := subagenttask.New(subagenttask.Deps{
-		Catalog:           subagentservice.NewMergedCatalog(builtinDefinitions, capabilityDefinitions, projectDefinitions),
+		Catalog:           subAgentCatalog,
 		Controller:        subagentController,
 		BaseAgent:         defaultAgent,
 		AllowedTools:      append([]string(nil), toolSet.Enabled...),
@@ -598,6 +603,19 @@ func hookScopeForProduct(product string) hookmodel.ScopeContext {
 		scope.Environment = "local"
 	}
 	return scope
+}
+
+// subAgentCatalogLookup 将 SubAgent Catalog 适配为 React mention 预校验端口。
+type subAgentCatalogLookup struct {
+	catalog subagentservice.Catalog
+}
+
+func (l subAgentCatalogLookup) Has(name string) bool {
+	if l.catalog == nil {
+		return false
+	}
+	_, ok := l.catalog.Get(name)
+	return ok
 }
 
 func buildSecretServices(configDir string, cfg *config.Config, log loggercontract.Logger) (credentialcontract.Service, connectioncontract.Service, error) {

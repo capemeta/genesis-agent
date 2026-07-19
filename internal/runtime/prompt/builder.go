@@ -206,8 +206,37 @@ func writeToolBehaviorRules(sb *strings.Builder, availableTools []string) {
 		sb.WriteString("- list_dir只需名称时使用detail=names；数量必须直接采用returned_count，不得手工计数；truncated=true时必须明确说明结果不完整\n")
 		sb.WriteString("- 用户只要求列出名称时，应原样使用工具返回的names，不要擅自补充用途、说明或其他推测信息\n")
 	}
+	if has("glob") {
+		sb.WriteString("- glob 返回 matches 路径数组与 match_count；matches=[] 表示无匹配且成功，禁止据此改用 shell ls 通配重试\n")
+	}
+	if has("grep") {
+		sb.WriteString("- grep 返回 matches 命中数组与 match_count；matches=[] 表示无命中且成功（例如确认无占位符），禁止据此改用 shell grep 重试\n")
+	}
 	if has("run_command") {
 		sb.WriteString("- run_command 仅用于结构化工具无法表达或用户明确要求命令的场景；command 只填写当前默认 Shell 的脚本正文，不要再次嵌套 powershell、cmd /c、bash -lc 等 Shell 启动命令；不得使用 environment_context 未声明支持的 Shell\n")
+		avoid := make([]string, 0, 3)
+		prefer := make([]string, 0, 3)
+		if has("list_dir") || has("glob") {
+			avoid = append(avoid, "ls/dir/Get-ChildItem 路径枚举")
+			if has("list_dir") {
+				prefer = append(prefer, "list_dir")
+			}
+			if has("glob") {
+				prefer = append(prefer, "glob")
+			}
+		}
+		if has("grep") {
+			avoid = append(avoid, "grep/rg 文本搜索")
+			prefer = append(prefer, "grep")
+		}
+		if len(avoid) > 0 {
+			sb.WriteString("- 禁止用 run_command 做")
+			sb.WriteString(strings.Join(avoid, "或"))
+			sb.WriteString("；应改用 ")
+			sb.WriteString(strings.Join(prefer, "/"))
+			sb.WriteString("\n")
+		}
+		sb.WriteString("- 对抽取管道做「无匹配即成功」的检查时，必须在脚本内显式定义业务退出码，勿依赖 shell grep/ls 的默认非零退出\n")
 	}
 }
 

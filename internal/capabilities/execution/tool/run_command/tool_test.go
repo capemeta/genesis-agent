@@ -211,6 +211,28 @@ func TestToolNonZeroExitReturnsStructuredFailureAndRecoveryHint(t *testing.T) {
 	}
 }
 
+func TestToolNonZeroGlobExitSuggestsGlob(t *testing.T) {
+	approval := &fakeApproval{decision: approvalmodel.Decision{Type: approvalmodel.DecisionApproved}}
+	runner := &fakeRunner{result: &execmodel.Result{ExitCode: 2, Stderr: "No such file"}}
+	tool := newTestTool(t, approval, runner, execmodel.SandboxProfile{})
+	out, err := tool.Execute(testRunContext(), `{"command":"ls -la slide-*.jpeg","shell":"bash"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result struct {
+		OK                   bool           `json:"ok"`
+		FailureKind          string         `json:"failure_kind"`
+		SuggestedTool        map[string]any `json:"suggested_tool"`
+		OperationFingerprint string         `json:"operation_fingerprint"`
+	}
+	if err := json.Unmarshal([]byte(out), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.OK || result.FailureKind != "command_exit_nonzero" || result.SuggestedTool["name"] != "glob" || result.OperationFingerprint != "filesystem.glob" {
+		t.Fatalf("result = %+v", result)
+	}
+}
+
 func TestToolExecuteRequiresRunBindingContext(t *testing.T) {
 	approval := &fakeApproval{decision: approvalmodel.Decision{Type: approvalmodel.DecisionApproved}}
 	runner := &fakeRunner{}
@@ -231,6 +253,24 @@ func testRunContext() context.Context {
 	binding := execmodel.ExecutionBinding{ID: "binding-command-test", Mode: execmodel.WorkspaceModeProject, Access: execmodel.WorkspaceAccessReadWrite, PathPolicy: execmodel.PathPolicyStrictWorkspace, Owner: execmodel.ExecutionOwnerRef{RunID: "run-command-test", SessionID: "session-command-test", TenantID: "tenant-command-test"}}
 	prepared := workmodel.PreparedRun{Execution: workmodel.PreparedExecutionSnapshot{Binding: binding, Workspace: execmodel.ExecutionWorkspace{WorkDir: "C:/workspace"}}}
 	return workcontract.WithPreparedRun(ctx, prepared)
+}
+
+func TestAssessConcurrencyAllowsReadOnlyCommand(t *testing.T) {
+	tool := newTestTool(t, &fakeApproval{}, &fakeRunner{}, execmodel.SandboxProfile{})
+	got := tool.AssessConcurrency(context.Background(), `{"command":"git status","shell":"bash"}`)
+	if !got.ConcurrencySafe || !got.ReadOnly {
+		t.Fatalf("got=%+v, want concurrency-safe read-only", got)
+	}
+}
+
+func TestAssessConcurrencyRejectsMutationAndBackground(t *testing.T) {
+	tool := newTestTool(t, &fakeApproval{}, &fakeRunner{}, execmodel.SandboxProfile{})
+	if got := tool.AssessConcurrency(context.Background(), `{"command":"rm -rf build","shell":"bash"}`); got.ConcurrencySafe {
+		t.Fatalf("mutation should be unsafe: %+v", got)
+	}
+	if got := tool.AssessConcurrency(context.Background(), `{"command":"git status","shell":"bash","background":true}`); got.ConcurrencySafe {
+		t.Fatalf("background should be unsafe: %+v", got)
+	}
 }
 
 func newTestTool(t *testing.T, approval *fakeApproval, runner *fakeRunner, sandbox execmodel.SandboxProfile) *Tool {

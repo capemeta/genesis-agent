@@ -11,6 +11,18 @@ import (
 	"genesis-agent/internal/runtime/prompt"
 )
 
+// SubAgentTypeLookup 供 @agent mention 预校验；与 Task Catalog 同源注入。
+type SubAgentTypeLookup interface {
+	Has(name string) bool
+}
+
+// WithSubAgentTypeLookup 注入子智能体类型查询（mention 预校验）。
+func WithSubAgentTypeLookup(lookup SubAgentTypeLookup) EngineOption {
+	return func(e *ReactLoopEngine) {
+		e.subAgentTypeLookup = lookup
+	}
+}
+
 // promptAudience 按委派深度选择 BuildSystem 受众。
 func promptAudience(ctx context.Context) prompt.Audience {
 	if multicontract.DelegationDepth(ctx) > 0 {
@@ -19,9 +31,9 @@ func promptAudience(ctx context.Context) prompt.Audience {
 	return prompt.AudienceRoot
 }
 
-// injectAgentMentions 在根 Run 首轮 LLM 前注入 @agent / @run-agent 强制 Task 提醒（L4）。
-// 不直接 Spawn：仍由模型经 Task 网关委派，与 Skill mention 同构。
-// 子 Run 不注入，避免把委派信封中的 mention 文本误当成用户点名。
+// injectAgentMentions 在根 Run 首轮 LLM 前注入 @agent / @run-agent 提醒（L4）。
+// Catalog 命中 → 强制 Task；未命中 → 禁止盲目 Task；lookup 未注入时保持强制提醒（兼容测试）。
+// 不直接 Spawn；子 Run 不注入。
 func (e *ReactLoopEngine) injectAgentMentions(ctx context.Context, rc *runtime.RunContext, userInput string) {
 	if rc == nil || strings.TrimSpace(userInput) == "" {
 		return
@@ -30,7 +42,13 @@ func (e *ReactLoopEngine) injectAgentMentions(ctx context.Context, rc *runtime.R
 		return
 	}
 	for _, agentType := range subagentprompt.ParseAgentMentions(userInput) {
-		reminder := subagentprompt.AgentMentionReminder(agentType, "run-agent-"+agentType)
+		mention := "run-agent-" + agentType
+		var reminder string
+		if e.subAgentTypeLookup != nil && !e.subAgentTypeLookup.Has(agentType) {
+			reminder = subagentprompt.UnknownAgentMentionReminder(agentType, mention)
+		} else {
+			reminder = subagentprompt.AgentMentionReminder(agentType, mention)
+		}
 		if reminder == "" {
 			continue
 		}

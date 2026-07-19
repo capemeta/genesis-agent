@@ -35,9 +35,26 @@ func (t *Tool) GetInfo() *tool.Info {
 	}, tool.ToolTraits{
 		Exposure:        tool.ToolExposureDirect,
 		ReadOnly:        false,
-		ConcurrencySafe: true,
+		ConcurrencySafe: false, // promote 会改 registry；仅无 promote 时由 AssessConcurrency 升级
 		NeedsPermission: true,
 	})
+}
+
+// AssessConcurrency：无 promote 的检索可并行；promote=true 或解析失败降级串行。
+func (t *Tool) AssessConcurrency(_ context.Context, params string) tool.ConcurrencyAssessment {
+	// 字段需与 Execute 入参对齐，避免 DisallowUnknownFields 把合法 query/limit 误判为失败。
+	var req struct {
+		Query   string `json:"query"`
+		Promote bool   `json:"promote"`
+		Limit   int    `json:"limit"`
+	}
+	if err := toolparam.DecodeOptional(params, &req); err != nil {
+		return tool.ConcurrencyAssessment{}
+	}
+	if req.Promote {
+		return tool.ConcurrencyAssessment{}
+	}
+	return tool.ConcurrencyAssessment{ConcurrencySafe: true, ReadOnly: true}
 }
 
 func (t *Tool) Execute(ctx context.Context, params string) (string, error) {

@@ -23,6 +23,39 @@ func TestDefaultPromptUsesReadFileForKnownExactPath(t *testing.T) {
 	}
 }
 
+func TestDefaultPromptTeachesEmptyMatchesSemantics(t *testing.T) {
+	prompt, err := New().BuildSystem(context.Background(), BuildRequest{AvailableTools: []string{
+		"glob", "grep", "list_dir", "run_command",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"matches=[]",
+		"禁止用 run_command 做",
+		"显式定义业务退出码",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("missing %q in system prompt:\n%s", want, prompt)
+		}
+	}
+}
+
+func TestDefaultPromptRunCommandRuleOnlyNamesAvailableFileTools(t *testing.T) {
+	prompt, err := New().BuildSystem(context.Background(), BuildRequest{AvailableTools: []string{
+		"list_dir", "run_command",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(prompt, "ls/dir/Get-ChildItem 路径枚举") || !strings.Contains(prompt, "应改用 list_dir") {
+		t.Fatalf("expected list_dir-only steer:\n%s", prompt)
+	}
+	if strings.Contains(prompt, "grep/rg") || strings.Contains(prompt, "应改用 list_dir/grep") {
+		t.Fatalf("must not mention unavailable grep:\n%s", prompt)
+	}
+}
+
 func TestDefaultPromptDoesNotReferenceUnavailableTools(t *testing.T) {
 	prompt, err := New().BuildSystem(context.Background(), BuildRequest{AvailableTools: []string{"current_time"}})
 	if err != nil {

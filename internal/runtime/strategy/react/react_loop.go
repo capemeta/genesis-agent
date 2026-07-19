@@ -62,6 +62,7 @@ type ReactLoopEngine struct {
 	skillNameMatcher          SkillNameMatcher
 	skillMentionSelector      SkillMentionSelector
 	skillExplicitLoader       SkillExplicitLoader
+	subAgentTypeLookup        SubAgentTypeLookup
 	autoRewriteSkillCollision *bool // nil 表示默认开启
 	taskListReminder          TaskListReminderSource
 	collabStore               collab.Store
@@ -873,13 +874,12 @@ func (e *ReactLoopEngine) executeToolCalls(ctx context.Context, rc *runtime.RunC
 	tasks := make([]scheduler.Task, 0, len(calls))
 	for _, tc := range calls {
 		tc := tc
-		traits := tool.TraitsOf(nil)
-		if registered := e.registry.Get(strings.TrimSpace(tc.Function.Name)); registered != nil {
-			traits = tool.TraitsOf(registered.GetInfo())
-		}
+		registered := e.registry.Get(strings.TrimSpace(tc.Function.Name))
+		traits := tool.ResolveExecutionTraits(ctx, registered, tc.Function.Arguments)
 		tasks = append(tasks, scheduler.Task{ID: tc.ID, Name: tc.Function.Name, Params: tc.Function.Arguments, Traits: traits, Run: func(taskCtx context.Context) (string, error) {
 			result, err := e.runToolCall(taskCtx, rc, tc, log)
-			if errors.Is(err, approvalcontract.ErrRunAborted) || errors.Is(err, context.Canceled) {
+			// 用户 abort 才取消整批；普通失败由 scheduler 转为 sibling_error，避免误杀整 Run。
+			if errors.Is(err, approvalcontract.ErrRunAborted) {
 				cancelExecutions()
 			}
 			return result, err
@@ -890,13 +890,21 @@ func (e *ReactLoopEngine) executeToolCalls(ctx context.Context, rc *runtime.RunC
 	for _, tc := range calls {
 		argsByID[tc.ID] = tc.Function.Arguments
 	}
-	out := make([]toolExecutionResult, 0, len(results))
 	for _, result := range results {
-		if errors.Is(result.Err, approvalcontract.ErrRunAborted) || errors.Is(result.Err, context.Canceled) {
+		if errors.Is(result.Err, approvalcontract.ErrRunAborted) {
 			return nil, result.Err
 		}
+		if errors.Is(result.Err, context.Canceled) && ctx.Err() != nil {
+			return nil, result.Err
+		}
+	}
+	out := make([]toolExecutionResult, 0, len(results))
+	for _, result := range results {
 		content := result.Output
-		if result.Err != nil {
+		switch {
+		case errors.Is(result.Err, scheduler.ErrSiblingCanceled):
+			content = scheduler.SiblingErrorContent
+		case result.Err != nil:
 			content = toolFailureContent(result.Output, result.Err)
 		}
 		if err := recordSkillQAEvidence(ctx, rc, result.Name, argsByID[result.ID], content); err != nil {
@@ -1127,32 +1135,51 @@ func (e *ReactLoopEngine) runToolCall(ctx context.Context, rc *runtime.RunContex
 		} else {
 			errMsg = "ok=false"
 		}
-		toolLog.Warn("工具执行失败",
-			"error", errMsg,
-			"failure_kind", kind,
-			"stdout", summarizeToolOutputForLog(stdout, 500),
-			"stderr", summarizeToolOutputForLog(stderr, 500),
-		)
+		// 命令非零退出是进程状态，不是工具基础设施故障；降低日志/进度恐吓措辞，完整 JSON 仍回传模型。
+		processNonzero := toolErr == nil && kind == "command_exit_nonzero"
+		if processNonzero {
+			toolLog.Info("命令非零退出",
+				"error", errMsg,
+				"failure_kind", kind,
+				"stdout", summarizeToolOutputForLog(stdout, 500),
+				"stderr", summarizeToolOutputForLog(stderr, 500),
+			)
+		} else {
+			toolLog.Warn("工具执行失败",
+				"error", errMsg,
+				"failure_kind", kind,
+				"stdout", summarizeToolOutputForLog(stdout, 500),
+				"stderr", summarizeToolOutputForLog(stderr, 500),
+			)
+		}
 		e.tracer.EndSpan(ctx, toolSpan, toolErr)
 		detail := errMsg
 		if trimmed := strings.TrimSpace(result); trimmed != "" {
 			detail = trimmed
 		}
+		summary := "工具执行失败: " + tc.Function.Name
+		level := progress.LevelError
+		stopReason := "error"
+		if processNonzero {
+			summary = "命令非零退出: " + tc.Function.Name
+			level = progress.LevelWarn
+			stopReason = "command_exit_nonzero"
+		}
 		progress.Emit(ctx, progress.Event{
 			Kind:       progress.KindTool,
 			Phase:      progress.PhaseError,
-			Level:      progress.LevelError,
+			Level:      level,
 			RunID:      runID,
 			CallID:     tc.ID,
 			Name:       tc.Function.Name,
-			Summary:    "工具执行失败: " + tc.Function.Name,
+			Summary:    summary,
 			Detail:     truncate(detail, 240),
 			Component:  "tool",
 			BlockIndex: &resultBlockIdx,
 			BlockType:  "tool_result",
 			StepIndex:  &stepIdx,
 			Display:    &displayTrue,
-			StopReason: "error",
+			StopReason: stopReason,
 			Metadata:   toolTimingMetadata(toolName, result),
 		})
 		// 保留 result JSON（如 ok=false + failure_kind），对齐 Codex RespondToModel(content)。

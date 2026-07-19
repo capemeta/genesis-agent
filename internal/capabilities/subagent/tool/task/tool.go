@@ -74,6 +74,8 @@ func New(deps Deps) (*Tool, error) {
 }
 
 func (t *Tool) GetInfo() *tool.Info {
+	// ConcurrencySafe=true：同轮多个 Task 由 scheduler 并行；并发槽位由 Controller SlotLimiter 硬限。
+	// ReadOnly=false：父会话会创建/更新子智能体实例，不等于「子代理只读」。
 	return &tool.Info{Name: toolName, Description: "委派独立子智能体执行任务；resume 可基于已完成 agent_id 发起后续任务。", DescriptionFunc: t.description, Parameters: &tool.ParameterSchema{Type: "object", Properties: map[string]*tool.ParameterSchema{"subagent_type": {Type: "string", Description: "新建时来自 available_agents 的子智能体类型"}, "prompt": {Type: "string", Description: "给子智能体的完整、独立任务说明；resume 时为后续任务"}, "resume": {Type: "string", Description: "可选，已完成 Task 返回的 agent_id；存在时忽略新建定义字段"}, "description": {Type: "string", Description: "委派摘要，用于审批和进度"}, "run_in_background": {Type: "boolean", Description: "为 true 时立即返回 agent_id"}, "fork_context": {Type: "boolean", Description: "为 true 时传入经过过滤的父线程背景（resume 不适用）"}, "max_turns": {Type: "integer", Description: "子 Run 最大轮次，仅可收紧"}, "max_tokens": {Type: "integer", Description: "子 Run token 硬预算，仅可收紧"}, "max_tool_calls": {Type: "integer", Description: "子 Run 工具调用硬上限，仅可收紧"}, "timeout_seconds": {Type: "integer", Description: "子 Run 墙钟超时秒数，仅可收紧"}}, Required: []string{"prompt"}}, Traits: tool.ToolTraits{Exposure: tool.ToolExposureDirect, ReadOnly: false, ConcurrencySafe: true, NeedsPermission: true}}
 }
 
