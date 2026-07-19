@@ -29,6 +29,10 @@ import (
 	execcontract "genesis-agent/internal/capabilities/execution/contract"
 	execmodel "genesis-agent/internal/capabilities/execution/model"
 	execservice "genesis-agent/internal/capabilities/execution/service"
+	"genesis-agent/internal/capabilities/filesystem/freshness"
+	fspermission "genesis-agent/internal/capabilities/filesystem/permission"
+	"genesis-agent/internal/capabilities/filesystem/tool/toolkit"
+	viewimage "genesis-agent/internal/capabilities/media/tool/view_image"
 	mcpstore "genesis-agent/internal/capabilities/mcp/adapter/store"
 	"genesis-agent/internal/capabilities/mcp/contract"
 	mcpstack "genesis-agent/internal/capabilities/mcp/stack"
@@ -38,6 +42,8 @@ import (
 	sandboxhttp "genesis-agent/internal/capabilities/sandbox/adapter/http"
 	sandboxcontract "genesis-agent/internal/capabilities/sandbox/contract"
 	scriptservice "genesis-agent/internal/capabilities/skill/script/service"
+	toolcontract "genesis-agent/internal/capabilities/tool/contract"
+	"genesis-agent/internal/capabilities/tool/scheduler"
 	toolvalidation "genesis-agent/internal/capabilities/tool/validation"
 	usagefile "genesis-agent/internal/capabilities/usage/adapter/file"
 	usagememory "genesis-agent/internal/capabilities/usage/adapter/memory"
@@ -57,6 +63,8 @@ import (
 	enterprisemcp "genesis-agent/products/enterprise/internal/mcp"
 	"genesis-agent/products/enterprise/internal/profile"
 	"genesis-agent/shared/skillstack"
+	localfs "genesis-agent/shared/local/filesystem"
+	localresolver "genesis-agent/shared/local/pathresolver"
 )
 
 func loadEnterpriseCapabilityIndex(adapters capcontract.RuntimeAdapterRegistry) (capcontract.Registry, error) {
@@ -104,6 +112,8 @@ type Container struct {
 type Dependencies struct {
 	RunManifests      workspacecontract.RunManifestStore
 	ProducedResources workspacecontract.ProducedResourceRegistrar
+	ProducedStore     workspacecontract.ProducedResourceStore // 可选：view_image candidate_id
+	ResourceReaders   workspacecontract.ResourceReaderRouter  // 可选：candidate 物化
 	RemoteSessions    scriptservice.RemoteSessionBinder
 	Reservations      artifactcontract.OutputReservationAllocator
 	Deliverables      artifactcontract.DeliverableSpecStore
@@ -140,7 +150,7 @@ func (c *Container) Init(ctx context.Context) error {
 		if c.configDirRef != nil {
 			configDir = *c.configDirRef
 		}
-		cfg, err := platformconfig.LoadWithOptions(configDir, platformconfig.LoadOptions{Product: "enterprise", EnsureUserConfig: true})
+		cfg, err := platformconfig.LoadWithOptions(configDir, platformconfig.LoadOptions{Product: "enterprise"})
 		if err != nil {
 			c.initErr = fmt.Errorf("加载Enterprise产品配置失败: %w", err)
 			return
@@ -231,6 +241,16 @@ func (c *Container) Init(ctx context.Context) error {
 			c.initErr = fmt.Errorf("初始化 Enterprise Run 工作空间失败: %w", err)
 			return
 		}
+		extraTools := append([]toolcontract.Tool{}, skillStack.Tools...)
+		if viewTool, viewErr := buildViewImageTool(".", approvalSvc, c.deps.ProducedStore, c.deps.ResourceReaders); viewErr != nil {
+			c.closeSkillStack()
+			_ = runtimeLogging.Close()
+			c.logging = nil
+			c.initErr = fmt.Errorf("初始化 view_image 失败: %w", viewErr)
+			return
+		} else if viewTool != nil {
+			extraTools = append(extraTools, viewTool)
+		}
 		c.bundle, c.initErr = shared.BuildAgentService(ctx, shared.BuildOptions{
 			Product:                    "enterprise",
 			ConfigDir:                  configDir,
@@ -240,7 +260,7 @@ func (c *Container) Init(ctx context.Context) error {
 			DefaultAgentName:           "Genesis Enterprise Agent",
 			Profile:                    prof,
 			RunWorkspace:               runWorkspace,
-			AdditionalTools:            skillStack.Tools,
+			AdditionalTools:            extraTools,
 			PromptInjectors:            injectors,
 			Logger:                     runtimeLogging.AgentLogger,
 			AuditSink:                  auditSink,
@@ -546,4 +566,34 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func buildViewImageTool(workspaceRoot string, baseApproval approvalcontract.Service, produced workspacecontract.ProducedResourceStore, readers workspacecontract.ResourceReaderRouter) (toolcontract.Tool, error) {
+	if strings.TrimSpace(workspaceRoot) == "" {
+		workspaceRoot = "."
+	}
+	resolver, err := localresolver.New(workspaceRoot)
+	if err != nil {
+		return nil, err
+	}
+	filePerms, err := fspermission.NewRuntimeFilePermissionsWithProjectStore(context.Background(), workspaceRoot)
+	if err != nil {
+		return nil, fmt.Errorf("初始化文件运行时授权失败: %w", err)
+	}
+	approvalSvc := fspermission.NewApprovalService(baseApproval, filePerms)
+	deps := toolkit.Deps{
+		Resolver: resolver, Backend: localfs.New(), Approval: approvalSvc,
+		Freshness: freshness.NewMemoryTracker(), Locker: scheduler.NewMemoryResourceLocker(),
+	}
+	t, err := viewimage.New(deps)
+	if err != nil {
+		return nil, err
+	}
+	if produced != nil {
+		t = viewimage.WithProducedStore(t, produced)
+	}
+	if readers != nil {
+		t = viewimage.WithReaders(t, readers)
+	}
+	return t, nil
 }

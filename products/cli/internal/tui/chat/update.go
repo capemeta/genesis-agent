@@ -29,8 +29,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 
 	case approval.ApprovalRequiredMsg:
-		m.activeApproval = &msg
-		m.approvalFocus = true
+		m.enqueueApproval(msg)
 		m.textarea.Blur()
 		m.refreshViewportContent()
 		m.viewport.GotoBottom()
@@ -50,70 +49,34 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// ── 键盘输入 ───────────────────────────────────────────────
 	case tea.KeyMsg:
 		if m.approvalFocus && m.activeApproval != nil {
-			switch strings.ToLower(msg.String()) {
-			case "y", "once":
+			choices := approval.BuildChoices(m.activeApproval.Request, m.activeApproval.Policy)
+			if choice, ok := approval.MatchChoice(choices, msg.String()); ok {
+				if choice.Decision.Type == approvalmodel.DecisionAbort {
+					m.messages = append(m.messages, uiMessage{
+						role:    "system",
+						content: "⚠️ 已终止整个任务",
+					})
+					// cancelCurrentRound 会向当前与排队审批投递 Abort，并取消 Run。
+					m = m.cancelCurrentRound()
+					m.refreshViewportContent()
+					m.viewport.GotoBottom()
+					return m, nil
+				}
+				prefix := "🟢 "
+				switch choice.Decision.Type {
+				case approvalmodel.DecisionDenied:
+					prefix = "🔴 "
+				}
 				m.messages = append(m.messages, uiMessage{
 					role:    "system",
-					content: "🟢 已允许本次操作：" + string(m.activeApproval.Request.Action),
+					content: prefix + choice.Label + "：" + string(m.activeApproval.Request.Action),
 				})
-				m.activeApproval.ResultCh <- approvalmodel.Decision{
-					Type:   approvalmodel.DecisionApproved,
-					Scope:  approvalmodel.GrantScopeOnce,
-					Reason: "用户在TUI同意本次操作",
+				m.resolveActiveApproval(choice.Decision)
+				if m.activeApproval == nil {
+					m.textarea.Focus()
+				} else {
+					m.textarea.Blur()
 				}
-				m.activeApproval = nil
-				m.approvalFocus = false
-				m.textarea.Focus()
-				m.refreshViewportContent()
-				m.viewport.GotoBottom()
-				return m, nil
-
-			case "s", "session":
-				m.messages = append(m.messages, uiMessage{
-					role:    "system",
-					content: "🟢 已允许当前会话所有此类操作：" + string(m.activeApproval.Request.Action),
-				})
-				m.activeApproval.ResultCh <- approvalmodel.Decision{
-					Type:   approvalmodel.DecisionApprovedForScope,
-					Scope:  approvalmodel.GrantScopeSession,
-					Reason: "用户在TUI同意当前会话",
-				}
-				m.activeApproval = nil
-				m.approvalFocus = false
-				m.textarea.Focus()
-				m.refreshViewportContent()
-				m.viewport.GotoBottom()
-				return m, nil
-
-			case "n", "no", "deny":
-				m.messages = append(m.messages, uiMessage{
-					role:    "system",
-					content: "🔴 已拒绝操作：" + string(m.activeApproval.Request.Action),
-				})
-				m.activeApproval.ResultCh <- approvalmodel.Decision{
-					Type:   approvalmodel.DecisionDenied,
-					Scope:  approvalmodel.GrantScopeOnce,
-					Reason: "用户在TUI拒绝操作",
-				}
-				m.activeApproval = nil
-				m.approvalFocus = false
-				m.textarea.Focus()
-				m.refreshViewportContent()
-				m.viewport.GotoBottom()
-				return m, nil
-
-			case "a", "abort":
-				m.messages = append(m.messages, uiMessage{
-					role:    "system",
-					content: "⚠️ 已终止整个任务",
-				})
-				m.activeApproval.ResultCh <- approvalmodel.Decision{
-					Type:   approvalmodel.DecisionAbort,
-					Scope:  approvalmodel.GrantScopeOnce,
-					Reason: "用户在TUI终止任务",
-				}
-				// approval decision 负责记录审计；Run context 取消负责立即打断正在进行或并发的工作。
-				m = m.cancelCurrentRound()
 				m.refreshViewportContent()
 				m.viewport.GotoBottom()
 				return m, nil
@@ -357,8 +320,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.err = nil
 		m.currentStatus = ""
 		m.progressCh = nil
-		m.activeApproval = nil
-		m.approvalFocus = false
+		m.rejectAllPendingApprovals(approvalmodel.Decision{
+			Type:   approvalmodel.DecisionDenied,
+			Scope:  approvalmodel.GrantScopeOnce,
+			Reason: "run completed",
+		})
 		m.textarea.Focus()
 		run := msg.result.Run
 		if len(m.progressLog) > 0 {
@@ -417,8 +383,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.err = msg.err
 		m.currentStatus = ""
 		m.progressCh = nil
-		m.activeApproval = nil
-		m.approvalFocus = false
+		m.rejectAllPendingApprovals(approvalmodel.Decision{
+			Type:   approvalmodel.DecisionDenied,
+			Scope:  approvalmodel.GrantScopeOnce,
+			Reason: "run error",
+		})
 		m.textarea.Focus()
 		errContent := "❌ 错误: " + msg.err.Error()
 		if len(m.progressLog) > 0 {

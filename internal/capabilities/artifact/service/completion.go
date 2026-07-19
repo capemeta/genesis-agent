@@ -119,8 +119,14 @@ func (e *CompletionEvaluator) hasMatchingQA(ctx context.Context, tenantID, runID
 		return false, err
 	}
 	for _, record := range records {
-		if record.Status == artifactmodel.QAEvidencePassed && record.PolicyID == spec.QAPolicy &&
-			record.ProducedResourceID == selection.ProducedResourceID && record.PublicationID == publication.ID &&
+		if record.Status != artifactmodel.QAEvidencePassed || record.PolicyID != spec.QAPolicy {
+			continue
+		}
+		// visual-qa/v1 等视觉策略必须由同名 Validator 证明；content/render 证据不得冒充
+		if spec.QAPolicy == "visual-qa/v1" && record.Validator != "visual-qa/v1" {
+			continue
+		}
+		if record.ProducedResourceID == selection.ProducedResourceID && record.PublicationID == publication.ID &&
 			record.SubjectVersion == publication.SubjectVersion && record.SubjectSHA256 == publication.SubjectSHA256 {
 			return true, nil
 		}

@@ -245,7 +245,11 @@ func externalScopes(scopes []approvalmodel.GrantScope) []approvalmodel.GrantScop
 	if len(scopes) > 0 {
 		return scopes
 	}
-	return []approvalmodel.GrantScope{approvalmodel.GrantScopeOnce, approvalmodel.GrantScopeSession}
+	return []approvalmodel.GrantScope{
+		approvalmodel.GrantScopeOnce,
+		approvalmodel.GrantScopeSession,
+		approvalmodel.GrantScopeProject,
+	}
 }
 
 func firstNonEmpty(values ...string) string {

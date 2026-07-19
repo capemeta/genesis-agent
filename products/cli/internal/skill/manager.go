@@ -51,6 +51,18 @@ func DefaultPaths() (Paths, error) {
 	}, nil
 }
 
+// EnsureUserSkillsDir 在 Skills 装配时创建用户级 skills 目录；配置加载不再承担该副作用。
+func EnsureUserSkillsDir() error {
+	paths, err := DefaultPaths()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(paths.UserSkillsDir, 0o755); err != nil {
+		return fmt.Errorf("创建用户 skills 目录失败: %w", err)
+	}
+	return nil
+}
+
 // MarketplaceOptions 控制 marketplace 与 runtime adapter 的共享。
 type MarketplaceOptions struct {
 	Adapters    capcontract.RuntimeAdapterRegistry

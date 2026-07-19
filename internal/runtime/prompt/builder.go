@@ -110,7 +110,7 @@ func writeBehaviorRules(sb *strings.Builder, req BuildRequest) {
 	sb.WriteString("## 行为规则\n")
 	if effectiveAudience(req) == AudienceSubAgent {
 		sb.WriteString("- 使用工具前先判断是否必要\n")
-		writeToolBehaviorRules(sb, req.AvailableTools)
+		writeToolBehaviorRules(sb, req)
 		sb.WriteString("- 收到 failure_kind=repeated_failure：禁止再次提交相同调用，必须改参、先完成 suggested_action，或向调用方说明阻塞\n")
 		sb.WriteString("- 收到 failure_kind=no_progress：必须总结阻塞并停止无效微调\n")
 		return
@@ -118,7 +118,7 @@ func writeBehaviorRules(sb *strings.Builder, req BuildRequest) {
 	sb.WriteString("- 思考时请清晰说明你的推理过程\n")
 	sb.WriteString("- 所有文件与目录路径必须使用工作区相对路径（例如 src/main.go、input/data.csv、output/report.pdf），禁止使用包含盘符、根斜杠或宿主机物理路径的绝对路径\n")
 	sb.WriteString("- 使用工具前先判断是否必要\n")
-	writeToolBehaviorRules(sb, req.AvailableTools)
+	writeToolBehaviorRules(sb, req)
 	sb.WriteString("- 工具结果需要结合上下文给出完整回答\n")
 	sb.WriteString("- 直接回答用户的问题，不要重复工具的原始输出\n")
 	sb.WriteString("- 收到 failure_kind=repeated_failure：禁止再次提交相同调用，必须改参、先完成 suggested_action，或向用户说明阻塞\n")
@@ -167,7 +167,8 @@ func writeDelegationBlock(sb *strings.Builder, availableTools []string, posture 
 	sb.WriteString("\n</delegation>\n\n")
 }
 
-func writeToolBehaviorRules(sb *strings.Builder, availableTools []string) {
+func writeToolBehaviorRules(sb *strings.Builder, req BuildRequest) {
+	availableTools := req.AvailableTools
 	available := make(map[string]struct{}, len(availableTools))
 	for _, name := range availableTools {
 		available[name] = struct{}{}
@@ -237,6 +238,26 @@ func writeToolBehaviorRules(sb *strings.Builder, availableTools []string) {
 			sb.WriteString("\n")
 		}
 		sb.WriteString("- 对抽取管道做「无匹配即成功」的检查时，必须在脚本内显式定义业务退出码，勿依赖 shell grep/ls 的默认非零退出\n")
+	}
+	writeVisionBehaviorRules(sb, availableTools, req.VisionMode)
+}
+
+// writeVisionBehaviorRules 约束看图路径，阻断形态 C 下 Pillow 伪看图弯路。
+func writeVisionBehaviorRules(sb *strings.Builder, availableTools []string, visionMode string) {
+	hasViewImage := false
+	for _, name := range availableTools {
+		if name == "view_image" {
+			hasViewImage = true
+			break
+		}
+	}
+	if !hasViewImage {
+		return
+	}
+	sb.WriteString("- 看图只能通过 view_image（workspace 相对路径或 candidate_id）。禁止用 run_command/sandbox_exec 复制图片后，再用 Pillow/OpenCV/ImageMagick/numpy 像素统计冒充「看懂画面内容」\n")
+	sb.WriteString("- 若 view_image 返回 vision_unavailable：必须如实告知用户当前无视觉能力（可提示配置 models.*.supports_image 或 router.vision）；禁止继续伪看图或声称已描述画面；文档类可做文本抽取 QA；仅当用户明确询问文件信息时才可报告文件名/大小/MIME\n")
+	if visionMode == "degraded_text" {
+		sb.WriteString("- 本 Run EffectiveVisionMode=degraded_text：从一开始就没有图像理解能力；不要尝试 view_image 以外的任何「看图」替代路径\n")
 	}
 }
 

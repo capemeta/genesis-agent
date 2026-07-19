@@ -89,13 +89,13 @@ func (r *FileRepository) SaveTaskList(ctx context.Context, plan *model.TaskList,
 		return fmt.Errorf("concurrency conflict: current version is %d, proposed version %d must be greater", existingVersion, plan.Version)
 	}
 
-	// 2. 写入主快照
+	// 2. 写入主快照 (使用原子写保证文件可靠性)
 	planData, err := json.Marshal(plan)
 	if err != nil {
 		return fmt.Errorf("marshal plan snapshot failed: %w", err)
 	}
 
-	if err := os.WriteFile(planPath, planData, 0644); err != nil {
+	if err := atomicWriteFile(planPath, planData, 0644); err != nil {
 		return fmt.Errorf("write plan file failed: %w", err)
 	}
 
@@ -108,16 +108,47 @@ func (r *FileRepository) SaveTaskList(ctx context.Context, plan *model.TaskList,
 		_ = json.Unmarshal(historyData, &history)
 	}
 
-	history = append(history, *revision)
+	if revision != nil {
+		history = append(history, *revision)
+	}
 	newHistoryData, err := json.Marshal(history)
 	if err != nil {
 		return fmt.Errorf("marshal revision logs failed: %w", err)
 	}
 
-	if err := os.WriteFile(historyPath, newHistoryData, 0644); err != nil {
+	if err := atomicWriteFile(historyPath, newHistoryData, 0644); err != nil {
 		return fmt.Errorf("write revision log file failed: %w", err)
 	}
 
+	return nil
+}
+
+// atomicWriteFile 通过临时文件与重命名实现原子写盘，防止异常中断导致 JSON 坏盘
+func atomicWriteFile(filename string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(filename)
+	tmpFile, err := os.CreateTemp(dir, ".tmp-tasklist-*")
+	if err != nil {
+		return fmt.Errorf("create temp file failed: %w", err)
+	}
+	tmpName := tmpFile.Name()
+	defer func() {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpName)
+	}()
+
+	if _, err := tmpFile.Write(data); err != nil {
+		return fmt.Errorf("write temp file failed: %w", err)
+	}
+	if err := tmpFile.Sync(); err != nil {
+		return fmt.Errorf("sync temp file failed: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("close temp file failed: %w", err)
+	}
+	_ = os.Chmod(tmpName, perm)
+	if err := os.Rename(tmpName, filename); err != nil {
+		return fmt.Errorf("rename temp file failed: %w", err)
+	}
 	return nil
 }
 

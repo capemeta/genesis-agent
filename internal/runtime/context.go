@@ -34,6 +34,9 @@ type RunContext struct {
 	// --- Skill 必做步骤软门禁跟踪（本 Run 内）---
 	SkillFollow *SkillFollowState
 
+	// --- 视觉能力形态（Run 级工具门控；Sanitizer 仍按请求级 TargetModel）---
+	VisionMode string
+
 	// --- Repeat Guard（本 Run 内；Resume 时须随可恢复状态一并恢复）---
 	RepeatGuard *repeatguard.Guard
 }

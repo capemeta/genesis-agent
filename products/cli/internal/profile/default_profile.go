@@ -25,6 +25,7 @@ func DefaultProfile(mcpEnabled bool) profilemodel.Profile {
 				"exit_plan_mode",
 				"write_implementation_plan",
 				"read_file",
+				"view_image",
 				"write_file",
 				"edit_file",
 				"apply_patch",
@@ -50,6 +51,10 @@ func DefaultProfile(mcpEnabled bool) profilemodel.Profile {
 			},
 		},
 		Skills: profilemodel.SkillSet{AllowImplicit: true},
+		TurnInput: profilemodel.TurnInputSettings{
+			DocumentExtract: "path_only",
+			MentionResolve:  "off",
+		},
 	}
 	if mcpEnabled {
 		prof.Tools.Enabled = append(prof.Tools.Enabled, "list_mcp_resources", "read_mcp_resource", "search_mcp_tools", "mcp__*")

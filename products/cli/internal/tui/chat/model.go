@@ -15,10 +15,14 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"genesis-agent/internal/app"
+	approvalmodel "genesis-agent/internal/capabilities/approval/model"
+	tasklistcontract "genesis-agent/internal/capabilities/tasklist/contract"
+	tasklistmodel "genesis-agent/internal/capabilities/tasklist/model"
 	"genesis-agent/internal/domain"
 	"genesis-agent/internal/runtime/collab"
 	"genesis-agent/internal/runtime/progress"
 	approval "genesis-agent/products/cli/internal/approval"
+	cliattach "genesis-agent/products/cli/internal/attach"
 	"genesis-agent/products/cli/internal/tui/clipboard"
 	"genesis-agent/products/cli/internal/tui/styles"
 )
@@ -67,12 +71,14 @@ type Model struct {
 	ready  bool // viewport 是否已完成首次初始化
 
 	// ── 审批流状态 ────────────────────────────────────────────
-	activeApproval *approval.ApprovalRequiredMsg // 当前等待人工确认的审批请求
-	approvalFocus  bool                          // 当前是否为审批输入拦截状态
+	activeApproval   *approval.ApprovalRequiredMsg   // 当前等待人工确认的审批请求
+	pendingApprovals []approval.ApprovalRequiredMsg  // 排队中的并行审批（防覆盖丢单）
+	approvalFocus    bool                            // 当前是否为审批输入拦截状态
 
 	// ── 计划状态 ──────────────────────────────────────────────
-	currentPlan  *domain.TaskList // 当前活跃任务清单（nil 表示无清单）
-	planExpanded bool             // 任务清单卡片是否展开
+	currentPlan  *domain.TaskList            // 当前活跃任务清单（nil 表示无清单）
+	planExpanded bool                        // 任务清单卡片是否展开
+	tasklistRepo tasklistcontract.Repository // 任务清单文件/持久化存储
 
 	// ── 协作模式（规划模式）────────────────────────────────────
 	collabStore   collab.Store
@@ -115,6 +121,15 @@ func (m Model) WithCollab(store collab.Store, workspaceRoot string) Model {
 		m.workspaceRoot = "."
 	}
 	m.collabMode = m.loadCollabMode()
+	return m
+}
+
+// WithTaskListRepository 注入任务清单存储，支持 Resume/Continue 时直接从磁盘恢复任务状态
+func (m Model) WithTaskListRepository(repo tasklistcontract.Repository) Model {
+	m.tasklistRepo = repo
+	if m.session != nil && m.session.ID != "" {
+		m.loadPlan(nil)
+	}
 	return m
 }
 
@@ -226,12 +241,83 @@ func (m *Model) hydrateFromSession() {
 	if len(m.messages) == 0 {
 		m.messages = append(m.messages, welcomeMsg(m.modelName(), m.shortSessionID()))
 	}
-	// 从消息历史中恢复计划状态（取最后一条 plan_snapshot）
-	m.currentPlan = loadPlanFromMessages(hist)
-	if m.currentPlan != nil {
-		m.planExpanded = true // 恢复后默认展开，让用户直观看到当前进度
-	}
+	// 从 Repository 或消息历史中恢复计划状态
+	m.loadPlan(hist)
 	m.collabMode = m.loadCollabMode()
+}
+
+// loadPlan 优先从 TaskListRepository 恢复最新的任务清单快照
+func (m *Model) loadPlan(msgs []*domain.Message) {
+	if m.tasklistRepo != nil && m.session != nil && m.session.ID != "" {
+		planModel, err := m.tasklistRepo.GetTaskList(context.Background(), m.session.ID)
+		if err == nil && planModel != nil {
+			m.currentPlan = convertModelToDomainTaskList(planModel)
+			if m.currentPlan != nil {
+				m.planExpanded = true
+			}
+			return
+		}
+	}
+	if len(msgs) > 0 {
+		m.currentPlan = loadPlanFromMessages(msgs)
+		if m.currentPlan != nil {
+			m.planExpanded = true
+		}
+	}
+}
+
+// convertModelToDomainTaskList 将 tasklistmodel.TaskList 转换为 domain.TaskList
+func convertModelToDomainTaskList(p *tasklistmodel.TaskList) *domain.TaskList {
+	if p == nil {
+		return nil
+	}
+
+	items := make([]domain.TaskListItem, len(p.Steps))
+	for i, step := range p.Steps {
+		item := domain.TaskListItem{
+			ID:     step.ID,
+			Text:   step.Title,
+			Status: convertStepStatusToDomain(step.Status),
+			Note:   step.Notes,
+		}
+		if step.Status == tasklistmodel.StepStatusCompleted && !step.UpdatedAt.IsZero() {
+			t := step.UpdatedAt
+			item.DoneAt = &t
+		}
+		items[i] = item
+	}
+
+	title := p.LatestExplanation
+	if title == "" {
+		title = "任务清单"
+	}
+	titleRunes := []rune(title)
+	if len(titleRunes) > 20 {
+		title = string(titleRunes[:20]) + "…"
+	}
+
+	return &domain.TaskList{
+		ID:        p.SessionID,
+		SessionID: p.SessionID,
+		Title:     title,
+		Items:     items,
+		Version:   int(p.Version),
+		CreatedAt: p.UpdatedAt,
+		UpdatedAt: p.UpdatedAt,
+	}
+}
+
+func convertStepStatusToDomain(s tasklistmodel.StepStatus) domain.TaskListItemStatus {
+	switch s {
+	case tasklistmodel.StepStatusInProgress:
+		return domain.TaskListItemDoing
+	case tasklistmodel.StepStatusCompleted:
+		return domain.TaskListItemDone
+	case tasklistmodel.StepStatusBlockedByApproval:
+		return domain.TaskListItemPending
+	default:
+		return domain.TaskListItemPending
+	}
 }
 
 // Init 返回 Bubble Tea 初始化命令（启动光标闪烁）
@@ -312,20 +398,27 @@ func (m *Model) renderApprovalCard() string {
 		display = req.Resource.URI
 	}
 
+	queueHint := ""
+	if n := len(m.pendingApprovals); n > 0 {
+		queueHint = fmt.Sprintf("\n  另有 %d 个并行审批排队中（处理完当前后会依次弹出）", n)
+	}
+
+	choices := approval.BuildChoices(req, m.activeApproval.Policy)
+	hotkeys := approval.FormatPrompt(choices)
 	content := fmt.Sprintf(
 		"%s\n\n"+
 			"  %s: %s\n"+
 			"  %s: %s\n"+
 			"  %s: %s\n"+
-			"  %s: %s\n\n"+
+			"  %s: %s%s\n\n"+
 			"%s",
 		titleStyle.Render("🛡️ 需要授权的操作 (Human Approval Required)"),
 		boldStyle.Render("工具"), req.ToolName,
 		boldStyle.Render("动作"), req.Action,
 		boldStyle.Render("资源"), display,
-		boldStyle.Render("原因"), req.Reason,
+		boldStyle.Render("原因"), req.Reason, queueHint,
 		lipgloss.NewStyle().Foreground(styles.ColorGreen).Bold(true).
-			Render("按键授权: [Y]允许本次 / [S]允许当前会话 / [N]拒绝 / [A]终止任务"),
+			Render(strings.TrimSuffix(hotkeys, ": ")),
 	)
 
 	return borderStyle.Render(content)
@@ -464,10 +557,65 @@ func (m Model) cancelCurrentRound() Model {
 	m.loading = false
 	m.currentStatus = ""
 	m.progressCh = nil
-	m.activeApproval = nil
-	m.approvalFocus = false
+	m.rejectAllPendingApprovals(approvalmodel.Decision{
+		Type:   approvalmodel.DecisionAbort,
+		Scope:  approvalmodel.GrantScopeOnce,
+		Reason: "用户取消当前轮次",
+	})
 	m.textarea.Focus()
 	return m
+}
+
+// enqueueApproval 展示或排队审批；禁止覆盖 activeApproval 以免 ResultCh 孤儿阻塞。
+func (m *Model) enqueueApproval(msg approval.ApprovalRequiredMsg) {
+	if m.activeApproval == nil {
+		cp := msg
+		m.activeApproval = &cp
+		m.approvalFocus = true
+		return
+	}
+	m.pendingApprovals = append(m.pendingApprovals, msg)
+}
+
+// resolveActiveApproval 向当前审批回写决策，并弹出队列中的下一项。
+func (m *Model) resolveActiveApproval(dec approvalmodel.Decision) {
+	if m.activeApproval != nil && m.activeApproval.ResultCh != nil {
+		select {
+		case m.activeApproval.ResultCh <- dec:
+		default:
+		}
+	}
+	m.activeApproval = nil
+	if len(m.pendingApprovals) > 0 {
+		next := m.pendingApprovals[0]
+		m.pendingApprovals = append([]approval.ApprovalRequiredMsg(nil), m.pendingApprovals[1:]...)
+		m.activeApproval = &next
+		m.approvalFocus = true
+		return
+	}
+	m.approvalFocus = false
+}
+
+// rejectAllPendingApprovals 取消当前与排队中的全部审批（非阻塞投递，避免二次写入卡死）。
+func (m *Model) rejectAllPendingApprovals(dec approvalmodel.Decision) {
+	deliver := func(ch chan<- approvalmodel.Decision) {
+		if ch == nil {
+			return
+		}
+		select {
+		case ch <- dec:
+		default:
+		}
+	}
+	if m.activeApproval != nil {
+		deliver(m.activeApproval.ResultCh)
+		m.activeApproval = nil
+	}
+	for i := range m.pendingApprovals {
+		deliver(m.pendingApprovals[i].ResultCh)
+	}
+	m.pendingApprovals = nil
+	m.approvalFocus = false
 }
 
 // ── 复制辅助 ─────────────────────────────────────────────────
@@ -837,13 +985,22 @@ func (m Model) runAgentCmd(input string, progressCh chan<- progressMsg) tea.Cmd 
 			case <-m.ctx.Done():
 			}
 		}
+		cleanInput, mentionPaths := cliattach.ParseAtMentions(input)
+		attachments, attachErr := cliattach.FromPaths(mentionPaths)
+		if attachErr != nil {
+			return runErrorMsg{err: attachErr}
+		}
+		if cleanInput == "" {
+			cleanInput = input
+		}
 		result, err := m.svc.RunOnce(m.ctx, app.RunRequest{
-			SessionID:  m.session.ID,
-			AppID:      m.session.AppID,
-			TenantID:   m.session.TenantID,
-			UserID:     m.session.UserID,
-			Input:      input,
-			OnProgress: emit,
+			SessionID:   m.session.ID,
+			AppID:       m.session.AppID,
+			TenantID:    m.session.TenantID,
+			UserID:      m.session.UserID,
+			Input:       cleanInput,
+			Attachments: attachments,
+			OnProgress:  emit,
 		})
 
 		if err != nil {

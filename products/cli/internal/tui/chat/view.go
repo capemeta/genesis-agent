@@ -9,6 +9,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"genesis-agent/internal/runtime/collab"
+	"genesis-agent/products/cli/internal/approval"
 	"genesis-agent/products/cli/internal/tui/styles"
 )
 
@@ -180,12 +181,10 @@ func (m Model) helpView() string {
 
 	if m.loading || m.helpOverlay {
 		if m.activeApproval != nil {
-			// 审批态
-			items = []string{
-				styles.HelpKey.Render("Y") + " " + styles.HelpBar.Render("允许本次"),
-				styles.HelpKey.Render("S") + " " + styles.HelpBar.Render("会话允许"),
-				styles.HelpKey.Render("N") + " " + styles.HelpBar.Render("拒绝"),
-				styles.HelpKey.Render("A") + " " + styles.HelpBar.Render("终止任务"),
+			// 审批态：按当前策略动态展示可选授权维度
+			items = nil
+			for _, choice := range approval.BuildChoices(m.activeApproval.Request, m.activeApproval.Policy) {
+				items = append(items, styles.HelpKey.Render(strings.ToUpper(choice.Key))+" "+styles.HelpBar.Render(choice.Label))
 			}
 		} else {
 			// 推理中

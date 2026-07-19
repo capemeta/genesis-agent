@@ -15,7 +15,9 @@ import (
 
 	"genesis-agent/internal/app"
 	execmodel "genesis-agent/internal/capabilities/execution/model"
+	"genesis-agent/internal/domain"
 	"genesis-agent/internal/runtime/progress"
+	"genesis-agent/products/enterprise/internal/interfaces/http/staging"
 )
 
 // Resource 存储大文件或大结果的数据结构
@@ -28,12 +30,25 @@ type Resource struct {
 // AgentHandler Agent 相关 HTTP 处理器
 type AgentHandler struct {
 	svc           app.AgentService
+	files         *staging.Store
 	resourceStore sync.Map // 线程安全的资源缓存（resourceID -> Resource）
 }
 
 // NewAgentHandler 创建处理器（通过构造函数注入依赖）
 func NewAgentHandler(svc app.AgentService) *AgentHandler {
-	h := &AgentHandler{svc: svc}
+	return NewAgentHandlerWithFiles(svc, nil)
+}
+
+// NewAgentHandlerWithFiles 注入上传 staging。
+func NewAgentHandlerWithFiles(svc app.AgentService, files *staging.Store) *AgentHandler {
+	if files == nil {
+		var err error
+		files, err = staging.New("", staging.DefaultMaxBytes)
+		if err != nil {
+			files = nil
+		}
+	}
+	h := &AgentHandler{svc: svc, files: files}
 	// 启动定期清理过期资源的 goroutine
 	go func() {
 		ticker := time.NewTicker(1 * time.Hour)
@@ -49,11 +64,12 @@ func NewAgentHandler(svc app.AgentService) *AgentHandler {
 
 // RunRequest POST /v1/runs 请求体
 type RunRequest struct {
-	SessionID string                    `json:"session_id"`       // 可选：指定会话 ID，否则自动创建新会话
-	AppID     string                    `json:"app_id,omitempty"` // 选择租户策略允许的 Agent App
-	UserID    string                    `json:"user_id"`          // 开发期身份占位；生产环境应由认证中间件注入
-	Input     string                    `json:"input"`            // 必填：用户输入内容
-	Sandbox   *execmodel.SandboxProfile `json:"sandbox,omitempty"`
+	SessionID   string                      `json:"session_id"`       // 可选：指定会话 ID，否则自动创建新会话
+	AppID       string                      `json:"app_id,omitempty"` // 选择租户策略允许的 Agent App
+	UserID      string                      `json:"user_id"`          // 开发期身份占位；生产环境应由认证中间件注入
+	Input       string                      `json:"input"`            // 必填：用户输入内容
+	Attachments []domain.AttachmentDescriptor `json:"attachments,omitempty"` // 标识优先；图片可暂带 content_base64（入站即 staging 清空）
+	Sandbox     *execmodel.SandboxProfile   `json:"sandbox,omitempty"`
 }
 
 // RunResponse POST /v1/runs 响应体
@@ -120,13 +136,20 @@ func (h *AgentHandler) Run(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	attachments, attErr := h.resolveAttachments(req.Attachments)
+	if attErr != nil {
+		writeError(w, http.StatusBadRequest, attErr.Error())
+		return
+	}
+
 	result, err := h.svc.RunOnce(r.Context(), app.RunRequest{
-		SessionID: sessionID,
-		AppID:     req.AppID,
-		TenantID:  "dev", // Phase 1A 硬编码租户，Phase 1B 从 JWT 解析
-		UserID:    userID,
-		Input:     req.Input,
-		Sandbox:   req.Sandbox,
+		SessionID:   sessionID,
+		AppID:       req.AppID,
+		TenantID:    "dev", // Phase 1A 硬编码租户，Phase 1B 从 JWT 解析
+		UserID:      userID,
+		Input:       req.Input,
+		Attachments: attachments,
+		Sandbox:     req.Sandbox,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("推理失败: %v", err))
@@ -204,13 +227,20 @@ func (h *AgentHandler) RunStream(w http.ResponseWriter, r *http.Request) {
 
 	// 异步启动推理以允许并发心跳与取消监测
 	go func() {
+		attachments, attErr := h.resolveAttachments(req.Attachments)
+		if attErr != nil {
+			close(progressCh)
+			resultCh <- runResult{err: attErr}
+			return
+		}
 		res, err := h.svc.RunOnce(r.Context(), app.RunRequest{
-			SessionID: sessionID,
-			AppID:     req.AppID,
-			TenantID:  tenantID,
-			UserID:    userID,
-			Input:     req.Input,
-			Sandbox:   req.Sandbox,
+			SessionID:   sessionID,
+			AppID:       req.AppID,
+			TenantID:    tenantID,
+			UserID:      userID,
+			Input:       req.Input,
+			Attachments: attachments,
+			Sandbox:     req.Sandbox,
 			OnProgress: func(event progress.Event) {
 				progressCh <- event
 			},
@@ -577,6 +607,19 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+func (h *AgentHandler) resolveAttachments(atts []domain.AttachmentDescriptor) ([]domain.AttachmentDescriptor, error) {
+	if h == nil || h.files == nil {
+		// 无 staging 时拒绝内联 base64，避免字节泄漏进引擎
+		for _, a := range atts {
+			if strings.TrimSpace(a.ContentBase64) != "" {
+				return nil, fmt.Errorf("content_base64 需要 file staging；请配置上传存储或改用 POST /files")
+			}
+		}
+		return atts, nil
+	}
+	return h.files.ResolveAttachments(atts)
 }
 
 func writeError(w http.ResponseWriter, code int, msg string) {

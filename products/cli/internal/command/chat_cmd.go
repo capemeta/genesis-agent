@@ -80,6 +80,9 @@ func newChatCmd(configDirRef *string, sandboxModeRef *string, factory ServiceFac
 			if ch, ok := handle.(CollabHandle); ok {
 				m = m.WithCollab(ch.CollabStore(), ch.WorkspaceRoot())
 			}
+			if th, ok := handle.(TaskListHandle); ok {
+				m = m.WithTaskListRepository(th.TaskListRepository())
+			}
 			restoreConsoleOutput := clitui.PrepareConsoleOutput()
 			defer restoreConsoleOutput()
 

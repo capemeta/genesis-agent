@@ -1,6 +1,7 @@
 # 用户 Turn 输入与附件契约设计
 
-> 状态：设计规范（对照 ChatGPT / Claude 网页抓包与业界多模态实践收束）  
+> 状态：**已实现（内核 + CLI）** — 2026-07-19；推迟项见文末「实现状态」  
+> 实现计划：[`superpowers/plans/2026-07-19-multimodal-and-turn-input.md`](./superpowers/plans/2026-07-19-multimodal-and-turn-input.md)  
 > 范围：CLI / Desktop / Enterprise 的用户文本+附件如何进入 Runtime；与视觉流水线、工作空间 staging 的边界  
 > 相关：[`多模态输入与视觉能力设计.md`](./多模态输入与视觉能力设计.md)、[`统一执行工作空间、文件权限与产物规范.md`](./统一执行工作空间、文件权限与产物规范.md)、[`agent loop设计-SSE与重试策略设计.md`](./agent%20loop设计-SSE与重试策略设计.md)、[`todo/cli desktop enterprise 三端统一设计.md`](./todo/cli%20desktop%20enterprise%20三端统一设计.md)
 
@@ -53,10 +54,29 @@
 
 ### 2.3 共同原则（Genesis 必须遵守）
 
-1. 上传/选文件 → 换稳定 ID，再进对话协议。  
+1. 上传/选文件 → 换稳定 ID，再进对话协议（§4.2）。  
 2. **图片 ≠ 任意文件**：image → 视觉；docx/pdf/xlsx → 文本抽取或工具读 staged 文件。  
 3. 附件清单与「进模型的多模态 parts」可以双轨（清单更宽，parts 更窄）。  
-4. 禁止把用户电脑绝对路径作为跨产品/跨 Run 协议字段。
+4. 禁止把用户电脑绝对路径作为跨产品/跨 Run 协议字段。  
+5. 跨端与持久化只传标识；字节仅在 Provider outbound 短暂出现。
+
+### 2.4 本地 Coding Agent 对照（Codex / Kode-CLI）
+
+网页产品（§2.1–2.2）偏「显式附件即消费」；本地 Coding Agent 偏「路径进上下文 + 工具按需读」。Genesis CLI/Desktop 必须同时能解释这两种锚点。
+
+| 维度 | Codex | Kode-CLI | Genesis 采纳 |
+|------|-------|----------|--------------|
+| 显式贴图 / `--image` / 剪贴板图 | 首轮前读成 data URL → `input_image` | 剪贴板图 → user message `image` blocks | **同**：E1 图片首轮进视觉 Parts（或形态 B Expert） |
+| `@路径` 指向图片 | TUI 识别扩展名则 attach 为图；否则当路径文本 | **不**预读；`<system-reminder>` 要求模型用 `Read` | **E1**（`--attach`/`@` 显式绑定）走视觉；**E2** 文本点名默认 `view_image` |
+| 文档 / 普通文件 | **无** Document 附件类型；路径写入 Text，模型用 shell/exec 等读取 | `@file` → reminder → 模型 `Read`；docx/xlsx 等二进制 **Read 拒绝** | **契约保留** `role=document`；默认策略见 §4.5 / §7 |
+| `extracted_text` 预抽 | **无** | **无**（旧「@file 内联全文」路径已从 turn 移除） | **可选**（对齐 Claude，非对齐 Codex/Kode）；见 §7 |
+| 客户端请求次数 | 一次 turn | 一次 turn | 一次 `StartRun`（抽取若发生，在同 Run 内、首次 LLM 前） |
+
+要点：
+
+1. Codex / Kode **都不**在「用户提交一轮」之外再开第二次「解析 API」；图的字节装配是同一次 turn 的同步预处理。  
+2. 二者对**文档默认不预抽正文**——首轮往往只有路径/提醒，正文靠工具。这与 Claude 网页的 `extracted_content` 不同。  
+3. Genesis：**图片对齐 Codex**（显式附件首轮进视觉）；**文档预抽对齐 Claude、可关闭以对齐 Codex/Kode**（Profile，见 §7.2）。
 
 ---
 
@@ -132,17 +152,72 @@ StartRunRequest
 
 持久化 Message 时：只存 `ImageRef` / attachment id，**不存**原始 bytes / 大 base64（与多模态设计一致）。
 
-### 4.2 分流规则（硬性）
+### 4.2 标识优先：上传换 ID，协议不传字节（业界硬约定）
+
+业界对用户附件的主流形态是：
+
+```text
+上传 / 选文件 → 文件存储（对象存储 / Files API / staging）
+            → 返回不透明 file_id（或 InputRef）
+对话 / StartRun / 会话持久化 → 只携带标识与元数据
+真正访问大模型前的一瞬间 → 服务端用标识取字节（或换成厂商已托管的 file）→ 缩放 → 写入 Provider Body
+```
+
+| 产品 / 形态 | 协议里传什么 | 字节何时出现 |
+|-------------|--------------|--------------|
+| ChatGPT 网页 | `sediment://file_...` 等指针 + attachments 元数据 | 服务端持有；请求不带大 base64 |
+| Claude 网页 | `files[]` UUID；文档另可带 `extracted_content` | 同上；正文预览是文本不是原文件字节 |
+| OpenAI / Anthropic API | 先 `files.upload` 得 `file_id`，再在 messages 里引用 | Provider 侧托管；调用侧传 id |
+| Codex 本地 | `LocalImage{path}` / 工具 `path` | 本机路径作「本地 staging」；进模型前才变 data URL |
+| **Genesis** | `AttachmentDescriptor.id` + `InputRef` / `ImageRef` | 见下表分层 |
+
+**Genesis 分层硬规则：**
+
+| 层 | 允许携带 | 禁止 |
+|----|----------|------|
+| 浏览器 / App → `POST /files` | multipart 或 JSON；常用文档/图片/音视频/压缩包 | `.exe`/`.dll`/未知二进制 |
+| 浏览器 / App → `StartRun`（发消息） | Descriptor id / `input_ref`；**仅图片**可带 `content_base64`（入站立即 staging 并清空） | 文档/音视频/压缩包的 base64；宿主绝对路径 |
+| Session / Message 持久化 | `ImageRef` / attachment id | 原始像素、data URL、残留 `content_base64` |
+| Provider Adapter outbound | 短暂打开 → 缩放 → data URL | 把 outbound 字节写回 DB / SSE |
+
+**时序：**
+
+```text
+路径 A（推荐，大文件/文档）：
+  POST /files (multipart) → id → StartRun{attachments:[{id}]}
+
+路径 B（发消息时内联图片，仅 jpeg/png/webp/gif）：
+  StartRun{attachments:[{name, mime, content_base64}]}
+  → 服务端 staging → 清空 content_base64 → 后续同路径 A
+```
+
+验收：Message Store / 落盘 JSON **不得**残留 `content_base64`；文档类不得通过 StartRun 内联 base64。
+
+**CLI / Desktop 本地特例（不等同于「协议传路径当永久真相」）：**
+
+- `--attach` / 拖拽可先落本机 staging 或直接持有可读路径，生成 `AttachmentDescriptor`（含 `id` + `workspace_alias`，`LocalPath` 仅进程内 `json:"-"`）。
+- **上云桥接 / 多实例 Resume** 前必须先 stage 成可跨端的 `InputRef`，不得把 `D:\...` 写进跨端 Body。
+- 语义上仍是「先有标识，再在出站读字节」；本地路径只是 staging 实现细节。
+
+**与「轻量抽取」的关系（避免误解）：**
+
+- 可选的 `extracted_text` 是**文本预览**，不是把原文件塞进协议。
+- 抽取若发生，仍在同一次 StartRun 内、首次 LLM 前完成（§7.1）；客户端无「先解析 API、再开聊」的第二次对话请求。
+- 原文件始终通过标识在存储侧可再次打开（工具深读 / 再物化）。
+
+验收要点：任意抓包会话落盘 JSON，**不得**残留附件 `content_base64`；StartRun 仅允许**图片**内联 base64（入站即清空）；文档等须先 `/files`。调模型的 HTTP Body 可短暂含 data URL，但该字节不得回写 Message Store。
+
+### 4.3 分流规则（硬性）
 
 | role / MIME | 进入视觉 Parts？ | 默认处理 |
 |-------------|------------------|----------|
 | `image/*`（jpeg/png/webp/gif…） | **是**（形态 A）；形态 B 走 VisionExpert | 首轮自动注入 image part |
-| 办公文档（docx/xlsx/pptx/pdf…） | **否** | 预抽取文本（可选）+ staged path；模型用文本或 Skill/工具 |
+| 办公文档（docx/xlsx/pptx/pdf…） | **否** | staged path 必有；`extracted_text` 按 §7.2 Profile 可选；深读靠工具/Skill |
 | 其它（zip/bin…） | **否** | 仅 staging；模型用工具，不伪造成 image |
 
 `view_image` **只**服务图片（及明确支持的视觉媒体）。对 docx 调用必须返回结构化错误（如 `not_an_image`），并提示走文档通道。
 
-### 4.3 与 ChatGPT / Claude 字段对照
+### 4.4 与 ChatGPT / Claude 字段对照
 
 | 语义 | ChatGPT | Claude | Genesis |
 |------|---------|--------|---------|
@@ -150,7 +225,24 @@ StartRunRequest
 | 图片 | `image_asset_pointer` | `files[]` | `attachments[role=image]` → ContentPart |
 | 文档清单 | `metadata.attachments` | `attachments[]` | `attachments[role=document]` |
 | 文档正文 | （服务端另路） | `extracted_content` | 可选 `extracted_text` +/或工具读 path |
-| 不透明指针 | `sediment://file_...` | file UUID / 沙箱 path | `InputRef` / `ImageRef` |
+| 不透明指针 | `sediment://file_...` | file UUID / 沙箱 path | `InputRef` / `ImageRef`（§4.2） |
+
+### 4.5 显式附件：系统分流 vs 模型选工具
+
+**规则（一句话）**：附件类型决定入口通道（系统确定性分流）；任务深度决定是否再调工具（模型探索）。
+
+| role | 系统在首次 LLM 前必须做的 | 留给模型 / Skill 的 |
+|------|---------------------------|---------------------|
+| `image`（E1） | staging + ImageRef；形态 A 注入 Parts / 形态 B 调 VisionExpert | 通常无需再 `view_image`；工作区另图仍可按需 view |
+| `document`（E1） | staging + `workspace_alias`；按 Profile **可选**轻量 `extracted_text`（有预算） | 深读、分页、编辑、QA、结构化表 → `read_file` / markitdown / Skill |
+| `other` | 仅 staging + 清单提示 | 解压、专用工具；禁止伪造成 image/text part |
+
+禁止：
+
+- 把 docx/pdf 当 image part。  
+- 在首轮无预算地全量解析大文档（堵 TTFB、爆上下文）。  
+- 要求用户先调「解析接口」再开对话（见 §7.1）。  
+- 在跨端协议或 Message 持久化中携带附件原文件 bytes / 大 base64（见 §4.2）。
 
 ---
 
@@ -177,12 +269,19 @@ StartRunRequest
 
 ### 5.3 Enterprise
 
-multipart / 对象存储上传 → file id → staging → 同一契约；租户隔离与审计挂在 Descriptor.id 上。
+```text
+multipart / 对象存储上传
+  → 返回 file id（§4.2 步骤 1–2）
+  → StartRun.attachments 只带 id + 元数据（步骤 3）
+  → 控制面 staging / InputRef 绑定租户与审计
+```
+
+禁止把上传响应里的临时下载 URL 或宿主路径当作跨 Run 永久真相；租户隔离与审计挂在 `Descriptor.id` / `InputRef` 上。
 
 ### 5.4 与 SSE / HTTP 的关系
 
-- **输入**：`POST StartRun`（或等价）Body 携带 `TurnInput`；因此不能用仅 GET 的原生 `EventSource`（SSE 文档已说明原因）。
-- **输出**：仍只遵循 SSE 事件规范；本文不扩展 `block.*`。
+- **输入**：`POST StartRun`（或等价）Body 携带 `TurnInput`（仅标识与元数据）；因此不能用仅 GET 的原生 `EventSource`（SSE 文档已说明原因）。大文件必须先走上传换 id（§4.2），不要塞进 SSE。
+- **输出**：仍只遵循 SSE 事件规范；本文不扩展 `block.*`；SSE **不**回传附件原文件。
 
 ---
 
@@ -243,19 +342,59 @@ User: 描述下111.png的内容
 
 ---
 
-## 7. 装配流水线（与多模态文档衔接）
+## 7. 装配流水线与轻量抽取时序
+
+### 7.1 客户端一次请求 ≠ 后端零预处理
+
+用户侧始终是**一次**进入对话（CLI 一次 run / Enterprise 一次 `POST StartRun`）。  
+若开启文档轻量抽取，抽取发生在**同一次 Run 内部、第一次 LLM Generate 之前**，是同步装配步骤，**不是**第二次用户对话请求。
+
+```text
+【客户端】文本 + 附件（或已上传 file id）
+        │  一次 StartRun / run
+        ▼
+【后端同 Run】
+  1. 校验 MIME / size / role
+  2. staging → InputRef + workspace_alias
+  3. role=image（E1）：准备 ImageRef（形态 A Parts / 形态 B 预跑 Expert）
+  4. role=document（E1）且 Profile 允许预抽：
+       Extractor.Extract(path) → extracted_text（截断到预算，失败则降级为仅 path 提示）
+  5. BuildUserTurnMessage → 写入 Messages
+  6. Per-Request ImageSanitizer(targetModel)
+  7. 第一次 LLM Generate / Stream  → 之后才是工具 Loop
+```
+
+易混淆点：
+
+| 现象 | 解释 |
+|------|------|
+| 内部「先抽再调模型」 | 同 Run 顺序两步，延迟叠在首包 TTFB |
+| Enterprise 先 upload 再 StartRun | upload 只换 file id；抽取仍挂在 StartRun，不是第二轮聊天 |
+| Codex/Kode 文档无预抽 | 步骤 4 跳过；首轮只有路径/提醒，正文靠工具（§2.4） |
+
+Extractor 约束：快、有预算、可失败降级；OCR / 整本 PDF / OOXML 全量等重活**不得**默认同步堵死首轮，应留给工具或异步任务。
+
+### 7.2 文档预抽 Profile（对齐哪条锚点）
+
+| `document_extract`（建议名） | 行为 | 对齐 |
+|------------------------------|------|------|
+| `preview`（Enterprise 默认推荐） | E1 文档同步抽预算内文本进本轮 user 上下文 + 保留 path | Claude `extracted_content` |
+| `path_only`（CLI Coding 默认推荐） | E1 文档只 staging + 路径/清单提示，不预抽正文 | Codex / Kode-CLI |
+| `off` | 与 path_only 同（显式关闭） | — |
+
+图片通道**不受**此开关影响：E1 图片始终按视觉形态首轮处理（对齐 Codex）。
+
+当前实现：明文 txt/md/csv 可预填 `ExtractedText`；docx/pdf 完整 Extractor 仍为后续项。落地 Extractor 时必须尊重本开关与 `MaxExtractedTextBytes` 预算。
+
+### 7.3 与多模态 / 产物图的边界
 
 ```text
 TurnInput
-  → 校验 MIME / size / role
-  → staging → InputRef + workspace_alias
-  → 文档：可选 Extractor → extracted_text（截断）写入 user 文本块或独立 context 段
-  → 图片（仅 E1 或 auto_attach）：ContentPart(ImageRef) 追加到本轮 user message
-  → Per-Request ImageSanitizer(targetModel)
+  → §7.1 装配
   → Provider Adapter
 ```
 
-工具侧产生的图（如 office-ppt QA）**不**走本 Turn 的用户 attachments，仍走 `view_image` + leased ProducedResource（见多模态设计）。
+工具侧产生的图（如 office-ppt QA thumbnail）**不**走本 Turn 的用户 attachments，仍走 `view_image` + leased ProducedResource（见多模态设计）。
 
 ---
 
@@ -277,7 +416,7 @@ TurnInput
 1. **契约类型**：`AttachmentDescriptor` + `StartRunRequest.Attachments`；文档与代码字段对齐。  
 2. **Enterprise 上传 → staging → TurnInput**（Web 路径最完整，对齐 ChatGPT/Claude）。  
 3. **CLI `--attach` + TUI `@path`**；默认 `mention_resolve=off` 或 `hint`。  
-4. **DocumentExtractor**（docx/pdf 等）与 `extracted_text` 预算。  
+4. **DocumentExtractor**（docx/pdf 等）与 `extracted_text` 预算；落地 `document_extract` Profile（§7.2）。  
 5. **Desktop** 拖拽/选择对齐同一适配器接口。  
 6. （可选）`mention_resolve=auto_attach` 产品开关。
 
@@ -285,11 +424,14 @@ TurnInput
 
 ## 10. 验收标准
 
-1. 同轮「文本 + 图 + docx」：图进视觉 Parts（或形态 B 专家结论），docx **从不**进 image part；可有抽取文本或 staged path。  
-2. 持久化与跨端 Body **无**原始 image bytes / 大 base64。  
-3. CLI `@a.png` 与 Enterprise 上传同一 `role=image` 语义。  
+1. 同轮「文本 + 图 + docx」：图进视觉 Parts（或形态 B 专家结论），docx **从不**进 image part；至少有 staged path，预抽与否服从 §7.2。  
+2. 持久化与跨端 Body **无**原始 image bytes / 大 base64；符合 §4.2「标识优先」。  
+3. CLI `@a.png` 与 Enterprise 上传同一 `role=image` 语义；Enterprise 路径为「先上传得 id，再 StartRun」。  
 4. 用户仅说「描述下 111.png 的内容」且未附件：默认**不**首轮注入像素；通过 `view_image`（或 hint 后 view）完成。  
-5. SSE 文档无需承载输入 schema；`StartRun` POST Body 能完整携带 `TurnInput`。
+5. SSE 文档无需承载输入 schema；`StartRun` POST Body 能完整携带 `TurnInput`（仅标识）。  
+6. 文档预抽若开启：发生在同一次 StartRun 内、首次 LLM 前；客户端无「先解析再对话」的第二次请求。  
+7. `document_extract=path_only` 时行为对齐 Codex/Kode：E1 文档不预抽正文。  
+8. Provider outbound 可读字节；该字节不得回写 Message Store / SSE 业务载荷。
 
 ---
 
@@ -302,3 +444,21 @@ TurnInput
 | 统一执行工作空间… | InputRef、staging、禁止宿主绝对路径 |
 | SSE 与重试策略 | **仅输出流**；可链接本文作为输入契约 |
 | agent loop 设计 | `StartRunRequest` 总览字段 |
+
+---
+
+## 12. 实现状态（2026-07-19）
+
+| 项 | 状态 |
+|----|------|
+| `AttachmentDescriptor` + `StartRunRequest.Attachments` + `app.RunRequest.Attachments` | 已落地 |
+| MIME 分流 + `BuildUserTurnMessage`（含 expert_route 不注入图） | 已落地 |
+| CLI `--attach` + TUI `@path` | 已落地 |
+| 文本点名默认不注入（E2） | 已落地（靠 `view_image`；默认 `mention_resolve=off`） |
+| §4.2 标识优先 | 已落地：`POST /files` 白名单（文档/图/音视频/压缩包）；**发消息/StartRun 仅图片**可带 `content_base64`（入站 staging 后清空） |
+| `mention_resolve=hint/auto_attach` | 已落地（`Profile.TurnInput.MentionResolve`；默认 off；单测覆盖） |
+| `document_extract` Profile（preview / path_only） | 已落地（`Profile.TurnInput.DocumentExtract`；Enterprise=preview，CLI/Desktop=path_only） |
+| docx/pdf Extractor | 已落地（OOXML `document.xml` + PDF 文本层；失败降级 path） |
+| Desktop 最小附件交互 | 已落地：`genesis-desktop run --attach`（Wails UI 仍待） |
+| Enterprise Web 最小上传 | 已落地：agent-demo/qa Live API（选文件→`/v1/files`→Run attachments） |
+| Codex / Kode 对照与同 Run 抽取时序 | **已写入** §2.4 / §4.5 / §7 |

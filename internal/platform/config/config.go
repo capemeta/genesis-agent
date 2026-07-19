@@ -254,6 +254,7 @@ type LLMModelConfig struct {
 	ToolChoice            string         `mapstructure:"tool_choice"`
 	ResponseFormat        string         `mapstructure:"response_format"`
 	SupportsTools         *bool          `mapstructure:"supports_tools"`
+	SupportsImage         *bool          `mapstructure:"supports_image"` // 未写默认 false（fail-safe）
 	Tags                  []string       `mapstructure:"tags"`
 	Metadata              map[string]any `mapstructure:"metadata"`
 	ContextWindow         int            `mapstructure:"context_window"`          // 新增：上下文总窗口数
@@ -283,11 +284,20 @@ type ResolvedLLMConfig struct {
 	ToolChoice            string
 	ResponseFormat        string
 	SupportsTools         *bool
+	SupportsImage         *bool // nil 或未配置时视为 false
 	Tags                  []string
 	Metadata              map[string]any
 	ContextWindow         int      // 新增：解析后的窗口限制
 	EffectiveContextRatio *float64 // 新增：解析后的有效比例
 	OutputReserveTokens   int      // 新增：解析后的输出预留
+}
+
+// ImageSupported 返回该模型是否允许携带 image input（未配置视为 false）。
+func (r *ResolvedLLMConfig) ImageSupported() bool {
+	if r == nil || r.SupportsImage == nil {
+		return false
+	}
+	return *r.SupportsImage
 }
 
 // HTTPClientConfig HTTP 请求工具默认配置。
@@ -404,6 +414,12 @@ type AgentConfig struct {
 	MaxIdenticalToolFailures *int   `mapstructure:"max_identical_tool_failures"`
 	MaxStagnantIterations    *int   `mapstructure:"max_stagnant_iterations"`
 	SystemPrompt             string `mapstructure:"system_prompt"`
+	// ToolMaxConcurrency 同轮 sibling 工具最大并发（仅 ConcurrencySafe=true）；<=0 表示用调度器默认 4。
+	ToolMaxConcurrency int `mapstructure:"tool_max_concurrency"`
+	// SubAgentMaxConcurrent 根会话子智能体并发槽；<=0 表示用产品 bootstrap 默认（CLI/Enterprise 3，Desktop 4）。
+	SubAgentMaxConcurrent int `mapstructure:"subagent_max_concurrent"`
+	// VisionMaxConcurrentReads 视觉读图并发；<=0 表示用 visionio 默认 3。
+	VisionMaxConcurrentReads int `mapstructure:"vision_max_concurrent_reads"`
 }
 
 // LogConfig 日志配置（agent/audit/usage 三类通道）。
@@ -454,31 +470,6 @@ type ServerConfig struct {
 	Port int    `mapstructure:"port"`
 }
 
-const defaultConfigTemplate = `# Genesis Agent CLI 用户配置
-# 由 Genesis CLI 自动生成。仅取消注释需要覆盖仓库默认值的配置。
-
-# web:
-#   brave_api_key: ""
-
-# sandbox:
-#   mode: local_host
-
-# llm:
-#   providers:
-#     qwen:
-#       auth:
-#         api_key: "" # 也可设置 AGENT_LLM_PROVIDERS_QWEN_AUTH_API_KEY。
-
-skills:
-  # Extra local skill roots scanned by CLI.
-  # Project default .genesis/skills and user default ~/.genesis-agent/cli/skills
-  # are added automatically; configure additional roots here when needed.
-  sources: []
-  install:
-    allowed_hosts:
-      - github.com
-`
-
 // Load 加载 CLI 配置，保留旧调用点兼容。
 func Load(configDir string) (*Config, error) {
 	return LoadForProduct(configDir, "cli")
@@ -491,9 +482,8 @@ func LoadForProduct(configDir string, product string) (*Config, error) {
 
 // LoadOptions 描述配置加载选项。ConfigHome 主要用于测试或产品自定义用户目录。
 type LoadOptions struct {
-	Product          string
-	ConfigHome       string
-	EnsureUserConfig bool
+	Product    string
+	ConfigHome string
 }
 
 // LoadWithOptions 按用户级、项目共享、项目本地和 AGENT_ 环境变量的优先级加载配置。
@@ -518,11 +508,6 @@ func LoadWithOptions(configDir string, opts LoadOptions) (*Config, error) {
 
 	userPath, hasUserPath := userConfigPath(opts, product)
 	if hasUserPath {
-		if opts.EnsureUserConfig || !hasBaseConfig {
-			if err := ensureProductUserConfig(userPath); err != nil {
-				return nil, err
-			}
-		}
 		if _, err := mergeYAMLConfigFile(settings, userPath, false, overrideConfigSections); err != nil {
 			return nil, err
 		}
@@ -533,9 +518,12 @@ func LoadWithOptions(configDir string, opts LoadOptions) (*Config, error) {
 		return nil, err
 	}
 
-	if !hasBaseConfig && hasUserPath {
+	if !hasBaseConfig {
+		if !hasUserPath {
+			return nil, fmt.Errorf("读取 config.yaml 失败: 缺少项目配置且无法定位用户配置路径")
+		}
 		if _, err := os.Stat(userPath); os.IsNotExist(err) {
-			return nil, fmt.Errorf("读取 config.yaml 失败: base config not found and user config not generated")
+			return nil, fmt.Errorf("读取 config.yaml 失败: 缺少项目配置，且用户配置不存在: %s", userPath)
 		}
 	}
 
@@ -684,24 +672,6 @@ func cloneConfigMap(source map[string]any) map[string]any {
 	return cloned
 }
 
-func ensureProductUserConfig(configPath string) error {
-	configPath = filepath.Clean(configPath)
-	configDir := filepath.Dir(configPath)
-	if err := os.MkdirAll(configDir, 0755); err != nil {
-		return fmt.Errorf("创建用户配置目录失败: %w", err)
-	}
-	if _, err := os.Stat(configPath); os.IsNotExist(err) {
-		if err := os.WriteFile(configPath, []byte(defaultConfigTemplate), 0600); err != nil {
-			return fmt.Errorf("创建用户默认配置文件失败: %w", err)
-		}
-	} else if err != nil {
-		return fmt.Errorf("检查用户配置文件失败: %w", err)
-	}
-	if err := os.MkdirAll(filepath.Join(configDir, "skills"), 0755); err != nil {
-		return fmt.Errorf("创建用户 skills 目录失败: %w", err)
-	}
-	return nil
-}
 func userConfigPath(opts LoadOptions, product string) (string, bool) {
 	root := strings.TrimSpace(opts.ConfigHome)
 	if root == "" {
@@ -864,6 +834,7 @@ func (c LLMConfig) ResolveModel(alias string) (*ResolvedLLMConfig, error) {
 		ToolChoice:            model.ToolChoice,
 		ResponseFormat:        model.ResponseFormat,
 		SupportsTools:         model.SupportsTools,
+		SupportsImage:         model.SupportsImage,
 		Tags:                  model.Tags,
 		Metadata:              model.Metadata,
 		ContextWindow:         contextWindow,

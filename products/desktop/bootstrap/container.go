@@ -22,12 +22,18 @@ import (
 	capservice "genesis-agent/internal/capabilities/capability/service"
 	execmodel "genesis-agent/internal/capabilities/execution/model"
 	execservice "genesis-agent/internal/capabilities/execution/service"
+	"genesis-agent/internal/capabilities/filesystem/freshness"
+	fspermission "genesis-agent/internal/capabilities/filesystem/permission"
+	"genesis-agent/internal/capabilities/filesystem/tool/toolkit"
+	viewimage "genesis-agent/internal/capabilities/media/tool/view_image"
 	mcpstore "genesis-agent/internal/capabilities/mcp/adapter/store"
 	"genesis-agent/internal/capabilities/mcp/contract"
 	mcpstack "genesis-agent/internal/capabilities/mcp/stack"
 	policyapproval "genesis-agent/internal/capabilities/policy/adapter/approval"
 	policyconfig "genesis-agent/internal/capabilities/policy/adapter/config"
 	profilemodel "genesis-agent/internal/capabilities/profile/model"
+	toolcontract "genesis-agent/internal/capabilities/tool/contract"
+	"genesis-agent/internal/capabilities/tool/scheduler"
 	toolvalidation "genesis-agent/internal/capabilities/tool/validation"
 	workservice "genesis-agent/internal/capabilities/workspace/service"
 	platformconfig "genesis-agent/internal/platform/config"
@@ -41,6 +47,8 @@ import (
 	localartifactcontrol "genesis-agent/shared/local/artifactcontrol"
 	localcollab "genesis-agent/shared/local/collab"
 	localexec "genesis-agent/shared/local/execution"
+	localfs "genesis-agent/shared/local/filesystem"
+	localresolver "genesis-agent/shared/local/pathresolver"
 	"genesis-agent/shared/local/skillmarket"
 	localworkspace "genesis-agent/shared/local/workspace"
 )
@@ -70,8 +78,7 @@ func NewContainer(configDir string, quiet bool) *Container {
 func (c *Container) Init(ctx context.Context) error {
 	c.once.Do(func() {
 		cfg, err := platformconfig.LoadWithOptions(c.configDir, platformconfig.LoadOptions{
-			Product:          "desktop",
-			EnsureUserConfig: true,
+			Product: "desktop",
 		})
 		if err != nil {
 			c.initErr = fmt.Errorf("加载 Desktop 配置失败: %w", err)
@@ -132,7 +139,7 @@ func (c *Container) Init(ctx context.Context) error {
 			ExternalApproval: true,
 		})
 
-		runWorkspace, err := buildDesktopRunWorkspace()
+		runWorkspace, artifactControl, err := buildDesktopRunWorkspace()
 		if err != nil {
 			_ = runtimeLogging.Close()
 			c.logging = nil
@@ -151,6 +158,15 @@ func (c *Container) Init(ctx context.Context) error {
 			c.initErr = fmt.Errorf("初始化 Desktop 协作模式存储失败: %w", err)
 			return
 		}
+		var extraTools []toolcontract.Tool
+		if viewTool, viewErr := buildDesktopViewImage(workspaceRoot, approvalSvc, artifactControl); viewErr != nil {
+			_ = runtimeLogging.Close()
+			c.logging = nil
+			c.initErr = fmt.Errorf("初始化 view_image 失败: %w", viewErr)
+			return
+		} else if viewTool != nil {
+			extraTools = append(extraTools, viewTool)
+		}
 		c.bundle, c.initErr = shared.BuildAgentService(ctx, shared.BuildOptions{
 			Product:                        "desktop",
 			ConfigDir:                      c.configDir,
@@ -160,6 +176,7 @@ func (c *Container) Init(ctx context.Context) error {
 			DefaultAgentName:               "Genesis Desktop Agent",
 			Profile:                        prof,
 			RunWorkspace:                   runWorkspace,
+			AdditionalTools:                extraTools,
 			PromptInjectors:                []promptbuilder.ContextInjector{environmentInjector},
 			Logger:                         runtimeLogging.AgentLogger,
 			AuditSink:                      auditSink,
@@ -320,42 +337,72 @@ func (desktopAskApprover) RequestApproval(ctx context.Context, req approvalmodel
 	}
 }
 
-func buildDesktopRunWorkspace() (app.RunWorkspaceRuntime, error) {
+func buildDesktopRunWorkspace() (app.RunWorkspaceRuntime, localartifactcontrol.Control, error) {
 	stateRoot, inbox, err := desktopStorageRoots()
 	if err != nil {
-		return app.RunWorkspaceRuntime{}, err
+		return app.RunWorkspaceRuntime{}, localartifactcontrol.Control{}, err
 	}
 	artifactControl, err := localartifactcontrol.Build(localartifactcontrol.Options{
 		StateRoot:             stateRoot,
 		DeliveryWorkspaceRoot: inbox,
 	})
 	if err != nil {
-		return app.RunWorkspaceRuntime{}, fmt.Errorf("装配 Desktop Artifact 控制面失败: %w", err)
+		return app.RunWorkspaceRuntime{}, localartifactcontrol.Control{}, fmt.Errorf("装配 Desktop Artifact 控制面失败: %w", err)
 	}
 	manifests, err := localworkspace.NewManifestStore(stateRoot)
 	if err != nil {
-		return app.RunWorkspaceRuntime{}, err
+		return app.RunWorkspaceRuntime{}, localartifactcontrol.Control{}, err
 	}
 	ids := idgen.NewUUIDGenerator()
 	resolver, err := workservice.NewWorkspaceResolver(ids)
 	if err != nil {
-		return app.RunWorkspaceRuntime{}, err
+		return app.RunWorkspaceRuntime{}, localartifactcontrol.Control{}, err
 	}
 	preparer, err := workservice.NewRunPreparer(workservice.RunPreparerDeps{IDs: ids, Resolver: resolver, StateRoots: localworkspace.StateRootResolver{UserStateDir: stateRoot}, Provisioner: localworkspace.NewProvisioner(), Manifests: manifests})
 	if err != nil {
-		return app.RunWorkspaceRuntime{}, err
+		return app.RunWorkspaceRuntime{}, localartifactcontrol.Control{}, err
 	}
 	modes := []execmodel.WorkspaceMode{execmodel.WorkspaceModeTask, execmodel.WorkspaceModeSession}
 	appProfile := agentappmodel.EffectiveProfile{ID: "code", Version: "1", Workspace: agentappmodel.WorkspaceSpec{DefaultMode: execmodel.WorkspaceModeTask, AllowedModes: modes, DefaultAccess: execmodel.WorkspaceAccessReadWrite}}
 	appResolver, err := agentappmemory.NewResolver(appProfile.ID, []agentappmodel.EffectiveProfile{appProfile})
 	if err != nil {
-		return app.RunWorkspaceRuntime{}, err
+		return app.RunWorkspaceRuntime{}, localartifactcontrol.Control{}, err
 	}
 	return app.RunWorkspaceRuntime{
 		Preparer: preparer, AgentApps: appResolver, IntentResolver: workservice.NewTaskIntentResolver(),
 		ProductModes: modes, BackendModes: modes, MaximumAccess: execmodel.WorkspaceAccessReadWrite,
 		ArtifactRuns: artifactControl.Initializer, Completion: artifactControl.Completion, QAEvidence: artifactControl.QAEvidence,
-	}, nil
+	}, artifactControl, nil
+}
+
+func buildDesktopViewImage(workspaceRoot string, baseApproval approvalcontract.Service, control localartifactcontrol.Control) (toolcontract.Tool, error) {
+	if strings.TrimSpace(workspaceRoot) == "" {
+		workspaceRoot = "."
+	}
+	resolver, err := localresolver.New(workspaceRoot)
+	if err != nil {
+		return nil, err
+	}
+	filePerms, err := fspermission.NewRuntimeFilePermissionsWithProjectStore(context.Background(), workspaceRoot)
+	if err != nil {
+		return nil, fmt.Errorf("初始化文件运行时授权失败: %w", err)
+	}
+	approvalSvc := fspermission.NewApprovalService(baseApproval, filePerms)
+	deps := toolkit.Deps{
+		Resolver: resolver, Backend: localfs.New(), Approval: approvalSvc,
+		Freshness: freshness.NewMemoryTracker(), Locker: scheduler.NewMemoryResourceLocker(),
+	}
+	t, err := viewimage.New(deps)
+	if err != nil {
+		return nil, err
+	}
+	if control.ProducedStore != nil {
+		t = viewimage.WithProducedStore(t, control.ProducedStore)
+	}
+	if control.Readers != nil {
+		t = viewimage.WithReaders(t, control.Readers)
+	}
+	return t, nil
 }
 
 func desktopStorageRoots() (stateRoot, inbox string, err error) {

@@ -25,6 +25,9 @@ type BuildRequest struct {
 	TurnID         string
 	Context        map[string]string
 	AvailableTools []string
+	// VisionMode 是本 Run 的 EffectiveVisionMode（direct_inject / expert_route / degraded_text）。
+	// 空值时不注入形态特定文案；有 view_image 工具时仍注入通用看图纪律。
+	VisionMode string
 	// Audience 为空时按 AudienceRoot 处理。
 	Audience Audience
 	// DelegationPosture 控制 Task 可用时的委派纪律文案（proactive / explicit_request_only）。

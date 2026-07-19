@@ -40,13 +40,13 @@ func (r *TerminalRequester) RequestApproval(ctx context.Context, req model.Reque
 		}, nil
 	}
 
-	allowSession := supportsScope(result, req, model.GrantScopeSession)
+	choices := BuildChoices(req, result)
 	r.printRequest(req, result)
 	for {
 		if err := ctx.Err(); err != nil {
 			return model.Decision{}, err
 		}
-		r.printPrompt(allowSession)
+		fmt.Fprint(r.out, FormatPrompt(choices))
 		line, err := r.in.ReadString('\n')
 		if err != nil && !(errors.Is(err, io.EOF) && strings.TrimSpace(line) != "") {
 			if errors.Is(err, io.EOF) {
@@ -59,19 +59,10 @@ func (r *TerminalRequester) RequestApproval(ctx context.Context, req model.Reque
 			return model.Decision{}, fmt.Errorf("读取审批输入失败: %w", err)
 		}
 
-		switch strings.ToLower(strings.TrimSpace(line)) {
-		case "o", "once":
-			return model.Decision{Type: model.DecisionApproved, Scope: model.GrantScopeOnce, Reason: "用户允许本次操作"}, nil
-		case "s", "session":
-			if allowSession {
-				return model.Decision{Type: model.DecisionApprovedForScope, Scope: model.GrantScopeSession, Reason: "用户允许当前会话"}, nil
-			}
-		case "n", "no", "deny":
-			return model.Decision{Type: model.DecisionDenied, Scope: model.GrantScopeOnce, Reason: "用户拒绝操作"}, nil
-		case "a", "abort":
-			return model.Decision{Type: model.DecisionAbort, Scope: model.GrantScopeOnce, Reason: "用户中断任务"}, nil
+		if choice, ok := MatchChoice(choices, line); ok {
+			return choice.Decision, nil
 		}
-		r.printInvalidInput(allowSession)
+		fmt.Fprintln(r.out, "输入无效，请按提示重新选择。")
 	}
 }
 
@@ -101,22 +92,6 @@ func (r *TerminalRequester) printRequest(req model.Request, result model.PolicyR
 		fmt.Fprintf(r.out, "  原因: %s\n", reason)
 	}
 	fmt.Fprintln(r.out)
-}
-
-func (r *TerminalRequester) printPrompt(allowSession bool) {
-	if allowSession {
-		fmt.Fprint(r.out, "请选择 [o]允许本次 / [s]允许本会话 / [n]拒绝 / [a]中断: ")
-		return
-	}
-	fmt.Fprint(r.out, "请选择 [o]允许本次 / [n]拒绝 / [a]中断: ")
-}
-
-func (r *TerminalRequester) printInvalidInput(allowSession bool) {
-	if allowSession {
-		fmt.Fprintln(r.out, "输入无效，请输入 o、s、n 或 a。")
-		return
-	}
-	fmt.Fprintln(r.out, "输入无效，请输入 o、n 或 a。")
 }
 
 func supportsScope(result model.PolicyResult, req model.Request, scope model.GrantScope) bool {

@@ -118,6 +118,11 @@ agent:
   # max_stagnant_iterations: 5       # 连续无进展达阈值触发 no_progress；0=关闭 L2
   # max_consecutive_fail: 0          # 任意工具连续失败上限；0=关闭
 
+  # 并发上限（省略则用代码/产品默认；取消注释即可覆盖）
+  # tool_max_concurrency: 4           # 同轮 sibling 工具并发（ConcurrencySafe=true）；默认 4
+  # subagent_max_concurrent: 3         # 根会话子智能体并发槽；默认 CLI/Enterprise=3、Desktop=4
+  # vision_max_concurrent_reads: 3     # 视觉读图并发；默认 3
+
   # Agent 系统提示词（可在 config.local.yaml 中覆盖为业务专属提示词）
   system_prompt: "你是一个有帮助、有能力的AI助手。善用提供的工具来准确回答用户的问题。回答时请简洁清晰，直接给出答案。"
 

@@ -43,6 +43,8 @@ func BuildTenantDependencies(opts Options) (enterprisebootstrap.Dependencies, er
 	return enterprisebootstrap.Dependencies{
 		RunManifests:      manifests,
 		ProducedResources: control.Produced,
+		ProducedStore:     control.ProducedStore,
+		ResourceReaders:   control.Readers,
 		RemoteSessions:    control.RemoteSessions,
 		Reservations:      control.Reservations,
 		Deliverables:      control.Deliverables,

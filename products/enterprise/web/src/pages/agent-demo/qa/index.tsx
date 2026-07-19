@@ -13,6 +13,7 @@ import {
   PlusOutlined,
   ClearOutlined,
   DeleteOutlined,
+  PaperClipOutlined,
 } from '@ant-design/icons';
 import { createStyles } from 'antd-style';
 import ThinkingProcess from './components/ThinkingProcess';
@@ -31,7 +32,7 @@ import {
   type ThoughtStep,
 } from './mockData';
 import type { ToolCallRecord } from './components/ToolCallBadge';
-
+import { API_BASE, runWithAttachments, uploadFile, type UploadedAttachment } from './attachLive';
 const { useToken } = theme;
 
 // ── 自定义消息类型 ────────────────────────────────────────────────────────────
@@ -122,6 +123,9 @@ export default function QAPage() {
   const [conversations, setConversations] = useState(mockConversations);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [loading, setLoading] = useState(false);
+  const [liveMode, setLiveMode] = useState(false);
+  const [pendingFiles, setPendingFiles] = useState<UploadedAttachment[]>([]);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const stopStreamRef = useRef<(() => void) | null>(null);
 
   /** 更新指定消息的部分字段 */
@@ -129,10 +133,52 @@ export default function QAPage() {
     setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, ...update } : m)));
   }, []);
 
+  const handlePickFiles = async (fileList: FileList | null) => {
+    if (!fileList?.length) return;
+    try {
+      const uploaded: UploadedAttachment[] = [];
+      for (const file of Array.from(fileList)) {
+        uploaded.push(await uploadFile(file));
+      }
+      setPendingFiles((prev) => [...prev, ...uploaded]);
+      message.success(`已上传 ${uploaded.length} 个文件（仅 id，无 StartRun base64）`);
+    } catch (e) {
+      message.error(e instanceof Error ? e.message : String(e));
+    }
+  };
+
   /** 发送消息 */
   const handleSend = useCallback(
     (text: string) => {
       if (!text.trim() || loading) return;
+
+      if (liveMode) {
+        const userMsg: ChatMessage = { id: `user-${Date.now()}`, role: 'user', content: text };
+        const assistantId = `ai-${Date.now() + 1}`;
+        setMessages((prev) => [
+          ...prev,
+          userMsg,
+          { id: assistantId, role: 'ai', content: '', streaming: true },
+        ]);
+        setLoading(true);
+        const atts = [...pendingFiles];
+        setPendingFiles([]);
+        void runWithAttachments(text, atts)
+          .then((res) => {
+            updateMessage(assistantId, {
+              content: res.answer || `(status=${res.status})`,
+              streaming: false,
+            });
+          })
+          .catch((e) => {
+            updateMessage(assistantId, {
+              content: `错误: ${e instanceof Error ? e.message : String(e)}`,
+              streaming: false,
+            });
+          })
+          .finally(() => setLoading(false));
+        return;
+      }
 
       const scenario = detectScenario(text);
       const userMsg: ChatMessage = { id: `user-${Date.now()}`, role: 'user', content: text };
@@ -259,7 +305,7 @@ export default function QAPage() {
         stopStreamRef.current = stop;
       }
     },
-    [loading, updateMessage],
+    [loading, updateMessage, liveMode, pendingFiles],
   );
 
   const handleStop = () => {
@@ -461,6 +507,38 @@ export default function QAPage() {
                 </Button>
               </div>
             )}
+            <div style={{ marginBottom: 8, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+              <Button
+                type={liveMode ? 'primary' : 'default'}
+                size="small"
+                onClick={() => setLiveMode((v) => !v)}
+              >
+                {liveMode ? 'Live API' : 'Mock'}
+              </Button>
+              <Button
+                size="small"
+                icon={<PaperClipOutlined />}
+                disabled={!liveMode || loading}
+                onClick={() => fileInputRef.current?.click()}
+              >
+                上传附件
+              </Button>
+              <input
+                ref={fileInputRef}
+                type="file"
+                multiple
+                style={{ display: 'none' }}
+                onChange={(e) => {
+                  void handlePickFiles(e.target.files);
+                  e.target.value = '';
+                }}
+              />
+              {pendingFiles.length > 0 && (
+                <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                  待发送: {pendingFiles.map((f) => f.name).join(', ')}
+                </Typography.Text>
+              )}
+            </div>
             <Sender
               placeholder="输入消息，按 Enter 发送…（Shift+Enter 换行）"
               loading={loading}
@@ -471,7 +549,9 @@ export default function QAPage() {
               type="secondary"
               style={{ fontSize: 11, marginTop: 8, display: 'block', textAlign: 'center' }}
             >
-              Genesis Agent 演示环境 · 数据为 Mock，仅供展示
+              {liveMode
+                ? `Live: ${API_BASE} — 选文件 → POST /v1/files → StartRun(attachments ids)`
+                : 'Genesis Agent 演示环境 · 默认 Mock；切换 Live API 可走真实上传'}
             </Typography.Text>
           </div>
         </div>

@@ -97,8 +97,9 @@ type RunRequest struct {
 	ProjectID       string        // 项目 ID（用于能力适用范围过滤）
 	UserID          string        // 用户 ID（隔离用户画像与长期记忆数据）
 	RoleIDs         []string      // 用户角色（用于能力适用范围过滤）
-	Input           string        // 用户输入内容
-	Agent           *domain.Agent // 可选：指定 Agent 配置；nil 时使用 DefaultAgent
+	Input           string                       // 用户输入内容
+	Attachments     []domain.AttachmentDescriptor // 本轮显式附件（TurnInput）；不含 bytes
+	Agent           *domain.Agent                 // 可选：指定 Agent 配置；nil 时使用 DefaultAgent
 	Sandbox         *execmodel.SandboxProfile
 	WorkspaceIntent workcontract.ExecutionIntent // 业务执行意图；模式由可信控制面解析
 	ParentRunID     string                       // 子 Run 显式关联父 Run，不继承父级可写 workspace

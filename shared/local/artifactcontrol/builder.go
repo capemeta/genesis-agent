@@ -42,6 +42,8 @@ type Options struct {
 // Control 是 CLI/Desktop 等产品复用的 Artifact 控制面组件集合。
 type Control struct {
 	Produced       workcontract.ProducedResourceRegistrar
+	ProducedStore  workcontract.ProducedResourceStore
+	Readers        workcontract.ResourceReaderRouter
 	RemoteSessions scriptservice.RemoteSessionBinder
 	Reservations   artifactcontract.OutputReservationAllocator
 	Deliverables   artifactcontract.DeliverableSpecStore
@@ -229,6 +231,8 @@ func Build(opts Options) (Control, error) {
 	}
 	return Control{
 		Produced:       registrar,
+		ProducedStore:  producedStore,
+		Readers:        readerRouter,
 		RemoteSessions: remoteSessions,
 		Reservations:   reservations,
 		Deliverables:   ledger,

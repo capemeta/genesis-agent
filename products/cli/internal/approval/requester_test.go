@@ -11,13 +11,17 @@ import (
 
 func TestTerminalRequesterDecisions(t *testing.T) {
 	tests := []struct {
-		name  string
-		in    string
-		want  model.DecisionType
-		scope model.GrantScope
+		name     string
+		in       string
+		want     model.DecisionType
+		scope    model.GrantScope
+		pathMode model.PathGrantMode
 	}{
-		{name: "allow once", in: "o\n", want: model.DecisionApproved, scope: model.GrantScopeOnce},
-		{name: "allow session", in: "s\n", want: model.DecisionApprovedForScope, scope: model.GrantScopeSession},
+		{name: "allow once", in: "y\n", want: model.DecisionApproved, scope: model.GrantScopeOnce},
+		{name: "allow session file", in: "s\n", want: model.DecisionApprovedForScope, scope: model.GrantScopeSession, pathMode: model.PathGrantExact},
+		{name: "allow session dir", in: "d\n", want: model.DecisionApprovedForScope, scope: model.GrantScopeSession, pathMode: model.PathGrantDirectory},
+		{name: "allow project file", in: "p\n", want: model.DecisionApprovedForScope, scope: model.GrantScopeProject, pathMode: model.PathGrantExact},
+		{name: "allow project dir", in: "f\n", want: model.DecisionApprovedForScope, scope: model.GrantScopeProject, pathMode: model.PathGrantDirectory},
 		{name: "deny", in: "n\n", want: model.DecisionDenied, scope: model.GrantScopeOnce},
 		{name: "abort", in: "a\n", want: model.DecisionAbort, scope: model.GrantScopeOnce},
 	}
@@ -31,8 +35,8 @@ func TestTerminalRequesterDecisions(t *testing.T) {
 			if err != nil {
 				t.Fatalf("RequestApproval() error = %v", err)
 			}
-			if got.Type != tt.want || got.Scope != tt.scope {
-				t.Fatalf("decision = (%s, %s), want (%s, %s)", got.Type, got.Scope, tt.want, tt.scope)
+			if got.Type != tt.want || got.Scope != tt.scope || got.PathMode != tt.pathMode {
+				t.Fatalf("decision = (%s, %s, %s), want (%s, %s, %s)", got.Type, got.Scope, got.PathMode, tt.want, tt.scope, tt.pathMode)
 			}
 		})
 	}
@@ -100,20 +104,34 @@ func TestTerminalRequesterDeniesOnEmptyEOF(t *testing.T) {
 
 func sampleRequest() model.Request {
 	return model.Request{
-		ToolName:        "read_file",
-		Action:          model.ActionFileRead,
-		Resource:        model.Resource{Type: "file", URI: "file:///tmp/a.txt", Display: "/tmp/a.txt"},
-		Reason:          "workspace 外路径需要确认",
-		Risk:            model.RiskHigh,
-		SuggestedScopes: []model.GrantScope{model.GrantScopeOnce, model.GrantScopeSession},
+		ToolName: "read_file",
+		Action:   model.ActionFileRead,
+		Resource: model.Resource{
+			Type:     "file",
+			URI:      "file:///tmp/dir/a.txt",
+			Display:  "/tmp/dir/a.txt",
+			Metadata: map[string]string{"backend": `/tmp/dir/a.txt`},
+		},
+		Reason:   "workspace 外路径需要确认",
+		Risk:     model.RiskHigh,
+		Metadata: map[string]string{"backend": `/tmp/dir/a.txt`},
+		SuggestedScopes: []model.GrantScope{
+			model.GrantScopeOnce,
+			model.GrantScopeSession,
+			model.GrantScopeProject,
+		},
 	}
 }
 
 func samplePolicy() model.PolicyResult {
 	return model.PolicyResult{
-		Type:            model.PolicyAsk,
-		Reason:          "workspace 外路径需要确认",
-		Risk:            model.RiskHigh,
-		SuggestedScopes: []model.GrantScope{model.GrantScopeOnce, model.GrantScopeSession},
+		Type:   model.PolicyAsk,
+		Reason: "workspace 外路径需要确认",
+		Risk:   model.RiskHigh,
+		SuggestedScopes: []model.GrantScope{
+			model.GrantScopeOnce,
+			model.GrantScopeSession,
+			model.GrantScopeProject,
+		},
 	}
 }

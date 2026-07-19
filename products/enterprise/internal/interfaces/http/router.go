@@ -35,6 +35,7 @@ func newRouterWithProjectionTenant(svc app.AgentService, mcp *mcpstack.Stack, pr
 	// GET  /v1/tools         获取已注册工具列表
 	mux.HandleFunc("POST /v1/runs", h.Run)
 	mux.HandleFunc("POST /v1/runs/stream", h.RunStream)
+	mux.HandleFunc("POST /v1/files", h.UploadFile)
 	mux.HandleFunc("GET /v1/tools", h.ListTools)
 	mux.HandleFunc("GET /v1/resources/{id}", h.GetResource)
 

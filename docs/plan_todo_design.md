@@ -294,12 +294,72 @@
 
 ---
 
-## 6. 三端存储与广播（摘要）
+## 6. 三端持久化存储、断点恢复与架构设计
 
-| 端 | 存储 | 广播 |
-| :--- | :--- | :--- |
-| CLI / Desktop | `shared/local/tasklist` 文件仓库 | `tasklist/adapter/progress` → `KindTaskList` |
-| Enterprise | Phase 2：多租户 DB（主快照与 revision 分离） | Phase 2：SSE/MQ |
+### 6.1 架构原则：废除消息依赖，拥抱 CQRS 领域状态实体
+
+1. **彻底废除消息历史存储依赖**：
+   - 任务清单是独立的**领域状态实体（State Entity）**，而非追加式的聊天日志（Append-only Message Log）。
+   - 彻底废除将 `MessageKindTaskListSnapshot` 存入 `ShortTermMemory` 的过渡方案。任务清单状态不再受会话消息截断（Message Compaction/Truncation）或上下文归档影响。
+2. **读写分离与契约化存储（CQRS）**：
+   - 状态修改由 `TaskListService` 校验，写操作持久化至 `contract.Repository` 接口（高一致性快照与 Revision 历史）。
+   - 状态变更通过 `contract.EventBroadcaster` 向接入端推送 `progress.KindTaskList` 领域事件。
+
+### 6.2 存储分层设计（CLI FileRepo vs Enterprise DBRepo）
+
+```text
+                             ┌──────────────────────────────────┐
+                             │    TaskListService (核心能力域)   │
+                             └──────────────────────────────────┘
+                                   │                      │
+                  ┌────────────────┴──────────────┐     ┌─┴────────────────────────────┐
+                  │ 1. 存储持久化 (Repository)     │     │ 2. 状态广播 (Broadcaster)     │
+                  └───────────────────────────────┘     └──────────────────────────────┘
+                       │                      │              │              │              │
+                       ▼                      ▼              ▼              ▼              ▼
+                 【CLI / Local】        【Enterprise】     【TUI】     【Desktop】    【Enterprise】
+                 本地 JSON/SQLite 文件    多租户关系 DB      Go Channel    Wails IPC       SSE / WS
+                 (.genesis/tasklist)   (PostgreSQL/MySQL) 刷屏渲染      前端 Panel      Web 实时更新
+```
+
+#### 1) CLI & Local Desktop: 本地文件存储 (`shared/local/tasklist`)
+- **实现**：`FileRepository`（实现 `contract.Repository` 接口）。
+- **存储路径**：写入工作区或宿主会话路径 `.genesis/sessions/{session_id}/tasklist.json`。
+- **并发与安全**：采用读写锁 + 临时文件原子替换（Atomic Write: `tempfile` + `rename`），保证异常中断时文件不损坏。进程重启后自动从磁盘 JSON 加载恢复。
+
+#### 2) Enterprise & Cloud Desktop: 多租户关系数据库存储 (`DBRepository`) [架构预留与 Phase 2 落地]
+- **架构设计**：`DBRepository` 同样实现 `contract.Repository` 接口，服务层 (`TaskListService`) 仅依赖 Port，实现与 DB ORM 细节解耦。
+- **存储 Schema 设计**：
+  - 快照表 `agent_task_lists`：`tenant_id`, `session_id`, `version`, `in_progress_step_id`, `payload` (JSONB / TEXT), `updated_at`。
+  - 变更表 `agent_task_list_revisions`：`tenant_id`, `session_id`, `revision_id`, `operator`, `explanation`, `delta_payload`, `created_at`。
+- **隔离与索引**：查询必须强制带 `tenant_id` + `session_id` 联合索引，主快照与修订历史拆表，避免读长链历史阻塞快照获取。
+
+### 6.3 断点恢复（Session Load / Resume）与三端人机感知一致性
+
+当会话重启、重新打开页面或长任务恢复执行时，系统按以下流转保证 **UI 感知** 与 **AI 视界** 绝对同步：
+
+```text
+[ Session 加载 / 唤醒 / 重启 ]
+              │
+              ├─► ① UI 侧同步恢复（渲染层）
+              │     └─► 接入端调用 TaskListService.GetTaskList(ctx, sessionID)
+              │     └─► 从 Repository (File/DB) 读取最新快照
+              │     └─► TUI 刷出初始任务卡片 / Desktop & Web 右侧 Task Panel 恢复进度高亮
+              │
+              └─► ② AI (LLM) 侧双重恢复（模型上下文）
+                    └─► Agent 发起首轮对话 / 自动恢复执行
+                    └─► TaskListReminderSource 从 Repository 加载未完成步骤
+                    └─► 注入 user 前缀 `<system-reminder>`：
+                        "当前会话任务清单恢复：已完成 2/5 步，当前正在执行：[task_3] 补全单元测试，请基于该进度继续。"
+```
+
+### 6.4 三端接入与广播矩阵
+
+| 接入端 | 存储后端 (Repository) | 状态广播 (Broadcaster) | 断点恢复 UI 交互 |
+| :--- | :--- | :--- | :--- |
+| **CLI (TUI)** | `shared/local/tasklist/file_repo` (JSON 文件) | 内核 Event Bus (Go Channel) | TUI 主界面顶部/侧边高亮恢复的任务卡片 |
+| **Desktop** | 本地文件 / SQLite 存储 | Wails IPC / Electron Bridge | 右侧面板/侧边栏「任务清单」Tab 恢复进度条 |
+| **Enterprise Web** | 多租户关系 DB (PostgreSQL/MySQL) | SSE (Server-Sent Events) / WebSocket | Web 端「任务清单」面板按 WebSocket/SSE 状态同步 |
 
 沙箱：任务清单元数据在宿主机会话侧；不把宿主机绝对路径当业务路径展示。
 

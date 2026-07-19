@@ -37,9 +37,11 @@ const (
 type QAEvidenceStatus string
 
 const (
-	QAEvidencePending QAEvidenceStatus = "pending"
-	QAEvidencePassed  QAEvidenceStatus = "passed"
-	QAEvidenceFailed  QAEvidenceStatus = "failed"
+	QAEvidencePending  QAEvidenceStatus = "pending"
+	QAEvidencePassed   QAEvidenceStatus = "passed"
+	QAEvidenceFailed   QAEvidenceStatus = "failed"
+	QAEvidenceDegraded QAEvidenceStatus = "degraded"
+	QAEvidenceSkipped  QAEvidenceStatus = "skipped"
 )
 
 type DeliverableResolution struct {
@@ -184,10 +186,11 @@ func (v QAEvidenceRecord) Validate() error {
 	if missing(v.ID, v.TenantID, v.RunID, v.DeliverableID, v.ProducedResourceID, v.SubjectVersion, v.SubjectSHA256, v.PolicyID, v.Validator, v.ValidatorVersion) || v.CreatedAt.IsZero() {
 		return fmt.Errorf("qa evidence 信息不完整")
 	}
-	if v.Status != QAEvidencePending && v.Status != QAEvidencePassed && v.Status != QAEvidenceFailed {
+	if v.Status != QAEvidencePending && v.Status != QAEvidencePassed && v.Status != QAEvidenceFailed &&
+		v.Status != QAEvidenceDegraded && v.Status != QAEvidenceSkipped {
 		return fmt.Errorf("qa evidence status 无效")
 	}
-	if v.Status == QAEvidenceFailed && strings.TrimSpace(v.FailureCode) == "" {
+	if (v.Status == QAEvidenceFailed || v.Status == QAEvidenceDegraded) && strings.TrimSpace(v.FailureCode) == "" {
 		return fmt.Errorf("失败 evidence 缺少 failure code")
 	}
 	return validateStringSet("evidence resource id", v.EvidenceResourceIDs)

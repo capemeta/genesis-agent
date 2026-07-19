@@ -67,8 +67,12 @@ func BuildApprovalRequest(toolName string, op Operation, path model.ResolvedPath
 		},
 		Reason:          reasonOf(op, path),
 		Risk:            risk,
-		SuggestedScopes: []approvalmodel.GrantScope{approvalmodel.GrantScopeOnce, approvalmodel.GrantScopeSession},
-		Metadata:        metadata,
+		SuggestedScopes: []approvalmodel.GrantScope{
+			approvalmodel.GrantScopeOnce,
+			approvalmodel.GrantScopeSession,
+			approvalmodel.GrantScopeProject,
+		},
+		Metadata: metadata,
 	}
 }
 

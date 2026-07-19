@@ -127,6 +127,16 @@ type QAPassRequest struct {
 	Validator string
 }
 
+type QADegradeRequest struct {
+	TenantID    string
+	RunID       string
+	PolicyID    string
+	Validator   string
+	FailureCode string
+	Status      string // degraded | skipped；空则 degraded
+}
+
 type QAEvidenceRecorder interface {
 	RecordPassed(context.Context, QAPassRequest) error
+	RecordDegraded(context.Context, QADegradeRequest) error
 }

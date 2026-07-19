@@ -1,0 +1,34 @@
+# Genesis Agent 项目级文件授权样例
+# 实际运行路径：<workspace>/.genesis/grants.yaml（已 gitignore，勿提交含本机绝对路径的生产文件）
+#
+# 语义：
+# - 仅持久化 scope=project 的文件授权
+# - path 为授权根：文件精确路径，或目录路径（含子树，等价于审批时选「本文件夹」）
+# - action 与审批动作一致，读写分离（file.read 不覆盖 file.write）
+# - 启动时加载；审批选择「本项目·本文件/本文件夹」后自动合并写回
+
+version: 1
+grants:
+  # 精确授权：仅允许读取该文件
+  - action: file.read
+    path: "D:/shared/specs/api-contract.md"
+    scope: project
+
+  # 目录授权：允许读取该目录及子路径（审批选「本项目·本文件夹」时写入父目录）
+  - action: file.read
+    path: "D:/shared/datasets/demo"
+    scope: project
+
+  # 列表/遍历目录（list_dir / walk_dir）
+  - action: file.list
+    path: "D:/shared/datasets/demo"
+    scope: project
+
+  # 写授权应更谨慎：通常只授单文件，或明确信任的输出目录
+  - action: file.write
+    path: "D:/tmp/genesis-agent-out"
+    scope: project
+
+  - action: file.edit
+    path: "D:/tmp/genesis-agent-out/notes.md"
+    scope: project

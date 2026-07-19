@@ -34,9 +34,14 @@ func DefaultProfile(mcpEnabled bool) profilemodel.Profile {
 				"list_skill_resources",
 				"read_skill_resource",
 				"search_skill_resources",
+				"view_image",
 			},
 		},
 		Skills: profilemodel.SkillSet{AllowImplicit: true},
+		TurnInput: profilemodel.TurnInputSettings{
+			DocumentExtract: "preview",
+			MentionResolve:  "off",
+		},
 	}
 	if mcpEnabled {
 		prof.Tools.Enabled = append(prof.Tools.Enabled, "list_mcp_resources", "read_mcp_resource", "search_mcp_tools", "mcp__*")

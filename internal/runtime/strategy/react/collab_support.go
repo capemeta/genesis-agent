@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	planmodeprompt "genesis-agent/internal/capabilities/planmode/prompt"
+	"genesis-agent/internal/capabilities/llm/vision"
 	"genesis-agent/internal/capabilities/tool/contract"
 	"genesis-agent/internal/domain"
 	"genesis-agent/internal/platform/logger"
@@ -94,10 +95,15 @@ func (e *ReactLoopEngine) rebuildSystemForCollab(
 	if rc == nil || len(rc.Messages) == 0 || e.prompt == nil {
 		return
 	}
+	visionMode := e.effectiveVisionMode
+	if visionMode == "" {
+		visionMode = vision.ModeDegradedText
+	}
 	systemPrompt, err := e.prompt.BuildSystem(ctx, prompt.BuildRequest{
 		Agent:             agent,
 		Run:               rc.Run,
 		AvailableTools:    toolNames,
+		VisionMode:        string(visionMode),
 		Audience:          promptAudience(ctx),
 		CollaborationMode: string(mode),
 		PlanDocumentPath:  collab.PlanDocumentRelPath(sessionID),

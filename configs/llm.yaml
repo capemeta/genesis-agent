@@ -1,4 +1,24 @@
 # LLM 独立默认配置。密钥请通过 config.local.yaml 或环境变量覆盖。
+#
+# ── 多模态 / 视觉能力（重要）──────────────────────────────────────────
+# 真相源字段：models.<alias>.supports_image（bool）
+#   - 未写或 null → 视为 false（fail-safe，禁止猜模型名）
+#   - true  → 该别名可作为「能看图」的模型（主会话直注图，或作 router.vision 专家）
+#   - false → 该别名不能接收 image part；若误带图，Per-Request Sanitizer 会剥离
+#
+# 路由字段：router.vision（模型别名，可选；与 coding/planning 同为单槽）
+#   - 空 / 未配置：主模型不能看图时进入形态 C（degraded_text）
+#   - 指向任一 supports_image=true 的别名（专用 VL 或多模态大模型均可）→ 形态 B
+#   - 主模型 supports_image=true 时：无论 vision 是否配置，均为形态 A（direct_inject）；
+#     本 Run 主看图路径不使用 router.vision（可留给 Task 二次审计）
+#   - models 池可配置多个可看图别名；router.vision 只选中其中一个作为本 Run 专家#
+# 四种组合 → EffectiveVisionMode：
+#   ① 主 supports_image=true  + 配了 vision  → A direct_inject（忽略 vision 主路径）
+#   ② 主 supports_image=true  + 无 vision    → A direct_inject
+#   ③ 主 supports_image=false + vision 可看图 → B expert_route（VisionExpert）
+#   ④ 主 supports_image=false + 无可用 vision → C degraded_text（vision_unavailable）
+# 详见 docs/多模态输入与视觉能力设计.md §2
+# ─────────────────────────────────────────────────────────────────────
 llm:
   # 全局默认请求超时；Provider 可单独覆盖
   timeout: 300s
@@ -78,6 +98,8 @@ llm:
       max_tokens: 8192
       tool_choice: auto
       supports_tools: true
+      # 是否多模态（可接收 image part）。默认 false；仅当确认模型支持视觉时改为 true。
+      supports_image: false
       # 必填：上下文管理配置（必须显式指定以保证预算裁剪和防溢出机制的运行）
       context_window: 128000
       effective_context_ratio: 0.92
@@ -95,6 +117,8 @@ llm:
       max_tokens: 16384
       tool_choice: auto
       supports_tools: true
+      # 主会话默认模型：当前按非视觉处理（形态 C，除非另配 router.vision 且该模型 supports_image=true）。
+      supports_image: false
       # 必填：上下文管理配置（必须显式指定以保证预算裁剪和防溢出机制的运行）
       context_window: 128000
       effective_context_ratio: 0.92
@@ -110,6 +134,7 @@ llm:
       max_tokens: 32768
       tool_choice: auto
       supports_tools: true
+      supports_image: false
       # 必填：上下文管理配置（必须显式指定以保证预算裁剪和防溢出机制的运行）
       context_window: 128000
       effective_context_ratio: 0.92
@@ -125,6 +150,7 @@ llm:
       max_tokens: 32768
       tool_choice: auto
       supports_tools: true
+      supports_image: false
       # 必填：上下文管理配置（必须显式指定以保证预算裁剪和防溢出机制的运行）
       context_window: 128000
       effective_context_ratio: 0.92
@@ -139,13 +165,38 @@ llm:
       temperature: 0.3
       max_tokens: 4096
       supports_tools: false
+      supports_image: false
       # 必填：上下文管理配置（必须显式指定以保证预算裁剪和防溢出机制的运行）
       context_window: 32768
       effective_context_ratio: 0.92
       output_reserve_tokens: 4096
       tags: [local, offline]
 
-  # 路由规则：不同任务选择不同模型别名
+    # ── 视觉 / 多模态模型说明 ──────────────────────────────────────────
+    # models 池里可以配置任意多个 supports_image=true 的别名（不限一个）。
+    # router.vision 只是「形态 B 时选用哪一个」的路由槽（与 coding/planning 同模式），
+    # 指向 models 中任一 supports_image=true 的别名即可，例如：
+    #   - 专用看图小模型：vision: qwen-vl
+    #   - 多模态大模型：  vision: gpt4o / vision: default（若 default 已 supports_image=true）
+    # 别名名字无特殊含义；「vision-helper」仅为示例，可删可改。
+    #
+    qwen-vl:                          # 示例：专用视觉模型
+      provider: qwen
+      model: qwen3.5-397b-a17b
+      strategy: vision
+      timeout: 300s
+      temperature: 0.2
+      max_tokens: 8192
+      tool_choice: none
+      supports_tools: true
+      supports_image: true            # 必须 true，否则 router.vision 指向它仍落形态 C
+      context_window: 256000
+      effective_context_ratio: 0.92
+      output_reserve_tokens: 8192
+      tags: [vision, multimodal]
+    #
+
+  # 路由规则：不同任务选择不同模型别名（每个槽位当前只指向一个别名）
   router:
     default: default
     fallback: default
@@ -155,4 +206,11 @@ llm:
     planning: reasoning
     summarization: fast
     embedding: default
-    vision: default
+    # 视觉专家路由槽（可选，空=未配置）。
+    # 值 = models 池中的别名，且该别名 supports_image 必须为 true。
+    # 可指向专用 VL 模型，也可指向多模态大模型（gpt-4o / qwen-vl-max 等）。
+    # - 主模型 supports_image=true → 形态 A，本字段不参与主看图
+    # - 主模型 supports_image=false 且本字段可用 → 形态 B（VisionExpert 用该模型看图，只回写文本）
+    # - 主模型 supports_image=false 且本字段空/不可用 → 形态 C
+    # 示例：vision: qwen-vl   或   vision: gpt4o
+    vision: "qwen-vl"

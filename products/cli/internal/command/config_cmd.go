@@ -25,7 +25,7 @@ func newConfigCmd(configDirRef *string) *cobra.Command {
 API Key 等敏感信息仅显示已配置/未配置状态，不打印实际值。
 使用 --validate 仅校验配置有效性（适合 CI/部署前检查）。`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := config.LoadWithOptions(*configDirRef, config.LoadOptions{Product: "cli", EnsureUserConfig: true})
+			cfg, err := config.LoadWithOptions(*configDirRef, config.LoadOptions{Product: "cli"})
 			if err != nil {
 				return fmt.Errorf("配置加载失败: %w", err)
 			}

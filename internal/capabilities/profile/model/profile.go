@@ -28,6 +28,16 @@ type Profile struct {
 	Scope       CapabilityScope
 	Tools       ToolSet
 	Skills      SkillSet
+	// TurnInput 控制本轮用户附件/文本点名装配（document_extract / mention_resolve）。
+	TurnInput TurnInputSettings
+}
+
+// TurnInputSettings 是 Profile 级 Turn 输入开关。
+type TurnInputSettings struct {
+	// DocumentExtract: preview | path_only | off；空则由产品默认回落。
+	DocumentExtract string
+	// MentionResolve: off | hint | auto_attach；空则 off。
+	MentionResolve string
 }
 
 // CapabilityScope 描述能力适用范围。第一轮只落模型，不做租户/角色持久化。

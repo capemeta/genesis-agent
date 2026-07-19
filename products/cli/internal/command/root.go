@@ -12,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"genesis-agent/internal/app"
+	tasklistcontract "genesis-agent/internal/capabilities/tasklist/contract"
 	"genesis-agent/internal/runtime/collab"
 	clisandbox "genesis-agent/products/cli/internal/sandbox"
 )
@@ -38,6 +39,11 @@ type ServiceHandle interface {
 type CollabHandle interface {
 	CollabStore() collab.Store
 	WorkspaceRoot() string
+}
+
+// TaskListHandle 可选扩展：任务清单持久化 Repository（CLI TUI 使用）。
+type TaskListHandle interface {
+	TaskListRepository() tasklistcontract.Repository
 }
 
 // ServiceFactory 由产品分发层注入可关闭的 AgentService 运行时。

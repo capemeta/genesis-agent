@@ -4,6 +4,8 @@ import (
 	"testing"
 
 	"github.com/cloudwego/eino/schema"
+
+	tool "genesis-agent/internal/capabilities/tool/contract"
 )
 
 func TestIsIncompleteFinishReason(t *testing.T) {
@@ -26,13 +28,12 @@ func TestFinishReason(t *testing.T) {
 	}
 }
 
-func TestRawLLMDebugDisabledByDefault(t *testing.T) {
-	t.Setenv("GENESIS_LLM_RAW_DEBUG", "")
-	if rawLLMDebugEnabled() {
-		t.Fatal("raw debug must be opt-in")
+func TestToolInfosToSchemaNilOrEmpty(t *testing.T) {
+	if got := toolInfosToSchema(nil); len(got) != 0 {
+		t.Fatalf("nil tools => empty schema, got %d", len(got))
 	}
-	t.Setenv("GENESIS_LLM_RAW_DEBUG", "true")
-	if !rawLLMDebugEnabled() {
-		t.Fatal("raw debug should accept explicit opt-in")
+	if got := toolInfosToSchema([]*tool.Info{}); len(got) != 0 {
+		t.Fatalf("empty tools => empty schema, got %d", len(got))
 	}
 }
+

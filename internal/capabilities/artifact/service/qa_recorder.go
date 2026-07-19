@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	artifactcontract "genesis-agent/internal/capabilities/artifact/contract"
@@ -53,10 +54,60 @@ func (r *QAEvidenceRecorder) RecordPassed(ctx context.Context, req artifactcontr
 			}
 			key := req.TenantID + "\x00" + req.RunID + "\x00" + spec.ID + "\x00" + publication.ID + "\x00" + req.Validator
 			digest := sha256.Sum256([]byte(key))
-			record := artifactmodel.QAEvidenceRecord{ID: "qa-" + hex.EncodeToString(digest[:16]), TenantID: req.TenantID, RunID: req.RunID, DeliverableID: spec.ID, ProducedResourceID: selection.ProducedResourceID, PublicationID: publication.ID, SubjectVersion: publication.SubjectVersion, SubjectSHA256: publication.SubjectSHA256, PolicyID: spec.QAPolicy, Validator: req.Validator, ValidatorVersion: "skill-command/v1", Status: artifactmodel.QAEvidencePassed, CreatedAt: r.now().UTC()}
+			validator := strings.TrimSpace(req.Validator)
+			if validator == "" {
+				continue
+			}
+			// 禁止用模糊 skill-command:* 写入 visual-qa 通过证据
+			if spec.QAPolicy == ValidatorVisualQA && validator != ValidatorVisualQA && strings.HasPrefix(validator, "skill-command:") {
+				continue
+			}
+			version := "skill-command/v1"
+			if validator == ValidatorVisualQA {
+				version = "visual-checklist/v1"
+			}
+			record := artifactmodel.QAEvidenceRecord{ID: "qa-" + hex.EncodeToString(digest[:16]), TenantID: req.TenantID, RunID: req.RunID, DeliverableID: spec.ID, ProducedResourceID: selection.ProducedResourceID, PublicationID: publication.ID, SubjectVersion: publication.SubjectVersion, SubjectSHA256: publication.SubjectSHA256, PolicyID: spec.QAPolicy, Validator: validator, ValidatorVersion: version, Status: artifactmodel.QAEvidencePassed, CreatedAt: r.now().UTC()}
 			if err := r.evidence.CreateQAEvidence(ctx, record); err != nil && !errors.Is(err, artifactcontract.ErrAlreadyExists) {
 				return err
 			}
+		}
+	}
+	return nil
+}
+
+func (r *QAEvidenceRecorder) RecordDegraded(ctx context.Context, req artifactcontract.QADegradeRequest) error {
+	status := artifactmodel.QAEvidenceDegraded
+	if strings.EqualFold(strings.TrimSpace(req.Status), string(artifactmodel.QAEvidenceSkipped)) {
+		status = artifactmodel.QAEvidenceSkipped
+	}
+	failure := strings.TrimSpace(req.FailureCode)
+	if failure == "" {
+		failure = "vision_unavailable"
+	}
+	specs, err := r.deliverables.ListDeliverables(ctx, req.TenantID, req.RunID)
+	if err != nil {
+		return err
+	}
+	validator := strings.TrimSpace(req.Validator)
+	if validator == "" {
+		validator = ValidatorVisualQA
+	}
+	for _, spec := range specs {
+		if !spec.Required || spec.QAPolicy == "" || (req.PolicyID != "" && req.PolicyID != spec.QAPolicy) {
+			continue
+		}
+		if spec.QAPolicy != ValidatorVisualQA && req.PolicyID == "" {
+			continue
+		}
+		key := req.TenantID + "\x00" + req.RunID + "\x00" + spec.ID + "\x00" + validator + "\x00" + failure + "\x00" + string(status)
+		digest := sha256.Sum256([]byte(key))
+		record := artifactmodel.QAEvidenceRecord{
+			ID: "qa-" + hex.EncodeToString(digest[:16]), TenantID: req.TenantID, RunID: req.RunID,
+			DeliverableID: spec.ID, PolicyID: spec.QAPolicy, Validator: validator, ValidatorVersion: "vision-degraded/v1",
+			Status: status, FailureCode: failure, CreatedAt: r.now().UTC(),
+		}
+		if err := r.evidence.CreateQAEvidence(ctx, record); err != nil && !errors.Is(err, artifactcontract.ErrAlreadyExists) {
+			return err
 		}
 	}
 	return nil

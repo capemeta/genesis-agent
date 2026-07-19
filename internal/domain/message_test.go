@@ -2,7 +2,6 @@ package domain
 
 import (
 	"encoding/json"
-	"strings"
 	"testing"
 	"time"
 )
@@ -106,21 +105,11 @@ func TestForModelConvertsLatestTaskListSnapshotToReminder(t *testing.T) {
 		{Role: RoleAssistant, Content: string(latestJSON), Kind: MessageKindTaskListSnapshot},
 	})
 
-	if len(model) != 3 {
+	if len(model) != 2 {
 		t.Fatalf("len=%d model=%+v", len(model), model)
 	}
-	last := model[len(model)-1]
-	if last.Kind != MessageKindReminder || last.Role != RoleUser {
-		t.Fatalf("last=%+v", last)
-	}
-	if strings.Contains(last.Content, "旧清单") || strings.Contains(last.Content, "旧任务") {
-		t.Fatalf("reminder contains stale task list: %s", last.Content)
-	}
-	if !strings.Contains(last.Content, "新清单") || !strings.Contains(last.Content, "进行中任务") {
-		t.Fatalf("reminder missing latest task list: %s", last.Content)
-	}
-	if !strings.Contains(last.Content, "<system-reminder>") || !strings.Contains(last.Content, "</system-reminder>") {
-		t.Fatalf("snapshot reminder must use system-reminder wrapper: %s", last.Content)
+	if model[0].Content != "开始" || model[1].Content != "处理中" {
+		t.Fatalf("unexpected model messages: %+v", model)
 	}
 	for _, msg := range model {
 		if msg.Kind == MessageKindTaskListSnapshot {

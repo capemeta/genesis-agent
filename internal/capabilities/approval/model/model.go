@@ -39,7 +39,7 @@ const (
 	RiskCritical RiskLevel = "critical"
 )
 
-// GrantScope 描述授权记忆范围。
+// GrantScope 描述授权记忆的时间/归属范围。
 type GrantScope string
 
 const (
@@ -49,6 +49,16 @@ const (
 	GrantScopeProject GrantScope = "project"
 	GrantScopeTenant  GrantScope = "tenant"
 	GrantScopeGlobal  GrantScope = "global"
+)
+
+// PathGrantMode 描述文件授权的路径广度（与 GrantScope 正交）。
+type PathGrantMode string
+
+const (
+	// PathGrantExact 仅授权请求路径本身（文件或目录）。
+	PathGrantExact PathGrantMode = "exact"
+	// PathGrantDirectory 授权文件的直接父目录（含子树）；对目录请求等价于该目录本身。
+	PathGrantDirectory PathGrantMode = "directory"
 )
 
 // DecisionType 描述审批结果。
@@ -85,9 +95,10 @@ type Request struct {
 
 // Decision 是最终审批决策。
 type Decision struct {
-	Type   DecisionType `json:"type"`
-	Scope  GrantScope   `json:"scope,omitempty"`
-	Reason string       `json:"reason,omitempty"`
+	Type     DecisionType  `json:"type"`
+	Scope    GrantScope    `json:"scope,omitempty"`
+	PathMode PathGrantMode `json:"path_mode,omitempty"`
+	Reason   string        `json:"reason,omitempty"`
 }
 
 // PolicyResult 是策略引擎输出。

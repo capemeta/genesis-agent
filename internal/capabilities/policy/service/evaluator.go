@@ -68,7 +68,11 @@ func (e *Evaluator) metadataFallback(req approvalmodel.Request) (approvalmodel.P
 		return approvalmodel.PolicyResult{Type: decisionOf(e.defaults.Dangerous), Reason: "dangerous operation requires approval", Risk: approvalmodel.RiskHigh, SuggestedScopes: []approvalmodel.GrantScope{approvalmodel.GrantScopeOnce}}, true
 	}
 	if metadata["scope"] == "external" {
-		return approvalmodel.PolicyResult{Type: approvalmodel.PolicyAsk, Reason: "external resource requires approval", Risk: approvalmodel.RiskHigh, SuggestedScopes: []approvalmodel.GrantScope{approvalmodel.GrantScopeOnce, approvalmodel.GrantScopeSession}}, true
+		return approvalmodel.PolicyResult{Type: approvalmodel.PolicyAsk, Reason: "external resource requires approval", Risk: approvalmodel.RiskHigh, SuggestedScopes: []approvalmodel.GrantScope{
+			approvalmodel.GrantScopeOnce,
+			approvalmodel.GrantScopeSession,
+			approvalmodel.GrantScopeProject,
+		}}, true
 	}
 	if metadata["scope"] == "workspace" {
 		return approvalmodel.PolicyResult{Type: approvalmodel.PolicyAllow, Reason: "policy allow", Risk: riskOrDefault(req.Risk)}, true

@@ -1,4 +1,3 @@
-// Package approval 提供 CLI 产品侧的审批交互适配。
 package approval
 
 import (
@@ -20,6 +19,10 @@ type ApprovalRequiredMsg struct {
 type TUIApprovalRequester struct {
 	program *tea.Program
 	mu      sync.Mutex
+	// serialize 保证同一时刻只有一个审批进入 TUI。
+	// 并行工具（如两个 read_file）同时 PolicyAsk 时，若并发 Send 会覆盖
+	// activeApproval，导致被覆盖请求的 ResultCh 永久阻塞、整轮 Run 假死。
+	serialize sync.Mutex
 }
 
 var GlobalTUIRequester = &TUIApprovalRequester{}
@@ -33,6 +36,13 @@ func (r *TUIApprovalRequester) SetProgram(p *tea.Program) {
 
 // RequestApproval 阻塞式挂起等待用户从 TUI 键盘返回决策
 func (r *TUIApprovalRequester) RequestApproval(ctx context.Context, req model.Request, result model.PolicyResult) (model.Decision, error) {
+	r.serialize.Lock()
+	defer r.serialize.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return model.Decision{Type: model.DecisionDenied, Reason: "context cancelled"}, err
+	}
+
 	r.mu.Lock()
 	p := r.program
 	r.mu.Unlock()

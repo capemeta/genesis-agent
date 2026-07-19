@@ -92,12 +92,15 @@ func TestPolicyDangerousOnlySuggestsOnce(t *testing.T) {
 	}
 }
 
-func TestPolicyExternalSuggestsSession(t *testing.T) {
+func TestPolicyExternalSuggestsSessionAndProject(t *testing.T) {
 	result, err := NewPolicyEngine().Evaluate(context.Background(), requestWithMetadata(map[string]string{"scope": "external"}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(result.SuggestedScopes) != 2 || result.SuggestedScopes[1] != model.GrantScopeSession {
-		t.Fatalf("SuggestedScopes = %#v, want once and session", result.SuggestedScopes)
+	if len(result.SuggestedScopes) != 3 ||
+		result.SuggestedScopes[0] != model.GrantScopeOnce ||
+		result.SuggestedScopes[1] != model.GrantScopeSession ||
+		result.SuggestedScopes[2] != model.GrantScopeProject {
+		t.Fatalf("SuggestedScopes = %#v, want once, session, project", result.SuggestedScopes)
 	}
 }

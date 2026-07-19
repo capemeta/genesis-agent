@@ -26,6 +26,8 @@ import (
 	hookmodel "genesis-agent/internal/capabilities/hook/model"
 	hookservice "genesis-agent/internal/capabilities/hook/service"
 	llmadapter "genesis-agent/internal/capabilities/llm/adapter"
+	"genesis-agent/internal/capabilities/llm/vision"
+	"genesis-agent/internal/capabilities/media/visionio"
 	filememory "genesis-agent/internal/capabilities/memory/adapter/file"
 	memorycontract "genesis-agent/internal/capabilities/memory/contract"
 	memoryservice "genesis-agent/internal/capabilities/memory/service"
@@ -43,6 +45,7 @@ import (
 	"genesis-agent/internal/capabilities/tool/gateway"
 	"genesis-agent/internal/capabilities/tool/scheduler"
 	toolvalidation "genesis-agent/internal/capabilities/tool/validation"
+	"genesis-agent/internal/capabilities/turninput"
 	consoletrace "genesis-agent/internal/capabilities/trace/adapter"
 	tracecontract "genesis-agent/internal/capabilities/trace/contract"
 	usagememory "genesis-agent/internal/capabilities/usage/adapter/memory"
@@ -61,6 +64,7 @@ import (
 	multiresult "genesis-agent/internal/runtime/multiagent/result"
 	promptbuilder "genesis-agent/internal/runtime/prompt"
 	"genesis-agent/internal/runtime/strategy/react"
+	runtimevision "genesis-agent/internal/runtime/vision"
 
 	progressbc "genesis-agent/internal/capabilities/tasklist/adapter/progress"
 	webcontract "genesis-agent/internal/capabilities/web/contract"
@@ -350,7 +354,6 @@ func BuildAgentService(ctx context.Context, opts BuildOptions) (*RuntimeBundle, 
 	planner := runtimecontext.NewContextBudgetPlanner(customProfiles)
 
 	fileMem := filememory.NewFileShortTermMemory(sessionDir, estimator, llmClient)
-	planSvc.SetShortTermMemory(fileMem)
 	memStore := fileMem
 
 	// 长期记忆资产与用户画像资产目录解耦与结构化归档
@@ -414,6 +417,52 @@ func BuildAgentService(ctx context.Context, opts BuildOptions) (*RuntimeBundle, 
 	}
 	subAgentCatalog := subagentservice.NewMergedCatalog(builtinDefinitions, capabilityDefinitions, projectDefinitions)
 
+	visionMode := resolveVisionMode(cfg, resolvedLLM)
+	engineOpts := []react.EngineOption{
+		react.WithSkillNameMatcher(opts.SkillNameMatcher),
+		react.WithSkillMentionSelector(opts.SkillMentionSelector),
+		react.WithSkillExplicitLoader(opts.SkillExplicitLoader),
+		react.WithSubAgentTypeLookup(subAgentCatalogLookup{catalog: subAgentCatalog}),
+		react.WithCompactor(compactor),
+		react.WithLongTermMemory(ltm),
+		react.WithUserProfileStore(userProfileStore),
+		react.WithContextBudgetConfig(effectiveContextRatio, resolvedLLM.OutputReserveTokens),
+		react.WithEffectiveVisionMode(visionMode),
+		react.WithCollabStore(collabStore),
+	}
+	turnOpts := turninput.DefaultOptionsForProduct(product)
+	if strings.TrimSpace(opts.WorkspaceRoot) != "" {
+		turnOpts.WorkspaceRoot = opts.WorkspaceRoot
+	} else {
+		turnOpts.WorkspaceRoot = workspace
+	}
+	if v := strings.TrimSpace(opts.Profile.TurnInput.DocumentExtract); v != "" {
+		turnOpts.DocumentExtract = turninput.NormalizeDocumentExtract(turninput.DocumentExtractMode(v))
+	}
+	if v := strings.TrimSpace(opts.Profile.TurnInput.MentionResolve); v != "" {
+		turnOpts.MentionResolve = turninput.NormalizeMentionResolve(turninput.MentionResolveMode(v))
+	}
+	engineOpts = append(engineOpts, react.WithTurnInputOptions(turnOpts))
+	if taskListReminderEnabled {
+		engineOpts = append(engineOpts, react.WithTaskListReminder(planSvc))
+	}
+	if opts.AutoRewriteSkillCollision != nil {
+		engineOpts = append(engineOpts, react.WithAutoRewriteSkillCollision(*opts.AutoRewriteSkillCollision))
+	}
+	if visionMode == vision.ModeExpertRoute {
+		expert, err := buildVisionExpert(ctx, cfg, tracer, estimator)
+		if err != nil {
+			return nil, fmt.Errorf("初始化 VisionExpert 失败: %w", err)
+		}
+		engineOpts = append(engineOpts, react.WithVisionExpert(expert))
+	}
+	if cfg.Agent.ToolMaxConcurrency > 0 {
+		engineOpts = append(engineOpts, react.WithToolMaxConcurrency(cfg.Agent.ToolMaxConcurrency))
+	}
+	if cfg.Agent.VisionMaxConcurrentReads > 0 {
+		visionio.SetMaxConcurrent(cfg.Agent.VisionMaxConcurrentReads)
+	}
+
 	runEngine := react.NewReactLoopEngine(
 		llmClient,
 		toolGateway,
@@ -428,27 +477,7 @@ func BuildAgentService(ctx context.Context, opts BuildOptions) (*RuntimeBundle, 
 		planner,
 		resolvedLLM.ContextWindow,
 		resolvedLLM.MaxTokens,
-		react.WithSkillNameMatcher(opts.SkillNameMatcher),
-		react.WithSkillMentionSelector(opts.SkillMentionSelector),
-		react.WithSkillExplicitLoader(opts.SkillExplicitLoader),
-		react.WithSubAgentTypeLookup(subAgentCatalogLookup{catalog: subAgentCatalog}),
-		react.WithCompactor(compactor),
-		react.WithLongTermMemory(ltm),
-		react.WithUserProfileStore(userProfileStore),
-		react.WithContextBudgetConfig(effectiveContextRatio, resolvedLLM.OutputReserveTokens),
-		react.WithCollabStore(collabStore),
-		func() react.EngineOption {
-			if !taskListReminderEnabled {
-				return nil
-			}
-			return react.WithTaskListReminder(planSvc)
-		}(),
-		func() react.EngineOption {
-			if opts.AutoRewriteSkillCollision == nil {
-				return nil
-			}
-			return react.WithAutoRewriteSkillCollision(*opts.AutoRewriteSkillCollision)
-		}(),
+		engineOpts...,
 	)
 
 	defaultAgent := &domain.Agent{
@@ -468,7 +497,11 @@ func BuildAgentService(ctx context.Context, opts BuildOptions) (*RuntimeBundle, 
 	}
 
 	// 子智能体内核与三端共享；当前使用内存槽位，不引入 DB/分布式后端。
+	// 配置优先；未配置时沿用产品 bootstrap 注入值，再回退 3。
 	maxConcurrent := opts.SubAgentMaxConcurrent
+	if cfg.Agent.SubAgentMaxConcurrent > 0 {
+		maxConcurrent = cfg.Agent.SubAgentMaxConcurrent
+	}
 	if maxConcurrent <= 0 {
 		maxConcurrent = 3
 	}
@@ -642,6 +675,66 @@ func buildSecretServices(configDir string, cfg *config.Config, log loggercontrac
 		return nil, nil, fmt.Errorf("初始化 connection store 失败: %w", err)
 	}
 	return credentialSvc, connectionservice.New(connectionStore, credentialSvc), nil
+}
+
+func resolveVisionMode(cfg *config.Config, main *config.ResolvedLLMConfig) vision.Mode {
+	if cfg == nil || main == nil {
+		return vision.ModeDegradedText
+	}
+	visionAlias, visionOK := resolveVisionRoute(cfg)
+	return vision.ResolveEffectiveVisionMode(main.ImageSupported(), visionAlias, visionOK)
+}
+
+func resolveVisionRoute(cfg *config.Config) (alias string, supportsImage bool) {
+	if cfg == nil {
+		return "", false
+	}
+	alias = strings.TrimSpace(cfg.LLM.Router.ModelAlias("vision"))
+	if alias == "" {
+		alias = strings.TrimSpace(cfg.LLM.Router.Vision)
+	}
+	if alias == "" {
+		return "", false
+	}
+	resolvedVision, err := cfg.LLM.ResolveModel(alias)
+	if err != nil || resolvedVision == nil {
+		return alias, false
+	}
+	return alias, resolvedVision.ImageSupported()
+}
+
+func buildVisionExpert(ctx context.Context, cfg *config.Config, tracer tracecontract.Tracer, estimator runtimecontext.TokenEstimator) (runtimevision.Analyzer, error) {
+	alias, ok := resolveVisionRoute(cfg)
+	if alias == "" || !ok {
+		return nil, fmt.Errorf("expert_route 需要可用的 router.vision 且 supports_image=true")
+	}
+	resolvedVision, err := cfg.LLM.ResolveModel(alias)
+	if err != nil {
+		return nil, fmt.Errorf("解析 vision 模型 %q: %w", alias, err)
+	}
+	visionClient, err := llmadapter.NewChatModelByConfig(ctx, resolvedVision)
+	if err != nil {
+		return nil, fmt.Errorf("创建 vision ChatModel: %w", err)
+	}
+	return &runtimevision.Expert{
+		Mode:   vision.ModeExpertRoute,
+		Model:  visionClient,
+		Tracer: tracer,
+		OnUsage: func(usageCtx context.Context, _ string, tokens int64) {
+			if tokens <= 0 {
+				return
+			}
+			if budget := multicontract.TreeBudgetFromContext(usageCtx); budget != nil {
+				_ = budget.Consume(tokens, 0)
+			}
+		},
+		Estimator: func(estCtx context.Context, text, model string) int {
+			if estimator == nil {
+				return len(text) / 4
+			}
+			return estimator.Estimate(estCtx, text, model)
+		},
+	}, nil
 }
 
 func resolveDataRoot(configDir string, dataDir string) (string, error) {

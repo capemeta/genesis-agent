@@ -65,8 +65,10 @@ type Message struct {
 	UUID string `json:"uuid,omitempty"`
 	// Role 消息发送方角色（协议层）
 	Role RoleType `json:"role"`
-	// Content 文本内容（assistant发起工具调用时可能为空）
+	// Content 文本内容（assistant发起工具调用时可能为空；多模态时与 Parts 文本聚合兼容）
 	Content string `json:"content,omitempty"`
+	// Parts 多模态内容分片；持久化时 Image 仅存 ImageRef，禁止存 bytes/base64
+	Parts []ContentPart `json:"parts,omitempty"`
 	// ToolCalls LLM请求调用的工具列表（仅 assistant 角色时有值）
 	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
 	// ToolCallID 本消息对应的工具调用ID（仅 tool 角色时有值）
@@ -122,6 +124,13 @@ func NewToolResultMessage(toolCallID, result string) *Message {
 		ToolCallID: toolCallID,
 		Kind:       MessageKindToolResult,
 	}
+}
+
+// NewToolResultMessageWithParts 创建可带 ImageRef 的工具结果（形态 A direct_inject）。
+func NewToolResultMessageWithParts(toolCallID, result string, parts []ContentPart) *Message {
+	msg := NewToolResultMessage(toolCallID, result)
+	msg.Parts = parts
+	return msg
 }
 
 // WithSource 设置审计 Source，返回自身便于链式调用。
@@ -223,29 +232,22 @@ func ForUI(msgs []*Message) []*Message {
 
 // ForModel 投影为送给 LLM 的上下文。
 //
-// task_list_snapshot 是持久化/UI 恢复快照，不应把历史全量 JSON 逐条喂给模型；
-// 只把最新快照转为 reminder 注入上下文，避免模型参考过期清单版本。
+// ForModel 过滤给 LLM 的历史消息。
+// task_list_snapshot 属旧版消息过渡产物，过滤丢弃，由 TaskListReminderSource 经 Repository 直接注入最新提醒。
 func ForModel(msgs []*Message) []*Message {
 	if len(msgs) == 0 {
 		return nil
 	}
 	out := make([]*Message, 0, len(msgs))
-	var latest *TaskList
 	for _, m := range msgs {
 		if m == nil {
 			continue
 		}
 		m.EnsureKind()
 		if m.Kind == MessageKindTaskListSnapshot {
-			if p := parseTaskListSnapshot(m.Content); p != nil {
-				latest = p
-			}
 			continue
 		}
 		out = append(out, m)
-	}
-	if latest != nil {
-		out = append(out, NewReminderMessage(taskListReminderContent(latest)))
 	}
 	return out
 }

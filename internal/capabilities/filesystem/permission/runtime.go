@@ -31,12 +31,53 @@ type RuntimeGrant struct {
 
 // RuntimeFilePermissions 保存会话/项目级文件授权集合。
 type RuntimeFilePermissions struct {
-	mu     sync.RWMutex
-	grants []RuntimeGrant
+	mu           sync.RWMutex
+	persistMu    sync.Mutex // 串行化 project 落盘，避免与 store 锁形成死锁
+	grants       []RuntimeGrant
+	projectStore ProjectGrantStore
 }
 
 // NewRuntimeFilePermissions 创建运行时文件权限集合。
 func NewRuntimeFilePermissions() *RuntimeFilePermissions { return &RuntimeFilePermissions{} }
+
+// SetProjectStore 注入项目级授权持久化；可在 LoadProject 前调用。
+func (p *RuntimeFilePermissions) SetProjectStore(store ProjectGrantStore) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.projectStore = store
+}
+
+// LoadProject 从持久化存储加载 project grant。
+func (p *RuntimeFilePermissions) LoadProject(ctx context.Context) error {
+	if p == nil {
+		return nil
+	}
+	p.persistMu.Lock()
+	defer p.persistMu.Unlock()
+
+	p.mu.RLock()
+	store := p.projectStore
+	p.mu.RUnlock()
+	if store == nil {
+		return nil
+	}
+	loaded, err := store.Load(ctx)
+	if err != nil {
+		return err
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, grant := range loaded {
+		if grant.Scope != approvalmodel.GrantScopeProject {
+			continue
+		}
+		p.grants = mergeGrant(p.grants, grant)
+	}
+	return nil
+}
 
 // IsAllowed 判断请求是否命中已有运行时授权。
 func (p *RuntimeFilePermissions) IsAllowed(req approvalmodel.Request) bool {
@@ -67,22 +108,58 @@ func (p *RuntimeFilePermissions) Match(req approvalmodel.Request) (RuntimeGrant,
 	return RuntimeGrant{}, false
 }
 
-// Remember 记录用户授予的 session/project 权限，once 不缓存。
-func (p *RuntimeFilePermissions) Remember(req approvalmodel.Request, decision approvalmodel.Decision) {
+// Remember 记录用户授予的可记忆权限；once 不缓存；project 额外落盘。
+func (p *RuntimeFilePermissions) Remember(ctx context.Context, req approvalmodel.Request, decision approvalmodel.Decision) error {
 	if p == nil || !isFileRequest(req) || decision.Type != approvalmodel.DecisionApprovedForScope {
-		return
+		return nil
 	}
-	if decision.Scope != approvalmodel.GrantScopeSession && decision.Scope != approvalmodel.GrantScopeProject {
-		return
+	if !isMemorableScope(decision.Scope) {
+		return nil
 	}
-	path := requestPath(req)
+	path := resolveGrantPath(req, decision.PathMode)
 	if path == "" {
+		return nil
+	}
+	grant := RuntimeGrant{Action: req.Action, Scope: decision.Scope, Path: path}
+	p.mu.Lock()
+	p.grants = mergeGrant(p.grants, grant)
+	needPersist := decision.Scope == approvalmodel.GrantScopeProject && p.projectStore != nil
+	p.mu.Unlock()
+	if needPersist {
+		return p.persistProject(ctx)
+	}
+	return nil
+}
+
+func (p *RuntimeFilePermissions) persistProject(ctx context.Context) error {
+	p.persistMu.Lock()
+	defer p.persistMu.Unlock()
+
+	p.mu.RLock()
+	store := p.projectStore
+	snapshot := projectGrantsSnapshot(p.grants)
+	p.mu.RUnlock()
+	if store == nil {
+		return nil
+	}
+	return store.Save(ctx, snapshot)
+}
+
+// ClearScope 清除指定时间作用域的内存授权（不影响已落盘 project，除非随后 Save）。
+func (p *RuntimeFilePermissions) ClearScope(scope approvalmodel.GrantScope) {
+	if p == nil || scope == "" {
 		return
 	}
-	grant := RuntimeGrant{Action: req.Action, Scope: decision.Scope, Path: normalizeGrantPath(path)}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.grants = mergeGrant(p.grants, grant)
+	out := p.grants[:0]
+	for _, grant := range p.grants {
+		if grant.Scope == scope {
+			continue
+		}
+		out = append(out, grant)
+	}
+	p.grants = out
 }
 
 // Grants 返回当前授权快照，主要用于测试和调试。
@@ -123,9 +200,62 @@ func (s *ApprovalService) Authorize(ctx context.Context, req approvalmodel.Reque
 		return approvalmodel.Decision{}, err
 	}
 	if s.perms != nil {
-		s.perms.Remember(req, decision)
+		if remErr := s.perms.Remember(ctx, req, decision); remErr != nil {
+			return approvalmodel.Decision{}, remErr
+		}
 	}
 	return decision, nil
+}
+
+func isMemorableScope(scope approvalmodel.GrantScope) bool {
+	switch scope {
+	case approvalmodel.GrantScopeTurn, approvalmodel.GrantScopeSession, approvalmodel.GrantScopeProject:
+		return true
+	default:
+		return false
+	}
+}
+
+func resolveGrantPath(req approvalmodel.Request, mode approvalmodel.PathGrantMode) string {
+	path := requestPath(req)
+	if path == "" {
+		return ""
+	}
+	path = normalizeGrantPath(path)
+	if mode != approvalmodel.PathGrantDirectory {
+		return path
+	}
+	// 目录资源本身已是授权根；文件则提升到直接父目录。
+	if isDirectoryResource(req) {
+		return path
+	}
+	parent := filepath.Dir(path)
+	if parent == "" || parent == "." || parent == path {
+		return path
+	}
+	return normalizeGrantPath(parent)
+}
+
+func isDirectoryResource(req approvalmodel.Request) bool {
+	if req.Resource.Type == "directory" {
+		return true
+	}
+	switch req.Action {
+	case approvalmodel.ActionFileList, approvalmodel.ActionFileWalk:
+		return true
+	default:
+		return false
+	}
+}
+
+func projectGrantsSnapshot(grants []RuntimeGrant) []RuntimeGrant {
+	out := make([]RuntimeGrant, 0, len(grants))
+	for _, grant := range grants {
+		if grant.Scope == approvalmodel.GrantScopeProject {
+			out = append(out, grant)
+		}
+	}
+	return out
 }
 
 func mergeGrant(grants []RuntimeGrant, grant RuntimeGrant) []RuntimeGrant {

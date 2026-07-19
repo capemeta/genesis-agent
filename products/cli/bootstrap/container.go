@@ -23,6 +23,7 @@ import (
 	auditfile "genesis-agent/internal/capabilities/audit/adapter/file"
 	auditmemory "genesis-agent/internal/capabilities/audit/adapter/memory"
 	auditcontract "genesis-agent/internal/capabilities/audit/contract"
+	tasklistcontract "genesis-agent/internal/capabilities/tasklist/contract"
 	capcontract "genesis-agent/internal/capabilities/capability/contract"
 	capservice "genesis-agent/internal/capabilities/capability/service"
 	execsandbox "genesis-agent/internal/capabilities/execution/adapter/sandbox"
@@ -41,6 +42,7 @@ import (
 	listdir "genesis-agent/internal/capabilities/filesystem/tool/list_dir"
 	readfile "genesis-agent/internal/capabilities/filesystem/tool/read_file"
 	"genesis-agent/internal/capabilities/filesystem/tool/toolkit"
+	viewimage "genesis-agent/internal/capabilities/media/tool/view_image"
 	walkdir "genesis-agent/internal/capabilities/filesystem/tool/walk_dir"
 	writefile "genesis-agent/internal/capabilities/filesystem/tool/write_file"
 	mcpstore "genesis-agent/internal/capabilities/mcp/adapter/store"
@@ -130,6 +132,7 @@ type Container struct {
 	logging        *logger.RuntimeLogging
 	mcpStack       *mcpstack.Stack
 	mcpStore       contract.ApprovalStore
+	planRepo       tasklistcontract.Repository
 	runtimeClosers []runtimeCloser
 }
 
@@ -192,7 +195,7 @@ func (c *Container) Init(ctx context.Context) error {
 		if c.configDirRef != nil {
 			configDir = *c.configDirRef
 		}
-		cfg, err := platformconfig.LoadWithOptions(configDir, platformconfig.LoadOptions{Product: "cli", EnsureUserConfig: true})
+		cfg, err := platformconfig.LoadWithOptions(configDir, platformconfig.LoadOptions{Product: "cli"})
 		if err != nil {
 			c.initErr = fmt.Errorf("加载CLI产品配置失败: %w", err)
 			return
@@ -234,6 +237,7 @@ func (c *Container) Init(ctx context.Context) error {
 			c.initErr = fmt.Errorf("初始化CLI Plan本地存储失败: %w", err)
 			return
 		}
+		c.planRepo = planRepo
 		collabStoreDir := filepath.Join(runtime.workspaceRoot, ".genesis", "runtime", "collab")
 		collabStore, err := localcollab.NewFileStore(collabStoreDir)
 		if err != nil {
@@ -382,6 +386,14 @@ func (c *Container) CollabStore() runtimecollab.Store {
 	return c.bundle.CollabStore
 }
 
+// TaskListRepository 返回任务清单文件存储 Repository。
+func (c *Container) TaskListRepository() tasklistcontract.Repository {
+	if c == nil {
+		return nil
+	}
+	return c.planRepo
+}
+
 // WorkspaceRoot 返回当前 CLI 工作区根路径。
 func (c *Container) WorkspaceRoot() string {
 	if c == nil {
@@ -460,7 +472,7 @@ func (a *mcpAdmin) ApprovalStore() contract.ApprovalStore {
 
 func buildProductRuntime(ctx context.Context, configDir string, cfg *platformconfig.Config, quiet bool, sandboxCfg clisandbox.Config, prof profilemodel.Profile, workspaceRoot string) (productRuntime, logger.Logger, error) {
 	if cfg == nil {
-		loaded, err := platformconfig.LoadWithOptions(configDir, platformconfig.LoadOptions{Product: "cli", EnsureUserConfig: true})
+		loaded, err := platformconfig.LoadWithOptions(configDir, platformconfig.LoadOptions{Product: "cli"})
 		if err != nil {
 			return productRuntime{}, nil, fmt.Errorf("加载CLI产品配置失败: %w", err)
 		}
@@ -503,6 +515,16 @@ func buildProductRuntime(ctx context.Context, configDir string, cfg *platformcon
 	if err != nil {
 		_ = runtimeLogging.Close()
 		return productRuntime{}, nil, fmt.Errorf("初始化 Artifact 控制面失败: %w", err)
+	}
+	if artifactControl.producedStore != nil {
+		for i, t := range productTools {
+			if t != nil && t.GetInfo() != nil && t.GetInfo().Name == "view_image" {
+				productTools[i] = viewimage.WithProducedStore(t, artifactControl.producedStore)
+				if artifactControl.readers != nil {
+					productTools[i] = viewimage.WithReaders(productTools[i], artifactControl.readers)
+				}
+			}
+		}
 	}
 	environmentInjector := promptbuilder.NewEnvironmentContextInjector(cliEnvironmentContext(ctx, sandboxCfg.ExecutionProfile(), execStack.Shells))
 	tools := productTools
@@ -793,10 +815,14 @@ func buildProductTools(sandboxCfg clisandbox.Config, baseApprovalSvc approvalcon
 	if err != nil {
 		return nil, productExecStack{}, fmt.Errorf("初始化本地PathResolver失败: %w", err)
 	}
-	approvalSvc := fspermission.NewApprovalService(baseApprovalSvc, fspermission.NewRuntimeFilePermissions())
+	filePerms, err := fspermission.NewRuntimeFilePermissionsWithProjectStore(context.Background(), workspaceRootOrDot(workspaceRoot))
+	if err != nil {
+		return nil, productExecStack{}, fmt.Errorf("初始化文件运行时授权失败: %w", err)
+	}
+	approvalSvc := fspermission.NewApprovalService(baseApprovalSvc, filePerms)
 	locker := scheduler.NewMemoryResourceLocker()
 	fileDeps := toolkit.Deps{Resolver: resolver, Backend: localfs.New(), Approval: approvalSvc, Freshness: freshness.NewMemoryTracker(), Locker: locker}
-	constructors := []func(toolkit.Deps) (toolcontract.Tool, error){readfile.New, writefile.New, editfile.New, applypatchtool.New, listdir.New, walkdir.New, globtool.New, greptool.New}
+	constructors := []func(toolkit.Deps) (toolcontract.Tool, error){readfile.New, writefile.New, editfile.New, applypatchtool.New, listdir.New, walkdir.New, globtool.New, greptool.New, viewimage.New}
 	tools := make([]toolcontract.Tool, 0, len(constructors)+1)
 	for _, constructor := range constructors {
 		t, err := constructor(fileDeps)
@@ -995,6 +1021,9 @@ func buildSandboxStack(directRunner *localexec.Runner, sandboxCfg clisandbox.Con
 }
 
 func buildSkillService(configDir string, cfg platformconfig.SkillsConfig, prof profilemodel.Profile, auditSink auditcontract.Sink, usageSink usagecontract.Sink, visibility capcontract.Registry, workspaceRoot string) (skillcontract.Service, []localskill.Root, error) {
+	if err := cliskill.EnsureUserSkillsDir(); err != nil {
+		return nil, nil, err
+	}
 	roots := defaultSkillRoots(configDir, workspaceRootOrDot(workspaceRoot))
 	installedRoots, err := cliskill.InstalledSkillRoots(context.Background())
 	if err != nil {
@@ -1130,6 +1159,8 @@ func newApprovalRequester(quiet bool) approvalcontract.Requester {
 
 type cliArtifactControl struct {
 	produced       workcontract.ProducedResourceRegistrar
+	producedStore  workcontract.ProducedResourceStore
+	readers        workcontract.ResourceReaderRouter
 	remoteSessions scriptservice.RemoteSessionBinder
 	reservations   artifactcontract.OutputReservationAllocator
 	deliverables   artifactcontract.DeliverableSpecStore
@@ -1158,6 +1189,8 @@ func buildCLIArtifactControl(stateRoot, workspaceRoot string, execStack productE
 	}
 	return cliArtifactControl{
 		produced:       built.Produced,
+		producedStore:  built.ProducedStore,
+		readers:        built.Readers,
 		remoteSessions: built.RemoteSessions,
 		reservations:   built.Reservations,
 		deliverables:   built.Deliverables,

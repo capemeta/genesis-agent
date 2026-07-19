@@ -16,6 +16,7 @@ import (
 	artifactcontract "genesis-agent/internal/capabilities/artifact/contract"
 	"genesis-agent/internal/domain"
 	"genesis-agent/internal/runtime/progress"
+	cliattach "genesis-agent/products/cli/internal/attach"
 )
 
 // runResult run 命令的 JSON 输出结构（--json 模式）
@@ -36,6 +37,7 @@ func newRunCmd(configDirRef *string, sandboxModeRef *string, factory ServiceFact
 		progressMode string
 		resumeID     string
 		deliverables []string
+		attachPaths  []string
 	)
 
 	cmd := &cobra.Command{
@@ -50,7 +52,8 @@ func newRunCmd(configDirRef *string, sandboxModeRef *string, factory ServiceFact
   agent run "帮我计算 sqrt(144) + 2^10"
   agent run --json "今天星期几？"               JSON 格式输出
   agent run --quiet "北京现在几点？" > out.txt  仅输出最终回答（适合重定向）
-  agent run --deliverable deck.pptx "按 brief 做演示文稿"  显式声明交付物（优先于 prompt 猜测）`,
+  agent run --deliverable deck.pptx "按 brief 做演示文稿"  显式声明交付物（优先于 prompt 猜测）
+  agent run --attach slide.png --attach note.docx "分析图片和文档"`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) (runErr error) {
 			ctx := context.Background()
@@ -61,6 +64,10 @@ func newRunCmd(configDirRef *string, sandboxModeRef *string, factory ServiceFact
 			}
 			if err := validateProgressMode(progressMode); err != nil {
 				return err
+			}
+			attachments, attachErr := cliattach.FromPaths(attachPaths)
+			if attachErr != nil {
+				return attachErr
 			}
 
 			// JSON/quiet 模式不能出现交互式审批提示，避免污染机器可读输出。
@@ -99,6 +106,7 @@ func newRunCmd(configDirRef *string, sandboxModeRef *string, factory ServiceFact
 				TenantID:     session.TenantID,
 				UserID:       session.UserID,
 				Input:        input,
+				Attachments:  attachments,
 				OnProgress:   progressSink,
 				Deliverables: declaredDeliverablesFromFlags(deliverables),
 			})
@@ -165,6 +173,7 @@ func newRunCmd(configDirRef *string, sandboxModeRef *string, factory ServiceFact
 	cmd.Flags().StringVar(&progressMode, "progress", "auto", "进度输出模式：auto|off|text|jsonl（输出到stderr）")
 	cmd.Flags().StringVar(&resumeID, "resume", "", "在指定会话中继续单次推理")
 	cmd.Flags().StringArrayVar(&deliverables, "deliverable", nil, "显式声明交付文件名（可重复）；优先于 prompt 启发式")
+	cmd.Flags().StringArrayVar(&attachPaths, "attach", nil, "显式附加本地文件（可重复）；图片进视觉通道，文档进文本抽取通道")
 
 	return cmd
 }

@@ -41,6 +41,7 @@ type StartRunRequest struct {
 	SessionID       string
 	TenantID        string
 	UserInput       string
+	Attachments     []AttachmentDescriptor // 本轮显式附件（TurnInput）；不含 bytes
 	Agent           *Agent
 	ContextStrategy string // 新增：本次会话的上下文预算策略（如 default/rag/coding）
 }

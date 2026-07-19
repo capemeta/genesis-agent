@@ -173,6 +173,21 @@ func TestBuildSystemSubAgentAudienceSkipsDelegation(t *testing.T) {
 	}
 }
 
+func TestBuildSystemVisionDegradedRules(t *testing.T) {
+	got, err := New().BuildSystem(context.Background(), BuildRequest{
+		AvailableTools: []string{"view_image", "sandbox_exec"},
+		VisionMode:     "degraded_text",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"view_image", "Pillow", "vision_unavailable", "degraded_text"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in system prompt:\n%s", want, got)
+		}
+	}
+}
+
 func TestRenderEnvironmentContextEscapesAndDeduplicates(t *testing.T) {
 	got := renderEnvironmentContext(context.Background(), EnvironmentContext{
 		OS:               "windows",

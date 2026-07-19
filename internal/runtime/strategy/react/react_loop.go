@@ -18,8 +18,14 @@ import (
 
 	approvalcontract "genesis-agent/internal/capabilities/approval/contract"
 	artifactcontract "genesis-agent/internal/capabilities/artifact/contract"
+	artifactservice "genesis-agent/internal/capabilities/artifact/service"
 	hookcontract "genesis-agent/internal/capabilities/hook/contract"
 	hookmodel "genesis-agent/internal/capabilities/hook/model"
+	imagesanitize "genesis-agent/internal/capabilities/llm/sanitize"
+	"genesis-agent/internal/capabilities/llm/vision"
+	viewimage "genesis-agent/internal/capabilities/media/tool/view_image"
+	"genesis-agent/internal/capabilities/turninput"
+	runtimevision "genesis-agent/internal/runtime/vision"
 	"genesis-agent/internal/capabilities/llm/contract"
 	"genesis-agent/internal/capabilities/memory/contract"
 	skillcollision "genesis-agent/internal/capabilities/skill/collision"
@@ -75,6 +81,11 @@ type ReactLoopEngine struct {
 	effectiveContextRatio float64
 	outputReserveTokens   int
 	compactor             runtimecontext.Compactor
+	effectiveVisionMode   vision.Mode
+	visionExpert          runtimevision.Analyzer
+	turnInputOpts         turninput.Options
+	// toolMaxConcurrency 同轮 sibling 工具并发上限；<=0 时调度器使用默认 4。
+	toolMaxConcurrency int
 
 	// 新增：长期记忆与用户画像
 	ltm              memory.LongTermMemory
@@ -110,6 +121,38 @@ func WithContextBudgetConfig(effectiveRatio float64, outputReserveTokens int) En
 	return func(e *ReactLoopEngine) {
 		e.effectiveContextRatio = effectiveRatio
 		e.outputReserveTokens = outputReserveTokens
+	}
+}
+
+// WithEffectiveVisionMode 注入 Run 级视觉形态（配置真相源求解结果）。
+func WithEffectiveVisionMode(mode vision.Mode) EngineOption {
+	return func(e *ReactLoopEngine) {
+		if mode != "" {
+			e.effectiveVisionMode = mode
+		}
+	}
+}
+
+// WithVisionExpert 注入形态 B 视觉专家（Runtime 路由，非工具内裸调）。
+func WithVisionExpert(expert runtimevision.Analyzer) EngineOption {
+	return func(e *ReactLoopEngine) {
+		e.visionExpert = expert
+	}
+}
+
+// WithTurnInputOptions 注入 document_extract / mention_resolve 等 Turn 装配开关。
+func WithTurnInputOptions(opts turninput.Options) EngineOption {
+	return func(e *ReactLoopEngine) {
+		e.turnInputOpts = opts
+	}
+}
+
+// WithToolMaxConcurrency 注入同轮 sibling 工具最大并发；n<=0 时忽略（沿用调度器默认）。
+func WithToolMaxConcurrency(n int) EngineOption {
+	return func(e *ReactLoopEngine) {
+		if n > 0 {
+			e.toolMaxConcurrency = n
+		}
 	}
 }
 
@@ -153,6 +196,7 @@ func NewReactLoopEngine(
 		contextWindow:         contextWindow,
 		maxTokens:             maxTokens,
 		effectiveContextRatio: 0.92,
+		effectiveVisionMode:   vision.ModeDegradedText,
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -281,10 +325,15 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 
 	// ── 步骤2: 构建初始消息列表与弹性预算装配 ──────────────────
 	// System消息（Persona System Prompt）；子 Run 跳过主侧委派纪律
+	visionModeForPrompt := e.effectiveVisionMode
+	if visionModeForPrompt == "" {
+		visionModeForPrompt = vision.ModeDegradedText
+	}
 	systemPrompt, err := e.prompt.BuildSystem(ctx, prompt.BuildRequest{
 		Agent:             agent,
 		Run:               rc.Run,
 		AvailableTools:    activeToolNames,
+		VisionMode:        string(visionModeForPrompt),
 		Audience:          promptAudience(ctx),
 		CollaborationMode: string(collabMode),
 		PlanDocumentPath:  collab.PlanDocumentRelPath(req.SessionID),
@@ -408,6 +457,25 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 		history = res.Messages
 	}
 
+	visionMode := e.effectiveVisionMode
+	if visionMode == "" {
+		visionMode = vision.ModeDegradedText
+	}
+	rc.VisionMode = string(visionMode)
+	turnOpts := e.turnInputOpts
+	userText := req.UserInput
+	attachments := req.Attachments
+	mention := turninput.ResolveMentions(userText, attachments, turnOpts.MentionResolve, turnOpts.WorkspaceRoot, nil)
+	userText = mention.Text
+	attachments = turninput.PrepareAttachments(mention.Attachments, turnOpts.DocumentExtract, nil)
+	userTurn := turninput.BuildUserTurnMessage(userText, attachments, visionMode)
+	if visionMode == vision.ModeExpertRoute && len(attachments) > 0 {
+		userTurn = e.enrichUserTurnWithVisionExpert(ctx, userTurn, attachments)
+	}
+	if visionMode == vision.ModeDegradedText {
+		_ = tryRecordVisionUnavailable(ctx, attachments, false)
+	}
+
 	// 精密组装 messages (system -> history -> working_obs -> user)
 	assembler := runtimecontext.NewDefaultContextAssembler(e.estimator)
 	assemblerOpt := runtimecontext.AssemblerOptions{
@@ -419,7 +487,7 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 		LongTermMemories:   ltmEntries,
 		HistorySummary:     historySummary,
 		HistoryMessages:    history,
-		CurrentUserMessage: domain.NewUserMessage(req.UserInput),
+		CurrentUserMessage: userTurn,
 	}
 
 	rc.Messages, err = assembler.Assemble(ctx, assemblerOpt)
@@ -568,6 +636,7 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 		// 使用命名返回值 err，避免 := 遮蔽导致 defer 落盘读到错误的失败原因。
 		var llmResp *domain.Message
 		modelMsgs := projectMessagesForModel(rc.Messages, collabMode == collab.ModePlan)
+		modelMsgs = imagesanitize.CompactHistoricalImages(modelMsgs, 2)
 		if collabMode != collab.ModePlan {
 			modelMsgs = e.withTaskListReminder(ctx, req.SessionID, rc, modelMsgs, iterLog)
 		}
@@ -598,6 +667,11 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 			handoffPending = false
 		}
 		iterLog.Debug("LLM响应", "tool_calls", len(llmResp.ToolCalls), "content_len", len(llmResp.Content))
+		if llmResp.Content != "" {
+			if recErr := tryRecordVisualQAFromText(ctx, llmResp.Content); recErr != nil {
+				return fmt.Errorf("记录 visual-qa 证据失败: %w", recErr)
+			}
+		}
 		usage := domain.TokenUsage{CompletionTokens: int64(e.estimator.Estimate(ctx, llmResp.Content, req.Agent.DefaultModel))}
 		if payload, marshalErr := json.Marshal(llmResp.ToolCalls); marshalErr == nil {
 			usage.CompletionTokens += int64(e.estimator.Estimate(ctx, string(payload), req.Agent.DefaultModel))
@@ -670,7 +744,11 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 				if e.applySkillToolResult(rc, toolResult, &activeToolNames, &toolInfos, iterLog) {
 					continue
 				}
-				rc.Messages = append(rc.Messages, domain.NewToolResultMessage(toolResult.ID, toolResult.Content))
+				if len(toolResult.Parts) > 0 {
+					rc.Messages = append(rc.Messages, domain.NewToolResultMessageWithParts(toolResult.ID, toolResult.Content, toolResult.Parts))
+				} else {
+					rc.Messages = append(rc.Messages, domain.NewToolResultMessage(toolResult.ID, toolResult.Content))
+				}
 			}
 			var syncErr error
 			ctx, collabMode, handoffPending, syncErr = e.syncCollabAfterTools(ctx, req.SessionID, collabMode, rc, agent, &toolInfos, &activeToolNames, iterLog)
@@ -853,6 +931,7 @@ type toolExecutionResult struct {
 	ID      string
 	Name    string
 	Content string
+	Parts   []domain.ContentPart
 }
 
 func (e *ReactLoopEngine) executeToolCalls(ctx context.Context, rc *runtime.RunContext, calls []domain.ToolCall, log logger.Logger) ([]toolExecutionResult, error) {
@@ -885,7 +964,11 @@ func (e *ReactLoopEngine) executeToolCalls(ctx context.Context, rc *runtime.RunC
 			return result, err
 		}})
 	}
-	results := scheduler.NewQueue().Run(executionCtx, tasks)
+	queueOpts := make([]scheduler.QueueOptions, 0, 1)
+	if e.toolMaxConcurrency > 0 {
+		queueOpts = append(queueOpts, scheduler.QueueOptions{MaxConcurrency: e.toolMaxConcurrency})
+	}
+	results := scheduler.NewQueue(queueOpts...).Run(executionCtx, tasks)
 	argsByID := map[string]string{}
 	for _, tc := range calls {
 		argsByID[tc.ID] = tc.Function.Arguments
@@ -911,7 +994,11 @@ func (e *ReactLoopEngine) executeToolCalls(ctx context.Context, rc *runtime.RunC
 			return nil, err
 		}
 		content = annotateSkillFollowHints(rc, result.Name, argsByID[result.ID], content)
-		out = append(out, toolExecutionResult{ID: result.ID, Name: result.Name, Content: content})
+		tr := toolExecutionResult{ID: result.ID, Name: result.Name, Content: content}
+		if result.Name == "view_image" {
+			tr.Content, tr.Parts = e.applyViewImageRuntimeBridge(ctx, rc, content)
+		}
+		out = append(out, tr)
 	}
 	return out, nil
 }
@@ -970,7 +1057,11 @@ func (e *ReactLoopEngine) executeOneToolCall(ctx context.Context, rc *runtime.Ru
 		return toolExecutionResult{ID: tc.ID, Name: tc.Function.Name}, evidenceErr
 	}
 	content = annotateSkillFollowHints(rc, tc.Function.Name, tc.Function.Arguments, content)
-	return toolExecutionResult{ID: tc.ID, Name: tc.Function.Name, Content: content}, nil
+	tr := toolExecutionResult{ID: tc.ID, Name: tc.Function.Name, Content: content}
+	if tc.Function.Name == "view_image" {
+		tr.Content, tr.Parts = e.applyViewImageRuntimeBridge(ctx, rc, content)
+	}
+	return tr, nil
 }
 
 func recordSkillQAEvidence(ctx context.Context, rc *runtime.RunContext, toolName, args, content string) error {
@@ -989,13 +1080,22 @@ func recordSkillQAEvidence(ctx context.Context, rc *runtime.RunContext, toolName
 	if !ok {
 		return fmt.Errorf("QA evidence recorder 已配置但缺少 prepared run")
 	}
-	digest := sha256.Sum256([]byte(command))
-	return recorder.RecordPassed(ctx, artifactcontract.QAPassRequest{TenantID: prepared.Manifest.Scope.TenantID, RunID: prepared.Manifest.RunID, Validator: "skill-command:sha256:" + fmt.Sprintf("%x", digest[:])})
+	validator := artifactservice.ClassifySkillQACommand(command)
+	return recorder.RecordPassed(ctx, artifactcontract.QAPassRequest{
+		TenantID:  prepared.Manifest.Scope.TenantID,
+		RunID:     prepared.Manifest.RunID,
+		Validator: validator,
+	})
 }
 
 func (e *ReactLoopEngine) runToolCall(ctx context.Context, rc *runtime.RunContext, tc domain.ToolCall, log logger.Logger) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
+	}
+	if rc != nil && rc.VisionMode != "" {
+		ctx = viewimage.WithVisionMode(ctx, vision.Mode(rc.VisionMode))
+	} else if e.effectiveVisionMode != "" {
+		ctx = viewimage.WithVisionMode(ctx, e.effectiveVisionMode)
 	}
 	runID := rc.Run.ID
 	stepIdx := rc.Iteration

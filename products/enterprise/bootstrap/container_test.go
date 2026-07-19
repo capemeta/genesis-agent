@@ -47,6 +47,9 @@ func (testArtifactControl) EvaluateCompletion(context.Context, string, string) (
 func (testArtifactControl) RecordPassed(context.Context, artifactcontract.QAPassRequest) error {
 	return nil
 }
+func (testArtifactControl) RecordDegraded(context.Context, artifactcontract.QADegradeRequest) error {
+	return nil
+}
 func (testArtifactControl) Reserve(context.Context, artifactcontract.ReserveRequest) (artifactcontract.ReserveResult, error) {
 	return artifactcontract.ReserveResult{}, nil
 }

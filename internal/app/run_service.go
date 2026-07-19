@@ -144,11 +144,12 @@ func (s *agentServiceImpl) RunOnce(ctx context.Context, req RunRequest) (*RunRes
 		hookcontract.AppendAdditionalContext(ctx, result.AdditionalContext...)
 	}
 	run, err := s.runEngine.Start(ctx, domain.StartRunRequest{
-		RunID:     prepared.Manifest.RunID,
-		SessionID: req.SessionID,
-		TenantID:  req.TenantID,
-		UserInput: req.Input,
-		Agent:     agent,
+		RunID:       prepared.Manifest.RunID,
+		SessionID:   req.SessionID,
+		TenantID:    req.TenantID,
+		UserInput:   req.Input,
+		Attachments: req.Attachments,
+		Agent:       agent,
 	})
 	s.updateSessionAfterRun(ctx, req, run)
 	if err != nil {

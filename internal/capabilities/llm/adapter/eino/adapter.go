@@ -18,21 +18,24 @@ import (
 	"github.com/cloudwego/eino/schema"
 
 	"genesis-agent/internal/capabilities/llm/contract"
+	"genesis-agent/internal/capabilities/llm/sanitize"
 	"genesis-agent/internal/capabilities/tool/contract"
 	"genesis-agent/internal/domain"
 )
 
 // adapter 将 eino ToolCallingChatModel 适配为 llm.ChatModel 接口
 type adapter struct {
-	inner     einoModel.ToolCallingChatModel // 被包裹的 eino 模型实例
-	modelName string                         // 模型名称（日志/追踪用）
+	inner         einoModel.ToolCallingChatModel // 被包裹的 eino 模型实例
+	modelName     string                         // 模型名称（日志/追踪用）
+	supportsImage bool                           // Per-Request Sanitizer 真相
 }
 
 // newAdapter 创建 eino 适配器，返回 llm.ChatModel 接口
-func newAdapter(m einoModel.ToolCallingChatModel, modelName string) llm.ChatModel {
+func newAdapter(m einoModel.ToolCallingChatModel, modelName string, supportsImage bool) llm.ChatModel {
 	return &adapter{
-		inner:     m,
-		modelName: modelName,
+		inner:         m,
+		modelName:     modelName,
+		supportsImage: supportsImage,
 	}
 }
 
@@ -41,21 +44,36 @@ func (a *adapter) GetModelName() string {
 	return a.modelName
 }
 
-// Generate 实现 llm.ChatModel 接口
-// 执行流程：消息格式转换 → 工具绑定 → 调用 eino → 结果格式转换
-func (a *adapter) Generate(ctx context.Context, messages []*domain.Message, tools []*tool.Info) (*domain.Message, error) {
-	// Step 1：domain.Message → eino schema.Message
-	schemaMessages := batchDomainToSchema(messages)
-
-	// Step 2：通过 WithTools 绑定工具（返回新实例，线程安全）
+// bindCaller 在有工具时 WithTools；无工具时直接使用 inner，避免 "no tools to bind"。
+func (a *adapter) bindCaller(tools []*tool.Info) (einoModel.ToolCallingChatModel, error) {
 	schemaTools := toolInfosToSchema(tools)
-	boundModel, err := a.inner.WithTools(schemaTools)
+	if len(schemaTools) == 0 {
+		return a.inner, nil
+	}
+	bound, err := a.inner.WithTools(schemaTools)
 	if err != nil {
 		return nil, fmt.Errorf("llm/eino: 工具绑定失败: %w", err)
 	}
+	return bound, nil
+}
+
+// Generate 实现 llm.ChatModel 接口
+// 执行流程：消息格式转换 → 工具绑定 → 调用 eino → 结果格式转换
+func (a *adapter) Generate(ctx context.Context, messages []*domain.Message, tools []*tool.Info) (*domain.Message, error) {
+	// Step 0：Per-Request ImageSanitizer（目标模型不支持则硬剥离）
+	messages = sanitize.StripImages(messages, a.supportsImage, a.modelName)
+	// Step 1：domain.Message → eino schema.Message
+	schemaMessages := batchDomainToSchema(messages)
+
+	// Step 2：有工具才 WithTools；VisionExpert / 纯对话传 nil/空切片时必须跳过，
+	// 否则 eino 返回 "no tools to bind"，形态 B 会瞬间失败。
+	caller, err := a.bindCaller(tools)
+	if err != nil {
+		return nil, err
+	}
 
 	// Step 3：调用 eino 生成回复
-	resp, err := boundModel.Generate(ctx, schemaMessages)
+	resp, err := caller.Generate(ctx, schemaMessages)
 	if err != nil {
 		logLLMCall(a.modelName, messages, tools, nil, err)
 		return nil, fmt.Errorf("llm/eino: Generate 调用失败: %w", err)
@@ -74,18 +92,18 @@ func (a *adapter) Generate(ctx context.Context, messages []*domain.Message, tool
 // StreamGenerate 实现 llm.ChatModel 接口
 // 执行流程：消息格式转换 → 工具绑定 → 调用 eino.Stream → 循环 Recv 分片并回调 → 聚合最终消息
 func (a *adapter) StreamGenerate(ctx context.Context, messages []*domain.Message, tools []*tool.Info, onDelta func(delta string, isThought bool)) (*domain.Message, error) {
+	messages = sanitize.StripImages(messages, a.supportsImage, a.modelName)
 	// Step 1：domain.Message → eino schema.Message
 	schemaMessages := batchDomainToSchema(messages)
 
-	// Step 2：绑定工具
-	schemaTools := toolInfosToSchema(tools)
-	boundModel, err := a.inner.WithTools(schemaTools)
+	// Step 2：绑定工具（空工具跳过）
+	caller, err := a.bindCaller(tools)
 	if err != nil {
-		return nil, fmt.Errorf("llm/eino: 流式工具绑定失败: %w", err)
+		return nil, err
 	}
 
 	// Step 3：调用 eino Stream 接口
-	reader, err := boundModel.Stream(ctx, schemaMessages)
+	reader, err := caller.Stream(ctx, schemaMessages)
 	if err != nil {
 		return nil, fmt.Errorf("llm/eino: Stream 调用失败: %w", err)
 	}

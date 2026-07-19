@@ -118,6 +118,38 @@ llm:
 	}
 }
 
+func TestLoadAgentConcurrencyOverrides(t *testing.T) {
+	dir := t.TempDir()
+	content := `
+agent:
+  max_iterations: 10
+  system_prompt: test
+  tool_max_concurrency: 8
+  subagent_max_concurrent: 5
+  vision_max_concurrent_reads: 2
+log:
+  level: info
+server:
+  host: 127.0.0.1
+  port: 8080
+`
+	writeTestConfig(t, dir, content, minimalLLMConfig())
+
+	cfg, err := LoadWithOptions(dir, LoadOptions{Product: "cli", ConfigHome: t.TempDir()})
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Agent.ToolMaxConcurrency != 8 {
+		t.Fatalf("ToolMaxConcurrency = %d, want 8", cfg.Agent.ToolMaxConcurrency)
+	}
+	if cfg.Agent.SubAgentMaxConcurrent != 5 {
+		t.Fatalf("SubAgentMaxConcurrent = %d, want 5", cfg.Agent.SubAgentMaxConcurrent)
+	}
+	if cfg.Agent.VisionMaxConcurrentReads != 2 {
+		t.Fatalf("VisionMaxConcurrentReads = %d, want 2", cfg.Agent.VisionMaxConcurrentReads)
+	}
+}
+
 func TestLoadHTTPClientDefaults(t *testing.T) {
 	dir := t.TempDir()
 	content := `
@@ -527,40 +559,20 @@ web:
 		t.Fatalf("tavily key = %q, want script-env-key", cfg.Web.TavilyAPIKey)
 	}
 }
-func TestLoadEnsuresProductUserConfig(t *testing.T) {
+func TestLoadDoesNotCreateUserHomeSideEffects(t *testing.T) {
 	dir := t.TempDir()
 	configHome := t.TempDir()
 	writeTestConfig(t, dir, minimalConfig("", ""), minimalLLMConfig())
 
-	cfg, err := LoadWithOptions(dir, LoadOptions{Product: "cli", ConfigHome: configHome, EnsureUserConfig: true})
+	cfg, err := LoadWithOptions(dir, LoadOptions{Product: "cli", ConfigHome: configHome})
 	if err != nil {
 		t.Fatalf("LoadWithOptions() error = %v", err)
 	}
 	if cfg == nil {
 		t.Fatal("LoadWithOptions() returned nil config")
 	}
-	if _, err := os.Stat(filepath.Join(configHome, "cli", "config.yaml")); err != nil {
-		t.Fatalf("cli user config was not created: %v", err)
-	}
-	if info, err := os.Stat(filepath.Join(configHome, "cli", "skills")); err != nil || !info.IsDir() {
-		t.Fatalf("cli skills dir was not created: info=%v err=%v", info, err)
-	}
-}
-
-func TestLoadEnsuresDesktopUserConfig(t *testing.T) {
-	dir := t.TempDir()
-	configHome := t.TempDir()
-	writeTestConfig(t, dir, minimalConfig("", ""), minimalLLMConfig())
-
-	_, err := LoadWithOptions(dir, LoadOptions{Product: "desktop", ConfigHome: configHome, EnsureUserConfig: true})
-	if err != nil {
-		t.Fatalf("LoadWithOptions() error = %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(configHome, "desktop", "config.yaml")); err != nil {
-		t.Fatalf("desktop user config was not created: %v", err)
-	}
-	if info, err := os.Stat(filepath.Join(configHome, "desktop", "skills")); err != nil || !info.IsDir() {
-		t.Fatalf("desktop skills dir was not created: info=%v err=%v", info, err)
+	if _, err := os.Stat(filepath.Join(configHome, "cli")); !os.IsNotExist(err) {
+		t.Fatalf("config load must not create user product dir: err=%v", err)
 	}
 }
 func TestLoadLogDefaultsAndPathCompat(t *testing.T) {

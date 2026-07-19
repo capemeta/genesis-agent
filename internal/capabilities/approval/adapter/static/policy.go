@@ -29,7 +29,11 @@ func (e *PolicyEngine) Evaluate(ctx context.Context, req model.Request) (model.P
 		return askOnce("dangerous operation requires approval", model.RiskHigh), nil
 	}
 	if metadata["scope"] == "external" {
-		return askScoped("external resource requires approval", model.RiskHigh, []model.GrantScope{model.GrantScopeOnce, model.GrantScopeSession}), nil
+		return askScoped("external resource requires approval", model.RiskHigh, []model.GrantScope{
+			model.GrantScopeOnce,
+			model.GrantScopeSession,
+			model.GrantScopeProject,
+		}), nil
 	}
 	if metadata["scope"] == "workspace" {
 		return model.PolicyResult{Type: model.PolicyAllow, Reason: "policy allow", Risk: riskOrDefault(req.Risk)}, nil

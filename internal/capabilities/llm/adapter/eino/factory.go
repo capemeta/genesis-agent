@@ -69,6 +69,8 @@ type Config struct {
 	MaxTokens   int
 	Temperature *float64
 	TopP        *float64
+	// SupportsImage 该目标模型是否允许 image input；未配置视为 false（fail-safe）。
+	SupportsImage bool
 
 	// ---- Azure OpenAI 专用字段（ByAzure=true时使用）----
 	ByAzure    bool   // 是否使用 Azure OpenAI Service
@@ -113,7 +115,7 @@ func New(ctx context.Context, cfg *Config) (llm.ChatModel, error) {
 		return nil, err
 	}
 
-	return newAdapter(einoM, cfg.Model), nil
+	return newAdapter(einoM, cfg.Model, cfg.SupportsImage), nil
 }
 
 // ==================== 各 Provider eino 实例创建 ====================
