@@ -55,6 +55,10 @@ func TestReadinessAndSetup(t *testing.T) {
 	oldDir := sandboxDirOverride
 	SetSandboxDirOverride(t.TempDir())
 	defer SetSandboxDirOverride(oldDir)
+	t.Cleanup(func() {
+		cwd, _ := os.Getwd()
+		_ = os.RemoveAll(filepath.Join(cwd, ".genesis"))
+	})
 
 	// Backup existing readiness if any
 	dir := sandboxDir()

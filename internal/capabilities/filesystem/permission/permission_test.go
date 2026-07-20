@@ -24,9 +24,9 @@ func TestBuildApprovalRequestAllowsWorkspaceRead(t *testing.T) {
 }
 
 func TestBuildApprovalRequestMarksProtectedPath(t *testing.T) {
-	req := BuildApprovalRequest("read_file", OperationRead, model.ResolvedPath{
+	req := BuildApprovalRequest("write_file", OperationWrite, model.ResolvedPath{
 		DisplayPath: "system",
-		BackendPath: `C:\Windows\System32\config`,
+		BackendPath: `C:\Windows\System32\config\SAM`,
 		Scope:       model.PathScopeProtected,
 	})
 	if req.Metadata["protected"] != "true" || req.Metadata["critical"] != "true" {
@@ -63,13 +63,13 @@ func TestBuildApprovalRequestMetadataReadIsNotCritical(t *testing.T) {
 }
 
 func TestBuildApprovalRequestMarksSSHDirectoryItselfProtected(t *testing.T) {
-	req := BuildApprovalRequest("read_file", OperationRead, model.ResolvedPath{
+	req := BuildApprovalRequest("write_file", OperationWrite, model.ResolvedPath{
 		DisplayPath: ".ssh",
 		BackendPath: `C:\Users\dev\.ssh`,
 		Scope:       model.PathScopeExternal,
 	})
 	if req.Metadata["protected"] != "true" || req.Metadata["critical"] != "true" {
-		t.Fatalf("metadata = %#v, want protected critical", req.Metadata)
+		t.Fatalf("metadata = %#v, want protected critical on write", req.Metadata)
 	}
 }
 
@@ -83,3 +83,41 @@ func TestBuildApprovalRequestIncludesWorkspaceRel(t *testing.T) {
 		t.Fatalf("workspace_rel = %q, want internal/app.go", req.Metadata["workspace_rel"])
 	}
 }
+
+func TestBuildApprovalRequestMultiOSProtectedPaths(t *testing.T) {
+	criticalPaths := []string{
+		`C:\Windows\System32\config\SAM`,
+		`/etc/sudoers`,
+		`/Library/Keychains/System.keychain`,
+		`/home/user/.aws/credentials`,
+		`/home/user/.ssh/id_rsa`,
+	}
+	for _, path := range criticalPaths {
+		req := BuildApprovalRequest("write_file", OperationWrite, model.ResolvedPath{
+			DisplayPath: path,
+			BackendPath: path,
+			Scope:       model.PathScopeExternal,
+		})
+		if req.Metadata["protected"] != "true" || req.Metadata["critical"] != "true" {
+			t.Fatalf("critical path %q metadata = %#v, want protected and critical", path, req.Metadata)
+		}
+	}
+
+	protectedPaths := []string{
+		`C:\Windows\System32\drivers\etc\hosts`,
+		`/etc/crontab`,
+		`/home/user/.zshrc`,
+		`.github/workflows/ci.yml`,
+	}
+	for _, path := range protectedPaths {
+		req := BuildApprovalRequest("write_file", OperationWrite, model.ResolvedPath{
+			DisplayPath: path,
+			BackendPath: path,
+			Scope:       model.PathScopeExternal,
+		})
+		if req.Metadata["protected"] != "true" {
+			t.Fatalf("protected path %q metadata = %#v, want protected=true", path, req.Metadata)
+		}
+	}
+}
+

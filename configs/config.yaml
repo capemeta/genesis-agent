@@ -30,20 +30,34 @@ secrets:
   master_key_env: GENESIS_MASTER_KEY
 
 sandbox:
-  # 外部 genesis-sandbox API 默认关闭。CLI/Desktop 可仅使用本地宿主机或本地平台沙箱。
-  enabled: false
-  # local_host、local_platform_sandbox、docker_sandbox、remote_sandbox。
-  mode: local_host
-  # 全局默认执行策略：disabled、optional、required。会话级参数可覆盖。
-  default_execution: disabled
-  # 是否允许每次对话/每次 HTTP run 请求覆盖 sandbox 执行策略。
-  allow_session_override: true
-  # mode=docker_sandbox 或 remote_sandbox 时配置服务地址和凭据。
-  base_url: ${GENESIS_SANDBOX_BASE_URL}
-  api_key: ${GENESIS_SANDBOX_API_KEY}
-  api_key_env: GENESIS_SANDBOX_API_KEY
-  workspace_id: ""
-  default_runtime_profile: code-polyglot-basic
+  # 本地 OS 平台沙箱配置 (Process Confinement: Seatbelt/bwrap/Windows Token)
+  local:
+    enabled: true
+    preference: auto         # auto (默认,优先使用可降级) | required (强隔离) | disabled
+    default_level: process_constrained
+
+  # 远程容器沙箱配置 (genesis-sandbox API / Docker Service)
+  remote:
+    enabled: false            # Layer 1 硬门控开关：未开启时禁止任何远程调度
+    base_url: ${GENESIS_SANDBOX_BASE_URL}
+    api_key: ${GENESIS_SANDBOX_API_KEY}
+    api_key_env: GENESIS_SANDBOX_API_KEY
+    workspace_id: ""
+    default_runtime_profile: code-polyglot-basic
+
+  # 全局路由与调度配置
+  routing:
+    default_execution: optional       # disabled | optional | required
+    allow_session_override: true      # 允许每次对话或 HTTP run 请求覆盖 sandbox 策略
+    auto_route_risk: true             # 允许 CommandRiskEvaluator 自动按风险切分远程沙箱
+
+  # 外置技能沙箱集中覆盖 (skills_override)
+  skills_override:
+    office-ppt:
+      sandbox:
+        preferred_backend: remote_sandbox
+        allow_degradation: true
+
 
 policy:
   defaults:

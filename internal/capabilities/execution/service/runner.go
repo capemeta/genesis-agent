@@ -21,6 +21,8 @@ type Runner struct {
 	direct        execcontract.CommandRunner
 	sandbox       execcontract.SandboxRunner
 	pathValidator commandPathValidator
+	astAnalyzer   *ScriptASTAnalyzer
+	policyPipeline *PolicyPipeline
 	logger        logger.Logger
 }
 
@@ -58,6 +60,7 @@ func NewRunner(direct execcontract.CommandRunner, sandbox execcontract.SandboxRu
 		direct:        direct,
 		sandbox:       sandbox,
 		pathValidator: pathcontract.NewValidator(nil),
+		astAnalyzer:   NewScriptASTAnalyzer(),
 		logger:        logger.NewNop(),
 	}
 	for _, option := range options {
@@ -76,7 +79,11 @@ func (r *Runner) Run(ctx context.Context, cmd execmodel.Command, opts execcontra
 	if strings.TrimSpace(cmd.Cwd) == "" {
 		cmd.Cwd = opts.Workspace.WorkDir
 	}
+	if !filepath.IsAbs(cmd.Cwd) {
+		return nil, execcontract.NewError(execcontract.ErrCodeInvalidInput, fmt.Errorf("cmd.Cwd 必须为物理绝对路径, 收到: %q", cmd.Cwd))
+	}
 	cmd = applyExecutionWorkspaceEnv(cmd, opts.Workspace)
+	cmd.Env = NewEnvSanitizer().SanitizeEnv(cmd.Env)
 	validator := r.pathValidator
 	if validator == nil {
 		validator = pathcontract.NewValidator(nil)
@@ -88,6 +95,14 @@ func (r *Runner) Run(ctx context.Context, cmd execmodel.Command, opts execcontra
 	if mode == "" {
 		mode = execmodel.SandboxDisabled
 	}
+
+	// 触发复合脚本 AST 分析：若脚本内部含有敏感命令，强切为 SandboxRequired
+	if r.astAnalyzer != nil && r.astAnalyzer.AnalyzeScript(cmd.Command) == RiskLevelUntrustedRemote {
+		if mode == execmodel.SandboxDisabled {
+			mode = execmodel.SandboxRequired
+		}
+	}
+
 	l := correl.AttachLogger(ctx, r.logger).With("command", cmd.Command, "cwd", cmd.Cwd, "mode", string(mode))
 
 	switch mode {

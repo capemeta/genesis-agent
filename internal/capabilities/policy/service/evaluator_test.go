@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	approvalmodel "genesis-agent/internal/capabilities/approval/model"
+	fspermission "genesis-agent/internal/capabilities/filesystem/permission"
 	"genesis-agent/internal/platform/config"
 )
 
@@ -116,4 +117,21 @@ func TestEvaluatorSkillScriptSuggestsSessionScope(t *testing.T) {
 		t.Fatalf("SuggestedScopes = %v, want include session", result.SuggestedScopes)
 	}
 }
+
+func TestEvaluatorContextPermissionMode(t *testing.T) {
+	evaluator := NewEvaluator(config.PolicyDefaultsConfig{Unknown: "ask", AllowedGrantScopes: []string{"once", "session"}})
+	ctx := fspermission.WithPermissionMode(context.Background(), fspermission.PermissionModeReadOnly)
+	
+	// FileWrite should be PolicyDeny under ReadOnly mode in context
+	result, err := evaluator.Evaluate(ctx, approvalmodel.Request{
+		Action: approvalmodel.ActionFileWrite,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Type != approvalmodel.PolicyDeny {
+		t.Fatalf("result = %+v, want PolicyDeny under context ReadOnly mode", result)
+	}
+}
+
 

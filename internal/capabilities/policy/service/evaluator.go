@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	approvalmodel "genesis-agent/internal/capabilities/approval/model"
+	fspermission "genesis-agent/internal/capabilities/filesystem/permission"
 	"genesis-agent/internal/capabilities/policy/contract"
 	"genesis-agent/internal/platform/config"
 )
@@ -50,14 +51,30 @@ func (e *Evaluator) Evaluate(ctx context.Context, req approvalmodel.Request) (ap
 	if first != nil {
 		return *first, nil
 	}
-	if result, ok := e.metadataFallback(req); ok {
+	if result, ok := e.metadataFallback(ctx, req); ok {
 		return e.normalize(result, req), nil
 	}
 	return e.normalize(approvalmodel.PolicyResult{Type: decisionOf(e.defaults.Unknown), Reason: "policy default for unknown operation", Risk: riskOrDefault(req.Risk)}, req), nil
 }
 
-func (e *Evaluator) metadataFallback(req approvalmodel.Request) (approvalmodel.PolicyResult, bool) {
+func (e *Evaluator) metadataFallback(ctx context.Context, req approvalmodel.Request) (approvalmodel.PolicyResult, bool) {
 	metadata := mergeMetadata(req)
+	var mode fspermission.PermissionMode
+	if ctxMode, ok := fspermission.FromContext(ctx); ok && ctxMode != "" {
+		mode = ctxMode
+	} else if rawMode := firstNonEmptyString(metadata["permission_mode"], metadata["mode"]); rawMode != "" {
+		mode = fspermission.NormalizeMode(rawMode)
+	}
+
+	if mode != "" {
+		eval := fspermission.NewModeEvaluator()
+		res, err := eval.Evaluate(ctx, mode, req)
+		if err == nil {
+			return res, true
+		}
+	}
+
+
 	if metadata["critical"] == "true" || metadata["protected"] == "true" || metadata["scope"] == "protected" || metadata["workspace_metadata_write"] == "true" {
 		return approvalmodel.PolicyResult{Type: approvalmodel.PolicyDeny, Reason: denyReason(metadata), Risk: approvalmodel.RiskCritical}, true
 	}
@@ -171,4 +188,14 @@ func riskOrDefault(risk approvalmodel.RiskLevel) approvalmodel.RiskLevel {
 	}
 	return risk
 }
+
+func firstNonEmptyString(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}
+
 

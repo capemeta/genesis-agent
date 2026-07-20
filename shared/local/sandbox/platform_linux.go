@@ -86,10 +86,12 @@ func (b linuxBackend) buildBubblewrapPlan(_ context.Context, req BuildRequest, b
 	if err != nil {
 		return nil, NewError(ErrCodeSandboxInitFailed, err)
 	}
+	cmdEnv := applyProxyEnv(req.Command.Env, req.Profile.Network, req.Profile.ProxyEnv)
+
 	plan := &Plan{
 		Type:                    TypeLinuxBubblewrap,
 		Enforcement:             EnforcementFilesystemNetwork,
-		Command:                 CommandSpec{Argv: append([]string{built.Program}, built.Args...), Env: req.Command.Env, Cwd: req.Command.Cwd},
+		Command:                 CommandSpec{Argv: append([]string{built.Program}, built.Args...), Env: cmdEnv, Cwd: req.Command.Cwd},
 		HelperPath:              bwrapPath,
 		FileSystemPolicy:        fs,
 		NetworkPolicy:           req.Profile.Network,

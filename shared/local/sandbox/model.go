@@ -105,9 +105,12 @@ func (p ProcessPolicy) RequiresProcessConfinement() bool {
 
 // Profile 是本地平台沙箱策略的聚合。
 type Profile struct {
-	FileSystem FileSystemPolicy `json:"file_system"`
-	Network    NetworkMode      `json:"network"`
-	Process    ProcessPolicy    `json:"process"`
+	FileSystem       FileSystemPolicy  `json:"file_system"`
+	Network          NetworkMode       `json:"network"`
+	Process          ProcessPolicy     `json:"process"`
+	ProxyPorts       []int             `json:"proxy_ports,omitempty"`
+	AllowUnixSockets []string          `json:"allow_unix_sockets,omitempty"`
+	ProxyEnv         map[string]string `json:"proxy_env,omitempty"`
 }
 
 // RequiresPlatformSandbox 返回策略是否需要本地平台沙箱。

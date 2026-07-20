@@ -11,16 +11,63 @@ import (
 	approvalmodel "genesis-agent/internal/capabilities/approval/model"
 )
 
-// PermissionMode 描述产品侧对文件权限的默认策略。
+// PermissionMode 描述产品侧与运行时的权限许可模式。
 type PermissionMode string
 
 const (
-	PermissionModeDefault     PermissionMode = "default"
-	PermissionModeAcceptEdits PermissionMode = "accept_edits"
-	PermissionModeDontAsk     PermissionMode = "dont_ask"
-	PermissionModeYolo        PermissionMode = "yolo"
-	PermissionModeBypass      PermissionMode = "bypass"
+	PermissionModePlan           PermissionMode = "plan"
+	PermissionModeReadOnly       PermissionMode = "read_only"
+	PermissionModeProtectedWrite PermissionMode = "protected_write"
+	PermissionModeAgent          PermissionMode = "agent"
+	PermissionModeFullAccess     PermissionMode = "full_access"
 )
+
+type permissionModeKey struct{}
+
+// WithPermissionMode 将 PermissionMode 注入 Context。
+func WithPermissionMode(ctx context.Context, mode PermissionMode) context.Context {
+	return context.WithValue(ctx, permissionModeKey{}, NormalizeMode(string(mode)))
+}
+
+// FromContext 从 Context 中提取 PermissionMode。
+func FromContext(ctx context.Context) (PermissionMode, bool) {
+	if ctx == nil {
+		return "", false
+	}
+	if v, ok := ctx.Value(permissionModeKey{}).(PermissionMode); ok {
+		return v, true
+	}
+	return "", false
+}
+
+// ModeRank 返回 PermissionMode 的权限等级 (1-4)。数值越大，权限越高。
+func ModeRank(mode PermissionMode) int {
+	switch NormalizeMode(string(mode)) {
+	case PermissionModePlan:
+		return 1
+	case PermissionModeReadOnly:
+		return 1
+	case PermissionModeProtectedWrite:
+		return 2
+	case PermissionModeAgent:
+		return 3
+	case PermissionModeFullAccess:
+		return 4
+	default:
+		return 3
+	}
+}
+
+// NarrowPermissionMode 实施子 Agent / Turn 权限单向降权法则：
+// 子任务只能保持或收窄权限（Narrow），绝不允许向更高等级提权（Escalate）。
+func NarrowPermissionMode(parent, requested PermissionMode) PermissionMode {
+	parentNorm := NormalizeMode(string(parent))
+	requestedNorm := NormalizeMode(string(requested))
+	if ModeRank(requestedNorm) > ModeRank(parentNorm) {
+		return parentNorm
+	}
+	return requestedNorm
+}
 
 // RuntimeGrant 是一次运行时目录或文件授权。
 type RuntimeGrant struct {

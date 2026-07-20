@@ -4,6 +4,7 @@ package windowssandbox
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -117,7 +118,11 @@ func shellExecuteW(exe, params, workDir string) (uint32, error) {
 
 	ret, _, err := shellExecEx.Call(uintptr(unsafe.Pointer(&sei)))
 	if ret == 0 {
-		return 1, fmt.Errorf("ShellExecuteExW 失败（可能被用户取消 UAC）: %w", err)
+		var errno windows.Errno
+		if errors.As(err, &errno) && errno == windows.ERROR_CANCELLED {
+			return 1, fmt.Errorf("用户拒绝了 UAC 提权授权，无法自动完成 Windows 沙箱环境初始化")
+		}
+		return 1, fmt.Errorf("ShellExecuteExW 失败: %w", err)
 	}
 	if sei.HProcess == 0 {
 		// SEE_MASK_NOCLOSEPROCESS 要求操作系统返回进程句柄，若为 0 则异常

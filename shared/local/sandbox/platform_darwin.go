@@ -39,17 +39,22 @@ func (b darwinBackend) BuildPlan(ctx context.Context, req BuildRequest) (*Plan, 
 		AllowFullDiskWrite:     fs.AllowFullDiskWrite,
 	}
 	built, err := seatbelt.Build(seatbelt.BuildOptions{
-		Command:  seatbelt.CommandSpec{Argv: req.Command.Argv, Env: req.Command.Env, Cwd: req.Command.Cwd},
-		FileSystem: seatbeltFS,
-		Network:  seatbelt.NetworkPolicy(req.Profile.Network),
+		Command:          seatbelt.CommandSpec{Argv: req.Command.Argv, Env: req.Command.Env, Cwd: req.Command.Cwd},
+		FileSystem:       seatbeltFS,
+		Network:          seatbelt.NetworkPolicy(req.Profile.Network),
+		ProxyPorts:       req.Profile.ProxyPorts,
+		AllowUnixSockets: req.Profile.AllowUnixSockets,
 	})
 	if err != nil {
 		return nil, NewError(ErrCodeSandboxInitFailed, err)
 	}
+
+	cmdEnv := applyProxyEnv(req.Command.Env, req.Profile.Network, req.Profile.ProxyEnv)
+
 	plan := &Plan{
 		Type:                    TypeMacOSSeatbelt,
 		Enforcement:             EnforcementFilesystemNetwork,
-		Command:                 CommandSpec{Argv: append([]string{built.Program}, built.Args...), Env: req.Command.Env, Cwd: req.Command.Cwd},
+		Command:                 CommandSpec{Argv: append([]string{built.Program}, built.Args...), Env: cmdEnv, Cwd: req.Command.Cwd},
 		HelperPath:              path,
 		FileSystemPolicy:        fs,
 		NetworkPolicy:           req.Profile.Network,

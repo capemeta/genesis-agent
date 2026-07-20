@@ -133,6 +133,8 @@ func (b windowsBackend) BuildPlan(ctx context.Context, req BuildRequest) (*Plan,
 		enforcement = EnforcementProcessConstrained
 	}
 
+	env = applyProxyEnv(env, req.Profile.Network, req.Profile.ProxyEnv)
+
 	plan := &Plan{
 		Type:                    TypeWindowsProcessConstrained,
 		Enforcement:             enforcement,

@@ -82,3 +82,24 @@ func parseDenialLine(line string) (Violation, bool) {
 
 	return v, true
 }
+
+// FormatWarnings 从 stderr 中提取 Seatbelt 拒绝事件并格式化为友好的提示信息。
+func FormatWarnings(stderr string) []string {
+	violations := ParseDenials(stderr)
+	if len(violations) == 0 {
+		return nil
+	}
+	warnings := make([]string, 0, len(violations))
+	for _, v := range violations {
+		if v.Path != "" && v.Operation != "" {
+			warnings = append(warnings, "试图访问 "+v.Path+" (操作: "+v.Operation+")，已触发 macOS Seatbelt 拦截")
+		} else if v.Path != "" {
+			warnings = append(warnings, "试图访问 "+v.Path+"，已触发 macOS Seatbelt 拦截")
+		} else if v.Operation != "" {
+			warnings = append(warnings, "试图执行 "+v.Operation+" 操作，已触发 macOS Seatbelt 拦截")
+		} else {
+			warnings = append(warnings, "操作已触发 macOS Seatbelt 拦截: "+v.Raw)
+		}
+	}
+	return warnings
+}

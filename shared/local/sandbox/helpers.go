@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"genesis-agent/shared/local/sandbox/bubblewrap"
+	"genesis-agent/shared/local/sandbox/seatbelt"
 )
 
 // joinStrings 用 sep 拼接字符串切片。
@@ -73,4 +74,25 @@ func joinSandboxPath(root, name string) string {
 		return "/" + name
 	}
 	return root + "/" + name
+}
+
+func applyProxyEnv(env map[string]string, network NetworkMode, proxyEnv map[string]string) map[string]string {
+	if network != NetworkProxyOnly || len(proxyEnv) == 0 {
+		return env
+	}
+	out := make(map[string]string, len(env)+len(proxyEnv))
+	for k, v := range env {
+		out[k] = v
+	}
+	for k, v := range proxyEnv {
+		if _, exists := out[k]; !exists {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+// ParseSeatbeltWarnings 解析 stderr 中的 Seatbelt 沙箱拦截日志。
+func ParseSeatbeltWarnings(stderr string) []string {
+	return seatbelt.FormatWarnings(stderr)
 }
