@@ -19,42 +19,63 @@
 
 外部 `genesis-sandbox` 必须是可关闭、可开启、可按会话覆盖的能力。Codex 类本地执行可以完全不依赖 Docker 或远程 sandbox，因此 Genesis 的默认值必须保持外部 sandbox 关闭。
 
-顶层运行时配置使用 `sandbox`，不要把 endpoint/key 写进 `policy.sandbox`：
+顶层运行时配置使用 `sandbox`（分为 `local` 本地 OS 沙箱、`remote` 远程容器沙箱与 `routing` 路由策略）：
 
 ```yaml
 sandbox:
-  enabled: false
-  mode: local_host
-  default_execution: disabled
-  allow_session_override: true
-  base_url: ${GENESIS_SANDBOX_BASE_URL}
-  api_key: ${GENESIS_SANDBOX_API_KEY}
-  api_key_env: GENESIS_SANDBOX_API_KEY
-  workspace_id: ""
-  default_runtime_profile: code-polyglot-basic
+  # 1. 本地 OS 平台沙箱配置 (Process Confinement)
+  local:
+    enabled: true
+    preference: auto         # auto (默认,优先使用可降级) | required (强隔离) | disabled
+    default_level: process_constrained
+
+  # 2. 远程容器沙箱配置 (genesis-sandbox API / Docker Service)
+  remote:
+    enabled: false            # Layer 1 硬门控开关：未开启时禁止任何远程调度
+    base_url: ${GENESIS_SANDBOX_BASE_URL}
+    api_key: ${GENESIS_SANDBOX_API_KEY}
+    api_key_env: GENESIS_SANDBOX_API_KEY
+    workspace_id: ""
+    default_runtime_profile: code-polyglot-basic
+
+  # 3. 路由与调度策略
+  routing:
+    default_execution: optional       # disabled | optional | required
+    allow_session_override: true      # 允许会话/CLI --sandbox 参数覆盖
+    auto_route_risk: true             # 允许 CommandRiskEvaluator 自动按风险切分远程沙箱
+
+  # 4. 外置技能沙箱集中覆盖
+  skills_override:
+    office-ppt:
+      sandbox:
+        preferred_backend: remote_sandbox
+        allow_degradation: true
 ```
 
 字段语义：
 
 | 字段 | 说明 |
 | --- | --- |
-| `enabled` | 是否启用外部 sandbox API。默认 `false`，表示完全可以不使用 Docker/genesis-sandbox。 |
-| `mode` | `local_host`、`local_platform_sandbox`、`docker_sandbox`、`remote_sandbox`。只有后两者走 genesis-sandbox API。 |
-| `default_execution` | 全局默认执行策略：`disabled`、`optional`、`required`。 |
-| `allow_session_override` | 是否允许每次对话或 HTTP run 请求覆盖 sandbox 策略。企业可按租户/角色关闭。 |
-| `base_url` | genesis-sandbox 服务地址，例如 `http://127.0.0.1:18010`。 |
-| `api_key` / `api_key_env` | Bearer Token 来源。生产优先 `api_key_env`，不把明文 key 写进仓库配置。 |
-| `workspace_id` | 外部 sandbox workspace 标识；为空时由产品 bootstrap 或 sandbox 服务分配。 |
-| `default_runtime_profile` | 普通代码/命令默认 profile，当前推荐 `code-polyglot-basic`。 |
+| `local.enabled` | 是否开启本地 OS 平台沙箱 (Seatbelt/bwrap/Windows Token)。默认 `true`。 |
+| `remote.enabled` | 是否启用外部 `genesis-sandbox` 远程 API。默认 `false`（Layer 1 最高硬门控一票否决权）。 |
+| `remote.base_url` | genesis-sandbox 服务地址，例如 `http://127.0.0.1:18010`。 |
+| `remote.api_key` / `api_key_env` | Bearer Token 来源。生产优先 `api_key_env`，不把明文 key 写进仓库配置。 |
+| `remote.workspace_id` | 外部 sandbox workspace 标识；为空时由产品 bootstrap 或 sandbox 服务分配。 |
+| `remote.default_runtime_profile` | 普通代码/命令默认 profile，推荐 `code-polyglot-basic`。 |
+| `routing.default_execution` | 全局默认执行策略：`disabled`、`optional`、`required`。 |
+| `routing.allow_session_override` | 是否允许每次对话或 HTTP run 请求覆盖 sandbox 策略。 |
+| `routing.auto_route_risk` | 是否允许 `CommandRiskEvaluator` 和 `ScriptASTAnalyzer` 自动分析脚本风险切分远程沙箱。 |
 
 HTTP adapter 强制 `http.Client.Timeout=0`（自定义 Client 也会被克隆清零）；单次 Exec/Job 超时只认请求 context / `RunOptions.Timeout`。session-file locator / binding 只允许 `session_id` + `workspace_id`，禁止 `sandbox_id`。
 
-优先级从高到低：
+沙箱决策遵循 **四层链式策略评估器 (`PolicyPipeline`)**，优先级从高到低：
 
-1. 会话级覆盖：CLI `--sandbox`、HTTP `/v1/runs` 请求体里的 `sandbox` 字段、未来 Desktop UI 会话设置。
-2. Agent/App/Profile 策略：特定 Agent 或任务模板绑定的 sandbox 要求。
-3. 顶层 `sandbox` 全局配置。
-4. 默认值：外部 sandbox 关闭，本地执行仍受 approval、PathResolver、ToolGateway、资源锁约束。
+1. **Layer 1: 系统顶层硬门控**：`sandbox.remote.enabled = false` 时一票否决所有远程沙箱调度请求。
+2. **Layer 2: Skill / Task 配置**：外部 `skills_override[skill_name]` 覆盖 > `SKILL.md` YAML Frontmatter 静态声明 > 系统缺省配置。解析 `execution_mode` (per_call | sandboxed_session), `preferred_backend` (local | remote), `allow_degradation` (true | false)。
+3. **Layer 3: 通用降级法则**：若指定/首选的 `remote_sandbox` 不可用：
+   - 若 `allow_degradation = true` ──► 自动优雅降级为本地 OS 沙箱，带 Warning 审计上报；
+   - 若 `allow_degradation = false` ──► Fail Closed 阻断报错。
+4. **Layer 4: 对应 Backend 调度**：调度本地 OS 沙箱执行或派生沙箱 Worker 子 Agent（满足 `SubAgentDelegationRequest` / `Result` 契约）。
 
 会话级覆盖规则：
 
