@@ -324,7 +324,7 @@ func (s *TaskListService) UpdateStepStatus(ctx context.Context, sessionID string
 		}
 	}
 	if !stepFound {
-		return nil, fmt.Errorf("未找到 ID 为 [%s] 的步骤", stepID)
+		return nil, fmt.Errorf("未找到 ID 为 [%s] 的步骤。步骤 id 为 task_ 开头的唯一标识符（如 'task_28c4a00d'），可调用 todo_read 查看当前所有步骤的 ID，切勿传入数字序号", stepID)
 	}
 
 	nextVersion := oldPlan.Version + 1

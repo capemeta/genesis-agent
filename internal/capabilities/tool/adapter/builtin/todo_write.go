@@ -3,6 +3,7 @@ package builtin
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	tasklistcontract "genesis-agent/internal/capabilities/tasklist/contract"
 	tasklistmodel "genesis-agent/internal/capabilities/tasklist/model"
@@ -80,7 +81,6 @@ func (t *TodoWriteTool) Execute(ctx context.Context, params string) (string, err
 		return "", fmt.Errorf("update plan failed: %w", err)
 	}
 
-	// 检查是否有步骤因重构触发拦截审批
 	hasBlocked := false
 	for _, step := range plan.Steps {
 		if step.Status == tasklistmodel.StepStatusBlockedByApproval {
@@ -89,9 +89,12 @@ func (t *TodoWriteTool) Execute(ctx context.Context, params string) (string, err
 		}
 	}
 
-	if hasBlocked {
-		return fmt.Sprintf("任务清单覆写已成功提交。检测到属于【重大结构重构】，状态已锁定为 blocked_by_approval。系统已自动弹起人机审批流，请告知用户核准后再行执行。最新版本号：%d", plan.Version), nil
+	var stepSummaries []string
+	for i, step := range plan.Steps {
+		stepSummaries = append(stepSummaries, fmt.Sprintf("Step %d [ID: %s]: %q (%s)", i+1, step.ID, step.Title, step.Status))
 	}
-
-	return fmt.Sprintf("任务清单已成功覆写。最新版本号：%d，当前步骤均已准备完毕。", plan.Version), nil
+	if hasBlocked {
+		return fmt.Sprintf("任务清单覆写已提交（版本 %d），检测到【重大结构重构】已触发审批锁定。步骤列表：\n%s", plan.Version, strings.Join(stepSummaries, "\n")), nil
+	}
+	return fmt.Sprintf("任务清单已成功覆写（版本 %d）。步骤列表及更新用 ID：\n%s\n更新状态请使用 todo_update_step 并指定 id 为对应的 ID 字符串（如 \"task_xxx\"）。", plan.Version, strings.Join(stepSummaries, "\n")), nil
 }

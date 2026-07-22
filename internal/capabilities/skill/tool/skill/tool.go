@@ -369,15 +369,16 @@ func (t *Tool) fork(ctx context.Context, resolved model.ResolvedInvocation, bind
 	}
 	defer t.inFlight.Delete(fingerprint)
 
+	allowedTools := appendSubAgentTasklistTools(binding.ToolPolicy.Allowed)
 	definition := &subagentmodel.Definition{
 		Name: subagentprompt.SkillForkDefinitionName(binding.Handle), Description: "Skill Invocation fork: " + binding.Handle,
-		WhenToUse: "仅由Skill网关按Runtime Manifest创建", SystemPrompt: "", Tools: cloneStrings(binding.ToolPolicy.Allowed),
+		WhenToUse: "仅由Skill网关按Runtime Manifest创建", SystemPrompt: "", Tools: cloneStrings(allowedTools),
 		MaxTurns: binding.AgentMode.MaxTurns, MaxTokens: binding.AgentMode.MaxTokens, MaxToolCalls: binding.AgentMode.MaxToolCalls,
 		TimeoutSec: binding.AgentMode.TimeoutSec,
 	}
 	req := subagentcontract.DelegateRequest{
 		Prompt: injection.Contents, Description: "执行Skill Invocation " + binding.Handle,
-		AllowedTools: cloneStrings(binding.ToolPolicy.Allowed), Definition: definition,
+		AllowedTools: cloneStrings(allowedTools), Definition: definition,
 		SnapshotMode: subagentcontract.SnapshotModeSkillIsolated, PromptOrigin: "skill_fork",
 		MaxTurns: binding.AgentMode.MaxTurns, MaxTokens: binding.AgentMode.MaxTokens,
 		MaxToolCalls: binding.AgentMode.MaxToolCalls, TimeoutSec: binding.AgentMode.TimeoutSec,
@@ -570,6 +571,18 @@ func sortedKeys(values map[string]struct{}) []string {
 		out = append(out, key)
 	}
 	sort.Strings(out)
+	return out
+}
+
+func appendSubAgentTasklistTools(allowed []string) []string {
+	out := cloneStrings(allowed)
+	set := stringSet(out)
+	for _, toolName := range []string{"todo_read", "todo_update_step", "todo_write"} {
+		if _, ok := set[toolName]; !ok {
+			out = append(out, toolName)
+			set[toolName] = struct{}{}
+		}
+	}
 	return out
 }
 

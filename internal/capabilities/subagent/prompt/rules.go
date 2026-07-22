@@ -54,25 +54,36 @@ func SystemRules(posture Posture) string {
 		return "" +
 			"# 子智能体委派纪律 (Delegation)\n" +
 			"\n" +
+			"`Task` 委派下方 <available_agents> 中的子智能体；`Skill(skill=...)` 加载技能。二者网关不同，不可互替（MUST）。\n" +
+			"\n" +
 			"除非用户、项目指令（如 AGENTS.md）或已加载的 Skill **明确要求**委派、子智能体或并行 Agent 工作，否则不要调用 `Task`。\n" +
 			"「要深入」「要彻底研究」「详细分析代码库」**不算授权**。\n" +
 			"\n" +
 			"## 已获授权时\n" +
 			"- 必须使用 `Task(subagent_type=...)`，禁止把 agent 名当作工具名调用。\n" +
-			"- 从 available_agents 选择类型；已知精确路径 / 单文件 needle 仍优先直接 `read_file`/`grep`，不要为小事 spawn。\n"
+			"- 已知精确路径 / 1–3 个文件的局部确认：直接使用 `read_file`/`grep`/`glob`，不要为小事 spawn。\n"
 	default:
 		return "" +
 			"# 子智能体委派纪律 (Delegation)\n" +
 			"\n" +
-			"主线程可通过固定网关工具 `Task` 委派独立子智能体；禁止把 agent 名当作工具名调用。\n" +
+			"`Task` 委派下方 <available_agents> 中的子智能体；`Skill(skill=...)` 加载技能。二者网关不同，不可互替（MUST）。\n" +
 			"\n" +
-			"## 何时使用\n" +
-			"- 文件搜索 / 非 needle 的代码库探索：优先 `Task(subagent_type=explore)`，以节省主上下文。\n" +
-			"- 任务匹配某 agent 的 description / when_to_use（含自定义）：应主动使用 `Task`，无需用户点名。\n" +
-			"- 可并行的独立子任务：在同一条 assistant 消息内发起多个 `Task`（受并发上限约束）。\n" +
+			"## 委派决策（按顺序判断，主动委派）\n" +
+			"1. **范围否决**：已知精确路径、或仅涉及 1–3 个文件的局部读取/确认/修改 → 直接 `read_file`/`grep`/`glob`/`apply_patch`，不要为小事 spawn。\n" +
+			"2. **隔离与匹配委派**：排除①后，命中以下条件之一即主动使用 `Task`，无需用户点名：\n" +
+			"   - 属于宽泛代码库探索、非精确 needle 搜索、多方案对比等产生大量中间噪音的摸排 → 使用 `Task(subagent_type=explore)`。\n" +
+			"   - 任务匹配 <available_agents> 中某 agent 的专长领域 → 使用对应的 `Task(subagent_type=\"<agent_name>\")`。\n" +
+			"3. **并发修饰**：当触发②且存在 ≥2 个相互独立、不依赖彼此中间结果的子任务（如不同模块摸排）→ 必须在同一条回复中并发发起多个 `Task(..., run_in_background=true)`。\n" +
 			"\n" +
-			"## 何时不要使用\n" +
-			"- 已知精确路径 / 单文件或 2–3 个文件的 needle 查询：直接 `read_file`/`grep`/`glob`，不要为小事 spawn。\n"
+			"不得用 `Task` 代替 `Skill` 调用；纯格式转换、简单润色等主线程自身可低成本完成的工作，不委派（MUST NOT）。\n" +
+			"\n" +
+			"## 后台并发与参数纪律\n" +
+			"- **后台模式**：设置 `run_in_background=true` 立即返回 `agent_id`，主线程可继续处理其他工作，需要结果时用 `TaskOutput(agent_id=...)` 阻塞获取。\n" +
+			"- **并发要求**：多个子任务并发必须在同一条回复中一次性发起，禁止分轮串行发起。\n" +
+			"- **Prompt 完备性**：给 `Task` 的 `prompt` 必须提供自包含的上下文与明确的交付目标。\n" +
+			"\n" +
+			"## 产出去向\n" +
+			"子智能体的产出是**中间工作上下文**，用于支撑主线程后续的判断/写作/修改，不应原样呈现给用户；主线程需自行整合并转化为对用户有意义的结论或下一步行动。\n"
 	}
 }
 
@@ -103,6 +114,32 @@ func RenderToolDescription(agents []AgentSummary, opts DescriptionOptions) (stri
 	b.WriteString("- Tasks unrelated to any available agent description.\n\n")
 
 	fmt.Fprintf(&b, "Parallelism: launch independent Tasks in one assistant message when useful; hard limit max_concurrent=%d (tool rejects excess).\n\n", maxConcurrent)
+
+	b.WriteString("<examples>\n")
+	b.WriteString("<example>\n")
+	b.WriteString("user: \"看下 pkg/auth/jwt.go 里的 ValidateToken 函数怎么写的\"\n")
+	b.WriteString("commentary: 已知精确路径和具体函数，属于单文件针尖查询，命中\"1. 范围否决\" → 直接 read_file，严禁 spawn。\n")
+	b.WriteString("</example>\n\n")
+	b.WriteString("<example>\n")
+	b.WriteString("user: \"帮我梳理一下整个项目中多租户 (multi-tenant) 隔离逻辑都是怎么实现的\"\n")
+	b.WriteString("commentary: 无精确路径，涉及跨模块宽泛摸排，命中\"2. 隔离与匹配委派\" → 发起单个 Task(subagent_type=\"explore\") 保护主上下文。\n")
+	b.WriteString("</example>\n\n")
+	b.WriteString("<example>\n")
+	b.WriteString("user: \"帮我同时摸排一下数据库层 (db) 和缓存层 (cache) 的瓶颈问题\"\n")
+	b.WriteString("commentary: 存在 2 个相互独立的探索目标，命中\"3. 并发修饰\" → 同一回复中一次性发起 2 个后台 Task(run_in_background=true)。\n")
+	b.WriteString("assistant_tool_calls: [\n")
+	b.WriteString("  Task(subagent_type=\"explore\", run_in_background=true, prompt=\"探索 db 模块的瓶颈与慢查询处理...\"),\n")
+	b.WriteString("  Task(subagent_type=\"explore\", run_in_background=true, prompt=\"探索 cache 模块的缓存失效与内存使用...\")\n")
+	b.WriteString("]\n")
+	b.WriteString("</example>\n\n")
+	b.WriteString("<example>\n")
+	b.WriteString("user: \"我想为用户订阅模块设计一套全新的 RESTful API\"\n")
+	b.WriteString("commentary: 任务匹配到专门的 API 设计专家 api-designer，命中\"2. 领域匹配\" → 主动委派 api-designer 执行。\n")
+	b.WriteString("assistant_tool_calls: [\n")
+	b.WriteString("  Task(subagent_type=\"api-designer\", prompt=\"设计用户订阅模块的 RESTful API 规范、错误码与数据结构...\")\n")
+	b.WriteString("]\n")
+	b.WriteString("</example>\n")
+	b.WriteString("</examples>\n\n")
 
 	b.WriteString("<available_agents>\n")
 	for _, item := range agents {

@@ -98,7 +98,7 @@ func TestSkillForkDelegatesIsolatedBindingAndDeclarativeDeliverable(t *testing.T
 	if len(req.Deliverables) != 1 || req.Deliverables[0].ID != "deck" || req.Deliverables[0].QAPolicy != "visual-qa/v1" {
 		t.Fatalf("deliverables=%+v", req.Deliverables)
 	}
-	if len(req.AllowedTools) != 3 || len(req.InputRefs) != 1 {
+	if len(req.AllowedTools) != 6 || len(req.InputRefs) != 1 {
 		t.Fatalf("tools=%v inputs=%v", req.AllowedTools, req.InputRefs)
 	}
 }

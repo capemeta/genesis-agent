@@ -444,6 +444,8 @@ type AgentConfig struct {
 	ToolMaxConcurrency int `mapstructure:"tool_max_concurrency"`
 	// SubAgentMaxConcurrent 根会话子智能体并发槽；<=0 表示用产品 bootstrap 默认（CLI/Enterprise 3，Desktop 4）。
 	SubAgentMaxConcurrent int `mapstructure:"subagent_max_concurrent"`
+	// SubAgentDelegationPosture 控制主模型委派提示姿态：proactive / explicit_request_only；空表示用产品默认。
+	SubAgentDelegationPosture string `mapstructure:"subagent_delegation_posture"`
 	// VisionMaxConcurrentReads 视觉读图并发；<=0 表示用 visionio 默认 3。
 	VisionMaxConcurrentReads int `mapstructure:"vision_max_concurrent_reads"`
 }

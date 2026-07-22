@@ -471,12 +471,17 @@ func BuildAgentService(ctx context.Context, opts BuildOptions) (*RuntimeBundle, 
 		visionio.SetMaxConcurrent(cfg.Agent.VisionMaxConcurrentReads)
 	}
 
+	delegationPosture := opts.SubAgentDelegationPosture
+	if strings.TrimSpace(cfg.Agent.SubAgentDelegationPosture) != "" {
+		delegationPosture = strings.TrimSpace(cfg.Agent.SubAgentDelegationPosture)
+	}
+
 	runEngine := react.NewReactLoopEngine(
 		llmClient,
 		toolGateway,
 		memStore,
 		promptbuilder.NewWithOptions(
-			[]promptbuilder.Option{promptbuilder.WithDelegationPosture(opts.SubAgentDelegationPosture)},
+			[]promptbuilder.Option{promptbuilder.WithDelegationPosture(delegationPosture)},
 			injectors...,
 		),
 		log,
@@ -581,7 +586,7 @@ func BuildAgentService(ctx context.Context, opts BuildOptions) (*RuntimeBundle, 
 		SnapshotSource:    contextsnapshot.NewPersistentSource(memStore),
 		Background:        subagentBackground,
 		InputResolver:     taskInputResolver,
-		DelegationPosture: opts.SubAgentDelegationPosture,
+		DelegationPosture: delegationPosture,
 		MaxConcurrent:     maxConcurrent,
 	})
 	if err != nil {
