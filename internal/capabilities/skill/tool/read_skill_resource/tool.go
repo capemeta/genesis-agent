@@ -20,7 +20,11 @@ import (
 )
 
 type Deps struct {
-	Service        skillcontract.Service
+	Service interface {
+		Resolve(context.Context, skillcontract.ResolveRequest) (model.ResolvedInvocation, error)
+		ReadResource(context.Context, skillcontract.ResourceRequest) (model.ResourceContent, error)
+		ReadBoundResource(context.Context, skillcontract.BoundResourceRequest) (model.ResourceContent, error)
+	}
 	Approval       approvalcontract.Service
 	CatalogRequest skillcontract.CatalogRequest
 	Registry       capcontract.Registry
@@ -80,17 +84,29 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 	name := strings.TrimSpace(in.Skill)
 	pkg := model.PackageID(strings.TrimSpace(in.Package))
 	rawResource := strings.TrimSpace(in.Resource)
+	binding, bound := skillcontract.InvocationBindingFromContext(ctx)
+	if bound {
+		if err := skillcontract.ValidateBoundTarget(binding, name, pkg); err != nil {
+			return "", err
+		}
+		name = binding.Handle
+		pkg = binding.Package.PackageID
+	}
 	if name == "" && pkg == "" {
 		name = skillNameFromQualifiedResource(rawResource)
 	}
-	resource := model.QualifySkillResource(string(pkg), name, rawResource)
+	qualifier := name
+	if bound {
+		qualifier = binding.PhysicalSkill
+	}
+	resource := model.QualifySkillResource(string(pkg), qualifier, rawResource)
 	if resource == "" {
 		return "", fmt.Errorf("resource不能为空")
 	}
-	if name != "" {
-		if meta, resolveErr := t.deps.Service.Resolve(ctx, skillcontract.ResolveRequest{CatalogRequest: t.deps.CatalogRequest, Name: name}); resolveErr == nil && meta.Context == model.ContextModeFork {
+	if !bound && name != "" {
+		if resolved, resolveErr := t.deps.Service.Resolve(ctx, skillcontract.ResolveRequest{CatalogRequest: t.deps.CatalogRequest, Name: name}); resolveErr == nil && resolved.Definition.AgentMode.Mode == model.AgentModeFork {
 			if prepared, ok := workcontract.PreparedRunFromContext(ctx); ok && prepared.Manifest.ParentRunID == "" {
-				return "", fmt.Errorf("FORBIDDEN_FORK_SKILL_EXECUTION: Skill %q 声明为 context: fork 物理沙箱隔离，父 Agent 禁止读取包内资源。请调用 Skill(skill=%q, args=...) 委派子 Agent 处理。", meta.QualifiedName, meta.QualifiedName)
+				return "", fmt.Errorf("FORBIDDEN_FORK_SKILL_EXECUTION: Invocation %q声明为fork，父Agent禁止读取其包内资源；请调用Skill(skill=%q, task=...)委派子Run", resolved.Definition.Handle, resolved.Definition.Handle)
 			}
 		}
 	}
@@ -100,16 +116,22 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 	if err := t.ensureIndexed(ctx, pkg, name, resource); err != nil {
 		return "", err
 	}
-	content, err := t.deps.Service.ReadResource(ctx, skillcontract.ResourceRequest{
-		ResolveRequest: skillcontract.ResolveRequest{CatalogRequest: t.deps.CatalogRequest, Name: name},
-		PackageID:      pkg,
-		Resource:       resource,
-		MaxBytes:       in.MaxBytes,
-	})
+	var content model.ResourceContent
+	var err error
+	if bound {
+		content, err = t.deps.Service.ReadBoundResource(ctx, skillcontract.BoundResourceRequest{Binding: binding, Resource: resource, MaxBytes: in.MaxBytes})
+	} else {
+		content, err = t.deps.Service.ReadResource(ctx, skillcontract.ResourceRequest{
+			ResolveRequest: skillcontract.ResolveRequest{CatalogRequest: t.deps.CatalogRequest, Name: name},
+			PackageID:      pkg,
+			Resource:       resource,
+			MaxBytes:       in.MaxBytes,
+		})
+	}
 	if err != nil {
 		return "", err
 	}
-	data, err := json.Marshal(output{SkillQualifiedName: content.Skill.QualifiedName, Resource: string(content.Resource), Content: content.Content, Truncated: content.Truncated})
+	data, err := json.Marshal(output{SkillQualifiedName: content.Skill.Name, Resource: string(content.Resource), Content: content.Content, Truncated: content.Truncated})
 	if err != nil {
 		return "", err
 	}

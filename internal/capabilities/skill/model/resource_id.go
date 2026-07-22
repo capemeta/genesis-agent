@@ -10,6 +10,7 @@ import (
 //   - 已带 package 前缀：保持
 //   - bare 文件名（design.md）：→ <package>/design.md
 //   - references|assets|scripts/...：→ <package>/references/...
+//
 // packageID 优先；为空时用 skillName（通常即包名/技能名）。
 func QualifySkillResource(packageID, skillName, resource string) ResourceID {
 	raw := strings.TrimSpace(strings.ReplaceAll(resource, `\`, `/`))

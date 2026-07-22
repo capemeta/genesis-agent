@@ -775,6 +775,22 @@ func progressSummary(event progress.Event) string {
 			if event.Phase == progress.PhaseError {
 				label = "工具执行失败: run_skill_command"
 			}
+			backendTag := ""
+			if backend, ok := event.Metadata["selected_backend"]; ok && backend != "" {
+				switch backend {
+				case "remote_sandbox":
+					backendTag = "[远程容器沙箱]"
+				case "local_platform_sandbox":
+					backendTag = "[本地平台沙箱]"
+				case "local_host":
+					backendTag = "[宿主直跑]"
+				default:
+					backendTag = "[" + backend + "]"
+				}
+			}
+			if backendTag != "" {
+				label = label + " " + backendTag
+			}
 			parts := make([]string, 0, 2)
 			if cmd := extractJSONField(detail, "command"); cmd != "" {
 				parts = append(parts, "命令: "+truncateString(cmd, 40))

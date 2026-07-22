@@ -429,5 +429,3 @@ func renderSelectionMarker(messageIndex int, selectable []int, selectMode bool, 
 	}
 	return "  "
 }
-
-

@@ -10,6 +10,7 @@ import (
 	execcontract "genesis-agent/internal/capabilities/execution/contract"
 	execmodel "genesis-agent/internal/capabilities/execution/model"
 	profilemodel "genesis-agent/internal/capabilities/profile/model"
+	skillmemory "genesis-agent/internal/capabilities/skill/adapter/memory"
 	skillcontract "genesis-agent/internal/capabilities/skill/contract"
 	workspaceadapter "genesis-agent/internal/capabilities/workspace/adapter/sandbox"
 	workmodel "genesis-agent/internal/capabilities/workspace/model"
@@ -41,12 +42,15 @@ func TestBuildEmbeddedIncludesSharedOfficeWiring(t *testing.T) {
 		t.Fatal(err)
 	}
 	stack, err := skillstack.BuildEmbedded(skillstack.Options{
-		Product:     profilemodel.ChannelEnterprise,
-		Environment: profilemodel.EnvironmentServer,
-		Approval:    approval,
-		Logger:      logger.NewNop(),
-		StateRoot:   workmodel.StateRoot{ID: "test", Authority: "executor"},
-		Provisioner: workspaceadapter.NewProvisioner(),
+		Product:               profilemodel.ChannelEnterprise,
+		Environment:           profilemodel.EnvironmentServer,
+		Approval:              approval,
+		Logger:                logger.NewNop(),
+		StateRoot:             workmodel.StateRoot{ID: "test", Authority: "executor"},
+		Provisioner:           workspaceadapter.NewProvisioner(),
+		BindingStore:          skillmemory.NewBindingStore(),
+		PackageStore:          skillmemory.NewPackageStore(),
+		LocalSandboxAvailable: true,
 		EnabledTools: []string{
 			"Skill", "run_skill_command", "install_skill_dependencies", "list_skill_resources", "read_skill_resource", "search_skill_resources",
 		},
@@ -77,7 +81,7 @@ func TestBuildEmbeddedIncludesSharedOfficeWiring(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if meta.Name != "office-ppt" {
+	if meta.CatalogItem.Name != "office-ppt" || meta.Physical.Metadata.Name != "office-ppt" {
 		t.Fatalf("meta=%+v", meta)
 	}
 }

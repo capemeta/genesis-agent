@@ -1,17 +1,18 @@
-// Package skill 实现 Skill 网关工具。
+// Package skill 实现固定 Skill Invocation 网关。
 package skill
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
-	"regexp"
+	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	approvalcontract "genesis-agent/internal/capabilities/approval/contract"
 	approvalmodel "genesis-agent/internal/capabilities/approval/model"
+	artifactcontract "genesis-agent/internal/capabilities/artifact/contract"
 	hookcontract "genesis-agent/internal/capabilities/hook/contract"
 	hookmodel "genesis-agent/internal/capabilities/hook/model"
 	"genesis-agent/internal/capabilities/llm/vision"
@@ -23,39 +24,44 @@ import (
 	subagentprompt "genesis-agent/internal/capabilities/subagent/prompt"
 	tool "genesis-agent/internal/capabilities/tool/contract"
 	toolparam "genesis-agent/internal/capabilities/tool/param"
-	workcontract "genesis-agent/internal/capabilities/workspace/contract"
+	workmodel "genesis-agent/internal/capabilities/workspace/model"
+	"genesis-agent/internal/platform/contextutil"
 	"genesis-agent/internal/runtime/progress"
 )
 
 const (
 	toolNameSkill     = "Skill"
-	staticDescription = "加载已发现 Skill 的完整说明。参数 skill 必须来自本工具 description 中的 <available_skills>。禁止把技能名当作独立工具调用。"
+	staticDescription = "调用已发现的Skill Invocation。skill必须来自本工具description中的<available_skills>；task和inputs必须显式提供，禁止把技能名当作独立工具调用。"
 )
 
-// Deps 描述 Skill 网关依赖。
-type Deps struct {
-	Service        skillcontract.Service
-	Approval       approvalcontract.Service
-	CatalogRequest skillcontract.CatalogRequest
-	EnabledTools   []string
+type InputResolver interface {
+	ResolveInputs(ctx context.Context, inputs []string) ([]workmodel.ResourceRef, error)
 }
 
-// Tool 是 Skill 网关。
+type Deps struct {
+	Service                skillcontract.Service
+	Approval               approvalcontract.Service
+	CatalogRequest         skillcontract.CatalogRequest
+	EnabledTools           []string
+	InputResolver          InputResolver
+	RunInitializer         artifactcontract.RunInitializer
+	LocalSandboxAvailable  bool
+	RemoteSandboxAvailable bool
+	PolicyVersion          string
+}
+
 type Tool struct {
 	deps     Deps
 	forkTask tool.Tool
 	inFlight sync.Map
 }
 
-// SetForkTask 由共享 bootstrap 在 Task 创建后注入唯一委派网关。
-// Skill 不直接依赖 Controller 或具体运行策略；fork 优先走 Delegator。
 func (t *Tool) SetForkTask(task tool.Tool) { t.forkTask = task }
 
 type input struct {
-	Skill      string   `json:"skill,omitempty"`
-	Resource   string   `json:"resource,omitempty"`
-	Args       string   `json:"args,omitempty"`
-	InputFiles []string `json:"inputs,omitempty"`
+	Skill  string   `json:"skill"`
+	Task   string   `json:"task,omitempty"`
+	Inputs []string `json:"inputs,omitempty"`
 }
 
 type dependencyOutput struct {
@@ -65,49 +71,37 @@ type dependencyOutput struct {
 	Status      string `json:"status"`
 }
 
-// output 是短确认（不含完整 SKILL.md body）；body 由 runtime 单份 injection。
 type output struct {
-	Type              string             `json:"type"`
-	Name              string             `json:"name"`
-	QualifiedName     string             `json:"qualified_name"`
-	Resource          string             `json:"resource"`
-	Content           string             `json:"content,omitempty"` // 供 runtime 解析后剥离；模型侧应只看短确认
-	Args              string             `json:"args,omitempty"`
-	Truncated         bool               `json:"truncated"`
-	AllowedTools      []string           `json:"allowed_tools,omitempty"`
-	Context           string             `json:"context,omitempty"`
-	Agent             string             `json:"agent,omitempty"`
-	Model             string             `json:"model,omitempty"`
-	MaxThinkingTokens int                `json:"max_thinking_tokens,omitempty"`
-	Dependencies      []dependencyOutput `json:"dependencies,omitempty"`
+	Type          string             `json:"type"`
+	Name          string             `json:"name"`
+	QualifiedName string             `json:"qualified_name"`
+	PhysicalSkill string             `json:"physical_skill"`
+	InvocationID  string             `json:"invocation_id"`
+	BindingID     string             `json:"binding_id"`
+	Resource      string             `json:"resource"`
+	Content       string             `json:"content,omitempty"`
+	Task          string             `json:"task,omitempty"`
+	Truncated     bool               `json:"truncated"`
+	AllowedTools  []string           `json:"allowed_tools"`
+	Context       string             `json:"context"`
+	Dependencies  []dependencyOutput `json:"dependencies,omitempty"`
 }
 
-// New 创建 Skill 网关工具。
 func New(deps Deps) (tool.Tool, error) {
-	if deps.Service == nil {
-		return nil, fmt.Errorf("skill service不能为空")
-	}
-	if deps.Approval == nil {
-		return nil, fmt.Errorf("approval service不能为空")
+	if deps.Service == nil || deps.Approval == nil {
+		return nil, fmt.Errorf("skill service与approval service不能为空")
 	}
 	return &Tool{deps: deps}, nil
 }
 
 func (t *Tool) GetInfo() *tool.Info {
 	return &tool.Info{
-		Name:        toolNameSkill,
-		Description: staticDescription,
-		DescriptionFunc: t.renderDescription,
-		Parameters: &tool.ParameterSchema{
-			Type: "object",
-			Properties: map[string]*tool.ParameterSchema{
-				"skill":    {Type: "string", Description: "Skill 名称或 qualified_name，必须来自 <available_skills>，例如 office-ppt"},
-				"resource": {Type: "string", Description: "可选，不透明 resource id，用于消除同名冲突"},
-				"args":     {Type: "string", Description: "传给 Skill 的任务具体要求或上下文描述。对于 context: fork 技能（如 office-ppt），必须在此填入详细的任务目标与要求，禁止为空。"},
-				"inputs":   {Type: "array", Items: &tool.ParameterSchema{Type: "string"}, Description: "可选，显式指定引用的输入文件列表（如 [\"ultra5-comparison-summary.md\"]）。若未填则由系统按工作区真实文件自动匹配。"},
-			},
-			Required: []string{},
-		},
+		Name: toolNameSkill, Description: staticDescription, DescriptionFunc: t.renderDescription,
+		Parameters: &tool.ParameterSchema{Type: "object", Properties: map[string]*tool.ParameterSchema{
+			"skill":  {Type: "string", Description: "Invocation handle，必须来自<available_skills>，例如office-ppt-read或office-ppt"},
+			"task":   {Type: "string", Description: "任务目标；是否必填由Invocation契约决定"},
+			"inputs": {Type: "array", Items: &tool.ParameterSchema{Type: "string"}, Description: "显式输入资源引用或当前Run内已授权别名；数量和类型由Invocation契约校验"},
+		}, Required: []string{"skill"}},
 		Traits: tool.ToolTraits{Exposure: tool.ToolExposureDirect, ReadOnly: false, ConcurrencySafe: false, NeedsPermission: true, RequiresUserInteraction: true},
 	}
 }
@@ -117,360 +111,430 @@ func (t *Tool) renderDescription(ctx context.Context) (string, error) {
 	if err != nil {
 		return staticDescription, err
 	}
-	catalog = strings.TrimSpace(catalog)
-	if catalog == "" {
-		return staticDescription + "\n\n<available_skills>\n</available_skills>", nil
-	}
-	var sb strings.Builder
-	sb.WriteString(staticDescription)
-	sb.WriteString("\n\n<skills_instructions>\n")
-	sb.WriteString("当任务匹配可用技能时，必须先调用 Skill 工具加载该技能，再使用原语工具执行。\n")
-	sb.WriteString("禁止把技能名当作独立工具名调用。例如禁止调用 office-ppt；正确做法是 Skill(skill=\"office-ppt\")。\n")
-	sb.WriteString("</skills_instructions>\n\n")
-	sb.WriteString(catalog)
-	return sb.String(), nil
+	return staticDescription + "\n\n<skills_instructions>\n只调用一次Skill(skill, task?, inputs?)完成Invocation选择；不要传entrypoint、sandbox、model、qa或deliverable参数。\n</skills_instructions>\n\n" + strings.TrimSpace(catalog), nil
 }
 
 func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 	var in input
 	if err := toolparam.Decode(params, &in); err != nil {
-		return "", fmt.Errorf("解析Skill参数失败（参数仅支持 skill/resource/args，必须提供 skill或resource）: %w", err)
+		return "", fmt.Errorf("解析Skill参数失败（仅支持skill/task/inputs）: %w", err)
 	}
 	return t.load(ctx, in, true, "model")
 }
 
-// LoadExplicitSkill 加载用户显式选择的 Skill。
-// 这是 runtime 内部端口，不进入 LLM schema；它复用网关的依赖预检、审批和注入输出。
 func (t *Tool) LoadExplicitSkill(ctx context.Context, req skillcontract.ExplicitLoadRequest) (string, error) {
-	return t.load(ctx, input{Skill: req.Skill, Resource: req.Resource, Args: req.Args}, false, "explicit")
+	return t.load(ctx, input{Skill: req.Skill, Task: req.Task, Inputs: req.Inputs}, false, "explicit")
 }
 
-func (t *Tool) load(ctx context.Context, in input, modelCall bool, invocation string) (string, error) {
-	skillName := strings.TrimSpace(in.Skill)
-	if skillName == "" && strings.TrimSpace(in.Resource) == "" {
-		return "", fmt.Errorf("skill或resource必须至少提供一个")
+// GetInvocationBinding 供 Run Runtime 使用 opaque binding_id 激活 inline Invocation。
+// 模型不应也不需要传递 binding_id。
+func (t *Tool) GetInvocationBinding(ctx context.Context, bindingID string) (model.InvocationBinding, error) {
+	runID, _ := contextutil.GetRunID(ctx)
+	tenantID, _ := contextutil.GetTenantID(ctx)
+	binding, err := t.deps.Service.GetBinding(ctx, skillcontract.BindingLookup{ID: strings.TrimSpace(bindingID), TenantID: tenantID, RunID: runID})
+	if err != nil {
+		return model.InvocationBinding{}, err
 	}
-	resolveReq := skillcontract.ResolveRequest{
-		CatalogRequest: t.deps.CatalogRequest,
-		Name:           skillName,
-		Resource:       strings.TrimSpace(in.Resource),
-		ModelCall:      modelCall,
-		Invocation:     invocation,
+	if binding.ID != strings.TrimSpace(bindingID) || binding.RunID != runID || (binding.TenantID != "" && binding.TenantID != tenantID) {
+		return model.InvocationBinding{}, fmt.Errorf("SKILL_INVOCATION_ACTIVATION_FAILED: binding不属于当前Run")
 	}
-	meta, err := t.deps.Service.Resolve(ctx, resolveReq)
+	if binding.AgentMode.Mode != model.AgentModeMain {
+		return model.InvocationBinding{}, fmt.Errorf("SKILL_INVOCATION_ACTIVATION_FAILED: fork binding不能在父Run内激活")
+	}
+	return binding, nil
+}
+
+func (t *Tool) load(ctx context.Context, in input, modelCall bool, invocationSource string) (string, error) {
+	handle := strings.TrimSpace(in.Skill)
+	if handle == "" {
+		return "", fmt.Errorf("SKILL_REQUEST_INVALID: skill不能为空")
+	}
+	resolved, err := t.deps.Service.Resolve(ctx, skillcontract.ResolveRequest{CatalogRequest: t.deps.CatalogRequest, Name: handle, ModelCall: modelCall, Invocation: invocationSource})
 	if err != nil {
 		return "", err
 	}
-	if modelCall {
-		if dispatcher := hookcontract.FromContext(ctx); dispatcher != nil {
-			result, hookErr := dispatcher.Dispatch(ctx, hookmodel.Event{Name: hookmodel.EventPreSkillUse, MatchKey: meta.QualifiedName, Payload: map[string]any{"skill_name": meta.QualifiedName, "invocation": invocation}})
-			if hookErr != nil {
-				return "", fmt.Errorf("执行 PreSkillUse Hook 失败: %w", hookErr)
-			}
-			hookcontract.AppendAdditionalContext(ctx, result.AdditionalContext...)
-			if result.Blocked {
-				return "", fmt.Errorf("Skill %q 被 Hook 阻断: %s", meta.QualifiedName, result.BlockReason)
-			}
-		}
+	if err := t.checkRecursion(ctx, resolved.CatalogItem.ID); err != nil {
+		return "", err
 	}
-	depReport, err := t.checkDependencies(ctx, meta, invocation)
+	if err := t.dispatchPreHook(ctx, modelCall, invocationSource, resolved); err != nil {
+		return "", err
+	}
+
+	capabilities := t.resolveTargetCapabilities(ctx)
+	if err := checkRequiredCapabilities(resolved.Definition, capabilities); err != nil {
+		return "", err
+	}
+	toolPolicy, err := resolveToolPolicy(t.deps.EnabledTools, resolved.Definition.ToolPolicy)
 	if err != nil {
 		return "", err
 	}
-	if err := t.authorize(ctx, meta, depReport, invocation); err != nil {
-		return "", err
-	}
-	if err := t.checkRequiredCapabilities(ctx, meta); err != nil {
-		return "", err
-	}
-	if defaultContext(meta.Context) == model.ContextModeFork {
-		return t.fork(ctx, meta, resolveReq, in.Args, in.InputFiles)
-	}
-	injection, err := t.deps.Service.Load(ctx, skillcontract.LoadRequest{ResolveRequest: resolveReq, Args: in.Args})
+	executionPolicy, err := t.resolveExecutionPolicy(resolved)
 	if err != nil {
 		return "", err
 	}
-	if modelCall {
-		if dispatcher := hookcontract.FromContext(ctx); dispatcher != nil {
-			result, hookErr := dispatcher.Dispatch(ctx, hookmodel.Event{Name: hookmodel.EventPostSkillUse, MatchKey: injection.Skill.QualifiedName, Payload: map[string]any{"skill_name": injection.Skill.QualifiedName, "invocation": invocation, "injected": true}})
-			if hookErr != nil {
-				return "", fmt.Errorf("执行 PostSkillUse Hook 失败: %w", hookErr)
-			}
-			hookcontract.AppendAdditionalContext(ctx, result.AdditionalContext...)
-		}
+	inputRefs, err := t.resolveInputs(ctx, in.Inputs)
+	if err != nil {
+		return "", err
 	}
-	// Content 仍放入 JSON 供 runtime parseSkillInjection；react_loop 会改为短 ToolResult + 单份 system injection。
+	depReport, err := t.checkDependencies(ctx, resolved, invocationSource)
+	if err != nil {
+		return "", err
+	}
+	if err := t.authorize(ctx, resolved, depReport, invocationSource); err != nil {
+		return "", err
+	}
+
+	runID, _ := contextutil.GetRunID(ctx)
+	tenantID, _ := contextutil.GetTenantID(ctx)
+	parentRunID := ""
+	if resolved.Definition.AgentMode.Mode == model.AgentModeFork {
+		parentRunID = runID
+	}
+	binding, err := t.deps.Service.CreateBinding(ctx, skillcontract.BindingRequest{
+		Resolved: resolved, TenantID: tenantID, RunID: runID, ParentRunID: parentRunID,
+		Task: in.Task, Inputs: inputRefs, ToolPolicy: toolPolicy, ExecutionPolicy: executionPolicy,
+		Capabilities: capabilities, PolicySnapshotVersion: t.deps.PolicyVersion,
+	})
+	if err != nil {
+		return "", err
+	}
+	if resolved.Definition.AgentMode.Mode == model.AgentModeFork {
+		return t.fork(ctx, resolved, binding, depReport)
+	}
+	if err := t.initializeDeliverables(ctx, binding); err != nil {
+		return "", err
+	}
+	injection, err := t.deps.Service.Load(ctx, skillcontract.LoadRequest{Resolved: resolved, Binding: binding})
+	if err != nil {
+		return "", err
+	}
+	if err := t.dispatchPostHook(ctx, modelCall, invocationSource, resolved); err != nil {
+		return "", err
+	}
 	return toJSON(output{
-		Type:              "skill_injection",
-		Name:              injection.Skill.Name,
-		QualifiedName:     injection.Skill.QualifiedName,
-		Resource:          string(injection.Resource),
-		Content:           injection.Contents,
-		Args:              injection.Args,
-		Truncated:         injection.Truncated,
-		AllowedTools:      cloneStrings(injection.Skill.AllowedTools),
-		Context:           string(defaultContext(injection.Skill.Context)),
-		Agent:             injection.Skill.Agent,
-		Model:             injection.Skill.Model,
-		MaxThinkingTokens: injection.Skill.MaxThinkingTokens,
-		Dependencies:      depReport.Outputs,
+		Type: "skill_injection", Name: binding.Handle, QualifiedName: binding.Handle, PhysicalSkill: binding.PhysicalSkill,
+		InvocationID: binding.InvocationID, BindingID: binding.ID, Resource: string(injection.Resource), Content: injection.Contents,
+		Task: binding.Task, AllowedTools: cloneStrings(binding.ToolPolicy.Allowed), Context: string(binding.AgentMode.Mode), Dependencies: depReport.Outputs,
 	})
 }
 
-func (t *Tool) fork(ctx context.Context, meta model.Metadata, resolveReq skillcontract.ResolveRequest, args string, explicitInputs []string) (string, error) {
-	// 瞬间向 TUI 推送子 Agent 派生进度
-	progress.Emit(ctx, progress.Event{
-		Kind:      progress.KindSubAgent,
-		Phase:     progress.PhaseStart,
-		Component: "skill-gateway",
-		Name:      meta.QualifiedName,
-		Summary:   fmt.Sprintf("[Sub-Agent Worker] 派生沙箱 Worker 子智能体独立执行技能: %s", meta.QualifiedName),
-	})
-
-	if t.forkTask == nil {
-		return "", fmt.Errorf("skill %q 声明 context=fork，但 Task 委派网关未注入", meta.QualifiedName)
+func (t *Tool) resolveInputs(ctx context.Context, inputs []string) ([]workmodel.ResourceRef, error) {
+	inputs = normalizeStrings(inputs)
+	if len(inputs) == 0 {
+		return nil, nil
 	}
-	delegator, ok := t.forkTask.(subagentcontract.Delegator)
-	if !ok {
-		return "", fmt.Errorf("skill %q 的 Task 委派网关未实现 Delegator", meta.QualifiedName)
+	if t.deps.InputResolver == nil {
+		return nil, fmt.Errorf("SKILL_REQUEST_INVALID: 当前产品未配置ResourceRef输入解析器")
 	}
-	// fork 的参数由委派信封统一追加，避免 Skill.Load 与 Task.prompt 双重注入。
-	injection, err := t.deps.Service.Load(ctx, skillcontract.LoadRequest{ResolveRequest: resolveReq})
+	refs, err := t.deps.InputResolver.ResolveInputs(ctx, inputs)
 	if err != nil {
-		return "", err
+		return nil, fmt.Errorf("SKILL_REQUEST_INVALID: 解析显式inputs: %w", err)
 	}
-	body := strings.TrimSpace(injection.Contents)
-	if body == "" {
-		return "", fmt.Errorf("skill %q 的 fork 内容为空", meta.QualifiedName)
+	if len(refs) != len(inputs) {
+		return nil, fmt.Errorf("SKILL_REQUEST_INVALID: inputs解析数量不一致")
 	}
-	args = strings.TrimSpace(args)
-	fingerprint := fmt.Sprintf("%s:%s", meta.QualifiedName, args)
-	if _, loaded := t.inFlight.LoadOrStore(fingerprint, true); loaded {
-		return fmt.Sprintf("【重复任务拦截】相同的技能任务 [%s] 正在后台运行中，请勿重复发起。请等待当前任务交卷。", meta.QualifiedName), nil
-	}
-	defer t.inFlight.Delete(fingerprint)
-
-	// 方案 B：若大模型显式传了 inputs，直接优先使用；未传则回退到方案 A (工作区真实存在性交集匹配)
-	inputFiles := normalizeInputs(explicitInputs)
-	if len(inputFiles) == 0 {
-		inputFiles = extractWorkspaceInputFiles(ctx, args)
-	}
-
-	// 规则校验：对于 context: fork 隔离技能，必须在 args 中有明确描述，或者在 inputs 中有显式文件。禁止同时为空！
-	if args == "" && len(inputFiles) == 0 {
-		return "", fmt.Errorf("MISSING_INPUT_REQUIRED: Skill %q 声明为 context: fork 物理沙箱隔离技能，委派子 Agent 必须在 args 中提供具体的任务描述，或在 inputs 中指定输入文件。请补充参数重新调用，例如 Skill(skill=%q, args=\"根据文件内容制作对比PPT\", inputs=[\"ultra5-comparison-summary.md\"])", meta.QualifiedName, meta.QualifiedName)
-	}
-
-	agentType := strings.TrimSpace(meta.Agent)
-	req := subagentcontract.DelegateRequest{
-		Description:        "执行 Skill " + meta.QualifiedName,
-		AllowedTools:       cloneStrings(meta.AllowedTools),
-		InputFiles:         inputFiles,
-		PromptOrigin:       "skill_fork",
-		SkillQAPolicy:      strings.TrimSpace(meta.QA.Policy),
-		SkillQAEnforcement: strings.TrimSpace(meta.QA.Enforcement),
-	}
-	// Skill fork 一律 skill_isolated：不复制父聊天；正文进 definition/prompt，不注入主线程。
-	req.SnapshotMode = subagentcontract.SnapshotModeSkillIsolated
-	if agentType != "" {
-		// 命名 agent 必须来自 Catalog；Skill 正文进入 prompt，不覆盖 Definition system。
-		req.SubagentType = agentType
-		req.Prompt = body
-		if args != "" {
-			req.Prompt += "\n\n任务参数：\n" + args
-		}
-	} else {
-		// 无 agent：合成临时 Definition（不进用户 Catalog），body 作 system，args 作委派输入。
-		req.Definition = &subagentmodel.Definition{
-			Name:         subagentprompt.SkillForkDefinitionName(meta.QualifiedName),
-			Description:  "Skill fork: " + meta.QualifiedName,
-			WhenToUse:    "由 Skill(context=fork) 硬编码 Spawn",
-			SystemPrompt: body,
-			Tools:        cloneStrings(meta.AllowedTools),
-		}
-		req.Prompt = args
-	}
-	return delegator.Delegate(ctx, req)
+	return refs, nil
 }
 
-type dependencyReport struct {
-	Outputs          []dependencyOutput
-	ExternalCount    int
-	UnavailableTools []string
-	RequiresApproval bool
-	ApprovalReason   string
-	DependencyCount  int
+func resolveToolPolicy(base []string, declared model.ToolPolicy) (model.EffectiveToolPolicy, error) {
+	base = normalizeStrings(base)
+	allow := normalizeStrings(declared.Allow)
+	required := normalizeStrings(declared.Required)
+	if len(base) == 0 || len(allow) == 0 {
+		return model.EffectiveToolPolicy{}, fmt.Errorf("SKILL_TOOL_POLICY_UNSATISFIABLE: base或allow工具集为空")
+	}
+	baseSet := stringSet(base)
+	allowed := make([]string, 0, len(allow))
+	for _, name := range allow {
+		if _, ok := baseSet[name]; ok {
+			allowed = append(allowed, name)
+		}
+	}
+	if len(allowed) == 0 {
+		return model.EffectiveToolPolicy{}, fmt.Errorf("SKILL_TOOL_POLICY_UNSATISFIABLE: Tool Policy求交为空")
+	}
+	allowedSet := stringSet(allowed)
+	for _, name := range required {
+		if _, ok := allowedSet[name]; !ok {
+			return model.EffectiveToolPolicy{}, fmt.Errorf("SKILL_TOOL_POLICY_UNSATISFIABLE: 缺少required Tool %q", name)
+		}
+	}
+	return model.EffectiveToolPolicy{Base: base, Allowed: allowed, Required: required}, nil
 }
 
-func (t *Tool) checkDependencies(ctx context.Context, meta model.Metadata, invocation string) (dependencyReport, error) {
-	report := dependencyReport{}
-	availableTools := stringSet(normalizeEnabledTools(t.deps.EnabledTools))
-	hasToolInventory := len(t.deps.EnabledTools) > 0
-	for _, dep := range meta.Dependencies.Tools {
-		depType := strings.TrimSpace(strings.ToLower(dep.Type))
-		if depType == "" {
-			depType = "tool"
+func (t *Tool) resolveExecutionPolicy(resolved model.ResolvedInvocation) (model.EffectiveExecutionPolicy, error) {
+	backends := append([]string(nil), resolved.Profile.Sandbox.Backends...)
+	if len(backends) == 0 {
+		if resolved.Profile.Sandbox.Required {
+			backends = []string{"remote_sandbox", "local_platform_sandbox"}
+		} else {
+			backends = []string{"remote_sandbox", "local_platform_sandbox", "local_host"}
 		}
-		value := strings.TrimSpace(dep.Value)
-		if value == "" {
+	}
+
+	selected := ""
+	for _, b := range backends {
+		switch b {
+		case "remote_sandbox":
+			if t.deps.RemoteSandboxAvailable {
+				selected = "remote_sandbox"
+			}
+		case "local_platform_sandbox":
+			if t.deps.LocalSandboxAvailable {
+				selected = "local_platform_sandbox"
+			}
+		case "local_host":
+			selected = "local_host"
+		}
+		if selected != "" {
+			break
+		}
+	}
+
+	if selected == "" {
+		return model.EffectiveExecutionPolicy{}, fmt.Errorf("SKILL_RUNTIME_PROFILE_UNAVAILABLE: Invocation %q 所配置的物理后端列表 %v 在当前环境中均不可用", resolved.Definition.Handle, backends)
+	}
+
+	preferred := backends[0]
+	degraded := selected != preferred
+	var warnings []string
+	if degraded {
+		warnings = append(warnings, fmt.Sprintf("Invocation %q 物理后端由 %s 自动降级至 %s", resolved.Definition.Handle, preferred, selected))
+	}
+
+	hasHost := false
+	for _, b := range backends {
+		if b == "local_host" {
+			hasHost = true
+			break
+		}
+	}
+
+	return model.EffectiveExecutionPolicy{
+		SandboxRequired:  !hasHost,
+		ExecutionMode:    resolved.Profile.Sandbox.ExecutionMode,
+		Backends:         backends,
+		SelectedBackend:  selected,
+		PreferredBackend: preferred,
+		RequestedBackend: preferred,
+		AllowDegradation: len(backends) > 1,
+		Degraded:         degraded,
+		Warnings:         warnings,
+	}, nil
+}
+
+func (t *Tool) resolveTargetCapabilities(ctx context.Context) model.EffectiveCapabilitySnapshot {
+	mode, ok := viewimage.VisionModeFromContext(ctx)
+	if !ok {
+		mode = vision.ModeDegradedText
+	}
+	// Skill fork 当前复用同一受信 Agent/模型装配，仅隔离 Run 和工具/工作区；因此这里的
+	// EffectiveVisionMode 正是即将启动的子执行者能力，而不是按模型名猜测。
+	return model.EffectiveCapabilitySnapshot{VisionMode: string(mode), CheckedAt: time.Now().UTC()}
+}
+
+func checkRequiredCapabilities(definition model.InvocationDefinition, snapshot model.EffectiveCapabilitySnapshot) error {
+	for _, requirement := range definition.Requires {
+		if !model.IsRequiredEnforcement(requirement.Enforcement) {
 			continue
 		}
-		report.DependencyCount++
-		out := dependencyOutput{Type: depType, Value: value, Description: dep.Description, Status: "available"}
-		switch depType {
-		case "tool":
-			if !hasToolInventory {
-				out.Status = "missing"
-				report.UnavailableTools = append(report.UnavailableTools, value)
-			} else if _, ok := availableTools[value]; !ok {
-				out.Status = "missing"
-				report.UnavailableTools = append(report.UnavailableTools, value)
-			}
-		case "mcp", "connection", "external", "command", "url":
-			out.Status = "requires_approval"
-			report.ExternalCount++
-			report.RequiresApproval = true
-		default:
-			out.Status = "requires_approval"
-			report.ExternalCount++
-			report.RequiresApproval = true
-		}
-		report.Outputs = append(report.Outputs, out)
-	}
-	if len(report.UnavailableTools) > 0 {
-		return report, fmt.Errorf("skill %q 依赖未启用工具: %s", meta.QualifiedName, strings.Join(report.UnavailableTools, ", "))
-	}
-	if report.RequiresApproval {
-		report.ApprovalReason = "Skill声明了外部依赖，需要确认后才能加载"
-		decision, err := t.deps.Approval.Authorize(ctx, approvalmodel.Request{
-			ToolName: toolNameSkill,
-			Action:   approvalmodel.ActionSkillLoad,
-			Resource: approvalmodel.Resource{
-				Type:     "skill.dependencies",
-				URI:      model.SkillDependenciesDecisionKey(meta.QualifiedName),
-				Display:  model.SkillDependenciesDecisionKey(meta.QualifiedName),
-				Metadata: dependencyApprovalMetadata(meta, report, invocation),
-			},
-			Reason:          report.ApprovalReason,
-			Risk:            approvalmodel.RiskMedium,
-			SuggestedScopes: []approvalmodel.GrantScope{approvalmodel.GrantScopeOnce, approvalmodel.GrantScopeSession},
-		})
-		if err != nil {
-			return report, err
-		}
-		switch decision.Type {
-		case approvalmodel.DecisionApproved, approvalmodel.DecisionApprovedForScope:
-			return report, nil
-		default:
-			reason := strings.TrimSpace(decision.Reason)
-			if reason == "" {
-				reason = "skill dependencies require approval"
-			}
-			return report, fmt.Errorf("Skill依赖未通过审批: %s", reason)
-		}
-	}
-	return report, nil
-}
-
-// checkRequiredCapabilities 仅处理 enforcement=required 的能力门槛。
-// vision：依据 Run 的 EffectiveVisionMode（由主模型 / router.vision 的真实 supports_image 求解），
-// degraded_text 时拒绝加载；optional 或不配置不做任何限制。
-func (t *Tool) checkRequiredCapabilities(ctx context.Context, meta model.Metadata) error {
-	for _, req := range meta.Requires {
-		if !model.IsRequiredEnforcement(req.Enforcement) {
-			continue
-		}
-		kind := strings.ToLower(strings.TrimSpace(req.Kind))
-		switch kind {
+		switch strings.ToLower(strings.TrimSpace(requirement.Kind)) {
 		case "vision":
-			mode, ok := viewimage.VisionModeFromContext(ctx)
-			if !ok {
-				mode = vision.ModeDegradedText
-			}
-			if !vision.HasImageCapability(mode) {
-				return fmt.Errorf("SKILL_CAPABILITY_REQUIRED: Skill %q 声明 requires.vision=required，但当前 Run 无可用视觉模型（主模型与 router.vision 均未配置 supports_image=true）。请配置 models.*.supports_image 和/或 router.vision 后再调用", meta.QualifiedName)
+			if !vision.HasImageCapability(vision.Mode(snapshot.VisionMode)) {
+				return fmt.Errorf("SKILL_CAPABILITY_REQUIRED: Invocation %q要求真实视觉能力，目标执行者vision_mode=%s", definition.Handle, snapshot.VisionMode)
 			}
 		default:
-			return fmt.Errorf("SKILL_CAPABILITY_REQUIRED: Skill %q 声明了未知能力门槛 kind=%q", meta.QualifiedName, req.Kind)
+			return fmt.Errorf("SKILL_CAPABILITY_REQUIRED: Invocation %q要求未知能力%q", definition.Handle, requirement.Kind)
 		}
 	}
 	return nil
 }
 
-func (t *Tool) authorize(ctx context.Context, meta model.Metadata, deps dependencyReport, invocation string) error {
-	metadata := map[string]string{
-		"trusted":                   "true",
-		"authority":                 meta.Authority.String(),
-		"package":                   string(meta.PackageID),
-		"qualified_name":            meta.QualifiedName,
-		"dependency_count":          fmt.Sprintf("%d", deps.DependencyCount),
-		"external_dependency_count": fmt.Sprintf("%d", deps.ExternalCount),
+func (t *Tool) fork(ctx context.Context, resolved model.ResolvedInvocation, binding model.InvocationBinding, deps dependencyReport) (string, error) {
+	progress.Emit(ctx, progress.Event{Kind: progress.KindSubAgent, Phase: progress.PhaseStart, Component: "skill-gateway", Name: binding.Handle, Summary: "派生隔离子Run执行Invocation: " + binding.Handle})
+	if t.forkTask == nil {
+		return "", fmt.Errorf("SKILL_RUNTIME_PROFILE_UNAVAILABLE: Invocation %q要求fork，但Task网关未注入", binding.Handle)
 	}
-	addInvocationMetadata(metadata, invocation)
+	delegator, ok := t.forkTask.(subagentcontract.Delegator)
+	if !ok {
+		return "", fmt.Errorf("SKILL_RUNTIME_PROFILE_UNAVAILABLE: Task网关未实现Delegator")
+	}
+	injection, err := t.deps.Service.Load(ctx, skillcontract.LoadRequest{Resolved: resolved, Binding: binding})
+	if err != nil {
+		return "", err
+	}
+	fingerprint := binding.IdempotencyKey
+	if _, loaded := t.inFlight.LoadOrStore(fingerprint, struct{}{}); loaded {
+		return "", fmt.Errorf("SKILL_INVOCATION_IN_PROGRESS: 相同Invocation任务正在执行")
+	}
+	defer t.inFlight.Delete(fingerprint)
+
+	definition := &subagentmodel.Definition{
+		Name: subagentprompt.SkillForkDefinitionName(binding.Handle), Description: "Skill Invocation fork: " + binding.Handle,
+		WhenToUse: "仅由Skill网关按Runtime Manifest创建", SystemPrompt: "", Tools: cloneStrings(binding.ToolPolicy.Allowed),
+		MaxTurns: binding.AgentMode.MaxTurns, MaxTokens: binding.AgentMode.MaxTokens, MaxToolCalls: binding.AgentMode.MaxToolCalls,
+		TimeoutSec: binding.AgentMode.TimeoutSec,
+	}
+	req := subagentcontract.DelegateRequest{
+		Prompt: injection.Contents, Description: "执行Skill Invocation " + binding.Handle,
+		AllowedTools: cloneStrings(binding.ToolPolicy.Allowed), Definition: definition,
+		SnapshotMode: subagentcontract.SnapshotModeSkillIsolated, PromptOrigin: "skill_fork",
+		MaxTurns: binding.AgentMode.MaxTurns, MaxTokens: binding.AgentMode.MaxTokens,
+		MaxToolCalls: binding.AgentMode.MaxToolCalls, TimeoutSec: binding.AgentMode.TimeoutSec,
+		InvocationBinding: binding, Deliverables: declaredDeliverables(binding.Result),
+	}
+	for _, input := range binding.Inputs {
+		req.InputRefs = append(req.InputRefs, input.Ref)
+	}
+	_ = deps
+	return delegator.Delegate(skillcontract.WithInvocationAncestors(ctx, append(skillcontract.InvocationAncestors(ctx), resolved.CatalogItem.ID)), req)
+}
+
+func (t *Tool) initializeDeliverables(ctx context.Context, binding model.InvocationBinding) error {
+	deliverables := declaredDeliverables(binding.Result)
+	if len(deliverables) == 0 {
+		return nil
+	}
+	if t.deps.RunInitializer == nil {
+		return fmt.Errorf("SKILL_DELIVERABLE_REQUIRED: Invocation声明交付物，但RunInitializer未配置")
+	}
+	return t.deps.RunInitializer.InitializeRun(ctx, artifactcontract.RunInitializationRequest{TenantID: binding.TenantID, RunID: binding.RunID, Deliverables: deliverables})
+}
+
+func declaredDeliverables(result model.ResultContract) []artifactcontract.DeclaredDeliverable {
+	if result.Kind != model.ResultKindDeliverables {
+		return nil
+	}
+	out := make([]artifactcontract.DeclaredDeliverable, 0, len(result.Deliverables))
+	for _, declaration := range result.Deliverables {
+		out = append(out, artifactcontract.DeclaredDeliverable{
+			ID: declaration.ID, Required: declaration.Required, Cardinality: declaration.Cardinality, Role: declaration.Role, DesiredName: declaration.DesiredName,
+			AcceptedMIMEs: cloneStrings(declaration.AcceptedMIMEs), AcceptedSuffix: cloneStrings(declaration.AcceptedSuffixes),
+			QAPolicy: declaration.QA.Policy, QAEnforcement: declaration.QA.Enforcement, DeliveryPolicy: declaration.DeliveryPolicy,
+		})
+	}
+	return out
+}
+
+type dependencyReport struct {
+	Outputs          []dependencyOutput
+	ExternalCount    int
+	RequiresApproval bool
+	DependencyCount  int
+}
+
+func (t *Tool) checkDependencies(ctx context.Context, resolved model.ResolvedInvocation, invocationSource string) (dependencyReport, error) {
+	report := dependencyReport{}
+	available := stringSet(normalizeStrings(t.deps.EnabledTools))
+	for _, dependency := range resolved.Profile.Dependencies.Tools {
+		kind := strings.ToLower(strings.TrimSpace(dependency.Type))
+		value := strings.TrimSpace(dependency.Value)
+		if kind == "" || value == "" {
+			continue
+		}
+		report.DependencyCount++
+		item := dependencyOutput{Type: kind, Value: value, Description: dependency.Description, Status: "available"}
+		if kind == "tool" {
+			if _, ok := available[value]; !ok {
+				return report, fmt.Errorf("SKILL_RUNTIME_PROFILE_UNAVAILABLE: Invocation %q依赖未启用Tool %q", resolved.Definition.Handle, value)
+			}
+		} else {
+			item.Status = "requires_approval"
+			report.ExternalCount++
+			report.RequiresApproval = true
+		}
+		report.Outputs = append(report.Outputs, item)
+	}
+	if report.RequiresApproval {
+		decision, err := t.deps.Approval.Authorize(ctx, approvalmodel.Request{
+			ToolName: toolNameSkill, Action: approvalmodel.ActionSkillLoad,
+			Resource: approvalmodel.Resource{Type: "skill.dependencies", URI: model.SkillDependenciesDecisionKey(resolved.Definition.Handle), Display: resolved.Definition.Handle},
+			Reason:   "Skill Invocation声明外部依赖", Risk: approvalmodel.RiskMedium,
+			SuggestedScopes: []approvalmodel.GrantScope{approvalmodel.GrantScopeOnce, approvalmodel.GrantScopeSession},
+			Metadata:        map[string]string{"invocation_source": invocationSource, "dependency_count": fmt.Sprintf("%d", report.DependencyCount)},
+		})
+		if err != nil {
+			return report, err
+		}
+		if decision.Type != approvalmodel.DecisionApproved && decision.Type != approvalmodel.DecisionApprovedForScope {
+			return report, fmt.Errorf("Skill依赖未通过审批: %s", firstNonEmpty(decision.Reason, string(decision.Type)))
+		}
+	}
+	return report, nil
+}
+
+func (t *Tool) authorize(ctx context.Context, resolved model.ResolvedInvocation, deps dependencyReport, source string) error {
 	decision, err := t.deps.Approval.Authorize(ctx, approvalmodel.Request{
-		ToolName: toolNameSkill,
-		Action:   approvalmodel.ActionSkillLoad,
-		Resource: approvalmodel.Resource{
-			Type:     "skill",
-			URI:      model.SkillDecisionKey(meta.QualifiedName),
-			Display:  model.SkillDecisionKey(meta.QualifiedName),
-			Metadata: metadata,
-		},
-		Reason: "加载Skill上下文",
-		Risk:   approvalmodel.RiskLow,
+		ToolName: toolNameSkill, Action: approvalmodel.ActionSkillLoad,
+		Resource: approvalmodel.Resource{Type: "skill_invocation", URI: model.SkillDecisionKey(resolved.Definition.Handle), Display: resolved.Definition.Handle,
+			Metadata: map[string]string{"authority": resolved.CatalogItem.Authority.String(), "package": string(resolved.CatalogItem.PackageID), "package_digest": resolved.CatalogItem.PackageDigest, "invocation_id": resolved.Definition.ID, "source": source, "dependency_count": fmt.Sprintf("%d", deps.DependencyCount)}},
+		Reason: "调用Skill Invocation", Risk: approvalmodel.RiskLow,
 	})
 	if err != nil {
 		return err
 	}
-	switch decision.Type {
-	case approvalmodel.DecisionApproved, approvalmodel.DecisionApprovedForScope:
-		return nil
-	default:
-		reason := strings.TrimSpace(decision.Reason)
-		if reason == "" {
-			reason = "skill load denied"
+	if decision.Type != approvalmodel.DecisionApproved && decision.Type != approvalmodel.DecisionApprovedForScope {
+		return fmt.Errorf("Skill未通过审批: %s", firstNonEmpty(decision.Reason, string(decision.Type)))
+	}
+	return nil
+}
+
+func (t *Tool) checkRecursion(ctx context.Context, invocationID string) error {
+	ancestors := skillcontract.InvocationAncestors(ctx)
+	if len(ancestors) >= 8 {
+		return fmt.Errorf("SKILL_RECURSION_DENIED: Invocation调用深度超过8")
+	}
+	for _, ancestor := range ancestors {
+		if ancestor == invocationID {
+			return fmt.Errorf("SKILL_RECURSION_DENIED: Invocation祖先链形成环: %s", invocationID)
 		}
-		return fmt.Errorf("Skill未通过审批: %s", reason)
 	}
+	return nil
 }
 
-func dependencyApprovalMetadata(meta model.Metadata, report dependencyReport, invocation string) map[string]string {
-	metadata := map[string]string{
-		"trusted":                   "false",
-		"dangerous":                 "true",
-		"authority":                 meta.Authority.String(),
-		"package":                   string(meta.PackageID),
-		"qualified_name":            meta.QualifiedName,
-		"dependency_count":          fmt.Sprintf("%d", report.DependencyCount),
-		"external_dependency_count": fmt.Sprintf("%d", report.ExternalCount),
+func (t *Tool) dispatchPreHook(ctx context.Context, modelCall bool, source string, resolved model.ResolvedInvocation) error {
+	if !modelCall {
+		return nil
 	}
-	addInvocationMetadata(metadata, invocation)
-	return metadata
+	if dispatcher := hookcontract.FromContext(ctx); dispatcher != nil {
+		result, err := dispatcher.Dispatch(ctx, hookmodel.Event{Name: hookmodel.EventPreSkillUse, MatchKey: resolved.Definition.Handle, Payload: map[string]any{"skill_handle": resolved.Definition.Handle, "invocation_id": resolved.Definition.ID, "source": source}})
+		if err != nil {
+			return fmt.Errorf("执行PreSkillUse Hook失败: %w", err)
+		}
+		hookcontract.AppendAdditionalContext(ctx, result.AdditionalContext...)
+		if result.Blocked {
+			return fmt.Errorf("Skill Invocation %q被Hook阻断: %s", resolved.Definition.Handle, result.BlockReason)
+		}
+	}
+	return nil
 }
 
-func addInvocationMetadata(metadata map[string]string, invocation string) {
-	invocation = strings.TrimSpace(invocation)
-	if invocation == "" {
-		return
+func (t *Tool) dispatchPostHook(ctx context.Context, modelCall bool, source string, resolved model.ResolvedInvocation) error {
+	if !modelCall {
+		return nil
 	}
-	metadata["invocation"] = invocation
+	if dispatcher := hookcontract.FromContext(ctx); dispatcher != nil {
+		result, err := dispatcher.Dispatch(ctx, hookmodel.Event{Name: hookmodel.EventPostSkillUse, MatchKey: resolved.Definition.Handle, Payload: map[string]any{"skill_handle": resolved.Definition.Handle, "invocation_id": resolved.Definition.ID, "source": source, "injected": true}})
+		if err != nil {
+			return fmt.Errorf("执行PostSkillUse Hook失败: %w", err)
+		}
+		hookcontract.AppendAdditionalContext(ctx, result.AdditionalContext...)
+	}
+	return nil
 }
 
-func toJSON(value any) (string, error) {
-	data, err := json.Marshal(value)
-	if err != nil {
-		return "", err
-	}
-	return string(data), nil
-}
-
-func normalizeEnabledTools(values []string) []string {
+func normalizeStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
 	out := make([]string, 0, len(values))
 	for _, value := range values {
 		value = strings.TrimSpace(value)
 		if value == "" {
 			continue
 		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
 		out = append(out, value)
 	}
 	return out
@@ -479,122 +543,34 @@ func normalizeEnabledTools(values []string) []string {
 func stringSet(values []string) map[string]struct{} {
 	out := make(map[string]struct{}, len(values))
 	for _, value := range values {
-		value = strings.TrimSpace(value)
-		if value == "" {
-			continue
-		}
 		out[value] = struct{}{}
 	}
 	return out
 }
-
-func cloneStrings(values []string) []string {
-	if len(values) == 0 {
-		return nil
+func cloneStrings(values []string) []string { return append([]string(nil), values...) }
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
 	}
-	return append([]string(nil), values...)
+	return ""
+}
+func toJSON(value any) (string, error) {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
 }
 
-func defaultContext(value model.ContextMode) model.ContextMode {
-	if value == "" {
-		return model.ContextModeInline
+func sortedKeys(values map[string]struct{}) []string {
+	out := make([]string, 0, len(values))
+	for key := range values {
+		out = append(out, key)
 	}
-	return value
+	sort.Strings(out)
+	return out
 }
 
-func normalizeInputs(inputs []string) []string {
-	if len(inputs) == 0 {
-		return nil
-	}
-	seen := make(map[string]bool)
-	var res []string
-	for _, item := range inputs {
-		clean := strings.TrimSpace(item)
-		if clean != "" && !seen[clean] {
-			seen[clean] = true
-			res = append(res, clean)
-		}
-	}
-	return res
-}
-
-func extractWorkspaceInputFiles(ctx context.Context, text string) []string {
-	if strings.TrimSpace(text) == "" {
-		return nil
-	}
-	seen := make(map[string]bool)
-	var res []string
-
-	addCandidate := func(candidate string) {
-		candidate = strings.TrimSpace(candidate)
-		if candidate != "" && !seen[candidate] {
-			seen[candidate] = true
-			res = append(res, candidate)
-		}
-	}
-
-	// 1. 方案 A 核心：工作区真实存在性交集匹配（Workspace File Intersection Matching）
-	// 不依赖正则猜中文词汇边界，而是拿真实工作区现存的文件名/别名与 Prompt 字符串比对（strings.Contains）
-	if prepared, ok := workcontract.PreparedRunFromContext(ctx); ok {
-		for _, inputRef := range prepared.Manifest.Inputs.Inputs {
-			name := strings.TrimSpace(inputRef.Name)
-			alias := strings.TrimSpace(string(inputRef.Alias))
-			if name != "" && strings.Contains(text, name) {
-				addCandidate(name)
-			} else if alias != "" && strings.Contains(text, alias) {
-				addCandidate(alias)
-			}
-		}
-		dirsToCheck := []string{
-			prepared.Execution.Workspace.WorkDir,
-			prepared.Execution.Workspace.InputDir,
-			prepared.Manifest.ProjectDir,
-		}
-		for _, dir := range dirsToCheck {
-			dir = strings.TrimSpace(dir)
-			if dir == "" {
-				continue
-			}
-			if entries, err := os.ReadDir(dir); err == nil {
-				for _, entry := range entries {
-					if entry.IsDir() {
-						continue
-					}
-					name := entry.Name()
-					if name != "" && strings.Contains(text, name) {
-						addCandidate(name)
-					}
-				}
-			}
-		}
-	}
-
-	// 2. 方案 A 备用：纯 ASCII/绝对路径/无 PreparedRun 时的标准模式提取
-	for _, m := range extractFallbackInputFiles(text) {
-		addCandidate(m)
-	}
-
-	return res
-}
-
-var fallbackPathPattern = regexp.MustCompile(`(?i)(?:[a-zA-Z]:[\\/][^\s"'，。；：、（）()]+|[a-zA-Z0-9_\-\.]+\.(?:md|markdown|txt|csv|tsv|json|ya?ml|pdf|docx?|xlsx?|pptx?|html?|xml|go|py|js|ts|java|sql|png|jpe?g))`)
-
-func extractFallbackInputFiles(text string) []string {
-	if strings.TrimSpace(text) == "" {
-		return nil
-	}
-	matches := fallbackPathPattern.FindAllString(text, -1)
-	if len(matches) == 0 {
-		return nil
-	}
-	seen := make(map[string]bool)
-	var res []string
-	for _, m := range matches {
-		clean := strings.TrimSpace(m)
-		if clean != "" && !seen[clean] {
-			seen[clean] = true
-			res = append(res, clean)
-		}
-	}
-	return res
-}
+var _ tool.Tool = (*Tool)(nil)

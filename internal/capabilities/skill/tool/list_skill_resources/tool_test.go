@@ -16,31 +16,13 @@ type fakeSkillService struct {
 	resources []model.ResourceInfo
 }
 
-func (s fakeSkillService) Catalog(context.Context, skillcontract.CatalogRequest) (model.Catalog, error) {
-	return model.Catalog{Entries: []model.Metadata{s.meta}}, nil
-}
-func (s fakeSkillService) Resolve(context.Context, skillcontract.ResolveRequest) (model.Metadata, error) {
-	return s.meta, nil
-}
-func (s fakeSkillService) Load(context.Context, skillcontract.LoadRequest) (model.Injection, error) {
-	return model.Injection{}, nil
-}
-func (s fakeSkillService) ReadResource(context.Context, skillcontract.ResourceRequest) (model.ResourceContent, error) {
-	return model.ResourceContent{}, nil
-}
 func (s fakeSkillService) ListResources(context.Context, skillcontract.ListResourcesRequest) (model.ResourceList, error) {
 	return model.ResourceList{Skill: s.meta, Resources: s.resources}, nil
 }
-func (s fakeSkillService) SearchResources(context.Context, skillcontract.SearchResourcesRequest) (model.SearchResult, error) {
-	return model.SearchResult{}, nil
+
+func (s fakeSkillService) ListBoundResources(context.Context, model.InvocationBinding) (model.ResourceList, error) {
+	return model.ResourceList{Skill: s.meta, Resources: s.resources}, nil
 }
-func (s fakeSkillService) SelectForTurn(context.Context, skillcontract.SelectionRequest) ([]model.Metadata, error) {
-	return nil, nil
-}
-func (s fakeSkillService) RenderAvailableSkills(context.Context, skillcontract.CatalogRequest) (string, error) {
-	return "", nil
-}
-func (s fakeSkillService) ClearCache() {}
 
 type allowApproval struct{}
 
@@ -49,7 +31,7 @@ func (allowApproval) Authorize(context.Context, approvalmodel.Request) (approval
 }
 
 func TestToolListsSkillResources(t *testing.T) {
-	meta := model.Metadata{Name: "review", QualifiedName: "review", Description: "Review", Enabled: true, PromptVisible: true, Authority: model.Authority{Kind: model.SourceKindEmbedded, ID: "test"}, PackageID: "review", MainResource: "review/SKILL.md"}.Normalize()
+	meta := model.Metadata{Name: "review", Description: "Review", Authority: model.Authority{Kind: model.SourceKindEmbedded, ID: "test"}, PackageID: "review", MainResource: "review/SKILL.md"}.Normalize()
 	created, err := New(Deps{Service: fakeSkillService{meta: meta, resources: []model.ResourceInfo{{Resource: "review/assets/logo.bin", Kind: model.ResourceKindAsset, Name: "logo.bin", Size: 3, Text: false}, {Resource: "review/references/guide.md", Kind: model.ResourceKindReference, Name: "guide.md", Size: 10, Text: true}}}, Approval: allowApproval{}, CatalogRequest: skillcontract.CatalogRequest{Product: profilemodel.ChannelCLI}})
 	if err != nil {
 		t.Fatal(err)
@@ -66,7 +48,7 @@ func TestToolListsSkillResources(t *testing.T) {
 // TestToolRejectsLegacyNameParam 固化单一权威参数设计：技能标识只认 skill（与 Skill/run_skill_command
 // 等全家族一致），旧的 name 参数已移除，传入会作为未知字段被拒，避免 schema 出现两个易混淆的名字。
 func TestToolRejectsLegacyNameParam(t *testing.T) {
-	meta := model.Metadata{Name: "review", QualifiedName: "review", Description: "Review", Enabled: true, PromptVisible: true, Authority: model.Authority{Kind: model.SourceKindEmbedded, ID: "test"}, PackageID: "review", MainResource: "review/SKILL.md"}.Normalize()
+	meta := model.Metadata{Name: "review", Description: "Review", Authority: model.Authority{Kind: model.SourceKindEmbedded, ID: "test"}, PackageID: "review", MainResource: "review/SKILL.md"}.Normalize()
 	deps := Deps{Service: fakeSkillService{meta: meta, resources: []model.ResourceInfo{{Resource: "review/references/guide.md", Kind: model.ResourceKindReference, Name: "guide.md", Size: 10, Text: true}}}, Approval: allowApproval{}, CatalogRequest: skillcontract.CatalogRequest{Product: profilemodel.ChannelCLI}}
 	created, err := New(deps)
 	if err != nil {

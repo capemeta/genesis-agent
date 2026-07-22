@@ -8,11 +8,68 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
+	"testing/fstest"
 
 	execmodel "genesis-agent/internal/capabilities/execution/model"
+	skillcontract "genesis-agent/internal/capabilities/skill/contract"
+	skillmodel "genesis-agent/internal/capabilities/skill/model"
 	workcontract "genesis-agent/internal/capabilities/workspace/contract"
 	workmodel "genesis-agent/internal/capabilities/workspace/model"
 )
+
+type testSkillService struct{ skillcontract.Service }
+
+func (s testSkillService) GetBinding(ctx context.Context, req skillcontract.BindingLookup) (skillmodel.InvocationBinding, error) {
+	resolved, err := s.Service.Resolve(ctx, skillcontract.ResolveRequest{Name: req.Handle})
+	if err != nil {
+		return skillmodel.InvocationBinding{}, err
+	}
+	return s.Service.CreateBinding(ctx, skillcontract.BindingRequest{
+		Resolved: resolved, TenantID: req.TenantID, RunID: req.RunID,
+		ToolPolicy:            skillmodel.EffectiveToolPolicy{Base: []string{"run_skill_command"}, Allowed: []string{"run_skill_command"}, Required: []string{"run_skill_command"}},
+		ExecutionPolicy:       skillmodel.EffectiveExecutionPolicy{ExecutionMode: skillmodel.ExecutionModePerCall},
+		PolicySnapshotVersion: "test/v1",
+	})
+}
+
+func (s testSkillService) GetPackageSnapshot(ctx context.Context, digest string) (skillmodel.SkillPackageSnapshot, []skillmodel.SkillPackageFile, error) {
+	return s.Service.(skillcontract.PackageSnapshotReader).GetPackageSnapshot(ctx, digest)
+}
+
+func testRuntimeSkillFS(source fstest.MapFS) fstest.MapFS {
+	out := fstest.MapFS{}
+	for name, file := range source {
+		out[name] = file
+		if !strings.HasSuffix(name, "/SKILL.md") {
+			continue
+		}
+		pkg := strings.TrimSuffix(name, "/SKILL.md")
+		out[name] = &fstest.MapFile{Data: []byte("---\nname: " + pkg + "\ndescription: Runtime command test skill\n---\nDemo")}
+		out[pkg+"/genesis.skill.yaml"] = &fstest.MapFile{Data: []byte("schema: genesis.skill/v1\nskill: " + pkg + `
+runtime_profiles:
+  default:
+    sandbox: {required: true, execution_mode: per_call}
+    dependencies:
+      runtime:
+        node: [{name: pptxgenjs, require: pptxgenjs}]
+        system: [{name: libreoffice, command: soffice}]
+invocations:
+  - id: default
+    handle: ` + pkg + `
+    description: Execute runtime command tests
+    agent_mode: main
+    runtime_profile: default
+    request:
+      task: {required: false}
+      inputs: {min_items: 0, max_items: 64, access: read_only}
+    prompt: {skill_body: include}
+    tool_policy: {allow: [run_skill_command], required: [run_skill_command]}
+    result: {kind: message}
+`)}
+	}
+	return out
+}
 
 type testProvisioner struct{}
 

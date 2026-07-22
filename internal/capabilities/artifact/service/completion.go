@@ -15,7 +15,7 @@ import (
 
 // AdoptionSource 提供父 Run 已接纳的子产物列表（可选依赖；nil 时不做委派销账）。
 type AdoptionSource interface {
-	ListByConsumer(consumerRunID string) []AdoptionRecord
+	ListByConsumer(consumerTenantID, consumerRunID string) []artifactcontract.AdoptionRecord
 }
 
 // CompletionEvaluator 只根据持久化控制面事实判断 required deliverable 是否完成。
@@ -51,11 +51,11 @@ func NewCompletionEvaluator(
 	return &CompletionEvaluator{
 		deliverables: deliverables, selections: selections, publications: publications,
 		deliveries: deliveries, evidence: evidence, produced: produced,
-		adoptions: GlobalAdoptionStore, now: time.Now,
+		now: time.Now,
 	}, nil
 }
 
-// WithAdoptions 覆盖接纳来源（单测可注入；生产默认 GlobalAdoptionStore）。
+// WithAdoptions 注入当前租户/工作空间的接纳来源。
 func (e *CompletionEvaluator) WithAdoptions(src AdoptionSource) *CompletionEvaluator {
 	if e != nil {
 		e.adoptions = src
@@ -141,7 +141,7 @@ func (e *CompletionEvaluator) adoptedSatisfies(ctx context.Context, tenantID, co
 	if e.adoptions == nil {
 		return false, nil
 	}
-	for _, adoption := range e.adoptions.ListByConsumer(consumerRunID) {
+	for _, adoption := range e.adoptions.ListByConsumer(tenantID, consumerRunID) {
 		if strings.EqualFold(strings.TrimSpace(adoption.Role), "qa_asset") {
 			continue
 		}

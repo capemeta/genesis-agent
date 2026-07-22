@@ -10,11 +10,14 @@ import (
 
 	artifactcontract "genesis-agent/internal/capabilities/artifact/contract"
 	artifactmodel "genesis-agent/internal/capabilities/artifact/model"
+	artifactservice "genesis-agent/internal/capabilities/artifact/service"
 	sandboxcontract "genesis-agent/internal/capabilities/sandbox/contract"
+	skillmemory "genesis-agent/internal/capabilities/skill/adapter/memory"
 	workspacememory "genesis-agent/internal/capabilities/workspace/adapter/memory"
 	workcontract "genesis-agent/internal/capabilities/workspace/contract"
 	workmodel "genesis-agent/internal/capabilities/workspace/model"
 	enterprisebootstrap "genesis-agent/products/enterprise/bootstrap"
+	localsubagent "genesis-agent/shared/local/subagent"
 )
 
 type testArtifactControl struct{}
@@ -44,10 +47,7 @@ func (testArtifactControl) SelectAndFinalize(context.Context, string, string, st
 func (testArtifactControl) EvaluateCompletion(context.Context, string, string) (artifactcontract.CompletionDecision, error) {
 	return artifactcontract.CompletionDecision{Complete: true}, nil
 }
-func (testArtifactControl) RecordPassed(context.Context, artifactcontract.QAPassRequest) error {
-	return nil
-}
-func (testArtifactControl) RecordDegraded(context.Context, artifactcontract.QADegradeRequest) error {
+func (testArtifactControl) RecordOutcome(context.Context, artifactcontract.QAOutcomeRequest) error {
 	return nil
 }
 func (testArtifactControl) Reserve(context.Context, artifactcontract.ReserveRequest) (artifactcontract.ReserveResult, error) {
@@ -100,8 +100,12 @@ func TestEnterpriseContainerWiresSkillTools(t *testing.T) {
 		Dependencies: enterprisebootstrap.Dependencies{
 			RunManifests: workspacememory.NewManifestStore(), ProducedResources: testArtifactControl{},
 			RemoteSessions: testArtifactControl{}, Reservations: testArtifactControl{}, Deliverables: testArtifactControl{}, ArtifactRuns: testArtifactControl{}, Finalizer: testArtifactControl{},
-			Completion: testArtifactControl{},
-			QAEvidence: testArtifactControl{},
+			Completion:    testArtifactControl{},
+			QAEvidence:    testArtifactControl{},
+			SkillBindings: skillmemory.NewBindingStore(),
+			SkillPackages: skillmemory.NewPackageStore(),
+			SubAgentStore: mustSubAgentStore(t),
+			Adoptions:     mustAdoptionStore(t),
 		},
 	})
 	t.Cleanup(func() { _ = c.Close() })
@@ -111,6 +115,24 @@ func TestEnterpriseContainerWiresSkillTools(t *testing.T) {
 	if c.Service() == nil {
 		t.Fatal("service is nil")
 	}
+}
+
+func mustSubAgentStore(t *testing.T) *localsubagent.Store {
+	t.Helper()
+	store, err := localsubagent.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return store
+}
+
+func mustAdoptionStore(t *testing.T) *artifactservice.AdoptionStore {
+	t.Helper()
+	store, err := artifactservice.NewAdoptionStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return store
 }
 
 func TestEnterpriseContainerRequiresTenantRunManifestStore(t *testing.T) {

@@ -165,6 +165,26 @@ func denyReadAccessLowLevel(path string, sid *windows.SID) error {
 	return setNamedSecurityInfo(path, newAcl)
 }
 
+func grantAncestorsAccess(workspacePath, targetPath string, sid *windows.SID) {
+	absWorkspace, err1 := filepath.Abs(workspacePath)
+	absTarget, err2 := filepath.Abs(targetPath)
+	if err1 != nil || err2 != nil {
+		return
+	}
+	absWorkspace = strings.ToLower(filepath.Clean(absWorkspace))
+	curr := filepath.Dir(filepath.Clean(absTarget))
+	for len(curr) >= len(absWorkspace) && strings.HasPrefix(strings.ToLower(curr), absWorkspace) {
+		if _, err := os.Stat(curr); err == nil {
+			_ = grantModifyAccessLowLevel(curr, sid)
+		}
+		parent := filepath.Dir(curr)
+		if parent == curr || len(curr) <= len(absWorkspace) {
+			break
+		}
+		curr = parent
+	}
+}
+
 // ApplyWorkspaceACLs grants modify access to writable roots, and denies read access to unreadable paths.
 func ApplyWorkspaceACLs(workspacePath string, writables []string, unreadables []string) error {
 	sidStr, err := GetWorkspaceCapabilitySID(workspacePath)
@@ -176,7 +196,7 @@ func ApplyWorkspaceACLs(workspacePath string, writables []string, unreadables []
 		return fmt.Errorf("failed to parse capability SID: %w", err)
 	}
 
-	// 1. Grant modify access to writable roots
+	// 1. Grant modify access to writable roots and their ancestor paths up to workspace root
 	for _, path := range writables {
 		if path == "" {
 			continue
@@ -188,7 +208,8 @@ func ApplyWorkspaceACLs(workspacePath string, writables []string, unreadables []
 		if _, err := os.Stat(absPath); os.IsNotExist(err) {
 			continue
 		}
-		
+
+		grantAncestorsAccess(workspacePath, absPath, sid)
 		err = grantModifyAccessLowLevel(absPath, sid)
 		if err != nil {
 			return fmt.Errorf("grant modify failed for %s: %w", absPath, err)
@@ -207,7 +228,7 @@ func ApplyWorkspaceACLs(workspacePath string, writables []string, unreadables []
 		if _, err := os.Stat(absPath); os.IsNotExist(err) {
 			continue
 		}
-		
+
 		err = denyReadAccessLowLevel(absPath, sid)
 		if err != nil {
 			return fmt.Errorf("deny read failed for %s: %w", absPath, err)
@@ -239,7 +260,7 @@ func ApplyWorkspaceACLsForUser(workspacePath string, username string, writables 
 		_ = grantModifyAccessLowLevel(absWorkspace, sid)
 	}
 
-	// 2. Grant modify access to writable roots
+	// 2. Grant modify access to writable roots and ancestor directories up to workspace root
 	for _, path := range writables {
 		if path == "" {
 			continue
@@ -252,6 +273,7 @@ func ApplyWorkspaceACLsForUser(workspacePath string, username string, writables 
 			continue
 		}
 
+		grantAncestorsAccess(workspacePath, absPath, sid)
 		err = grantModifyAccessLowLevel(absPath, sid)
 		if err != nil {
 			return fmt.Errorf("grant modify failed for %s: %w", absPath, err)

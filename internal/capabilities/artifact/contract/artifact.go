@@ -15,17 +15,18 @@ import (
 type ErrorCode string
 
 const (
-	ErrCodeArtifactPathInvalid       ErrorCode = "ARTIFACT_PATH_INVALID"
-	ErrCodeArtifactInvalid           ErrorCode = "ARTIFACT_INVALID"
-	ErrCodeArtifactNameConflict      ErrorCode = "ARTIFACT_NAME_CONFLICT"
-	ErrCodeDeliveryTargetDenied      ErrorCode = "DELIVERY_TARGET_DENIED"
-	ErrCodeDeliveryTargetConflict    ErrorCode = "DELIVERY_TARGET_CONFLICT"
-	ErrCodeDeliveryMaterializeFailed ErrorCode = "DELIVERY_MATERIALIZE_FAILED"
-	ErrCodeDeliveryInProgress        ErrorCode = "DELIVERY_IN_PROGRESS"
+	ErrCodeArtifactPathInvalid           ErrorCode = "ARTIFACT_PATH_INVALID"
+	ErrCodeArtifactInvalid               ErrorCode = "ARTIFACT_INVALID"
+	ErrCodeArtifactNameConflict          ErrorCode = "ARTIFACT_NAME_CONFLICT"
+	ErrCodeDeliveryTargetDenied          ErrorCode = "DELIVERY_TARGET_DENIED"
+	ErrCodeDeliveryTargetConflict        ErrorCode = "DELIVERY_TARGET_CONFLICT"
+	ErrCodeDeliveryMaterializeFailed     ErrorCode = "DELIVERY_MATERIALIZE_FAILED"
+	ErrCodeDeliveryInProgress            ErrorCode = "DELIVERY_IN_PROGRESS"
 	ErrCodeArtifactDeliveryRequired      ErrorCode = "ARTIFACT_DELIVERY_REQUIRED"
 	ErrCodeDeliverableNotProduced        ErrorCode = "DELIVERABLE_NOT_PRODUCED"
 	ErrCodeDeliverableSelectionAmbiguous ErrorCode = "DELIVERABLE_SELECTION_AMBIGUOUS"
 	ErrCodeArtifactPublicationConflict   ErrorCode = "ARTIFACT_PUBLICATION_CONFLICT"
+	ErrCodeQARequired                    ErrorCode = "QA_REQUIRED"
 )
 
 type Error struct {

@@ -70,7 +70,7 @@ func (s *TaskDeliverableInitializer) persistHeuristic(ctx context.Context, req a
 	// DesiredName 留空：Publish 时回退到 produced.ObservedName（模型在脚本/命令中写出的文件名即声明）。
 	spec := artifactmodel.DeliverableSpec{
 		ID: "deliverable-" + hex.EncodeToString(digest[:8]), TenantID: req.TenantID, RunID: req.RunID,
-		Required: true, Role: artifactmodel.DeliverableRolePrimary, DesiredName: "",
+		Required: true, Cardinality: "exactly_one", Role: artifactmodel.DeliverableRolePrimary, DesiredName: "",
 		AcceptedMIMEs: []string{mimeForSuffix(suffix)}, AcceptedSuffix: []string{suffix},
 		DeliveryPolicy: "run-output", CreatedAt: s.now().UTC(),
 	}
@@ -159,8 +159,16 @@ func declaredToSpec(tenantID, runID string, index int, declared artifactcontract
 	if role == artifactmodel.DeliverableRoleSupporting {
 		required = declared.Required
 	}
+	cardinality := strings.TrimSpace(declared.Cardinality)
+	if cardinality == "" {
+		if required {
+			cardinality = "exactly_one"
+		} else {
+			cardinality = "zero_or_one"
+		}
+	}
 	spec := artifactmodel.DeliverableSpec{
-		ID: id, TenantID: tenantID, RunID: runID, Required: required, Role: role,
+		ID: id, TenantID: tenantID, RunID: runID, Required: required, Cardinality: cardinality, Role: role,
 		DesiredName: desired, AcceptedMIMEs: mimes, AcceptedSuffix: suffixes,
 		QAPolicy: strings.TrimSpace(declared.QAPolicy), QAEnforcement: strings.TrimSpace(declared.QAEnforcement),
 		DeliveryPolicy: delivery, CreatedAt: now,

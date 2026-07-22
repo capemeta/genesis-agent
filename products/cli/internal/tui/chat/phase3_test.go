@@ -316,4 +316,3 @@ func TestChronologicalRollingProgressLog(t *testing.T) {
 		}
 	}
 }
-

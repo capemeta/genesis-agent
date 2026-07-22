@@ -76,6 +76,7 @@ func (v *Validator) ValidateSkillFS(root fs.FS, source contract.ParseSource) Val
 	}
 
 	validateFrontmatterShape(data, skillPath, &result)
+	validateRuntimeManifestFS(root, result.Metadata.Name, v.parser, &result)
 	validateResourceReferences(root, string(data), &result)
 	validateDirectories(root, &result)
 	validateEvals(root, result.Metadata.Name, &result)
@@ -109,16 +110,6 @@ func validateMetadata(meta model.Metadata, skillPath string, result *ValidationR
 	if len([]rune(meta.Description)) > model.MaxDescriptionLen {
 		result.add(SeverityError, "description_too_long", skillPath, fmt.Sprintf("description不能超过%d字符", model.MaxDescriptionLen))
 	}
-	for _, tool := range meta.AllowedTools {
-		if strings.TrimSpace(tool) == "" {
-			result.add(SeverityWarning, "allowed_tool_empty", skillPath, "allowed-tools包含空值")
-		}
-	}
-	for _, dep := range meta.Dependencies.Tools {
-		if dep.Type == "" || dep.Value == "" {
-			result.add(SeverityWarning, "dependency_incomplete", skillPath, "dependencies.tools中存在缺少type或value的依赖")
-		}
-	}
 }
 
 func validateFrontmatterShape(data []byte, skillPath string, result *ValidationResult) {
@@ -134,14 +125,7 @@ func validateFrontmatterShape(data []byte, skillPath string, result *ValidationR
 		result.add(SeverityError, "frontmatter_not_mapping", skillPath, "frontmatter必须是YAML对象")
 		return
 	}
-	allowed := map[string]struct{}{
-		"name": {}, "description": {}, "short-description": {}, "version": {},
-		"allowed-tools": {}, "context": {}, "agent": {}, "model": {},
-		"disable-model-invocation": {}, "allow-implicit-invocation": {},
-		"products": {}, "max-thinking-tokens": {}, "dependencies": {},
-		"requires": {}, "qa": {}, "sandbox": {},
-		"metadata": {}, "license": {}, "compatibility": {},
-	}
+	allowed := map[string]struct{}{"name": {}, "description": {}}
 	mapping := node.Content[0]
 	seenName := false
 	seenDescription := false
@@ -159,17 +143,9 @@ func validateFrontmatterShape(data []byte, skillPath string, result *ValidationR
 			if value.Kind != yaml.ScalarNode || value.Tag != "!!str" {
 				result.add(SeverityError, "description_not_string", skillPath, "description必须是字符串")
 			}
-		case "allowed-tools", "products", "requires":
-			if value.Kind != yaml.SequenceNode {
-				result.add(SeverityError, key+"_not_sequence", skillPath, key+"必须是字符串数组或对象数组")
-			}
-		case "dependencies", "metadata", "qa", "sandbox":
-			if value.Kind != yaml.MappingNode && value.Kind != yaml.SequenceNode {
-				result.add(SeverityWarning, key+"_shape", skillPath, key+"建议使用YAML对象或数组")
-			}
 		}
 		if _, ok := allowed[key]; !ok {
-			result.add(SeverityInfo, "frontmatter_extension", skillPath, "未识别frontmatter字段"+key+"，将按外部扩展处理")
+			result.add(SeverityError, "frontmatter_unknown_field", skillPath, "SKILL.md frontmatter只允许name和description，未知字段: "+key)
 		}
 	}
 	if !seenName {
@@ -177,6 +153,26 @@ func validateFrontmatterShape(data []byte, skillPath string, result *ValidationR
 	}
 	if !seenDescription {
 		result.add(SeverityError, "description_missing", skillPath, "缺少description")
+	}
+}
+
+func validateRuntimeManifestFS(root fs.FS, skillName string, parser *Parser, result *ValidationResult) {
+	data, err := fs.ReadFile(root, model.RuntimeManifestFileName)
+	if err != nil {
+		return
+	}
+	manifest, err := parser.ParseRuntimeManifest(data, skillName)
+	if err != nil {
+		result.add(SeverityError, "runtime_manifest_invalid", model.RuntimeManifestFileName, err.Error())
+		return
+	}
+	for _, invocation := range manifest.Invocations {
+		if invocation.Prompt.Instructions == "" {
+			continue
+		}
+		if _, err := fs.Stat(root, invocation.Prompt.Instructions); err != nil {
+			result.add(SeverityError, "invocation_instructions_missing", invocation.Prompt.Instructions, "Manifest引用的Invocation指令不存在")
+		}
 	}
 }
 
@@ -204,6 +200,15 @@ func validateResourceReferences(root fs.FS, content string, result *ValidationRe
 
 func stripFencedCodeBlocks(content string) string {
 	return fencedCodePattern.ReplaceAllString(content, "")
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 func normalizeResourceRef(ref string) string {
 	ref = strings.TrimSpace(ref)

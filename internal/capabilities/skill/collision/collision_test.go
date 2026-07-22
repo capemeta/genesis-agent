@@ -11,46 +11,16 @@ import (
 )
 
 type fakeCatalogService struct {
-	entries []skillmodel.Metadata
+	entries []skillmodel.InvocationMetadata
 }
 
 func (f fakeCatalogService) Catalog(context.Context, skillcontract.CatalogRequest) (skillmodel.Catalog, error) {
 	return skillmodel.Catalog{Entries: f.entries}, nil
 }
 
-func (f fakeCatalogService) Resolve(context.Context, skillcontract.ResolveRequest) (skillmodel.Metadata, error) {
-	return skillmodel.Metadata{}, nil
-}
-
-func (f fakeCatalogService) Load(context.Context, skillcontract.LoadRequest) (skillmodel.Injection, error) {
-	return skillmodel.Injection{}, nil
-}
-
-func (f fakeCatalogService) SelectForTurn(context.Context, skillcontract.SelectionRequest) ([]skillmodel.Metadata, error) {
-	return nil, nil
-}
-
-func (f fakeCatalogService) RenderAvailableSkills(context.Context, skillcontract.CatalogRequest) (string, error) {
-	return "", nil
-}
-
-func (f fakeCatalogService) ListResources(context.Context, skillcontract.ListResourcesRequest) (skillmodel.ResourceList, error) {
-	return skillmodel.ResourceList{}, nil
-}
-
-func (f fakeCatalogService) ReadResource(context.Context, skillcontract.ResourceRequest) (skillmodel.ResourceContent, error) {
-	return skillmodel.ResourceContent{}, nil
-}
-
-func (f fakeCatalogService) SearchResources(context.Context, skillcontract.SearchResourcesRequest) (skillmodel.SearchResult, error) {
-	return skillmodel.SearchResult{}, nil
-}
-
-func (f fakeCatalogService) ClearCache() {}
-
 func TestMatcherHitsSkillName(t *testing.T) {
 	m := &Matcher{
-		Service: fakeCatalogService{entries: []skillmodel.Metadata{
+		Service: fakeCatalogService{entries: []skillmodel.InvocationMetadata{
 			{Name: "office-ppt", QualifiedName: "office-ppt"},
 		}},
 	}
@@ -62,7 +32,7 @@ func TestMatcherHitsSkillName(t *testing.T) {
 
 func TestMatcherIgnoresGatewayNames(t *testing.T) {
 	m := &Matcher{
-		Service: fakeCatalogService{entries: []skillmodel.Metadata{
+		Service: fakeCatalogService{entries: []skillmodel.InvocationMetadata{
 			{Name: "office-ppt", QualifiedName: "office-ppt"},
 		}},
 	}
@@ -70,6 +40,16 @@ func TestMatcherIgnoresGatewayNames(t *testing.T) {
 		if _, ok, err := m.Match(context.Background(), name); err != nil || ok {
 			t.Fatalf("Match(%q) should miss, got ok=%v err=%v", name, ok, err)
 		}
+	}
+}
+
+func TestRewriteArgsUsesOnlyPublicTaskParameter(t *testing.T) {
+	var got map[string]string
+	if err := json.Unmarshal([]byte(RewriteArgs("office-ppt", "生成季度汇报")), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["skill"] != "office-ppt" || got["task"] != "生成季度汇报" || got["args"] != "" {
+		t.Fatalf("got=%v", got)
 	}
 }
 

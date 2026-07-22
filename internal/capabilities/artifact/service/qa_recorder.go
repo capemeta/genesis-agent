@@ -28,7 +28,21 @@ func NewQAEvidenceRecorder(d artifactcontract.DeliverableSpecStore, s artifactco
 	return &QAEvidenceRecorder{deliverables: d, selections: s, publications: p, evidence: e, now: time.Now}, nil
 }
 
-func (r *QAEvidenceRecorder) RecordPassed(ctx context.Context, req artifactcontract.QAPassRequest) error {
+func (r *QAEvidenceRecorder) RecordOutcome(ctx context.Context, req artifactcontract.QAOutcomeRequest) error {
+	status := req.Status
+	switch status {
+	case artifactmodel.QAEvidencePassed, artifactmodel.QAEvidenceFailed, artifactmodel.QAEvidenceDegraded, artifactmodel.QAEvidenceSkipped:
+	default:
+		return fmt.Errorf("QA outcome status无效: %q", status)
+	}
+	validator := strings.TrimSpace(req.Validator)
+	if validator == "" {
+		return fmt.Errorf("QA outcome validator不能为空")
+	}
+	failure := strings.TrimSpace(req.FailureCode)
+	if status != artifactmodel.QAEvidencePassed && failure == "" {
+		return fmt.Errorf("非passed QA outcome必须提供failure_code")
+	}
 	specs, err := r.deliverables.ListDeliverables(ctx, req.TenantID, req.RunID)
 	if err != nil {
 		return err
@@ -52,62 +66,20 @@ func (r *QAEvidenceRecorder) RecordPassed(ctx context.Context, req artifactcontr
 			if publication.Status != artifactmodel.PublicationCommitted || publication.ProducedResourceID != selection.ProducedResourceID {
 				continue
 			}
-			key := req.TenantID + "\x00" + req.RunID + "\x00" + spec.ID + "\x00" + publication.ID + "\x00" + req.Validator
+			key := req.TenantID + "\x00" + req.RunID + "\x00" + spec.ID + "\x00" + publication.ID + "\x00" + validator + "\x00" + string(status) + "\x00" + failure
 			digest := sha256.Sum256([]byte(key))
-			validator := strings.TrimSpace(req.Validator)
-			if validator == "" {
-				continue
-			}
 			// 禁止用模糊 skill-command:* 写入 visual-qa 通过证据
-			if spec.QAPolicy == ValidatorVisualQA && validator != ValidatorVisualQA && strings.HasPrefix(validator, "skill-command:") {
+			if status == artifactmodel.QAEvidencePassed && spec.QAPolicy == ValidatorVisualQA && validator != ValidatorVisualQA && strings.HasPrefix(validator, "skill-command:") {
 				continue
 			}
-			version := "skill-command/v1"
-			if validator == ValidatorVisualQA {
+			version := "qa-outcome/v1"
+			if status == artifactmodel.QAEvidencePassed && validator == ValidatorVisualQA {
 				version = "visual-checklist/v1"
 			}
-			record := artifactmodel.QAEvidenceRecord{ID: "qa-" + hex.EncodeToString(digest[:16]), TenantID: req.TenantID, RunID: req.RunID, DeliverableID: spec.ID, ProducedResourceID: selection.ProducedResourceID, PublicationID: publication.ID, SubjectVersion: publication.SubjectVersion, SubjectSHA256: publication.SubjectSHA256, PolicyID: spec.QAPolicy, Validator: validator, ValidatorVersion: version, Status: artifactmodel.QAEvidencePassed, CreatedAt: r.now().UTC()}
+			record := artifactmodel.QAEvidenceRecord{ID: "qa-" + hex.EncodeToString(digest[:16]), TenantID: req.TenantID, RunID: req.RunID, DeliverableID: spec.ID, ProducedResourceID: selection.ProducedResourceID, PublicationID: publication.ID, SubjectVersion: publication.SubjectVersion, SubjectSHA256: publication.SubjectSHA256, PolicyID: spec.QAPolicy, Validator: validator, ValidatorVersion: version, Status: status, FailureCode: failure, CreatedAt: r.now().UTC()}
 			if err := r.evidence.CreateQAEvidence(ctx, record); err != nil && !errors.Is(err, artifactcontract.ErrAlreadyExists) {
 				return err
 			}
-		}
-	}
-	return nil
-}
-
-func (r *QAEvidenceRecorder) RecordDegraded(ctx context.Context, req artifactcontract.QADegradeRequest) error {
-	status := artifactmodel.QAEvidenceDegraded
-	if strings.EqualFold(strings.TrimSpace(req.Status), string(artifactmodel.QAEvidenceSkipped)) {
-		status = artifactmodel.QAEvidenceSkipped
-	}
-	failure := strings.TrimSpace(req.FailureCode)
-	if failure == "" {
-		failure = "vision_unavailable"
-	}
-	specs, err := r.deliverables.ListDeliverables(ctx, req.TenantID, req.RunID)
-	if err != nil {
-		return err
-	}
-	validator := strings.TrimSpace(req.Validator)
-	if validator == "" {
-		validator = ValidatorVisualQA
-	}
-	for _, spec := range specs {
-		if !spec.Required || spec.QAPolicy == "" || (req.PolicyID != "" && req.PolicyID != spec.QAPolicy) {
-			continue
-		}
-		if spec.QAPolicy != ValidatorVisualQA && req.PolicyID == "" {
-			continue
-		}
-		key := req.TenantID + "\x00" + req.RunID + "\x00" + spec.ID + "\x00" + validator + "\x00" + failure + "\x00" + string(status)
-		digest := sha256.Sum256([]byte(key))
-		record := artifactmodel.QAEvidenceRecord{
-			ID: "qa-" + hex.EncodeToString(digest[:16]), TenantID: req.TenantID, RunID: req.RunID,
-			DeliverableID: spec.ID, PolicyID: spec.QAPolicy, Validator: validator, ValidatorVersion: "vision-degraded/v1",
-			Status: status, FailureCode: failure, CreatedAt: r.now().UTC(),
-		}
-		if err := r.evidence.CreateQAEvidence(ctx, record); err != nil && !errors.Is(err, artifactcontract.ErrAlreadyExists) {
-			return err
 		}
 	}
 	return nil

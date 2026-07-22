@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	artifactcontract "genesis-agent/internal/capabilities/artifact/contract"
-	artifactservice "genesis-agent/internal/capabilities/artifact/service"
 	toolcontract "genesis-agent/internal/capabilities/tool/contract"
 	toolparam "genesis-agent/internal/capabilities/tool/param"
 	workcontract "genesis-agent/internal/capabilities/workspace/contract"
@@ -53,8 +52,10 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 	}
 	// 跨 Run 候选（子 Run 产物）已被父在 finish 时接纳为「只读引用」，其交付在子 Run 内完成：
 	// 父不得再在自己作用域 select/发布子产物。返回明确的边界码，不伪装成 NOT_FOUND（spec §7.2）。
-	if rec, found := artifactservice.GlobalAdoptionStore.Resolve(prepared.Manifest.Scope.TenantID, prepared.Manifest.RunID, in.CandidateID, prepared.Manifest.StateRoot.Path); found && rec.OwnerRunID != "" && rec.OwnerRunID != prepared.Manifest.RunID {
-		return "", fmt.Errorf("ADOPTION_REQUIRED: candidate %q 由子 Run %q 生产、已被当前 Run 接纳为只读引用；其交付已在子 Run 内完成。父 Agent 应直接向用户总结已交付结果，不要在父 Run 重新 select/发布子产物", in.CandidateID, rec.OwnerRunID)
+	if adoptions, configured := artifactcontract.AdoptionStoreFromContext(ctx); configured {
+		if rec, found := adoptions.Resolve(prepared.Manifest.Scope.TenantID, prepared.Manifest.RunID, in.CandidateID); found && rec.OwnerRunID != "" && rec.OwnerRunID != prepared.Manifest.RunID {
+			return "", fmt.Errorf("ADOPTION_REQUIRED: candidate %q 由子 Run %q 生产、已被当前 Run 接纳为只读引用；其交付已在子 Run 内完成。父 Agent 应直接向用户总结已交付结果，不要在父 Run 重新 select/发布子产物", in.CandidateID, rec.OwnerRunID)
+		}
 	}
 	result, err := t.finalizer.SelectAndFinalize(ctx, prepared.Manifest.Scope.TenantID, prepared.Manifest.RunID, in.DeliverableID, in.CandidateID)
 	if err != nil {

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	artifactmemory "genesis-agent/internal/capabilities/artifact/adapter/memory"
+	artifactcontract "genesis-agent/internal/capabilities/artifact/contract"
 	artifactmodel "genesis-agent/internal/capabilities/artifact/model"
 	workmemory "genesis-agent/internal/capabilities/workspace/adapter/memory"
 	workmodel "genesis-agent/internal/capabilities/workspace/model"
@@ -98,9 +99,11 @@ func TestCompletionEvaluatorSoftQADoesNotBlock(t *testing.T) {
 	}
 }
 
-type stubAdoptions []AdoptionRecord
+type stubAdoptions []artifactcontract.AdoptionRecord
 
-func (s stubAdoptions) ListByConsumer(string) []AdoptionRecord { return append([]AdoptionRecord(nil), s...) }
+func (s stubAdoptions) ListByConsumer(string, string) []artifactcontract.AdoptionRecord {
+	return append([]artifactcontract.AdoptionRecord(nil), s...)
+}
 
 // TestCompletionEvaluatorAcceptsAdoptedChildDelivery 父未本地 select，但已接纳且子已交付匹配类型 → 销账。
 func TestCompletionEvaluatorAcceptsAdoptedChildDelivery(t *testing.T) {
@@ -160,7 +163,7 @@ func TestCompletionEvaluatorBindsSpecFromProducedEvidence(t *testing.T) {
 	produced := workmemory.NewProducedResourceStore()
 	if err := produced.Create(ctx, workmodel.ProducedResourceDescriptor{
 		ID: "p1", TenantID: "tenant", RunID: "run", BindingID: "b1", LogicalRef: "run:/work/b1/deck.pptx",
-		Source: workmodel.ResourceRef{Authority: "host", Scheme: "run-file", ID: "loc-p1", Version: "sha256:abc", MediaType: "application/pptx", Scope: workmodel.ResourceScope{TenantID: "tenant"}},
+		Source:       workmodel.ResourceRef{Authority: "host", Scheme: "run-file", ID: "loc-p1", Version: "sha256:abc", MediaType: "application/pptx", Scope: workmodel.ResourceScope{TenantID: "tenant"}},
 		ObservedName: "deck.pptx", MediaType: "application/pptx", Size: 3, Availability: workmodel.ResourceAvailabilityDurable, CreatedAt: now,
 	}); err != nil {
 		t.Fatal(err)

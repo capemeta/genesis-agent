@@ -1,85 +1,74 @@
 package parser
 
 import (
+	"strings"
 	"testing"
 
 	"genesis-agent/internal/capabilities/skill/contract"
 	"genesis-agent/internal/capabilities/skill/model"
 )
 
-func TestParseFullSkill(t *testing.T) {
-	data := []byte("---\nname: code-review\ndescription: Review code carefully\nallowed-tools:\n  - read_file\ncontext: inline\n---\nBody")
+func TestParseFullSkillOnlyAcceptsPortableFrontmatter(t *testing.T) {
+	data := []byte("---\nname: code-review\ndescription: Review code carefully\n---\nBody")
 	meta, body, err := New().ParseFull(data, contract.ParseSource{Authority: model.Authority{Kind: model.SourceKindHost, ID: "test"}, Scope: model.ScopeProject, DirectoryName: "code-review"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if meta.Name != "code-review" || meta.Description == "" || len(meta.AllowedTools) != 1 {
-		t.Fatalf("unexpected metadata: %+v", meta)
-	}
-	if body != "Body" {
-		t.Fatalf("body = %q", body)
+	if meta.Name != "code-review" || meta.Description != "Review code carefully" || body != "Body" {
+		t.Fatalf("meta=%+v body=%q", meta, body)
 	}
 }
 
-func TestParseRejectsDirectoryNameMismatch(t *testing.T) {
-	data := []byte("---\nname: other\ndescription: desc\n---\nBody")
-	_, _, err := New().ParseFull(data, contract.ParseSource{DirectoryName: "code-review"})
-	if err == nil {
-		t.Fatal("expected mismatch error")
+func TestParseRejectsRuntimeFieldsAndDirectoryMismatch(t *testing.T) {
+	for _, data := range []string{
+		"---\nname: code-review\ndescription: desc\ncontext: fork\n---\nBody",
+		"---\nname: other\ndescription: desc\n---\nBody",
+	} {
+		_, _, err := New().ParseFull([]byte(data), contract.ParseSource{DirectoryName: "code-review"})
+		if err == nil {
+			t.Fatalf("expected rejection for %q", data)
+		}
 	}
 }
 
-func TestParseDependencies(t *testing.T) {
-	data := []byte("---\nname: code-review\ndescription: Review code carefully\ndependencies:\n  tools:\n    - read_file\n    - type: mcp\n      value: github\n      transport: stdio\n---\nBody")
-	meta, _, err := New().ParseFull(data, contract.ParseSource{Authority: model.Authority{Kind: model.SourceKindHost, ID: "test"}, Scope: model.ScopeProject, DirectoryName: "code-review"})
+func TestParseRuntimeManifestStrictMultiInvocation(t *testing.T) {
+	manifest, err := New().ParseRuntimeManifest([]byte(`schema: genesis.skill/v1
+skill: demo
+runtime_profiles:
+  read:
+    sandbox: {required: true, execution_mode: per_call}
+invocations:
+  - id: read
+    handle: demo-read
+    description: Read demo documents
+    agent_mode: main
+    runtime_profile: read
+    request:
+      task: {required: false}
+      inputs: {min_items: 1, max_items: 1, access: read_only, accepted_suffixes: [.pptx]}
+    prompt: {skill_body: omit}
+    tool_policy: {allow: [run_skill_command], required: [run_skill_command]}
+    result: {kind: message}
+`), "demo")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(meta.Dependencies.Tools) != 2 {
-		t.Fatalf("dependencies = %+v", meta.Dependencies)
-	}
-	if meta.Dependencies.Tools[1].Type != "mcp" || meta.Dependencies.Tools[1].Transport != "stdio" {
-		t.Fatalf("unexpected dependency: %+v", meta.Dependencies.Tools[1])
+	if len(manifest.Invocations) != 1 || manifest.Invocations[0].Handle != "demo-read" {
+		t.Fatalf("manifest=%+v", manifest)
 	}
 }
 
-func TestParseDependenciesRuntime(t *testing.T) {
-	data := []byte(`---
-name: office-ppt
-description: PPT skill
-dependencies:
-  tools:
-    - type: tool
-      value: run_skill_command
-  runtime:
-    node:
-      - name: pptxgenjs
-        require: pptxgenjs
-    python:
-      - name: pillow
-        import: PIL
-  install_hints:
-    - npm install pptxgenjs
----
-Body`)
-	meta, _, err := New().ParseFull(data, contract.ParseSource{Authority: model.Authority{Kind: model.SourceKindHost, ID: "test"}, Scope: model.ScopeProject, DirectoryName: "office-ppt"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(meta.Dependencies.Runtime.Node) != 1 || meta.Dependencies.Runtime.Node[0].Name != "pptxgenjs" || meta.Dependencies.Runtime.Node[0].Require != "pptxgenjs" {
-		t.Fatalf("node runtime = %+v", meta.Dependencies.Runtime.Node)
-	}
-	if len(meta.Dependencies.Runtime.Python) != 1 || meta.Dependencies.Runtime.Python[0].Name != "pillow" {
-		t.Fatalf("python runtime = %+v", meta.Dependencies.Runtime.Python)
-	}
-	if len(meta.Dependencies.InstallHints) != 1 {
-		t.Fatalf("install_hints = %+v", meta.Dependencies.InstallHints)
-	}
-	wl := meta.Dependencies.RuntimeWhitelist()
-	if _, ok := wl["npm:pptxgenjs"]; !ok {
-		t.Fatalf("whitelist missing npm:pptxgenjs: %+v", wl)
-	}
-	if _, ok := wl["pip:pillow"]; !ok {
-		t.Fatalf("whitelist missing pip:pillow: %+v", wl)
+func TestParseRuntimeManifestRejectsUnknownAndDuplicateFields(t *testing.T) {
+	base := `schema: genesis.skill/v1
+skill: demo
+runtime_profiles:
+  read:
+    sandbox: {required: true, execution_mode: per_call}
+invocations: []
+`
+	for _, data := range []string{base + "unknown: true\n", strings.Replace(base, "skill: demo", "skill: demo\nskill: demo", 1)} {
+		if _, err := New().ParseRuntimeManifest([]byte(data), "demo"); err == nil {
+			t.Fatalf("expected strict YAML rejection: %s", data)
+		}
 	}
 }

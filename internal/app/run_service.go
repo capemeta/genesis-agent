@@ -104,6 +104,7 @@ func (s *agentServiceImpl) RunOnce(ctx context.Context, req RunRequest) (*RunRes
 	ctx = artifactcontract.WithCompletionPolicy(ctx, s.workspace.Completion)
 	ctx = workcontract.WithCompletionGuard(ctx, s.workspace.WorkspaceCompletion)
 	ctx = artifactcontract.WithQAEvidenceRecorder(ctx, s.workspace.QAEvidence)
+	ctx = artifactcontract.WithAdoptionStore(ctx, s.workspace.Adoptions)
 	if s.cfg != nil {
 		ctx = fspermission.WithPermissionMode(ctx, fspermission.NormalizeMode(s.cfg.Policy.PermissionMode))
 	}

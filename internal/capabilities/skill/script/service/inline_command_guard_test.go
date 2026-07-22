@@ -81,4 +81,3 @@ func TestAutoRewriteRiskyInlineCommand(t *testing.T) {
 		t.Errorf("expected rewritten cmd %q, got %q", wantCmd, rewritten)
 	}
 }
-

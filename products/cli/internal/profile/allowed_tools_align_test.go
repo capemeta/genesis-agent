@@ -32,17 +32,22 @@ func TestEmbeddedOfficeAllowedToolsAlignWithCLIProfile(t *testing.T) {
 		t.Fatal(err)
 	}
 	checked := 0
-	for _, meta := range listed.Entries {
-		switch meta.Name {
+	for _, physical := range listed.Packages {
+		switch physical.Metadata.Name {
 		case "office-ppt", "office-word", "office-excel", "office-pdf":
 		default:
 			continue
 		}
 		checked++
-		for _, allowed := range meta.AllowedTools {
-			norm := strings.TrimSpace(allowed)
-			if _, ok := enabled[norm]; !ok {
-				t.Fatalf("skill %s allowed-tools 含 %q，但 CLI DefaultProfile 未启用", meta.Name, allowed)
+		if physical.Manifest == nil {
+			t.Fatalf("skill %s missing genesis.skill.yaml", physical.Metadata.Name)
+		}
+		for _, invocation := range physical.Manifest.Invocations {
+			for _, allowed := range invocation.ToolPolicy.Allow {
+				norm := strings.TrimSpace(allowed)
+				if _, ok := enabled[norm]; !ok {
+					t.Fatalf("skill %s invocation %s allow含%q，但 CLI DefaultProfile 未启用", physical.Metadata.Name, invocation.ID, allowed)
+				}
 			}
 		}
 	}

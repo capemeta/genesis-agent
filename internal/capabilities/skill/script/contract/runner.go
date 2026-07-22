@@ -5,6 +5,7 @@ import (
 
 	execmodel "genesis-agent/internal/capabilities/execution/model"
 	skillcontract "genesis-agent/internal/capabilities/skill/contract"
+	skillmodel "genesis-agent/internal/capabilities/skill/model"
 	workmodel "genesis-agent/internal/capabilities/workspace/model"
 )
 
@@ -17,6 +18,7 @@ type Runner interface {
 type RunRequest struct {
 	Catalog    skillcontract.CatalogRequest
 	Skill      string
+	Invocation skillmodel.InvocationBinding
 	Command    string
 	Inputs     workmodel.InputManifest // 控制面完成权限、版本、hash 与 staging 后生成的不可变输入清单
 	Binding    execmodel.ExecutionBinding

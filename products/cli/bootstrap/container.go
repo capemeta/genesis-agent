@@ -23,7 +23,6 @@ import (
 	auditfile "genesis-agent/internal/capabilities/audit/adapter/file"
 	auditmemory "genesis-agent/internal/capabilities/audit/adapter/memory"
 	auditcontract "genesis-agent/internal/capabilities/audit/contract"
-	tasklistcontract "genesis-agent/internal/capabilities/tasklist/contract"
 	capcontract "genesis-agent/internal/capabilities/capability/contract"
 	capservice "genesis-agent/internal/capabilities/capability/service"
 	execsandbox "genesis-agent/internal/capabilities/execution/adapter/sandbox"
@@ -42,13 +41,13 @@ import (
 	listdir "genesis-agent/internal/capabilities/filesystem/tool/list_dir"
 	readfile "genesis-agent/internal/capabilities/filesystem/tool/read_file"
 	"genesis-agent/internal/capabilities/filesystem/tool/toolkit"
-	viewimage "genesis-agent/internal/capabilities/media/tool/view_image"
 	walkdir "genesis-agent/internal/capabilities/filesystem/tool/walk_dir"
 	writefile "genesis-agent/internal/capabilities/filesystem/tool/write_file"
 	mcpstore "genesis-agent/internal/capabilities/mcp/adapter/store"
 	"genesis-agent/internal/capabilities/mcp/contract"
 	"genesis-agent/internal/capabilities/mcp/model"
 	mcpstack "genesis-agent/internal/capabilities/mcp/stack"
+	viewimage "genesis-agent/internal/capabilities/media/tool/view_image"
 	policyapproval "genesis-agent/internal/capabilities/policy/adapter/approval"
 	policyconfig "genesis-agent/internal/capabilities/policy/adapter/config"
 	profilemodel "genesis-agent/internal/capabilities/profile/model"
@@ -69,6 +68,7 @@ import (
 	runskillcommand "genesis-agent/internal/capabilities/skill/tool/run_skill_command"
 	searchskillresources "genesis-agent/internal/capabilities/skill/tool/search_skill_resources"
 	skilltool "genesis-agent/internal/capabilities/skill/tool/skill"
+	tasklistcontract "genesis-agent/internal/capabilities/tasklist/contract"
 	toolcapability "genesis-agent/internal/capabilities/tool/adapter/capability"
 	toolcontract "genesis-agent/internal/capabilities/tool/contract"
 	"genesis-agent/internal/capabilities/tool/scheduler"
@@ -161,6 +161,7 @@ type productRuntime struct {
 	artifactRuns         artifactcontract.RunInitializer
 	completion           artifactcontract.CompletionPolicy
 	qaEvidence           artifactcontract.QAEvidenceRecorder
+	adoptions            artifactcontract.AdoptionStore
 	runResources         []workcontract.RunResourceReleaser
 	producedStore        workcontract.ProducedResourceStore
 	runtimeClosers       []runtimeCloser
@@ -261,7 +262,7 @@ func (c *Container) Init(ctx context.Context) error {
 			c.initErr = err
 			return
 		}
-		runWorkspace, err := buildLocalRunWorkspace(runtime.workspaceRoot, runtime.requestInputs, runtime.runInputs, runtime.artifactRuns, runtime.completion, runtime.qaEvidence, runtime.runResources)
+		runWorkspace, err := buildLocalRunWorkspace(runtime.workspaceRoot, runtime.requestInputs, runtime.runInputs, runtime.artifactRuns, runtime.completion, runtime.qaEvidence, runtime.adoptions, runtime.runResources)
 		if err != nil {
 			_ = c.logging.Close()
 			c.logging = nil
@@ -601,7 +602,13 @@ func buildProductRuntime(ctx context.Context, configDir string, cfg *platformcon
 	}
 	// 依赖预检以 Profile 可见工具集为准（含 shared builder 注册的 builtin/web），不是仅 AdditionalTools。
 	enabledToolInventory := append([]string(nil), prof.Tools.Enabled...)
-	skillGateway, err := skilltool.New(skilltool.Deps{Service: skillSvc, Approval: baseApprovalSvc, CatalogRequest: catalogReq, EnabledTools: enabledToolInventory})
+	skillGateway, err := skilltool.New(skilltool.Deps{
+		Service: skillSvc, Approval: baseApprovalSvc, CatalogRequest: catalogReq, EnabledTools: enabledToolInventory,
+		InputResolver: inputRegistry, RunInitializer: artifactControl.initializer,
+		LocalSandboxAvailable:  cfg.Sandbox.Local.Enabled,
+		RemoteSandboxAvailable: remoteSessionManager != nil,
+		PolicyVersion:          "cli-skill-policy/v1",
+	})
 	if err != nil {
 		_ = runtimeLogging.Close()
 		return productRuntime{}, nil, err
@@ -672,6 +679,7 @@ func buildProductRuntime(ctx context.Context, configDir string, cfg *platformcon
 		InputResolver:  inputRegistry,
 		InputStager:    inputStager,
 		Finalizer:      artifactControl.finalizer,
+		QAEvidence:     artifactControl.qaEvidence,
 	})
 	if err != nil {
 		_ = runtimeLogging.Close()
@@ -733,6 +741,7 @@ func buildProductRuntime(ctx context.Context, configDir string, cfg *platformcon
 		artifactRuns:         artifactControl.initializer,
 		completion:           artifactControl.completion,
 		qaEvidence:           artifactControl.qaEvidence,
+		adoptions:            artifactControl.adoptions,
 		runResources:         runResourceReleasers(skillScriptSvc, remoteSessionManager),
 		producedStore:        artifactControl.producedStore,
 		runtimeClosers:       runtimeResourceClosers(skillScriptSvc, remoteSessionManager),
@@ -1071,8 +1080,22 @@ func buildSkillService(configDir string, cfg platformconfig.SkillsConfig, prof p
 	if err != nil {
 		return nil, nil, fmt.Errorf("初始化CLI内置Skills失败: %w", err)
 	}
-	return skillservice.New([]skillcontract.Source{systemSource, source}, skillservice.Options{AuditSink: auditSink, UsageSink: usageSink, Visibility: visibility}), roots, nil
+	bindingStore, err := localskill.NewBindingStore(filepath.Join(workspaceRootOrDot(workspaceRoot), ".genesis"))
+	if err != nil {
+		return nil, nil, fmt.Errorf("初始化 Skill InvocationBinding store: %w", err)
+	}
+	packageStore, err := localskill.NewPackageStore(filepath.Join(workspaceRootOrDot(workspaceRoot), ".genesis"))
+	if err != nil {
+		return nil, nil, fmt.Errorf("初始化 Skill package snapshot store: %w", err)
+	}
+	return skillservice.New([]skillcontract.Source{systemSource, source}, skillservice.Options{
+		AuditSink: auditSink, UsageSink: usageSink, Visibility: visibility,
+		KnownTools: append([]string(nil), prof.Tools.Enabled...), DefaultInvocationTools: append([]string(nil), prof.Tools.Enabled...),
+		KnownCapabilities: []string{"vision"}, KnownQAPolicies: []string{"visual-qa/v1"}, PolicySnapshotVersion: "cli-skill-policy/v1",
+		BindingStore: bindingStore, PackageStore: packageStore,
+	}), roots, nil
 }
+
 
 func startSkillWatcher(ctx context.Context, roots []localskill.Root, svc skillcontract.Service) {
 	if svc == nil || len(roots) == 0 {
@@ -1174,6 +1197,7 @@ type cliArtifactControl struct {
 	initializer    artifactcontract.RunInitializer
 	completion     artifactcontract.CompletionPolicy
 	qaEvidence     artifactcontract.QAEvidenceRecorder
+	adoptions      artifactcontract.AdoptionStore
 	selector       toolcontract.Tool
 }
 
@@ -1205,11 +1229,12 @@ func buildCLIArtifactControl(stateRoot, workspaceRoot string, execStack productE
 		initializer:    built.Initializer,
 		completion:     built.Completion,
 		qaEvidence:     built.QAEvidence,
+		adoptions:      built.Adoptions,
 		selector:       built.Selector,
 	}, nil
 }
 
-func buildLocalRunWorkspace(projectDir string, requestInputs workcontract.RequestInputPlanner, runInputs workcontract.RunInputBinder, artifactRuns artifactcontract.RunInitializer, completion artifactcontract.CompletionPolicy, qaEvidence artifactcontract.QAEvidenceRecorder, runResources []workcontract.RunResourceReleaser) (app.RunWorkspaceRuntime, error) {
+func buildLocalRunWorkspace(projectDir string, requestInputs workcontract.RequestInputPlanner, runInputs workcontract.RunInputBinder, artifactRuns artifactcontract.RunInitializer, completion artifactcontract.CompletionPolicy, qaEvidence artifactcontract.QAEvidenceRecorder, adoptions artifactcontract.AdoptionStore, runResources []workcontract.RunResourceReleaser) (app.RunWorkspaceRuntime, error) {
 	stateRoot := filepath.Join(projectDir, ".genesis")
 	manifests, err := localworkspace.NewManifestStore(stateRoot)
 	if err != nil {
@@ -1236,7 +1261,7 @@ func buildLocalRunWorkspace(projectDir string, requestInputs workcontract.Reques
 		return app.RunWorkspaceRuntime{}, err
 	}
 	projectRef := &workmodel.ResourceRef{Authority: "host", Scheme: "project", ID: filepath.ToSlash(projectDir), Path: "."}
-	return app.RunWorkspaceRuntime{Preparer: preparer, AgentApps: appResolver, IntentResolver: workservice.NewTaskIntentResolver(), RequestInputs: requestInputs, ProjectRoot: projectRef, ProjectDir: projectDir, ProductModes: modes, BackendModes: modes, MaximumAccess: execmodel.WorkspaceAccessReadWrite, ArtifactRuns: artifactRuns, Completion: completion, QAEvidence: qaEvidence, WorkspaceCompletion: localworkspace.NewGitChangeGuard(), RunResources: append([]workcontract.RunResourceReleaser(nil), runResources...)}, nil
+	return app.RunWorkspaceRuntime{Preparer: preparer, AgentApps: appResolver, IntentResolver: workservice.NewTaskIntentResolver(), RequestInputs: requestInputs, ProjectRoot: projectRef, ProjectDir: projectDir, ProductModes: modes, BackendModes: modes, MaximumAccess: execmodel.WorkspaceAccessReadWrite, ArtifactRuns: artifactRuns, Completion: completion, QAEvidence: qaEvidence, Adoptions: adoptions, WorkspaceCompletion: localworkspace.NewGitChangeGuard(), RunResources: append([]workcontract.RunResourceReleaser(nil), runResources...)}, nil
 }
 
 func buildWebOptions(cfg *platformconfig.Config, log logger.Logger) (shared.WebBuildOptions, error) {

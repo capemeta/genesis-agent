@@ -18,6 +18,7 @@ import (
 	skillparser "genesis-agent/internal/capabilities/skill/parser"
 	scriptcontract "genesis-agent/internal/capabilities/skill/script/contract"
 	skillservice "genesis-agent/internal/capabilities/skill/service"
+	workmodel "genesis-agent/internal/capabilities/workspace/model"
 	localexec "genesis-agent/shared/local/execution"
 )
 
@@ -92,6 +93,18 @@ func TestSkillCommandServiceRunsLocalSkillCommand(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(root, "made.txt")); !os.IsNotExist(err) {
 		t.Fatalf("skill artifact leaked to workspace root, err=%v", err)
+	}
+}
+
+func TestValidateInputManifestRejectsPackageFileCollision(t *testing.T) {
+	binding := testBinding("collision-run")
+	pkg := skillmodel.SkillPackageSnapshot{PackageID: "demo", Files: []skillmodel.PackageFileDigest{{Resource: "demo/scripts/run.py"}}}
+	manifest := workmodel.InputManifest{
+		RunID: binding.Owner.RunID, BindingID: binding.ID,
+		Inputs: []workmodel.InputRef{{ID: "input-1", Alias: "scripts/run.py"}},
+	}
+	if err := validateInputManifest(binding, pkg, manifest); err == nil || !strings.Contains(err.Error(), "不可变Skill包文件冲突") {
+		t.Fatalf("expected package collision rejection, got %v", err)
 	}
 }
 
@@ -203,11 +216,12 @@ func newTestService(t *testing.T, fsys fstest.MapFS) *Service {
 
 func newTestServiceWithApproval(t *testing.T, fsys fstest.MapFS, approval allowAllApproval) *Service {
 	t.Helper()
+	fsys = testRuntimeSkillFS(fsys)
 	source, err := embedded.NewSource(skillmodel.Authority{Kind: skillmodel.SourceKindEmbedded, ID: "test"}, skillmodel.ScopeSystem, fsys, skillparser.New())
 	if err != nil {
 		t.Fatal(err)
 	}
-	skills := skillservice.New([]skillcontract.Source{source}, skillservice.Options{})
+	skills := testSkillService{Service: skillservice.New([]skillcontract.Source{source}, skillservice.Options{KnownTools: []string{"run_skill_command"}})}
 	runner, err := execservice.NewRunner(localexec.NewRunner(), nil)
 	if err != nil {
 		t.Fatal(err)
@@ -258,4 +272,3 @@ func TestIsReservedDOSDeviceName(t *testing.T) {
 		}
 	}
 }
-

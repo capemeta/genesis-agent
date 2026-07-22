@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	skillcontract "genesis-agent/internal/capabilities/skill/contract"
+	skillmodel "genesis-agent/internal/capabilities/skill/model"
 	tool "genesis-agent/internal/capabilities/tool/contract"
+	traceadapter "genesis-agent/internal/capabilities/trace/adapter"
 	"genesis-agent/internal/domain"
 	"genesis-agent/internal/platform/logger"
 	"genesis-agent/internal/runtime"
@@ -22,14 +25,14 @@ func TestNarrowToolNamesEmptyAllowedKeepsCurrent(t *testing.T) {
 	}
 }
 
-func TestNarrowToolNamesIntersectsAndKeepsMetaTools(t *testing.T) {
+func TestNarrowToolNamesUsesExactIntersectionWithoutHiddenEscalation(t *testing.T) {
 	current := []string{"read_file", "write_file", "run_command", "Skill", "list_skill_resources", "run_skill_command", "install_skill_dependencies", "web_search"}
 	allowed := []string{"read_file", "run_command"}
 	got, ok := narrowToolNames(current, allowed)
 	if !ok {
 		t.Fatal("expected ok")
 	}
-	want := map[string]bool{"read_file": true, "run_command": true, "Skill": true, "list_skill_resources": true, "run_skill_command": true, "install_skill_dependencies": true}
+	want := map[string]bool{"read_file": true, "run_command": true}
 	if len(got) != len(want) {
 		t.Fatalf("got=%v", got)
 	}
@@ -112,11 +115,12 @@ func (emptyRegistry) FilterInfos([]string) []*tool.Info { return nil }
 func (emptyRegistry) Names() []string                   { return nil }
 
 func TestInjectMentionedSkillsUsesExplicitLoader(t *testing.T) {
-	loader := &fakeExplicitLoader{result: `{"type":"skill_injection","name":"manual","qualified_name":"manual","resource":"manual/SKILL.md","content":"Manual body","truncated":false}`}
+	loader := &fakeExplicitLoader{result: `{"type":"skill_injection","name":"manual","qualified_name":"manual","physical_skill":"manual","invocation_id":"default","binding_id":"binding-manual","resource":"manual/SKILL.md","content":"Manual body","truncated":false,"allowed_tools":["read_file"]}`}
 	e := &ReactLoopEngine{
 		registry:             emptyRegistry{},
 		skillMentionSelector: fakeMentionSelector{mentions: []SkillMention{{Skill: "manual", Resource: "manual/SKILL.md"}}},
 		skillExplicitLoader:  loader,
+		skillBindingResolver: fakeBindingResolver{binding: testInvocationBinding("binding-manual", "manual", "manual", []string{"read_file"})},
 	}
 	rc := runtime.NewRunContext(&domain.Run{ID: "run-skill"}, &domain.Agent{})
 	active := []string{"Skill", "read_file"}
@@ -145,12 +149,15 @@ func TestInjectMentionedSkillsUsesExplicitLoader(t *testing.T) {
 }
 
 func TestApplySkillToolResultInjectsUserMessage(t *testing.T) {
-	e := &ReactLoopEngine{registry: emptyRegistry{}}
+	e := &ReactLoopEngine{registry: emptyRegistry{}, skillBindingResolver: fakeBindingResolver{binding: testInvocationBinding("binding-demo", "demo", "demo", []string{"read_file"})}}
 	rc := runtime.NewRunContext(&domain.Run{ID: "run-skill-tool"}, &domain.Agent{})
 	active := []string{"Skill", "read_file", "run_skill_command"}
 	var infos []*tool.Info
-	payload := `{"type":"skill_injection","name":"demo","qualified_name":"demo","resource":"embedded:demo","content":"Demo body","truncated":false,"allowed_tools":["read_file"]}`
-	ok := e.applySkillToolResult(rc, toolExecutionResult{ID: "call-1", Name: "Skill", Content: payload}, &active, &infos, logger.NewNop())
+	payload := `{"type":"skill_injection","name":"demo","qualified_name":"demo","physical_skill":"demo","invocation_id":"default","binding_id":"binding-demo","resource":"embedded:demo","content":"Demo body","truncated":false,"allowed_tools":["read_file"]}`
+	ok, err := e.applySkillToolResult(context.Background(), rc, toolExecutionResult{ID: "call-1", Name: "Skill", Content: payload}, &active, &infos, logger.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ok {
 		t.Fatal("expected skill tool result applied")
 	}
@@ -172,6 +179,65 @@ func TestApplySkillToolResultInjectsUserMessage(t *testing.T) {
 	ui := domain.ForUI(rc.Messages)
 	if len(ui) != 0 {
 		t.Fatalf("ForUI should hide skill/tool, got %+v", ui)
+	}
+}
+
+func TestInvocationToolPolicyIsEnforcedBeforeRegistry(t *testing.T) {
+	registry := &bindingCaptureRegistry{}
+	e := &ReactLoopEngine{registry: registry, logger: logger.NewNop(), tracer: traceadapter.NewNopTracer()}
+	rc := runtime.NewRunContext(&domain.Run{ID: "run-skill-tool"}, &domain.Agent{})
+	binding := testInvocationBinding("binding-demo", "demo", "demo", []string{"read_file"})
+	if err := rc.ActivateInvocation(binding); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.runToolCall(context.Background(), rc, domain.ToolCall{ID: "denied", Function: domain.FunctionCall{Name: "sandbox_exec", Arguments: `{}`}}, logger.NewNop()); err == nil || !strings.Contains(err.Error(), "TOOL_NOT_ALLOWED_BY_INVOCATION") {
+		t.Fatalf("err=%v", err)
+	}
+	if registry.calls != 0 {
+		t.Fatalf("denied tool reached registry: calls=%d", registry.calls)
+	}
+	if _, err := e.runToolCall(context.Background(), rc, domain.ToolCall{ID: "allowed", Function: domain.FunctionCall{Name: "read_file", Arguments: `{}`}}, logger.NewNop()); err != nil {
+		t.Fatal(err)
+	}
+	if registry.calls != 1 || registry.binding.ID != binding.ID {
+		t.Fatalf("calls=%d binding=%+v", registry.calls, registry.binding)
+	}
+}
+
+type bindingCaptureRegistry struct {
+	calls   int
+	binding skillmodel.InvocationBinding
+}
+
+func (r *bindingCaptureRegistry) Register(tool.Tool) error                { return nil }
+func (r *bindingCaptureRegistry) Replace(string, string, tool.Tool) error { return nil }
+func (r *bindingCaptureRegistry) Owner(string) (string, bool)             { return "", false }
+func (r *bindingCaptureRegistry) Unregister(string)                       {}
+func (r *bindingCaptureRegistry) Get(string) tool.Tool                    { return nil }
+func (r *bindingCaptureRegistry) ListInfos() []*tool.Info                 { return nil }
+func (r *bindingCaptureRegistry) FilterInfos([]string) []*tool.Info       { return nil }
+func (r *bindingCaptureRegistry) Names() []string                         { return nil }
+func (r *bindingCaptureRegistry) Execute(ctx context.Context, _, _ string) (string, error) {
+	r.calls++
+	r.binding, _ = skillcontract.InvocationBindingFromContext(ctx)
+	return `{"ok":true}`, nil
+}
+
+type fakeBindingResolver struct {
+	binding skillmodel.InvocationBinding
+	err     error
+}
+
+func (f fakeBindingResolver) GetInvocationBinding(context.Context, string) (skillmodel.InvocationBinding, error) {
+	return f.binding.Clone(), f.err
+}
+
+func testInvocationBinding(id, handle, physical string, allowed []string) skillmodel.InvocationBinding {
+	return skillmodel.InvocationBinding{
+		ID: id, RunID: "run-skill-tool", InvocationID: "default", Handle: handle, PhysicalSkill: physical,
+		Package:   skillmodel.SkillPackageSnapshot{Authority: skillmodel.Authority{Kind: skillmodel.SourceKindEmbedded, ID: "test"}, PackageID: skillmodel.PackageID(physical), Digest: strings.Repeat("a", 64)},
+		AgentMode: skillmodel.AgentModeSpec{Mode: skillmodel.AgentModeMain}, ToolPolicy: skillmodel.EffectiveToolPolicy{Allowed: allowed},
+		IdempotencyKey: "idem-" + id, CreatedAt: time.Now(),
 	}
 }
 func TestRenderSkillInjectionAddsRuntimeBridge(t *testing.T) {

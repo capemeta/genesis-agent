@@ -45,25 +45,31 @@ type ExecStack struct {
 
 // Options 描述产品侧 Skill 工具栈装配参数。
 type Options struct {
-	Product           profilemodel.ChannelType
-	Environment       profilemodel.RuntimeEnvironment
-	Approval          approvalcontract.Service
-	Exec              ExecStack
-	Logger            logger.Logger
-	EnabledTools      []string
-	EnabledSkills     []string
-	DisabledSkills    []string
-	ProjectDir        string
-	StateRoot         workmodel.StateRoot
-	Provisioner       workcontract.Provisioner
-	InputResolver     runskillcommand.InputResolver
-	InputStager       workcontract.InputStager
-	InputSnapshots    workcontract.InputSnapshotReader
-	ProducedResources workcontract.ProducedResourceRegistrar
-	RemoteSessions    scriptservice.RemoteSessionBinder
-	Reservations      artifactcontract.OutputReservationAllocator
-	Deliverables      artifactcontract.DeliverableSpecStore
-	Finalizer         artifactcontract.RequiredDeliverableFinalizer
+	Product                profilemodel.ChannelType
+	Environment            profilemodel.RuntimeEnvironment
+	Approval               approvalcontract.Service
+	Exec                   ExecStack
+	Logger                 logger.Logger
+	EnabledTools           []string
+	EnabledSkills          []string
+	DisabledSkills         []string
+	ProjectDir             string
+	StateRoot              workmodel.StateRoot
+	Provisioner            workcontract.Provisioner
+	InputResolver          runskillcommand.InputResolver
+	InputStager            workcontract.InputStager
+	InputSnapshots         workcontract.InputSnapshotReader
+	ProducedResources      workcontract.ProducedResourceRegistrar
+	RemoteSessions         scriptservice.RemoteSessionBinder
+	Reservations           artifactcontract.OutputReservationAllocator
+	Deliverables           artifactcontract.DeliverableSpecStore
+	Finalizer              artifactcontract.RequiredDeliverableFinalizer
+	QAEvidence             artifactcontract.QAEvidenceRecorder
+	BindingStore           skillcontract.InvocationBindingStore
+	PackageStore           skillcontract.SkillPackageSnapshotStore
+	RunInitializer         artifactcontract.RunInitializer
+	LocalSandboxAvailable  bool
+	RemoteSandboxAvailable bool
 
 	// EnablePreflight / AutoRetryAfterInstall 对齐 CLI skills.* 配置（默认 false）。
 	EnablePreflight       bool
@@ -103,6 +109,12 @@ func BuildEmbedded(opts Options) (*Stack, error) {
 	if opts.Provisioner == nil {
 		return nil, fmt.Errorf("workspace provisioner未配置")
 	}
+	if opts.BindingStore == nil {
+		return nil, fmt.Errorf("InvocationBindingStore未配置；生产Skill栈禁止回退到进程内存")
+	}
+	if opts.PackageStore == nil {
+		return nil, fmt.Errorf("SkillPackageSnapshotStore未配置；生产Skill栈禁止回读可变Source")
+	}
 	if opts.Product == "" {
 		opts.Product = profilemodel.ChannelEnterprise
 	}
@@ -127,7 +139,7 @@ func BuildEmbedded(opts Options) (*Stack, error) {
 	if err != nil {
 		return nil, fmt.Errorf("初始化内置Skill Source失败: %w", err)
 	}
-	skillSvc := skillservice.New([]skillcontract.Source{systemSource}, skillservice.Options{})
+	skillSvc := skillservice.New([]skillcontract.Source{systemSource}, skillservice.Options{BindingStore: opts.BindingStore, PackageStore: opts.PackageStore})
 
 	scriptSvc, err := scriptservice.New(scriptservice.Deps{
 		Skills:                skillSvc,
@@ -159,10 +171,10 @@ func BuildEmbedded(opts Options) (*Stack, error) {
 	}
 
 	skillGateway, err := skilltool.New(skilltool.Deps{
-		Service:        skillSvc,
-		Approval:       opts.Approval,
-		CatalogRequest: catalogReq,
-		EnabledTools:   opts.EnabledTools,
+		Service: skillSvc, Approval: opts.Approval, CatalogRequest: catalogReq, EnabledTools: opts.EnabledTools,
+		InputResolver: opts.InputResolver, RunInitializer: opts.RunInitializer,
+		LocalSandboxAvailable: opts.LocalSandboxAvailable, RemoteSandboxAvailable: opts.RemoteSandboxAvailable,
+		PolicyVersion: string(opts.Product) + "-skill-policy/v1",
 	})
 	if err != nil {
 		return nil, err
@@ -196,6 +208,7 @@ func BuildEmbedded(opts Options) (*Stack, error) {
 		InputResolver:  opts.InputResolver,
 		InputStager:    opts.InputStager,
 		Finalizer:      opts.Finalizer,
+		QAEvidence:     opts.QAEvidence,
 	})
 	if err != nil {
 		return nil, err

@@ -28,17 +28,11 @@ func (f fakeExpert) Analyze(context.Context, domain.ImageRef, string) (runtimevi
 }
 
 type fakeQARecorder struct {
-	got      []artifactcontract.QAPassRequest
-	degraded []artifactcontract.QADegradeRequest
+	got []artifactcontract.QAOutcomeRequest
 }
 
-func (f *fakeQARecorder) RecordPassed(_ context.Context, req artifactcontract.QAPassRequest) error {
+func (f *fakeQARecorder) RecordOutcome(_ context.Context, req artifactcontract.QAOutcomeRequest) error {
 	f.got = append(f.got, req)
-	return nil
-}
-
-func (f *fakeQARecorder) RecordDegraded(_ context.Context, req artifactcontract.QADegradeRequest) error {
-	f.degraded = append(f.degraded, req)
 	return nil
 }
 
@@ -114,6 +108,21 @@ func TestTryRecordVisualChecklist(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(rec.got) != 1 || rec.got[0].Validator != artifactservice.ValidatorVisualQA {
+		t.Fatalf("got=%+v", rec.got)
+	}
+}
+
+func TestTryRecordFailedVisualChecklist(t *testing.T) {
+	t.Parallel()
+	rec := &fakeQARecorder{}
+	ctx := artifactcontract.WithQAEvidenceRecorder(context.Background(), rec)
+	ctx = workcontract.WithPreparedRun(ctx, workmodel.PreparedRun{
+		Manifest: workmodel.RunManifest{RunID: "r1", Scope: workmodel.ResourceScope{TenantID: "t1"}},
+	})
+	if err := tryRecordVisualQAFromText(ctx, `{"passed":false,"defects":["overflow"]}`); err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.got) != 1 || rec.got[0].Status != "failed" || rec.got[0].FailureCode != "visual_qa_failed" {
 		t.Fatalf("got=%+v", rec.got)
 	}
 }

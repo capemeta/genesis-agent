@@ -26,19 +26,21 @@ type deliveryPort interface {
 // 多候选绝不让模型提交路径或 locator。
 // 同槽位 produced supersede 后，若旧 selection 已不是当前 head，则重绑到唯一新候选并重新发布。
 type DeterministicFinalizer struct {
-	deliverables artifactcontract.DeliverableSpecStore
-	selections   artifactcontract.DeliverableSelectionStore
-	produced     workcontract.ProducedResourceStore
-	publications publicationPort
-	deliveries   deliveryPort
-	now          func() time.Time
+	deliverables     artifactcontract.DeliverableSpecStore
+	selections       artifactcontract.DeliverableSelectionStore
+	produced         workcontract.ProducedResourceStore
+	publications     publicationPort
+	publicationStore artifactcontract.ArtifactPublicationStore
+	evidence         artifactcontract.QAEvidenceStore
+	deliveries       deliveryPort
+	now              func() time.Time
 }
 
-func NewDeterministicFinalizer(deliverables artifactcontract.DeliverableSpecStore, selections artifactcontract.DeliverableSelectionStore, produced workcontract.ProducedResourceStore, publications publicationPort, deliveries deliveryPort) (*DeterministicFinalizer, error) {
-	if deliverables == nil || selections == nil || produced == nil || publications == nil || deliveries == nil {
+func NewDeterministicFinalizer(deliverables artifactcontract.DeliverableSpecStore, selections artifactcontract.DeliverableSelectionStore, produced workcontract.ProducedResourceStore, publications publicationPort, publicationStore artifactcontract.ArtifactPublicationStore, evidence artifactcontract.QAEvidenceStore, deliveries deliveryPort) (*DeterministicFinalizer, error) {
+	if deliverables == nil || selections == nil || produced == nil || publications == nil || publicationStore == nil || evidence == nil || deliveries == nil {
 		return nil, fmt.Errorf("deterministic finalizer 依赖不完整")
 	}
-	return &DeterministicFinalizer{deliverables: deliverables, selections: selections, produced: produced, publications: publications, deliveries: deliveries, now: time.Now}, nil
+	return &DeterministicFinalizer{deliverables: deliverables, selections: selections, produced: produced, publications: publications, publicationStore: publicationStore, evidence: evidence, deliveries: deliveries, now: time.Now}, nil
 }
 
 func (s *DeterministicFinalizer) FinalizeRequired(ctx context.Context, tenantID, runID string) (artifactmodel.FinalizationResult, error) {
@@ -80,7 +82,14 @@ func (s *DeterministicFinalizer) SelectAndFinalize(ctx context.Context, tenantID
 	if err := s.bindSelection(ctx, tenantID, runID, realDeliverableID, candidateID, "model-candidate-id"); err != nil {
 		return artifactmodel.DeliveryResult{}, err
 	}
-	return s.publishAndDeliver(ctx, tenantID, runID, realDeliverableID, candidateID)
+	delivery, status, err := s.publishGateAndDeliver(ctx, tenantID, runID, spec, candidateID)
+	if err != nil {
+		return artifactmodel.DeliveryResult{}, err
+	}
+	if status != "delivered" {
+		return artifactmodel.DeliveryResult{}, artifactcontract.NewError(artifactcontract.ErrCodeQARequired, fmt.Errorf("deliverable %s 尚未取得当前版本的 QA 证据: %s", realDeliverableID, status))
+	}
+	return delivery, nil
 }
 
 func (s *DeterministicFinalizer) resolve(ctx context.Context, tenantID, runID string, spec artifactmodel.DeliverableSpec, resources []workmodel.ProducedResourceDescriptor) (artifactmodel.DeliverableResolution, error) {
@@ -127,7 +136,7 @@ func (s *DeterministicFinalizer) finalizeSelected(ctx context.Context, tenantID,
 		SelectedID:    selectedID,
 		CandidateIDs:  candidates,
 	}
-	delivery, err := s.publishAndDeliver(ctx, tenantID, runID, spec.ID, selectedID)
+	delivery, status, err := s.publishGateAndDeliver(ctx, tenantID, runID, spec, selectedID)
 	if err != nil {
 		if isDeliveryTargetConflict(err) {
 			base.Status = "delivery_conflict"
@@ -135,6 +144,10 @@ func (s *DeterministicFinalizer) finalizeSelected(ctx context.Context, tenantID,
 			return base, nil
 		}
 		return base, err
+	}
+	if status != "delivered" {
+		base.Status = status
+		return base, nil
 	}
 	base.Status = "delivered"
 	base.Delivery = delivery
@@ -187,11 +200,24 @@ func (s *DeterministicFinalizer) isCurrentProducedHead(ctx context.Context, tena
 	return head.ID == producedResourceID, nil
 }
 
-func (s *DeterministicFinalizer) publishAndDeliver(ctx context.Context, tenantID, runID, deliverableID, candidateID string) (artifactmodel.DeliveryResult, error) {
-	if _, err := s.publications.Publish(ctx, PublicationRequest{TenantID: tenantID, RunID: runID, DeliverableID: deliverableID, ProducedResourceID: candidateID}); err != nil {
-		return artifactmodel.DeliveryResult{}, err
+func (s *DeterministicFinalizer) publishGateAndDeliver(ctx context.Context, tenantID, runID string, spec artifactmodel.DeliverableSpec, candidateID string) (artifactmodel.DeliveryResult, string, error) {
+	if _, err := s.publications.Publish(ctx, PublicationRequest{TenantID: tenantID, RunID: runID, DeliverableID: spec.ID, ProducedResourceID: candidateID}); err != nil {
+		return artifactmodel.DeliveryResult{}, "", err
 	}
-	return s.deliveries.Deliver(ctx, DeliveryRequest{TenantID: tenantID, RunID: runID, DeliverableID: deliverableID})
+	if strings.TrimSpace(spec.QAPolicy) != "" {
+		state, err := evaluateQAState(ctx, s.publicationStore, s.evidence, tenantID, runID, spec, candidateID)
+		if err != nil {
+			return artifactmodel.DeliveryResult{}, "", err
+		}
+		if state != qaStatePassed && !((state == qaStateDegraded || state == qaStateFailed) && !artifactmodel.IsRequiredEnforcement(spec.QAEnforcement)) {
+			if artifactmodel.IsRequiredEnforcement(spec.QAEnforcement) {
+				return artifactmodel.DeliveryResult{}, "qa_required", nil
+			}
+			return artifactmodel.DeliveryResult{}, "qa_pending", nil
+		}
+	}
+	delivery, err := s.deliveries.Deliver(ctx, DeliveryRequest{TenantID: tenantID, RunID: runID, DeliverableID: spec.ID})
+	return delivery, "delivered", err
 }
 
 func (s *DeterministicFinalizer) loadCandidate(ctx context.Context, tenantID, runID, deliverableID, candidateID string) (artifactmodel.DeliverableSpec, workmodel.ProducedResourceDescriptor, error) {
@@ -201,13 +227,11 @@ func (s *DeterministicFinalizer) loadCandidate(ctx context.Context, tenantID, ru
 	}
 	resource, err := s.produced.Get(ctx, tenantID, runID, candidateID)
 	if err != nil {
-		var stateRoot string
-		if prepared, ok := workcontract.PreparedRunFromContext(ctx); ok {
-			stateRoot = prepared.Manifest.StateRoot.Path
-		}
 		// 跨 Run 只对已显式接纳的产物可读，由 AdoptionRecord 解析所属 Run，不再扫目录/扫 manifest 做启发式。
-		if rec, ok := GlobalAdoptionStore.Resolve(tenantID, runID, candidateID, stateRoot); ok && rec.OwnerRunID != "" && rec.OwnerRunID != runID {
-			resource, err = s.produced.Get(ctx, rec.OwnerTenantID, rec.OwnerRunID, candidateID)
+		if adoptions, configured := artifactcontract.AdoptionStoreFromContext(ctx); configured {
+			if rec, ok := adoptions.Resolve(tenantID, runID, candidateID); ok && rec.OwnerRunID != "" && rec.OwnerRunID != runID {
+				resource, err = s.produced.Get(ctx, rec.OwnerTenantID, rec.OwnerRunID, candidateID)
+			}
 		}
 		// 同 Run 内按名回退：candidate_id 可能是 ObservedName 而非 produced-id。
 		if err != nil {

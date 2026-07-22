@@ -12,7 +12,9 @@ import (
 	artifactcontract "genesis-agent/internal/capabilities/artifact/contract"
 	artifactmodel "genesis-agent/internal/capabilities/artifact/model"
 	execmodel "genesis-agent/internal/capabilities/execution/model"
+	"genesis-agent/internal/capabilities/llm/vision"
 	skillcontract "genesis-agent/internal/capabilities/skill/contract"
+	skillmodel "genesis-agent/internal/capabilities/skill/model"
 	scriptcontract "genesis-agent/internal/capabilities/skill/script/contract"
 	tool "genesis-agent/internal/capabilities/tool/contract"
 	toolparam "genesis-agent/internal/capabilities/tool/param"
@@ -28,6 +30,7 @@ type Deps struct {
 	InputResolver  InputResolver
 	InputStager    workcontract.InputStager
 	Finalizer      artifactcontract.RequiredDeliverableFinalizer
+	QAEvidence     artifactcontract.QAEvidenceRecorder
 }
 
 // InputResolver 是产品控制面的裸路径到已授权 ResourceRef 转换端口。
@@ -100,9 +103,20 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("EXECUTION_BINDING_REQUIRED: run_skill_command 缺少调用方 execution workspace")
 	}
-	backend := trustedExecutionBackend(t.deps.Sandbox)
+	invocation, ok := skillcontract.InvocationBindingFromContext(ctx)
+	if !ok {
+		return "", fmt.Errorf("SKILL_INVOCATION_BINDING_REQUIRED: run_skill_command 只能在已解析的 Skill Invocation 内执行")
+	}
+	if skill != invocation.PhysicalSkill && skill != invocation.Handle {
+		return "", fmt.Errorf("SKILL_INVOCATION_MISMATCH: 参数 skill=%q 与当前 binding %q/%q 不一致", skill, invocation.PhysicalSkill, invocation.Handle)
+	}
+	sandbox, err := invocationSandboxProfile(t.deps.Sandbox, invocation.ExecutionPolicy)
+	if err != nil {
+		return "", err
+	}
+	backend := trustedExecutionBackend(sandbox)
 	execution, err := control.PrepareExecution(ctx, workcontract.PrepareExecutionRequest{
-		Subject: execmodel.ExecutionSubjectRef{TaskID: "skill:" + skill},
+		Subject: execmodel.ExecutionSubjectRef{TaskID: "skill:" + invocation.ID},
 		Backend: backend,
 		// 同一 Run 内相同 Skill 主体稳定复用 task workspace：第三方 Skill 的相对 cwd、
 		// staged inputs和中间状态可跨多条命令保持一致，但不会错误升级成跨 Run session 生命周期。
@@ -158,6 +172,7 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 	result, err := t.deps.Runner.Run(ctx, scriptcontract.RunRequest{
 		Catalog:    t.deps.CatalogRequest,
 		Skill:      skill,
+		Invocation: invocation,
 		Command:    command,
 		Inputs:     manifest,
 		Binding:    binding,
@@ -165,7 +180,7 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 		StateRoot:  manifestState.StateRoot,
 		ProjectDir: manifestState.ProjectDir,
 		TimeoutMS:  in.TimeoutMS,
-		Sandbox:    cloneSandbox(t.deps.Sandbox),
+		Sandbox:    sandbox,
 	})
 	if err != nil {
 		return "", err
@@ -173,12 +188,31 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 	if result != nil {
 		result.StagingDurationMS += controlPlaneStagingMS
 		result.DurationMS = time.Since(harnessStarted).Milliseconds()
+		result.Warnings = append(result.Warnings, invocation.ExecutionPolicy.Warnings...)
 
 	}
 	if result != nil && result.OK && t.deps.Finalizer != nil {
 		finalized, finalizeErr := t.deps.Finalizer.FinalizeRequired(ctx, binding.Owner.TenantID, binding.Owner.RunID)
 		if finalizeErr != nil {
 			return "", fmt.Errorf("自动完成 required deliverable: %w", finalizeErr)
+		}
+		// optional visual QA 在无视觉执行者时由 Harness 形成精确降级证据，不能依赖模型
+		// 主动调用 view_image 才记账。首次 Finalize 已提交内部 publication，Recorder 因而能
+		// 绑定当前版本/hash；随后重跑 Finalize 才允许进入外部 Delivery。
+		if needsAutomaticVisionDegrade(invocation, finalized) {
+			if t.deps.QAEvidence == nil {
+				return "", fmt.Errorf("SKILL_QA_REQUIRED: optional visual QA 缺少QAEvidenceRecorder")
+			}
+			if err := t.deps.QAEvidence.RecordOutcome(ctx, artifactcontract.QAOutcomeRequest{
+				TenantID: binding.Owner.TenantID, RunID: binding.Owner.RunID,
+				PolicyID: "visual-qa/v1", Validator: "visual-qa/v1", FailureCode: "vision_unavailable", Status: artifactmodel.QAEvidenceDegraded,
+			}); err != nil {
+				return "", fmt.Errorf("记录 optional visual QA 降级证据: %w", err)
+			}
+			finalized, finalizeErr = t.deps.Finalizer.FinalizeRequired(ctx, binding.Owner.TenantID, binding.Owner.RunID)
+			if finalizeErr != nil {
+				return "", fmt.Errorf("QA降级后完成 required deliverable: %w", finalizeErr)
+			}
 		}
 		applyFinalization(result, finalized)
 	}
@@ -194,6 +228,28 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 		return string(data), fmt.Errorf("%s", msg)
 	}
 	return string(data), nil
+}
+
+func needsAutomaticVisionDegrade(binding skillmodel.InvocationBinding, finalized artifactmodel.FinalizationResult) bool {
+	if vision.HasImageCapability(vision.Mode(binding.Capabilities.VisionMode)) {
+		return false
+	}
+	hasPending := false
+	for _, resolution := range finalized.Resolutions {
+		if resolution.Status == "qa_pending" {
+			hasPending = true
+			break
+		}
+	}
+	if !hasPending {
+		return false
+	}
+	for _, deliverable := range binding.Result.Deliverables {
+		if deliverable.Required && strings.EqualFold(deliverable.QA.Policy, "visual-qa/v1") && !skillmodel.IsRequiredEnforcement(deliverable.QA.Enforcement) {
+			return true
+		}
+	}
+	return false
 }
 
 func applyFinalization(result *scriptcontract.RunResult, finalized artifactmodel.FinalizationResult) {
@@ -235,6 +291,8 @@ func applyFinalization(result *scriptcontract.RunResult, finalized artifactmodel
 				warning = fmt.Sprintf("DELIVERY_TARGET_CONFLICT: deliverable %s 交付目标冲突", resolution.DeliverableID)
 			}
 			result.Warnings = append(result.Warnings, warning)
+		case "qa_pending", "qa_required":
+			result.Warnings = append(result.Warnings, fmt.Sprintf("deliverable %s 已锁定当前候选，但 %s；完成 QA 后调用 select_deliverable_candidate", resolution.DeliverableID, resolution.Status))
 		}
 	}
 }
@@ -276,6 +334,43 @@ func cloneSandbox(in execmodel.SandboxProfile) execmodel.SandboxProfile {
 	return out
 }
 
+func invocationSandboxProfile(base execmodel.SandboxProfile, policy skillmodel.EffectiveExecutionPolicy) (execmodel.SandboxProfile, error) {
+	out := cloneSandbox(base)
+	selected := strings.ToLower(strings.TrimSpace(policy.SelectedBackend))
+	if selected == "" {
+		selected = strings.ToLower(strings.TrimSpace(policy.PreferredBackend))
+	}
+	switch selected {
+	case "", "inherit":
+	case "remote_sandbox":
+		out.Provider = "genesis-sandbox"
+		if policy.SandboxRequired {
+			out.Mode = execmodel.SandboxRequired
+		} else if out.Mode == "" || out.Mode == execmodel.SandboxDisabled {
+			out.Mode = execmodel.SandboxOptional
+		}
+	case "local_platform_sandbox":
+		out.Provider = "local-platform"
+		if policy.SandboxRequired {
+			out.Mode = execmodel.SandboxRequired
+		} else if out.Mode == "" || out.Mode == execmodel.SandboxDisabled {
+			out.Mode = execmodel.SandboxOptional
+		}
+	case "local_host":
+		out.Provider = "local-host"
+		out.Mode = execmodel.SandboxDisabled
+	default:
+		return execmodel.SandboxProfile{}, fmt.Errorf("SKILL_RUNTIME_PROFILE_UNAVAILABLE: 未知 selected_backend %q", selected)
+	}
+	if out.Metadata == nil {
+		out.Metadata = map[string]string{}
+	}
+	out.Metadata["invocation_execution_mode"] = string(policy.ExecutionMode)
+	out.Metadata["invocation_allow_degradation"] = fmt.Sprintf("%t", policy.AllowDegradation)
+	out.Metadata["selected_backend"] = selected
+	return out, nil
+}
+
 // trustedExecutionBackend 只解析产品 bootstrap 注入的 SandboxProfile，不读取模型参数。
 func trustedExecutionBackend(profile execmodel.SandboxProfile) execmodel.ExecutionBackendRef {
 	if profile.Mode == "" || profile.Mode == execmodel.SandboxDisabled {
@@ -283,7 +378,9 @@ func trustedExecutionBackend(profile execmodel.SandboxProfile) execmodel.Executi
 	}
 	provider := strings.ToLower(strings.TrimSpace(profile.Provider))
 	switch provider {
-	case "", "local", "local_host", "host":
+	case "local-host", "host":
+		return execmodel.ExecutionBackendRef{Kind: execmodel.BackendKindHost, Provider: "local-host", Authority: "host"}
+	case "", "local", "local-platform", "local_platform":
 		return execmodel.ExecutionBackendRef{Kind: execmodel.BackendKindLocalSandbox, Provider: "local-platform", Authority: "host"}
 	default:
 		return execmodel.ExecutionBackendRef{Kind: execmodel.BackendKindRemote, Provider: strings.TrimSpace(profile.Provider), Authority: "remote-executor"}

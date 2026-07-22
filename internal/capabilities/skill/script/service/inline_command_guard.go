@@ -157,4 +157,3 @@ func autoRewriteRiskyInlineCommand(command string) (rewrittenCmd, scriptName, pa
 	rewrittenCmd = strings.TrimSpace(prefix + " " + scriptName + " " + strings.TrimSpace(rest))
 	return rewrittenCmd, scriptName, risk.Payload, true
 }
-

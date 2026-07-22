@@ -91,13 +91,13 @@ type SessionScope struct {
 
 // RunRequest RunOnce 的请求参数
 type RunRequest struct {
-	SessionID       string        // 会话 ID（跨 Run 保持对话历史）
-	AppID           string        // 选择产品已注册的 Agent App；权限配置只能由 resolver 返回
-	TenantID        string        // 租户 ID（隔离租户数据）
-	ProjectID       string        // 项目 ID（用于能力适用范围过滤）
-	UserID          string        // 用户 ID（隔离用户画像与长期记忆数据）
-	RoleIDs         []string      // 用户角色（用于能力适用范围过滤）
-	Input           string                       // 用户输入内容
+	SessionID       string                        // 会话 ID（跨 Run 保持对话历史）
+	AppID           string                        // 选择产品已注册的 Agent App；权限配置只能由 resolver 返回
+	TenantID        string                        // 租户 ID（隔离租户数据）
+	ProjectID       string                        // 项目 ID（用于能力适用范围过滤）
+	UserID          string                        // 用户 ID（隔离用户画像与长期记忆数据）
+	RoleIDs         []string                      // 用户角色（用于能力适用范围过滤）
+	Input           string                        // 用户输入内容
 	Attachments     []domain.AttachmentDescriptor // 本轮显式附件（TurnInput）；不含 bytes
 	Agent           *domain.Agent                 // 可选：指定 Agent 配置；nil 时使用 DefaultAgent
 	Sandbox         *execmodel.SandboxProfile
@@ -125,6 +125,7 @@ type RunWorkspaceRuntime struct {
 	ArtifactRuns        artifactcontract.RunInitializer
 	Completion          artifactcontract.CompletionPolicy
 	QAEvidence          artifactcontract.QAEvidenceRecorder
+	Adoptions           artifactcontract.AdoptionStore
 	WorkspaceCompletion workcontract.RunCompletionGuard
 	RunResources        []workcontract.RunResourceReleaser
 }

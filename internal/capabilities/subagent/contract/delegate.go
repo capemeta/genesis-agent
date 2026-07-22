@@ -4,7 +4,10 @@ package contract
 import (
 	"context"
 
+	artifactcontract "genesis-agent/internal/capabilities/artifact/contract"
+	skillmodel "genesis-agent/internal/capabilities/skill/model"
 	"genesis-agent/internal/capabilities/subagent/model"
+	workmodel "genesis-agent/internal/capabilities/workspace/model"
 )
 
 // 上下文快照模式（与 runtime/multiagent/contextsnapshot.Mode 对齐）。
@@ -28,14 +31,14 @@ type DelegateRequest struct {
 	ForkContext  *bool
 	AllowedTools []string
 	InputFiles   []string
+	InputRefs    []workmodel.ResourceRef
 	// Definition 非空时跳过 Catalog（skill-fork 临时定义）。
 	Definition *model.Definition
 	// SnapshotMode 覆盖默认上下文模式；空则按 fork_context / isolated。
-	SnapshotMode string
-	PromptOrigin string
-	// SkillQA* 来自 Skill frontmatter qa:，经 Task 传入子 Run 交付契约。
-	SkillQAPolicy      string
-	SkillQAEnforcement string
+	SnapshotMode      string
+	PromptOrigin      string
+	InvocationBinding skillmodel.InvocationBinding
+	Deliverables      []artifactcontract.DeclaredDeliverable
 }
 
 // Delegator 是固定 Task 网关的内部委派端口。

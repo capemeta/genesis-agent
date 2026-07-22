@@ -100,15 +100,15 @@ type MCPScopeConfig struct {
 
 // SandboxConfig 描述外部 sandbox API 和产品默认沙箱执行配置。
 type SandboxConfig struct {
-	Enabled               bool                 `mapstructure:"enabled"`
-	Mode                  string               `mapstructure:"mode"`
-	DefaultExecution      string               `mapstructure:"default_execution"`
-	AllowSessionOverride  bool                 `mapstructure:"allow_session_override"`
-	BaseURL               string               `mapstructure:"base_url"`
-	APIKey                string               `mapstructure:"api_key"`
-	APIKeyEnv             string               `mapstructure:"api_key_env"`
-	WorkspaceID           string               `mapstructure:"workspace_id"`
-	DefaultRuntimeProfile string               `mapstructure:"default_runtime_profile"`
+	Enabled               bool                                       `mapstructure:"enabled"`
+	Mode                  string                                     `mapstructure:"mode"`
+	DefaultExecution      string                                     `mapstructure:"default_execution"`
+	AllowSessionOverride  bool                                       `mapstructure:"allow_session_override"`
+	BaseURL               string                                     `mapstructure:"base_url"`
+	APIKey                string                                     `mapstructure:"api_key"`
+	APIKeyEnv             string                                     `mapstructure:"api_key_env"`
+	WorkspaceID           string                                     `mapstructure:"workspace_id"`
+	DefaultRuntimeProfile string                                     `mapstructure:"default_runtime_profile"`
 	Local                 SandboxLocalConfig   `mapstructure:"local"`
 	Remote                SandboxRemoteConfig  `mapstructure:"remote"`
 	Routing               SandboxRoutingConfig `mapstructure:"routing"`
@@ -1338,6 +1338,28 @@ func validateSandboxConfig(cfg SandboxConfig) error {
 		}
 	}
 	return nil
+}
+
+func validInvocationHandle(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 128 || value[0] == '-' || value[len(value)-1] == '-' {
+		return false
+	}
+	previousDash := false
+	for _, char := range value {
+		if char == '-' {
+			if previousDash {
+				return false
+			}
+			previousDash = true
+			continue
+		}
+		previousDash = false
+		if (char < 'a' || char > 'z') && (char < '0' || char > '9') {
+			return false
+		}
+	}
+	return true
 }
 
 func validatePolicyConfig(cfg PolicyConfig) error {

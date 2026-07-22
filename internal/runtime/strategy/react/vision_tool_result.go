@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	artifactcontract "genesis-agent/internal/capabilities/artifact/contract"
+	artifactmodel "genesis-agent/internal/capabilities/artifact/model"
 	artifactservice "genesis-agent/internal/capabilities/artifact/service"
 	"genesis-agent/internal/capabilities/llm/vision"
 	viewimage "genesis-agent/internal/capabilities/media/tool/view_image"
@@ -184,14 +185,21 @@ func tryRecordVisualQAFromText(ctx context.Context, text string) error {
 	if !hit {
 		signOff, hit = artifactservice.ParseExpertVisualJSON(text)
 	}
-	if !hit || !signOff.Passed {
+	if !hit {
 		return nil
 	}
-	return recorder.RecordPassed(ctx, artifactcontract.QAPassRequest{
+	status := artifactmodel.QAEvidencePassed
+	failureCode := ""
+	if !signOff.Passed {
+		status = artifactmodel.QAEvidenceFailed
+		failureCode = "visual_qa_failed"
+	}
+	return recorder.RecordOutcome(ctx, artifactcontract.QAOutcomeRequest{
 		TenantID:  prepared.Manifest.Scope.TenantID,
 		RunID:     prepared.Manifest.RunID,
 		PolicyID:  artifactservice.ValidatorVisualQA,
 		Validator: artifactservice.ValidatorVisualQA,
+		Status:    status, FailureCode: failureCode,
 	})
 }
 
@@ -222,12 +230,12 @@ func tryRecordVisionUnavailable(ctx context.Context, attachments []domain.Attach
 	if !ok {
 		return nil
 	}
-	return recorder.RecordDegraded(ctx, artifactcontract.QADegradeRequest{
+	return recorder.RecordOutcome(ctx, artifactcontract.QAOutcomeRequest{
 		TenantID:    prepared.Manifest.Scope.TenantID,
 		RunID:       prepared.Manifest.RunID,
 		PolicyID:    artifactservice.ValidatorVisualQA,
 		Validator:   artifactservice.ValidatorVisualQA,
 		FailureCode: "vision_unavailable",
-		Status:      "degraded",
+		Status:      artifactmodel.QAEvidenceDegraded,
 	})
 }

@@ -10,6 +10,7 @@ import (
 
 	approvalcontract "genesis-agent/internal/capabilities/approval/contract"
 	approvalmodel "genesis-agent/internal/capabilities/approval/model"
+	artifactcontract "genesis-agent/internal/capabilities/artifact/contract"
 	subagentcontract "genesis-agent/internal/capabilities/subagent/contract"
 	subagentmodel "genesis-agent/internal/capabilities/subagent/model"
 	subagentprompt "genesis-agent/internal/capabilities/subagent/prompt"
@@ -174,7 +175,7 @@ func (t *Tool) Delegate(ctx context.Context, req subagentcontract.DelegateReques
 		PathFormat: "workspace-relative",
 	})
 
-	var inputSources []workmodel.ResourceRef
+	inputSources := append([]workmodel.ResourceRef(nil), req.InputRefs...)
 	if len(req.InputFiles) > 0 {
 		var hints []string
 		for _, f := range req.InputFiles {
@@ -183,7 +184,7 @@ func (t *Tool) Delegate(ctx context.Context, req subagentcontract.DelegateReques
 		req.Prompt += fmt.Sprintf("\n\n【关联输入文件通知】本任务关切的输入文件如下，请直接通过 read_file 工具读取对应文件名：\n%s", strings.Join(hints, "\n"))
 		if t.deps.InputResolver != nil {
 			if resolved, err := t.deps.InputResolver.ResolveAvailableInputs(ctx, req.InputFiles); err == nil {
-				inputSources = resolved
+				inputSources = append(inputSources, resolved...)
 			}
 		}
 	}
@@ -242,7 +243,7 @@ func (t *Tool) Delegate(ctx context.Context, req subagentcontract.DelegateReques
 		Depth: currentDepth + 1, MaxDepth: maxDepth, ReadOnly: readOnly,
 		SubagentType: definition.Name, Prompt: delegation.UserInput, Agent: agent,
 		Timeout: timeout, Budget: budget, Inputs: inputSources,
-		SkillQAPolicy: req.SkillQAPolicy, SkillQAEnforcement: req.SkillQAEnforcement,
+		InvocationBinding: req.InvocationBinding, Deliverables: append([]artifactcontract.DeclaredDeliverable(nil), req.Deliverables...),
 	})
 	if err != nil {
 		return "", err

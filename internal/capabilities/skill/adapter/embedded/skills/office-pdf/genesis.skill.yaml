@@ -1,0 +1,69 @@
+schema: genesis.skill/v1
+skill: office-pdf
+runtime_profiles:
+  read:
+    sandbox: {execution_mode: per_call, backends: [remote_sandbox, local_platform_sandbox]}
+    dependencies:
+      runtime:
+        python:
+          - {name: pypdf, import: pypdf}
+          - {name: pdfplumber, import: pdfplumber}
+        system: [{name: pdftotext, command: pdftotext}]
+  work:
+    sandbox: {execution_mode: sandboxed_session, backends: [remote_sandbox, local_platform_sandbox]}
+    dependencies:
+      runtime:
+        python:
+          - {name: pypdf, import: pypdf}
+          - {name: pdfplumber, import: pdfplumber}
+          - {name: reportlab, import: reportlab}
+          - {name: pdf2image, import: pdf2image}
+          - {name: Pillow, import: PIL}
+          - {name: pytesseract, import: pytesseract}
+        node: [{name: pdf-lib, require: pdf-lib}]
+        system:
+          - {name: pdftoppm, command: pdftoppm}
+          - {name: pdftotext, command: pdftotext}
+          - {name: pdfimages, command: pdfimages}
+          - {name: qpdf, command: qpdf}
+          - {name: tesseract, command: tesseract}
+invocations:
+  - id: read
+    handle: office-pdf-read
+    description: 提取并总结已有 PDF 的文字、表格和元数据，不渲染、不编辑
+    agent_mode: {mode: main}
+    runtime_profile: read
+    request:
+      task: {required: false}
+      inputs: {min_items: 1, max_items: 1, access: read_only, accepted_suffixes: [.pdf], accepted_mimes: [application/pdf]}
+    prompt: {instructions: references/invocations/read.md, skill_body: omit}
+    tool_policy:
+      allow: [list_skill_resources, read_skill_resource, search_skill_resources, run_skill_command, install_skill_dependencies]
+      required: [run_skill_command]
+    result: {kind: message}
+  - id: work
+    handle: office-pdf
+    description: 创建、编辑、合并、拆分、OCR、转换或视觉检查 PDF
+    agent_mode: {mode: fork}
+    runtime_profile: work
+    request:
+      task: {required: true}
+      inputs:
+        min_items: 0
+        max_items: 16
+        access: read_only
+        accepted_suffixes: [.pdf, .md, .txt, .png, .jpg, .jpeg]
+    prompt: {instructions: references/invocations/work.md, skill_body: include}
+    tool_policy:
+      allow: [list_skill_resources, read_skill_resource, search_skill_resources, run_skill_command, install_skill_dependencies, read_file, write_file, edit_file, view_image, select_deliverable_candidate]
+      required: [run_skill_command, write_file, select_deliverable_candidate]
+    result:
+      kind: deliverables
+      deliverables:
+        - id: pdf
+          role: primary
+          required: true
+          cardinality: exactly_one
+          accepted_suffixes: [.pdf]
+          accepted_mimes: [application/pdf]
+          delivery_policy: run-output

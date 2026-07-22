@@ -64,12 +64,12 @@ func NewAgentHandlerWithFiles(svc app.AgentService, files *staging.Store) *Agent
 
 // RunRequest POST /v1/runs 请求体
 type RunRequest struct {
-	SessionID   string                      `json:"session_id"`       // 可选：指定会话 ID，否则自动创建新会话
-	AppID       string                      `json:"app_id,omitempty"` // 选择租户策略允许的 Agent App
-	UserID      string                      `json:"user_id"`          // 开发期身份占位；生产环境应由认证中间件注入
-	Input       string                      `json:"input"`            // 必填：用户输入内容
+	SessionID   string                        `json:"session_id"`            // 可选：指定会话 ID，否则自动创建新会话
+	AppID       string                        `json:"app_id,omitempty"`      // 选择租户策略允许的 Agent App
+	UserID      string                        `json:"user_id"`               // 开发期身份占位；生产环境应由认证中间件注入
+	Input       string                        `json:"input"`                 // 必填：用户输入内容
 	Attachments []domain.AttachmentDescriptor `json:"attachments,omitempty"` // 标识优先；图片可暂带 content_base64（入站即 staging 清空）
-	Sandbox     *execmodel.SandboxProfile   `json:"sandbox,omitempty"`
+	Sandbox     *execmodel.SandboxProfile     `json:"sandbox,omitempty"`
 }
 
 // RunResponse POST /v1/runs 响应体

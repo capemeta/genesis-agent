@@ -19,7 +19,10 @@ import (
 )
 
 type Deps struct {
-	Service        skillcontract.Service
+	Service interface {
+		ListResources(context.Context, skillcontract.ListResourcesRequest) (model.ResourceList, error)
+		ListBoundResources(context.Context, model.InvocationBinding) (model.ResourceList, error)
+	}
 	Approval       approvalcontract.Service
 	CatalogRequest skillcontract.CatalogRequest
 	Registry       capcontract.Registry
@@ -59,19 +62,33 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 	}
 	pkg := model.PackageID(strings.TrimSpace(in.Package))
 	name := strings.TrimSpace(in.Skill)
+	binding, bound := skillcontract.InvocationBindingFromContext(ctx)
+	if bound {
+		if err := skillcontract.ValidateBoundTarget(binding, name, pkg); err != nil {
+			return "", err
+		}
+		pkg = binding.Package.PackageID
+		name = binding.Handle
+	}
 	if pkg == "" && name == "" {
 		return "", fmt.Errorf("skill或package必须提供一个")
 	}
 	if err := t.authorize(ctx, pkg, name); err != nil {
 		return "", err
 	}
-	result, err := t.deps.Service.ListResources(ctx, skillcontract.ListResourcesRequest{ResolveRequest: skillcontract.ResolveRequest{CatalogRequest: t.deps.CatalogRequest, Name: name}, PackageID: pkg})
+	var result model.ResourceList
+	var err error
+	if bound {
+		result, err = t.deps.Service.ListBoundResources(ctx, binding)
+	} else {
+		result, err = t.deps.Service.ListResources(ctx, skillcontract.ListResourcesRequest{ResolveRequest: skillcontract.ResolveRequest{CatalogRequest: t.deps.CatalogRequest, Name: name}, PackageID: pkg})
+	}
 	if err != nil {
 		return "", err
 	}
 	resources := t.filterIndexedResources(ctx, pkg, name, result.Resources)
 	resources = filterExecutableScriptEntries(resources)
-	data, err := json.Marshal(output{SkillQualifiedName: result.Skill.QualifiedName, Package: string(result.Skill.PackageID), Resources: resources})
+	data, err := json.Marshal(output{SkillQualifiedName: result.Skill.Name, Package: string(result.Skill.PackageID), Resources: resources})
 	if err != nil {
 		return "", err
 	}

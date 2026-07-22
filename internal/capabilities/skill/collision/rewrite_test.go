@@ -22,7 +22,7 @@ func TestRewriteArgsDropsForgedJSON(t *testing.T) {
 
 func TestRewriteArgsKeepsPlainString(t *testing.T) {
 	got := RewriteArgs("office-ppt", "make a comparison deck")
-	if !strings.Contains(got, `"args":"make a comparison deck"`) {
+	if !strings.Contains(got, `"task":"make a comparison deck"`) || strings.Contains(got, `"args"`) {
 		t.Fatalf("got = %s", got)
 	}
 }

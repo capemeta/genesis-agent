@@ -1,9 +1,12 @@
 package runtime
 
 import (
+	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 
+	skillmodel "genesis-agent/internal/capabilities/skill/model"
 	"genesis-agent/internal/domain"
 	"genesis-agent/internal/runtime/repeatguard"
 )
@@ -30,6 +33,7 @@ type RunContext struct {
 	// --- Skill 注入去重（本 Run 内）---
 	injectedMu     sync.Mutex
 	injectedSkills map[string]struct{} // key = opaque resource 或 authority:package
+	activeSkill    *skillmodel.InvocationBinding
 
 	// --- Skill 必做步骤软门禁跟踪（本 Run 内）---
 	SkillFollow *SkillFollowState
@@ -39,6 +43,57 @@ type RunContext struct {
 
 	// --- Repeat Guard（本 Run 内；Resume 时须随可恢复状态一并恢复）---
 	RepeatGuard *repeatguard.Guard
+}
+
+// ActivateInvocation 原子激活当前 Run 唯一的 Skill Invocation。
+// 第一版明确采用单 active invocation：一旦激活，权限只能保持或收紧，禁止在同一
+// Run 内隐式切换到另一个 binding，避免工具调用、包快照和交付所有者产生歧义。
+func (rc *RunContext) ActivateInvocation(binding skillmodel.InvocationBinding) error {
+	if rc == nil {
+		return fmt.Errorf("SKILL_INVOCATION_ACTIVATION_FAILED: run context为空")
+	}
+	if err := skillmodel.ValidateBindingIdentity(binding); err != nil {
+		return fmt.Errorf("SKILL_INVOCATION_ACTIVATION_FAILED: %w", err)
+	}
+	rc.injectedMu.Lock()
+	defer rc.injectedMu.Unlock()
+	if rc.activeSkill != nil {
+		if rc.activeSkill.ID == binding.ID {
+			return nil
+		}
+		return fmt.Errorf("SKILL_INVOCATION_ALREADY_ACTIVE: 当前Run已激活%q，禁止隐式切换到%q", rc.activeSkill.Handle, binding.Handle)
+	}
+	cloned := binding.Clone()
+	rc.activeSkill = &cloned
+	return nil
+}
+
+// ActiveInvocation 返回当前 Run 的不可变 InvocationBinding 副本。
+func (rc *RunContext) ActiveInvocation() (skillmodel.InvocationBinding, bool) {
+	if rc == nil {
+		return skillmodel.InvocationBinding{}, false
+	}
+	rc.injectedMu.Lock()
+	defer rc.injectedMu.Unlock()
+	if rc.activeSkill == nil {
+		return skillmodel.InvocationBinding{}, false
+	}
+	return rc.activeSkill.Clone(), true
+}
+
+// InvocationAllowsTool 是执行期硬门禁；工具可见性过滤不能替代本检查。
+func (rc *RunContext) InvocationAllowsTool(name string) bool {
+	binding, ok := rc.ActiveInvocation()
+	if !ok {
+		return true
+	}
+	name = strings.TrimSpace(name)
+	for _, allowed := range binding.ToolPolicy.Allowed {
+		if strings.TrimSpace(allowed) == name {
+			return true
+		}
+	}
+	return false
 }
 
 // NewRunContext 初始化RunContext

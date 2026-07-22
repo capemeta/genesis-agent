@@ -36,7 +36,7 @@ var (
 
 // SkillResolver 解析 Skill 元数据（产品注入完整 skill.Service 即可）。
 type SkillResolver interface {
-	Resolve(ctx context.Context, req skillcontract.ResolveRequest) (model.Metadata, error)
+	Resolve(ctx context.Context, req skillcontract.ResolveRequest) (model.ResolvedInvocation, error)
 }
 
 // Deps 是 install_skill_dependencies 依赖。
@@ -146,6 +146,13 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 	if len(in.Packages) == 0 {
 		return "", fmt.Errorf("packages不能为空")
 	}
+	binding, bound := skillcontract.InvocationBindingFromContext(ctx)
+	if !bound {
+		return "", fmt.Errorf("SKILL_INVOCATION_BINDING_REQUIRED: install_skill_dependencies只能在已激活Invocation内执行")
+	}
+	if err := skillcontract.ValidateBoundTarget(binding, skillName, ""); err != nil {
+		return "", err
+	}
 	scope := strings.ToLower(strings.TrimSpace(in.Scope))
 	if scope == "" {
 		scope = "workspace"
@@ -187,15 +194,8 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 		return marshalFail(out, out.Error)
 	}
 
-	meta, err := t.deps.Skills.Resolve(ctx, skillcontract.ResolveRequest{
-		CatalogRequest: t.deps.CatalogRequest,
-		Name:           skillName,
-	})
-	if err != nil {
-		return "", err
-	}
-
-	pkgs, err := normalizeAndAuthorizePackages(in.Packages, meta.Dependencies)
+	meta := model.Metadata{Name: binding.PhysicalSkill, Authority: binding.Package.Authority, PackageID: binding.Package.PackageID, Version: binding.Package.Version}.Normalize()
+	pkgs, err := normalizeAndAuthorizePackages(in.Packages, binding.RuntimeProfile.Dependencies)
 	if err != nil {
 		out.OK = false
 		out.Error = err.Error()
@@ -226,7 +226,7 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 		Action:   approvalmodel.ActionCommandExec,
 		Resource: approvalmodel.Resource{
 			Type:    "skill_dep_install",
-			URI:     "Skill(" + meta.QualifiedName + ")+install_dependencies",
+			URI:     "Skill(" + binding.Handle + ")+install_dependencies",
 			Display: "安装 " + meta.Name + " 依赖: " + joinPkgNames(pkgs),
 			Metadata: map[string]string{
 				"skill_dep_install": "true",
@@ -599,7 +599,7 @@ func venvBinDirName() string {
 }
 
 func skillDependencyInstallRoot(workspaceRoot string, meta model.Metadata) string {
-	skillID := sanitizePathPart(firstNonEmpty(string(meta.PackageID), meta.QualifiedName, meta.Name))
+	skillID := sanitizePathPart(firstNonEmpty(string(meta.PackageID), meta.Name))
 	return filepath.Join(workspaceRoot, ".genesis", "cache", "skill-deps", skillID)
 }
 

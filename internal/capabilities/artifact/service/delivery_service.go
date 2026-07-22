@@ -24,6 +24,7 @@ type DeliveryService struct {
 	deliverables artifactcontract.DeliverableSpecStore
 	selections   artifactcontract.DeliverableSelectionStore
 	publications artifactcontract.ArtifactPublicationStore
+	evidence     artifactcontract.QAEvidenceStore
 	deliveries   artifactcontract.DeliveryRecordStore
 	artifacts    artifactcontract.TransactionalStore
 	planner      artifactcontract.DeliveryTargetPlanner
@@ -32,20 +33,30 @@ type DeliveryService struct {
 	locks        sync.Map
 }
 
-func NewDeliveryService(deliverables artifactcontract.DeliverableSpecStore, selections artifactcontract.DeliverableSelectionStore, publications artifactcontract.ArtifactPublicationStore, deliveries artifactcontract.DeliveryRecordStore, artifacts artifactcontract.TransactionalStore, planner artifactcontract.DeliveryTargetPlanner, materializer artifactcontract.RecoverableMaterializer) (*DeliveryService, error) {
-	if deliverables == nil || selections == nil || publications == nil || deliveries == nil || artifacts == nil || planner == nil || materializer == nil {
+func NewDeliveryService(deliverables artifactcontract.DeliverableSpecStore, selections artifactcontract.DeliverableSelectionStore, publications artifactcontract.ArtifactPublicationStore, evidence artifactcontract.QAEvidenceStore, deliveries artifactcontract.DeliveryRecordStore, artifacts artifactcontract.TransactionalStore, planner artifactcontract.DeliveryTargetPlanner, materializer artifactcontract.RecoverableMaterializer) (*DeliveryService, error) {
+	if deliverables == nil || selections == nil || publications == nil || evidence == nil || deliveries == nil || artifacts == nil || planner == nil || materializer == nil {
 		return nil, fmt.Errorf("delivery service 依赖不完整")
 	}
-	return &DeliveryService{deliverables: deliverables, selections: selections, publications: publications, deliveries: deliveries, artifacts: artifacts, planner: planner, materializer: materializer, now: time.Now}, nil
+	return &DeliveryService{deliverables: deliverables, selections: selections, publications: publications, evidence: evidence, deliveries: deliveries, artifacts: artifacts, planner: planner, materializer: materializer, now: time.Now}, nil
 }
 
 func (s *DeliveryService) Deliver(ctx context.Context, req DeliveryRequest) (artifactmodel.DeliveryResult, error) {
 	if strings.TrimSpace(req.TenantID) == "" || strings.TrimSpace(req.RunID) == "" || strings.TrimSpace(req.DeliverableID) == "" {
 		return artifactmodel.DeliveryResult{}, artifactcontract.NewError(artifactcontract.ErrCodeDeliveryTargetDenied, fmt.Errorf("delivery request 信息不完整"))
 	}
-	_, publication, artifact, target, err := s.load(ctx, req)
+	spec, publication, artifact, target, err := s.load(ctx, req)
 	if err != nil {
 		return artifactmodel.DeliveryResult{}, err
+	}
+	if strings.TrimSpace(spec.QAPolicy) != "" {
+		state, qaErr := evaluateQAState(ctx, s.publications, s.evidence, req.TenantID, req.RunID, spec, publication.ProducedResourceID)
+		if qaErr != nil {
+			return artifactmodel.DeliveryResult{}, qaErr
+		}
+		allowed := state == qaStatePassed || ((state == qaStateDegraded || state == qaStateFailed) && !artifactmodel.IsRequiredEnforcement(spec.QAEnforcement))
+		if !allowed {
+			return artifactmodel.DeliveryResult{}, artifactcontract.NewError(artifactcontract.ErrCodeQARequired, fmt.Errorf("QA 尚未形成可交付证据或与当前 publication 版本不匹配"))
+		}
 	}
 	key := deliveryKey(req, artifact, target)
 	id := "delivery-" + deliveryShortHash(key)

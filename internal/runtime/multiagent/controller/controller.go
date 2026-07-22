@@ -12,10 +12,11 @@ import (
 	"time"
 
 	artifactcontract "genesis-agent/internal/capabilities/artifact/contract"
-	artifactservice "genesis-agent/internal/capabilities/artifact/service"
 	execmodel "genesis-agent/internal/capabilities/execution/model"
 	hookcontract "genesis-agent/internal/capabilities/hook/contract"
 	hookmodel "genesis-agent/internal/capabilities/hook/model"
+	skillcontract "genesis-agent/internal/capabilities/skill/contract"
+	skillmodel "genesis-agent/internal/capabilities/skill/model"
 	workcontract "genesis-agent/internal/capabilities/workspace/contract"
 	workmodel "genesis-agent/internal/capabilities/workspace/model"
 	"genesis-agent/internal/domain"
@@ -193,23 +194,22 @@ func (c *Controller) Spawn(ctx context.Context, req contract.SpawnRequest) (mode
 	childCtx = contextutil.WithTenantID(childCtx, req.TenantID)
 	instance := model.Instance{AgentID: agentID, ParentRunID: req.ParentRunID, SessionID: req.SessionID, TenantID: req.TenantID, Depth: req.Depth, SubagentType: req.SubagentType, Status: model.StatusRunning, CreatedAt: time.Now()}
 	e := &entry{instance: instance, request: req, cancel: cancel, slot: token, done: make(chan struct{}), parentCtx: ctx, manifest: manifest}
-	c.mu.Lock()
-	c.instances[agentID] = e
-	c.mu.Unlock()
 	if err := c.limiter.Commit(token, agentID); err != nil {
-		c.mu.Lock()
-		delete(c.instances, agentID)
-		c.mu.Unlock()
 		cancel()
 		return instance, err
 	}
-	if err := c.store.Save(ctx, contract.StoredInstance{Instance: instance, Request: req}); err != nil {
-		c.mu.Lock()
-		delete(c.instances, agentID)
-		c.mu.Unlock()
+	stored, created, err := c.store.SaveIfInvocationAbsent(ctx, contract.StoredInstance{Instance: instance, Request: req})
+	if err != nil {
 		cancel()
 		return empty, fmt.Errorf("保存 subagent 实例失败: %w", err)
 	}
+	if !created {
+		cancel()
+		return stored.Instance, nil
+	}
+	c.mu.Lock()
+	c.instances[agentID] = e
+	c.mu.Unlock()
 	committed = true
 	c.emit(ctx, progress.PhaseStart, instance, "启动子智能体")
 	c.emitProjection(ctx, model.ProjectionEventSpawned, instance)
@@ -330,21 +330,35 @@ func (c *Controller) run(ctx context.Context, req contract.SpawnRequest, e *entr
 	}
 	ctx = workcontract.WithPreparedRun(ctx, prepared)
 	ctx = workcontract.WithControlPlane(ctx, c.workspace.Preparer)
-	ctx = c.prepareChildArtifactContext(ctx, req, prepared)
+	ctx, err = c.prepareChildArtifactContext(ctx, req, prepared)
+	if err != nil {
+		return
+	}
 	run, err = c.engine.Start(ctx, domain.StartRunRequest{RunID: prepared.Manifest.RunID, SessionID: req.SessionID, TenantID: req.TenantID, UserInput: req.Prompt, Agent: req.Agent})
 }
 
 // prepareChildArtifactContext 为子 Run 注入产物证据建约所需的可信 QA 偏好。
 // 交付 Spec 不再按 Prompt/Intent 预建：只读无产物可直接完成；写出 office 交付文件后由 FinalizeRequired 建约并交付。
-func (c *Controller) prepareChildArtifactContext(ctx context.Context, req contract.SpawnRequest, prepared workmodel.PreparedRun) context.Context {
-	ctx = artifactcontract.WithEvidenceQAHints(ctx, artifactcontract.EvidenceQAHints{
-		Policy:      req.SkillQAPolicy,
-		Enforcement: req.SkillQAEnforcement,
-	})
+func (c *Controller) prepareChildArtifactContext(ctx context.Context, req contract.SpawnRequest, prepared workmodel.PreparedRun) (context.Context, error) {
+	if req.InvocationBinding.ID != "" {
+		// InvocationBinding 记录父 Run 发起调用时的不可变解析事实；子 Run 身份由
+		// PreparedRun / ExecutionBinding 表达，禁止复制同一 binding_id 后篡改 RunID。
+		ctx = skillcontract.WithInvocationBinding(ctx, req.InvocationBinding)
+	}
+	if len(req.Deliverables) > 0 {
+		if c.workspace.ArtifactRuns == nil {
+			return ctx, fmt.Errorf("SKILL_DELIVERABLE_REQUIRED: 子Run缺少声明式Deliverable初始化器")
+		}
+		if err := c.workspace.ArtifactRuns.InitializeRun(ctx, artifactcontract.RunInitializationRequest{
+			TenantID: req.TenantID, RunID: prepared.Manifest.RunID, Deliverables: append([]artifactcontract.DeclaredDeliverable(nil), req.Deliverables...),
+		}); err != nil {
+			return ctx, fmt.Errorf("初始化子Run DeliverableSpec: %w", err)
+		}
+	}
 	if _, ok := artifactcontract.CompletionPolicyFromContext(ctx); !ok && !req.ReadOnly {
 		c.logger.Warn("子 Run 上下文缺少完成门禁，产物证据交付可能静默不触发", "agent_id", req.Agent.ID, "run_id", prepared.Manifest.RunID)
 	}
-	return ctx
+	return ctx, nil
 }
 
 func (c *Controller) finish(ctx context.Context, e *entry, run *domain.Run, err error) {
@@ -382,7 +396,22 @@ func (c *Controller) finish(ctx context.Context, e *entry, run *domain.Run, err 
 	projected := c.projector.Project(resultCtx, record)
 	instance.Result = &projected
 	instance.Summary = projected.Summary
+	var adoptionErr error
+	if e.request.InvocationBinding.Result.Kind == skillmodel.ResultKindDeliverables {
+		if run == nil || projected.Status != model.ResultStatusCompleted {
+			adoptionErr = fmt.Errorf("Skill子Run未达到可接纳的completed终态")
+		} else if policy, ok := artifactcontract.CompletionPolicyFromContext(resultCtx); !ok {
+			adoptionErr = fmt.Errorf("Skill子Run缺少CompletionPolicy，禁止接纳交付物")
+		} else if decision, evalErr := policy.EvaluateCompletion(resultCtx, run.TenantID, run.ID); evalErr != nil {
+			adoptionErr = fmt.Errorf("校验Skill子Run交付完成状态: %w", evalErr)
+		} else if !decision.Complete {
+			adoptionErr = fmt.Errorf("Skill子Run交付门禁未满足: missing=%v pending_qa=%v failures=%v", decision.MissingDeliverableIDs, decision.PendingQAIDs, decision.FailureCodes)
+		}
+	}
 	for _, art := range projected.Artifacts {
+		if adoptionErr != nil {
+			break
+		}
 		candidateID := art.CandidateID
 		if candidateID == "" {
 			candidateID = art.ResourceID
@@ -392,7 +421,12 @@ func (c *Controller) finish(ctx context.Context, e *entry, run *domain.Run, err 
 		}
 		// 父子边界唯一的跨 Run 接纳点：把子交付候选显式、版本锁定地接纳进父作用域，
 		// 供父随后按资源所属 backend 只读引用（view_image 等）。QA/中间物已在归约层剔除，不会到这里。
-		if _, adoptErr := artifactservice.GlobalAdoptionStore.Adopt(artifactservice.AdoptionRecord{
+		adoptions, configured := artifactcontract.AdoptionStoreFromContext(resultCtx)
+		if !configured {
+			adoptionErr = fmt.Errorf("Skill子Run缺少AdoptionStore，禁止跨Run接纳交付物")
+			break
+		}
+		if _, adoptErr := adoptions.Adopt(artifactcontract.AdoptionRecord{
 			ConsumerTenantID: instance.TenantID,
 			ConsumerRunID:    instance.ParentRunID,
 			ProducedID:       candidateID,
@@ -402,8 +436,19 @@ func (c *Controller) finish(ctx context.Context, e *entry, run *domain.Run, err 
 			ContentHash:      art.ContentHash,
 			Role:             art.Role,
 		}); adoptErr != nil {
-			c.logger.Warn("接纳子交付候选失败", "agent_id", instance.AgentID, "candidate_id", candidateID, "error", adoptErr)
+			adoptionErr = fmt.Errorf("接纳子交付候选 %s: %w", candidateID, adoptErr)
+			break
 		}
+	}
+	if adoptionErr != nil {
+		instance.Status = model.StatusFailed
+		instance.Error = adoptionErr.Error()
+		projected.Status = model.ResultStatusFailed
+		projected.Error = &model.ResultError{Code: "artifact_adoption_failed", Message: adoptionErr.Error(), Retryable: true}
+		projected.Artifacts = nil
+		projected.NextAction = "修复父子产物接纳存储后重试；父 Run 不得直接扫描子工作区。"
+		instance.Result = &projected
+		instance.Summary = projected.Summary
 	}
 	if projected.Error != nil {
 		instance.Error = projected.Error.Message
@@ -482,7 +527,14 @@ func (c *Controller) dispatchSubagentStop(ctx context.Context, instance model.In
 func (c *Controller) Wait(ctx context.Context, agentID string) (model.Instance, error) {
 	e, err := c.entry(agentID)
 	if err != nil {
-		return model.Instance{}, err
+		stored, storeErr := c.store.Get(ctx, agentID)
+		if storeErr != nil {
+			return model.Instance{}, err
+		}
+		if stored.Instance.Status == model.StatusRunning {
+			return model.Instance{}, fmt.Errorf("subagent %q 正在其他进程运行，当前进程不能等待其内存事件", agentID)
+		}
+		return stored.Instance, nil
 	}
 	select {
 	case <-ctx.Done():

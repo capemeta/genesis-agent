@@ -9,6 +9,8 @@ import (
 	workspaceadapter "genesis-agent/internal/capabilities/workspace/adapter/sandbox"
 	enterprisebootstrap "genesis-agent/products/enterprise/bootstrap"
 	localartifactcontrol "genesis-agent/shared/local/artifactcontrol"
+	localskill "genesis-agent/shared/local/skill"
+	localsubagent "genesis-agent/shared/local/subagent"
 	localworkspace "genesis-agent/shared/local/workspace"
 )
 
@@ -40,6 +42,18 @@ func BuildTenantDependencies(opts Options) (enterprisebootstrap.Dependencies, er
 	if err != nil {
 		return enterprisebootstrap.Dependencies{}, fmt.Errorf("装配租户 Artifact 控制面失败: %w", err)
 	}
+	bindingStore, err := localskill.NewBindingStore(opts.TenantStateRoot)
+	if err != nil {
+		return enterprisebootstrap.Dependencies{}, fmt.Errorf("装配租户 InvocationBindingStore 失败: %w", err)
+	}
+	packageStore, err := localskill.NewPackageStore(opts.TenantStateRoot)
+	if err != nil {
+		return enterprisebootstrap.Dependencies{}, fmt.Errorf("装配租户 SkillPackageSnapshotStore 失败: %w", err)
+	}
+	subAgentStore, err := localsubagent.NewStore(opts.TenantStateRoot)
+	if err != nil {
+		return enterprisebootstrap.Dependencies{}, fmt.Errorf("装配租户 SubAgent InstanceStore 失败: %w", err)
+	}
 	return enterprisebootstrap.Dependencies{
 		RunManifests:      manifests,
 		ProducedResources: control.Produced,
@@ -52,5 +66,9 @@ func BuildTenantDependencies(opts Options) (enterprisebootstrap.Dependencies, er
 		Finalizer:         control.Finalizer,
 		Completion:        control.Completion,
 		QAEvidence:        control.QAEvidence,
+		Adoptions:         control.Adoptions,
+		SkillBindings:     bindingStore,
+		SkillPackages:     packageStore,
+		SubAgentStore:     subAgentStore,
 	}, nil
 }

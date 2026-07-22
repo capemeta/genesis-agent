@@ -123,4 +123,3 @@ func TestFromRuntimeConfigDowngradesWhenRemoteDisabled(t *testing.T) {
 		t.Fatalf("cfg.Mode = %s, want %s (local platform sandbox)", cfg.Mode, ModePlatform)
 	}
 }
-

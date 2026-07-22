@@ -15,6 +15,9 @@ type StoredInstance struct {
 // InstanceStore 是产品注入的子智能体实例存储端口。
 type InstanceStore interface {
 	Save(ctx context.Context, value StoredInstance) error
+	// SaveIfInvocationAbsent 原子保存 Skill Invocation 的首次子任务；同一 tenant/parent/binding
+	// 已存在时返回既有记录且 created=false。非 Skill 请求等价于 Save + created=true。
+	SaveIfInvocationAbsent(ctx context.Context, value StoredInstance) (stored StoredInstance, created bool, err error)
 	Get(ctx context.Context, agentID string) (StoredInstance, error)
 }
 

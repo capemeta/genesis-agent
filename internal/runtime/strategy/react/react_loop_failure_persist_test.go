@@ -12,8 +12,8 @@ import (
 	traceadapter "genesis-agent/internal/capabilities/trace/adapter"
 	"genesis-agent/internal/domain"
 	"genesis-agent/internal/platform/logger"
-	"genesis-agent/internal/runtime/prompt"
 	runtimecontext "genesis-agent/internal/runtime/context"
+	"genesis-agent/internal/runtime/prompt"
 )
 
 // TestPersistOnLLMFailureMidRun 验证：长 Run 中途 LLM 失败时，已产生的增量消息链必须落盘，
@@ -115,8 +115,8 @@ func TestPersistOnLLMFailureMidRun(t *testing.T) {
 		TenantID:  "dev",
 		UserInput: "请继续",
 		Agent: &domain.Agent{
-			Name:         "Genesis Agent",
-			DefaultModel: "test-model",
+			Name:          "Genesis Agent",
+			DefaultModel:  "test-model",
 			RuntimePolicy: domain.RuntimePolicy{MaxIterations: 5},
 		},
 	})
@@ -175,8 +175,8 @@ func TestPersistOnMaxIterations(t *testing.T) {
 		TenantID:  "dev",
 		UserInput: "反复调用工具",
 		Agent: &domain.Agent{
-			Name:         "Genesis Agent",
-			DefaultModel: "test-model",
+			Name:          "Genesis Agent",
+			DefaultModel:  "test-model",
 			RuntimePolicy: domain.RuntimePolicy{MaxIterations: 2},
 		},
 	})

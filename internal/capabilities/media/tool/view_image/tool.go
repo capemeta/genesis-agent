@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	artifactservice "genesis-agent/internal/capabilities/artifact/service"
+	artifactcontract "genesis-agent/internal/capabilities/artifact/contract"
 	fscontract "genesis-agent/internal/capabilities/filesystem/contract"
 	"genesis-agent/internal/capabilities/filesystem/permission"
 	"genesis-agent/internal/capabilities/filesystem/tool/toolkit"
@@ -25,17 +25,17 @@ import (
 )
 
 const (
-	errNotAnImage              = "not_an_image"
+	errNotAnImage        = "not_an_image"
 	errVisionUnavailable = "vision_unavailable"
 	// msgVisionUnavailable 形态 C：明确禁止 Pillow 等伪看图弯路。
 	msgVisionUnavailable = "vision_unavailable: this run has no image-capable model (set models.*.supports_image=true and/or router.vision). " +
 		"Do NOT use sandbox_exec/run_command with Pillow/OpenCV/ImageMagick/numpy pixel stats to invent image content. " +
 		"Tell the user honestly that visual understanding is unavailable. " +
 		"Allowed: filename/size/MIME metadata only if the user explicitly asked for file info; text extract for documents is OK."
-	errInvalidPath             = "invalid_image_path"
-	errImageTooLarge           = "image_too_large"
-	errProducedResourceExpired = "PRODUCED_RESOURCE_EXPIRED"
-	maxImageBytes        int64 = 10 * 1024 * 1024
+	errInvalidPath                   = "invalid_image_path"
+	errImageTooLarge                 = "image_too_large"
+	errProducedResourceExpired       = "PRODUCED_RESOURCE_EXPIRED"
+	maxImageBytes              int64 = 10 * 1024 * 1024
 )
 
 // ModeFromContext 从 ctx 读取 EffectiveVisionMode（由 Runtime 注入）。
@@ -65,14 +65,14 @@ type input struct {
 }
 
 type output struct {
-	OK               bool             `json:"ok"`
-	Error            string           `json:"error,omitempty"`
-	Message          string           `json:"message,omitempty"`
-	SuggestedAction  string           `json:"suggested_action,omitempty"`
-	ImageRef         *domain.ImageRef `json:"image_ref,omitempty"`
-	VisionMode       string           `json:"vision_mode,omitempty"`
-	InjectImage      bool             `json:"inject_image,omitempty"` // Runtime 据此决定是否写入 Parts
-	RerenderHint     string           `json:"rerender_hint,omitempty"`
+	OK              bool             `json:"ok"`
+	Error           string           `json:"error,omitempty"`
+	Message         string           `json:"message,omitempty"`
+	SuggestedAction string           `json:"suggested_action,omitempty"`
+	ImageRef        *domain.ImageRef `json:"image_ref,omitempty"`
+	VisionMode      string           `json:"vision_mode,omitempty"`
+	InjectImage     bool             `json:"inject_image,omitempty"` // Runtime 据此决定是否写入 Parts
+	RerenderHint    string           `json:"rerender_hint,omitempty"`
 }
 
 // New 创建 view_image。
@@ -186,11 +186,11 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 		return toolkit.ToJSON(output{OK: false, Error: errNotAnImage, Message: "file is not a supported image; use document channel", VisionMode: string(mode)})
 	}
 	ref := &domain.ImageRef{
-		PathAlias:     pathRef.DisplayPath,
-		MediaType:     mime,
-		SHA256:        toolkit.HashBytes(raw),
-		Detail:        normalizeDetail(in.Detail),
-		InlineBytes:   raw,
+		PathAlias:   pathRef.DisplayPath,
+		MediaType:   mime,
+		SHA256:      toolkit.HashBytes(raw),
+		Detail:      normalizeDetail(in.Detail),
+		InlineBytes: raw,
 	}
 	materialize.RememberRef(ref)
 	wire := *ref
@@ -247,9 +247,11 @@ func (t *Tool) hydrateCandidate(ctx context.Context, ref *domain.ImageRef) error
 	ownerRun := prepared.Manifest.RunID
 	desc, err := t.produced.Get(ctx, ownerTenant, ownerRun, ref.CandidateID)
 	if err != nil {
-		if rec, ok := artifactservice.GlobalAdoptionStore.Resolve(ownerTenant, ownerRun, ref.CandidateID, prepared.Manifest.StateRoot.Path); ok && rec.OwnerRunID != "" {
-			ownerTenant, ownerRun = rec.OwnerTenantID, rec.OwnerRunID
-			desc, err = t.produced.Get(ctx, ownerTenant, ownerRun, ref.CandidateID)
+		if adoptions, configured := artifactcontract.AdoptionStoreFromContext(ctx); configured {
+			if rec, ok := adoptions.Resolve(ownerTenant, ownerRun, ref.CandidateID); ok && rec.OwnerRunID != "" {
+				ownerTenant, ownerRun = rec.OwnerTenantID, rec.OwnerRunID
+				desc, err = t.produced.Get(ctx, ownerTenant, ownerRun, ref.CandidateID)
+			}
 		}
 	}
 	if err != nil {

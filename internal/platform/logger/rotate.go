@@ -16,7 +16,7 @@ type RotateOptions struct {
 	Daily      bool
 	MaxSizeMB  int
 	RetainDays int
-	Compress   bool          // 预留；当前实现不压缩
+	Compress   bool             // 预留；当前实现不压缩
 	Now        func() time.Time // 可选；测试注入时钟
 }
 

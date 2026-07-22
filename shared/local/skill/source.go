@@ -14,6 +14,7 @@ import (
 
 	"genesis-agent/internal/capabilities/skill/contract"
 	"genesis-agent/internal/capabilities/skill/model"
+	"genesis-agent/internal/capabilities/skill/packaging"
 )
 
 const skillFileName = "SKILL.md"
@@ -64,7 +65,7 @@ func NewSource(authority model.Authority, roots []Root, parser contract.Parser) 
 func (s *Source) Authority() model.Authority { return s.authority }
 
 func (s *Source) List(ctx context.Context, query contract.ListQuery) (contract.ListResult, error) {
-	result := contract.ListResult{Entries: make([]model.Metadata, 0)}
+	result := contract.ListResult{Packages: make([]model.PhysicalSkillDefinition, 0)}
 	for _, root := range s.roots {
 		select {
 		case <-ctx.Done():
@@ -83,15 +84,15 @@ func (s *Source) List(ctx context.Context, query contract.ListQuery) (contract.L
 			if !entry.IsDir() && entry.Type()&os.ModeSymlink == 0 {
 				continue
 			}
-			meta, err := s.readMetadata(root, entry.Name(), true)
+			physical, err := s.readPhysical(root, entry.Name(), true)
 			if err != nil {
 				result.Errors = append(result.Errors, model.Error{Source: s.authority, Path: filepath.Join(root.Path, entry.Name()), Message: err.Error()})
 				continue
 			}
-			result.Entries = append(result.Entries, meta)
+			result.Packages = append(result.Packages, physical)
 		}
 	}
-	sort.SliceStable(result.Entries, func(i, j int) bool { return result.Entries[i].QualifiedName < result.Entries[j].QualifiedName })
+	sort.SliceStable(result.Packages, func(i, j int) bool { return result.Packages[i].Metadata.Name < result.Packages[j].Metadata.Name })
 	return result, nil
 }
 
@@ -127,6 +128,69 @@ func (s *Source) Read(ctx context.Context, req contract.ReadRequest) (contract.R
 		return contract.ReadResult{Metadata: meta, Resource: model.ResourceID(resource), Content: content, Truncated: truncated}, nil
 	}
 	return contract.ReadResult{}, fmt.Errorf("未找到skill package: %s", pkg)
+}
+
+// ReadPackageSnapshot 返回参与摘要计算的原始包字节，供 Binding 创建时写入 CAS。
+func (s *Source) ReadPackageSnapshot(ctx context.Context, expected model.SkillPackageSnapshot) ([]model.SkillPackageFile, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+	pkg := strings.TrimSpace(string(expected.PackageID))
+	for _, root := range s.roots {
+		_, baseDir, err := s.resolveSkillFile(root.Path, pkg, true)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, err
+		}
+		files := make([]model.SkillPackageFile, 0, len(expected.Files))
+		err = filepath.WalkDir(baseDir, func(filePath string, entry fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			if entry.IsDir() {
+				if entry.Name() == "__pycache__" {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if entry.Type()&os.ModeSymlink != 0 {
+				return fmt.Errorf("skill package禁止文件符号链接: %s", filePath)
+			}
+			if strings.HasSuffix(strings.ToLower(entry.Name()), ".pyc") {
+				return nil
+			}
+			resource, ok := resourceIDForPath(baseDir, pkg, filePath)
+			if !ok {
+				return fmt.Errorf("skill package resource越界: %s", filePath)
+			}
+			content, err := os.ReadFile(filePath)
+			if err != nil {
+				return err
+			}
+			files = append(files, model.SkillPackageFile{Resource: resource, Content: content})
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		if err := verifySourcePackage(expected, files); err != nil {
+			return nil, err
+		}
+		return files, nil
+	}
+	return nil, fmt.Errorf("未找到skill package: %s", pkg)
+}
+
+func verifySourcePackage(expected model.SkillPackageSnapshot, files []model.SkillPackageFile) error {
+	raw := make([]packaging.File, 0, len(files))
+	for _, file := range files {
+		raw = append(raw, packaging.File{Resource: file.Resource, Content: file.Content})
+	}
+	return packaging.ValidateSnapshot(expected, raw)
 }
 
 func (s *Source) ListResources(ctx context.Context, req contract.SourceListResourcesRequest) (contract.ListResourcesResult, error) {
@@ -230,29 +294,71 @@ func (s *Source) Search(ctx context.Context, req contract.SearchRequest) (contra
 }
 
 func (s *Source) readMetadata(root Root, dirName string, allowSymlink bool) (model.Metadata, error) {
+	physical, err := s.readPhysical(root, dirName, allowSymlink)
+	return physical.Metadata, err
+}
+
+func (s *Source) readPhysical(root Root, dirName string, allowSymlink bool) (model.PhysicalSkillDefinition, error) {
 	skillFile, baseDir, err := s.resolveSkillFile(root.Path, dirName, allowSymlink)
 	if err != nil {
-		return model.Metadata{}, err
+		return model.PhysicalSkillDefinition{}, err
 	}
-	file, err := os.Open(skillFile)
+	data, err := os.ReadFile(skillFile)
 	if err != nil {
-		return model.Metadata{}, err
+		return model.PhysicalSkillDefinition{}, err
 	}
-	defer file.Close()
-	buf := make([]byte, 64*1024)
-	n, err := file.Read(buf)
-	if err != nil && n == 0 {
-		return model.Metadata{}, err
-	}
-	return s.parser.ParseFrontmatter(buf[:n], contract.ParseSource{
-		Authority:     s.authority,
-		Scope:         root.Scope,
-		PackageID:     model.PackageID(dirName),
-		MainResource:  model.ResourceID(dirName + "/SKILL.md"),
-		DisplayPath:   skillFile,
-		BaseDirectory: baseDir,
-		DirectoryName: dirName,
+	meta, err := s.parser.ParseFrontmatter(data, contract.ParseSource{
+		Authority: s.authority, Scope: root.Scope, PackageID: model.PackageID(dirName),
+		MainResource: model.ResourceID(dirName + "/SKILL.md"), DisplayPath: skillFile,
+		BaseDirectory: baseDir, DirectoryName: dirName,
 	})
+	if err != nil {
+		return model.PhysicalSkillDefinition{}, err
+	}
+	files := make([]packaging.File, 0, 32)
+	var manifest *model.RuntimeManifest
+	err = filepath.WalkDir(baseDir, func(filePath string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			if entry.Name() == "__pycache__" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			return fmt.Errorf("skill package禁止文件符号链接: %s", filePath)
+		}
+		if strings.HasSuffix(strings.ToLower(entry.Name()), ".pyc") {
+			return nil
+		}
+		resource, ok := resourceIDForPath(baseDir, dirName, filePath)
+		if !ok {
+			return fmt.Errorf("skill package resource越界: %s", filePath)
+		}
+		content, readErr := os.ReadFile(filePath)
+		if readErr != nil {
+			return readErr
+		}
+		files = append(files, packaging.File{Resource: resource, Content: content})
+		if filepath.Base(filePath) == model.RuntimeManifestFileName {
+			parsed, parseErr := s.parser.ParseRuntimeManifest(content, meta.Name)
+			if parseErr != nil {
+				return parseErr
+			}
+			manifest = &parsed
+		}
+		return nil
+	})
+	if err != nil {
+		return model.PhysicalSkillDefinition{}, err
+	}
+	snapshot, err := packaging.BuildSnapshot(s.authority, meta.PackageID, meta.Version, files)
+	if err != nil {
+		return model.PhysicalSkillDefinition{}, err
+	}
+	return model.PhysicalSkillDefinition{Metadata: meta, Manifest: manifest, Snapshot: snapshot}, nil
 }
 
 func (s *Source) readFull(root Root, dirName string) (model.Metadata, string, string, error) {
@@ -339,11 +445,20 @@ func (s *Source) resolveSkillFile(rootPath, dirName string, allowSymlink bool) (
 func isAllowedResource(resource model.ResourceID) bool {
 	value := filepath.ToSlash(strings.TrimSpace(string(resource)))
 	parts := strings.Split(value, "/")
-	if len(parts) < 3 {
+	if len(parts) < 2 {
 		return false
 	}
 	if parts[0] == "" || strings.Contains(parts[0], "..") {
 		return false
+	}
+	for _, part := range parts {
+		if part == "__pycache__" || strings.HasSuffix(strings.ToLower(part), ".pyc") {
+			return false
+		}
+	}
+	if len(parts) == 2 {
+		name := strings.ToLower(parts[1])
+		return name != "skill.md" && (strings.HasSuffix(name, ".md") || strings.HasSuffix(name, ".txt") || strings.HasSuffix(name, ".json"))
 	}
 	switch parts[1] {
 	case "references", "assets", "scripts":

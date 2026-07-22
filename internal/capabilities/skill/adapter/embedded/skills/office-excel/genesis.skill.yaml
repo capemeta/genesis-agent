@@ -1,0 +1,63 @@
+schema: genesis.skill/v1
+skill: office-excel
+runtime_profiles:
+  read:
+    sandbox: {execution_mode: per_call, backends: [remote_sandbox, local_platform_sandbox]}
+    dependencies:
+      runtime:
+        python:
+          - {name: openpyxl, import: openpyxl}
+          - {name: pandas, import: pandas}
+  work:
+    sandbox: {execution_mode: sandboxed_session, backends: [remote_sandbox, local_platform_sandbox]}
+    dependencies:
+      runtime:
+        python:
+          - {name: openpyxl, import: openpyxl}
+          - {name: pandas, import: pandas}
+          - {name: defusedxml, import: defusedxml}
+        system: [{name: libreoffice, command: soffice}]
+invocations:
+  - id: read
+    handle: office-excel-read
+    description: 提取并总结已有工作簿或表格的数据、公式和工作表结构，不编辑
+    agent_mode: {mode: main}
+    runtime_profile: read
+    request:
+      task: {required: false}
+      inputs:
+        min_items: 1
+        max_items: 1
+        access: read_only
+        accepted_suffixes: [.xlsx, .xlsm, .csv, .tsv]
+    prompt: {instructions: references/invocations/read.md, skill_body: omit}
+    tool_policy:
+      allow: [list_skill_resources, read_skill_resource, search_skill_resources, run_skill_command, install_skill_dependencies]
+      required: [run_skill_command]
+    result: {kind: message}
+  - id: work
+    handle: office-excel
+    description: 创建、编辑、计算、重构或检查电子表格
+    agent_mode: {mode: fork}
+    runtime_profile: work
+    request:
+      task: {required: true}
+      inputs:
+        min_items: 0
+        max_items: 16
+        access: read_only
+        accepted_suffixes: [.xlsx, .xlsm, .csv, .tsv, .txt, .json]
+    prompt: {instructions: references/invocations/work.md, skill_body: include}
+    tool_policy:
+      allow: [list_skill_resources, read_skill_resource, search_skill_resources, run_skill_command, install_skill_dependencies, read_file, write_file, edit_file, view_image, select_deliverable_candidate]
+      required: [run_skill_command, write_file, select_deliverable_candidate]
+    result:
+      kind: deliverables
+      deliverables:
+        - id: workbook
+          role: primary
+          required: true
+          cardinality: exactly_one
+          accepted_suffixes: [.xlsx]
+          accepted_mimes: [application/vnd.openxmlformats-officedocument.spreadsheetml.sheet]
+          delivery_policy: run-output

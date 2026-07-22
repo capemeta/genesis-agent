@@ -32,15 +32,16 @@ import (
 	"genesis-agent/internal/capabilities/filesystem/freshness"
 	fspermission "genesis-agent/internal/capabilities/filesystem/permission"
 	"genesis-agent/internal/capabilities/filesystem/tool/toolkit"
-	viewimage "genesis-agent/internal/capabilities/media/tool/view_image"
 	mcpstore "genesis-agent/internal/capabilities/mcp/adapter/store"
 	"genesis-agent/internal/capabilities/mcp/contract"
 	mcpstack "genesis-agent/internal/capabilities/mcp/stack"
+	viewimage "genesis-agent/internal/capabilities/media/tool/view_image"
 	policyapproval "genesis-agent/internal/capabilities/policy/adapter/approval"
 	policyconfig "genesis-agent/internal/capabilities/policy/adapter/config"
 	profilemodel "genesis-agent/internal/capabilities/profile/model"
 	sandboxhttp "genesis-agent/internal/capabilities/sandbox/adapter/http"
 	sandboxcontract "genesis-agent/internal/capabilities/sandbox/contract"
+	skillcontract "genesis-agent/internal/capabilities/skill/contract"
 	scriptservice "genesis-agent/internal/capabilities/skill/script/service"
 	toolcontract "genesis-agent/internal/capabilities/tool/contract"
 	"genesis-agent/internal/capabilities/tool/scheduler"
@@ -62,9 +63,9 @@ import (
 	promptbuilder "genesis-agent/internal/runtime/prompt"
 	enterprisemcp "genesis-agent/products/enterprise/internal/mcp"
 	"genesis-agent/products/enterprise/internal/profile"
-	"genesis-agent/shared/skillstack"
 	localfs "genesis-agent/shared/local/filesystem"
 	localresolver "genesis-agent/shared/local/pathresolver"
+	"genesis-agent/shared/skillstack"
 )
 
 func loadEnterpriseCapabilityIndex(adapters capcontract.RuntimeAdapterRegistry) (capcontract.Registry, error) {
@@ -121,6 +122,10 @@ type Dependencies struct {
 	Finalizer         artifactcontract.RequiredDeliverableFinalizer
 	Completion        artifactcontract.CompletionPolicy
 	QAEvidence        artifactcontract.QAEvidenceRecorder
+	Adoptions         artifactcontract.AdoptionStore
+	SkillBindings     skillcontract.InvocationBindingStore
+	SkillPackages     skillcontract.SkillPackageSnapshotStore
+	SubAgentStore     multicontract.InstanceStore
 }
 
 // ContainerOptions 描述 Enterprise 容器装配参数。
@@ -142,7 +147,7 @@ func (c *Container) Init(ctx context.Context) error {
 			c.initErr = fmt.Errorf("Enterprise 租户 RunManifestStore 未配置；禁止回退到进程内存或实例本地文件")
 			return
 		}
-		if c.deps.ProducedResources == nil || c.deps.RemoteSessions == nil || c.deps.Reservations == nil || c.deps.Deliverables == nil || c.deps.ArtifactRuns == nil || c.deps.Finalizer == nil || c.deps.Completion == nil || c.deps.QAEvidence == nil {
+		if c.deps.ProducedResources == nil || c.deps.RemoteSessions == nil || c.deps.Reservations == nil || c.deps.Deliverables == nil || c.deps.ArtifactRuns == nil || c.deps.Finalizer == nil || c.deps.Completion == nil || c.deps.QAEvidence == nil || c.deps.Adoptions == nil || c.deps.SkillBindings == nil || c.deps.SkillPackages == nil || c.deps.SubAgentStore == nil {
 			c.initErr = fmt.Errorf("Enterprise 租户 ProducedResource/Artifact 控制面未完整配置；禁止回退到实例本地文件或旧发布链")
 			return
 		}
@@ -205,21 +210,27 @@ func (c *Container) Init(ctx context.Context) error {
 			return
 		}
 		skillStack, err := skillstack.BuildEmbedded(skillstack.Options{
-			Product:               profilemodel.ChannelEnterprise,
-			Environment:           profilemodel.EnvironmentServer,
-			Approval:              approvalSvc,
-			Logger:                runtimeLogging.AgentLogger,
-			EnabledTools:          append([]string{}, prof.Tools.Enabled...),
-			EnablePreflight:       cfg.Skills.EnablePreflight,
-			AutoRetryAfterInstall: cfg.Skills.AutoRetryAfterInstall,
-			StateRoot:             workmodel.StateRoot{ID: "enterprise-workspace:" + execStack.WorkspaceRef.ID, Authority: "executor"},
-			Provisioner:           workspaceadapter.NewProvisioner(),
-			ProducedResources:     c.deps.ProducedResources,
-			RemoteSessions:        c.deps.RemoteSessions,
-			Reservations:          c.deps.Reservations,
-			Deliverables:          c.deps.Deliverables,
-			Finalizer:             c.deps.Finalizer,
-			Exec:                  execStack,
+			Product:                profilemodel.ChannelEnterprise,
+			Environment:            profilemodel.EnvironmentServer,
+			Approval:               approvalSvc,
+			Logger:                 runtimeLogging.AgentLogger,
+			EnabledTools:           append([]string{}, prof.Tools.Enabled...),
+			EnablePreflight:        cfg.Skills.EnablePreflight,
+			AutoRetryAfterInstall:  cfg.Skills.AutoRetryAfterInstall,
+			StateRoot:              workmodel.StateRoot{ID: "enterprise-workspace:" + execStack.WorkspaceRef.ID, Authority: "executor"},
+			Provisioner:            workspaceadapter.NewProvisioner(),
+			ProducedResources:      c.deps.ProducedResources,
+			RemoteSessions:         c.deps.RemoteSessions,
+			Reservations:           c.deps.Reservations,
+			Deliverables:           c.deps.Deliverables,
+			Finalizer:              c.deps.Finalizer,
+			QAEvidence:             c.deps.QAEvidence,
+			BindingStore:           c.deps.SkillBindings,
+			PackageStore:           c.deps.SkillPackages,
+			RunInitializer:         c.deps.ArtifactRuns,
+			LocalSandboxAvailable:  cfg.Sandbox.Local.Enabled,
+			RemoteSandboxAvailable: cfg.Sandbox.Remote.Enabled && execStack.SessionClient != nil,
+			Exec:                   execStack,
 		})
 		if err != nil {
 			_ = runtimeLogging.Close()
@@ -233,7 +244,7 @@ func (c *Container) Init(ctx context.Context) error {
 		if skillStack.PromptInjector != nil {
 			injectors = append(injectors, skillStack.PromptInjector)
 		}
-		runWorkspace, err := buildEnterpriseRunWorkspace(execStack.WorkspaceRef.ID, c.deps.RunManifests, c.deps.ArtifactRuns, c.deps.Completion, c.deps.QAEvidence)
+		runWorkspace, err := buildEnterpriseRunWorkspace(execStack.WorkspaceRef.ID, c.deps.RunManifests, c.deps.ArtifactRuns, c.deps.Completion, c.deps.QAEvidence, c.deps.Adoptions)
 		if err != nil {
 			c.closeSkillStack()
 			_ = runtimeLogging.Close()
@@ -252,19 +263,19 @@ func (c *Container) Init(ctx context.Context) error {
 			extraTools = append(extraTools, viewTool)
 		}
 		c.bundle, c.initErr = shared.BuildAgentService(ctx, shared.BuildOptions{
-			Product:                    "enterprise",
-			ConfigDir:                  configDir,
-			Quiet:                      c.quiet,
-			RouteName:                  "chat",
-			DefaultAgentID:             "enterprise-default-agent",
-			DefaultAgentName:           "Genesis Enterprise Agent",
-			Profile:                    prof,
-			RunWorkspace:               runWorkspace,
-			AdditionalTools:            extraTools,
-			PromptInjectors:            injectors,
-			Logger:                     runtimeLogging.AgentLogger,
-			AuditSink:                  auditSink,
-			UsageSink:                  usageSink,
+			Product:          "enterprise",
+			ConfigDir:        configDir,
+			Quiet:            c.quiet,
+			RouteName:        "chat",
+			DefaultAgentID:   "enterprise-default-agent",
+			DefaultAgentName: "Genesis Enterprise Agent",
+			Profile:          prof,
+			RunWorkspace:     runWorkspace,
+			AdditionalTools:  extraTools,
+			PromptInjectors:  injectors,
+			Logger:           runtimeLogging.AgentLogger,
+			AuditSink:        auditSink,
+			UsageSink:        usageSink,
 			// Enterprise 不落 shared/local；进程内 ModeStore / PlanDocuments，后续可换 DB。
 			CollabStore:                runtimecollab.NewMemoryStore(),
 			PlanDocuments:              runtimecollab.NewMemoryPlanDocuments(),
@@ -272,6 +283,7 @@ func (c *Container) Init(ctx context.Context) error {
 			SkillMentionSelector:       skillStack.SkillMentionSelector,
 			SkillExplicitLoader:        skillStack.SkillExplicitLoader,
 			SubAgentMaxConcurrent:      3,
+			SubAgentStore:              c.deps.SubAgentStore,
 			SubAgentDelegationPosture:  "explicit_request_only",
 			SubAgentProjection:         multiprojection.NewMemorySink(multiagentmodel.ProjectionChannelEnterprise),
 			SubAgentCapabilityRegistry: capabilityRegistry,
@@ -344,6 +356,7 @@ func (c *Container) Init(ctx context.Context) error {
 	})
 	return c.initErr
 }
+
 
 // Service 返回初始化后的 AgentService。
 func (c *Container) Service() app.AgentService {
@@ -437,7 +450,7 @@ func buildEnterpriseApproval(policyCfg platformconfig.PolicyConfig, log logger.L
 	return approvalservice.New(policyEngine, headlessAskApprover{}, approvalmemory.NewStore(), log, approvalservice.WithAuditSink(auditSink))
 }
 
-func buildEnterpriseRunWorkspace(workspaceID string, manifests workspacecontract.RunManifestStore, artifactRuns artifactcontract.RunInitializer, completion artifactcontract.CompletionPolicy, qaEvidence artifactcontract.QAEvidenceRecorder) (app.RunWorkspaceRuntime, error) {
+func buildEnterpriseRunWorkspace(workspaceID string, manifests workspacecontract.RunManifestStore, artifactRuns artifactcontract.RunInitializer, completion artifactcontract.CompletionPolicy, qaEvidence artifactcontract.QAEvidenceRecorder, adoptions artifactcontract.AdoptionStore) (app.RunWorkspaceRuntime, error) {
 	if manifests == nil {
 		return app.RunWorkspaceRuntime{}, fmt.Errorf("Enterprise 租户 RunManifestStore 未配置")
 	}
@@ -461,7 +474,7 @@ func buildEnterpriseRunWorkspace(workspaceID string, manifests workspacecontract
 	if err != nil {
 		return app.RunWorkspaceRuntime{}, err
 	}
-	return app.RunWorkspaceRuntime{Preparer: preparer, AgentApps: appResolver, IntentResolver: workservice.NewTaskIntentResolver(), ProductModes: modes, BackendModes: modes, MaximumAccess: execmodel.WorkspaceAccessReadWrite, ArtifactRuns: artifactRuns, Completion: completion, QAEvidence: qaEvidence}, nil
+	return app.RunWorkspaceRuntime{Preparer: preparer, AgentApps: appResolver, IntentResolver: workservice.NewTaskIntentResolver(), ProductModes: modes, BackendModes: modes, MaximumAccess: execmodel.WorkspaceAccessReadWrite, ArtifactRuns: artifactRuns, Completion: completion, QAEvidence: qaEvidence, Adoptions: adoptions}, nil
 }
 
 // buildEnterpriseExecStack 只允许远程受治理执行；未配置时保留拒绝型 runner 使服务可启动，

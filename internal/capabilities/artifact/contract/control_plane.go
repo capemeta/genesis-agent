@@ -3,6 +3,7 @@ package contract
 import (
 	"context"
 	"errors"
+	"time"
 
 	artifactmodel "genesis-agent/internal/capabilities/artifact/model"
 )
@@ -87,14 +88,15 @@ type CompletionPolicy interface {
 type DeclaredDeliverable struct {
 	ID             string   `json:"id,omitempty"`
 	Required       bool     `json:"required"`
+	Cardinality    string   `json:"cardinality"`
 	Role           string   `json:"role,omitempty"`
 	DesiredName    string   `json:"desired_name,omitempty"`
 	AcceptedMIMEs  []string `json:"accepted_mimes,omitempty"`
 	AcceptedSuffix []string `json:"accepted_suffixes,omitempty"`
 	QAPolicy       string   `json:"qa_policy,omitempty"`
 	// QAEnforcement 空/optional=不因 QA 阻塞完成；仅 required 硬卡。
-	QAEnforcement  string   `json:"qa_enforcement,omitempty"`
-	DeliveryPolicy string   `json:"delivery_policy,omitempty"`
+	QAEnforcement  string `json:"qa_enforcement,omitempty"`
+	DeliveryPolicy string `json:"delivery_policy,omitempty"`
 }
 
 // RunInitializationRequest 是 App 控制面在 Run 创建后提交的可信任务事实。
@@ -118,7 +120,10 @@ type RunInitializer interface {
 }
 
 type RunInitializerFunc func(context.Context, RunInitializationRequest) error
-func (f RunInitializerFunc) InitializeRun(ctx context.Context, req RunInitializationRequest) error { return f(ctx, req) }
+
+func (f RunInitializerFunc) InitializeRun(ctx context.Context, req RunInitializationRequest) error {
+	return f(ctx, req)
+}
 
 // RequiredDeliverableFinalizer 由 Harness 调用；自动选择只允许唯一匹配。
 type RequiredDeliverableFinalizer interface {
@@ -126,23 +131,35 @@ type RequiredDeliverableFinalizer interface {
 	SelectAndFinalize(context.Context, string, string, string, string) (artifactmodel.DeliveryResult, error)
 }
 
-type QAPassRequest struct {
-	TenantID  string
-	RunID     string
-	PolicyID  string
-	Validator string
-}
-
-type QADegradeRequest struct {
+type QAOutcomeRequest struct {
 	TenantID    string
 	RunID       string
 	PolicyID    string
 	Validator   string
 	FailureCode string
-	Status      string // degraded | skipped；空则 degraded
+	Status      artifactmodel.QAEvidenceStatus
 }
 
 type QAEvidenceRecorder interface {
-	RecordPassed(context.Context, QAPassRequest) error
-	RecordDegraded(context.Context, QADegradeRequest) error
+	RecordOutcome(context.Context, QAOutcomeRequest) error
+}
+
+// AdoptionRecord 是父 Run 对子 Run 已交付产物的显式、版本锁定接纳事实。
+type AdoptionRecord struct {
+	ConsumerTenantID string    `json:"consumer_tenant_id"`
+	ConsumerRunID    string    `json:"consumer_run_id"`
+	ProducedID       string    `json:"produced_id"`
+	OwnerTenantID    string    `json:"owner_tenant_id"`
+	OwnerRunID       string    `json:"owner_run_id"`
+	AgentID          string    `json:"agent_id,omitempty"`
+	ContentHash      string    `json:"content_hash,omitempty"`
+	Role             string    `json:"role,omitempty"`
+	CreatedAt        time.Time `json:"created_at"`
+}
+
+// AdoptionStore 由每个租户/工作空间控制面独立注入，禁止使用进程级可变单例。
+type AdoptionStore interface {
+	Adopt(AdoptionRecord) (AdoptionRecord, error)
+	Resolve(consumerTenantID, consumerRunID, producedID string) (AdoptionRecord, bool)
+	ListByConsumer(consumerTenantID, consumerRunID string) []AdoptionRecord
 }

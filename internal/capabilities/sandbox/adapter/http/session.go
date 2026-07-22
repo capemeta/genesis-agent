@@ -26,7 +26,7 @@ func (c *Client) OpenSession(ctx context.Context, opts sandboxcontract.SessionOp
 	if c == nil {
 		return nil, execcontract.NewError(execcontract.ErrCodeSandboxUnavailable, fmt.Errorf("sandbox http client未初始化"))
 	}
-	progress.Emit(ctx, progress.Event{Kind: progress.KindSandbox, Phase: progress.PhaseStart, Component: "genesis-sandbox", Name: string(opts.Sandbox.RuntimeProfile), Summary: "创建 sandbox session"})
+	progress.Emit(ctx, progress.Event{Kind: progress.KindSandbox, Phase: progress.PhaseStart, Component: "genesis-sandbox", Name: string(opts.Sandbox.RuntimeProfile), Summary: "创建远程容器沙箱 session (genesis-sandbox)"})
 	payload := createSessionRequestFromOptions(opts)
 	var body bytes.Buffer
 	if err := json.NewEncoder(&body).Encode(payload); err != nil {
@@ -34,7 +34,7 @@ func (c *Client) OpenSession(ctx context.Context, opts sandboxcontract.SessionOp
 	}
 	var record sessionRecord
 	if err := c.doJSON(ctx, http.MethodPost, "/v1/sessions", &body, &record); err != nil {
-		progress.Emit(ctx, progress.Event{Kind: progress.KindSandbox, Phase: progress.PhaseError, Level: progress.LevelError, Component: "genesis-sandbox", Summary: "sandbox session创建失败", Detail: err.Error()})
+		progress.Emit(ctx, progress.Event{Kind: progress.KindSandbox, Phase: progress.PhaseError, Level: progress.LevelError, Component: "genesis-sandbox", Summary: "远程容器沙箱 session 创建失败", Detail: err.Error()})
 		return nil, err
 	}
 	if strings.TrimSpace(record.SessionID) == "" {
@@ -84,7 +84,7 @@ func (c *Client) OpenSession(ctx context.Context, opts sandboxcontract.SessionOp
 		defer session.renewWG.Done()
 		c.sessionRenewLoop(renewCtx, session)
 	}()
-	progress.Emit(ctx, progress.Event{Kind: progress.KindSandbox, Phase: progress.PhaseComplete, Component: "genesis-sandbox", Name: record.SessionID, Summary: "sandbox session已就绪（可为休眠态）"})
+	progress.Emit(ctx, progress.Event{Kind: progress.KindSandbox, Phase: progress.PhaseComplete, Component: "genesis-sandbox", Name: record.SessionID, Summary: "远程容器沙箱 session 已就绪（genesis-sandbox）"})
 	return session, nil
 }
 

@@ -65,15 +65,16 @@ type DeliverableSpec struct {
 	TenantID       string          `json:"tenant_id"`
 	RunID          string          `json:"run_id"`
 	Required       bool            `json:"required"`
+	Cardinality    string          `json:"cardinality"`
 	Role           DeliverableRole `json:"role"`
 	DesiredName    string          `json:"desired_name,omitempty"`
 	AcceptedMIMEs  []string        `json:"accepted_mimes,omitempty"`
 	AcceptedSuffix []string        `json:"accepted_suffixes,omitempty"`
 	QAPolicy       string          `json:"qa_policy,omitempty"`
 	// QAEnforcement 控制 QAPolicy 是否阻塞完成：空/optional=不限制；仅 required 必须 passed。
-	QAEnforcement  string          `json:"qa_enforcement,omitempty"`
-	DeliveryPolicy string          `json:"delivery_policy"`
-	CreatedAt      time.Time       `json:"created_at"`
+	QAEnforcement  string    `json:"qa_enforcement,omitempty"`
+	DeliveryPolicy string    `json:"delivery_policy"`
+	CreatedAt      time.Time `json:"created_at"`
 }
 
 // IsRequiredEnforcement 仅当显式声明 required 时为真；空/optional/其它均不限制。
@@ -87,6 +88,9 @@ func (v DeliverableSpec) Validate() error {
 	}
 	if v.Role != DeliverableRolePrimary && v.Role != DeliverableRoleSupporting {
 		return fmt.Errorf("deliverable role 无效: %q", v.Role)
+	}
+	if v.Cardinality != "" && v.Cardinality != "exactly_one" && v.Cardinality != "zero_or_one" {
+		return fmt.Errorf("deliverable cardinality无效: %q", v.Cardinality)
 	}
 	if strings.ContainsAny(v.DesiredName, "/\\\x00") {
 		return fmt.Errorf("desired name 必须是文件名")
@@ -222,9 +226,9 @@ type ArtifactPublicationRecord struct {
 	Status             PublicationStatus `json:"status"`
 	FailureCode        string            `json:"failure_code,omitempty"`
 	// FailureValidator / FailureReason 仅 Gate 拒绝时可选写入，供 Run 历史与失败诊断；Validate 不强制。
-	FailureValidator string `json:"failure_validator,omitempty"`
-	FailureReason    string `json:"failure_reason,omitempty"`
-	Revision         uint64 `json:"revision"`
+	FailureValidator string    `json:"failure_validator,omitempty"`
+	FailureReason    string    `json:"failure_reason,omitempty"`
+	Revision         uint64    `json:"revision"`
 	CreatedAt        time.Time `json:"created_at"`
 	UpdatedAt        time.Time `json:"updated_at"`
 }

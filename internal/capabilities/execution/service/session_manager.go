@@ -264,7 +264,6 @@ func (m *SessionManager) GetSessionStatus(ctx context.Context, sessionID string)
 	return s.Status, true, nil
 }
 
-
 // ── 内部多路复用广播器实现（带丢弃背压机制） ────────────────────────
 
 type subscriber struct {

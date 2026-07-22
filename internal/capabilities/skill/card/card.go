@@ -143,9 +143,6 @@ func TemplateDataFromMetadata(meta model.Metadata, owner, license, version strin
 		version = firstNonEmpty(meta.Version, "0.1.0")
 	}
 	dependencyHint := "None declared."
-	if len(meta.AllowedTools) > 0 {
-		dependencyHint = "Allowed tools: " + strings.Join(meta.AllowedTools, ", ") + "."
-	}
 	return TemplateData{
 		SkillName:        meta.Name,
 		Description:      meta.Description,

@@ -45,9 +45,9 @@ import (
 	"genesis-agent/internal/capabilities/tool/gateway"
 	"genesis-agent/internal/capabilities/tool/scheduler"
 	toolvalidation "genesis-agent/internal/capabilities/tool/validation"
-	"genesis-agent/internal/capabilities/turninput"
 	consoletrace "genesis-agent/internal/capabilities/trace/adapter"
 	tracecontract "genesis-agent/internal/capabilities/trace/contract"
+	"genesis-agent/internal/capabilities/turninput"
 	usagememory "genesis-agent/internal/capabilities/usage/adapter/memory"
 	usagecontract "genesis-agent/internal/capabilities/usage/contract"
 	"genesis-agent/internal/domain"
@@ -434,6 +434,9 @@ func BuildAgentService(ctx context.Context, opts BuildOptions) (*RuntimeBundle, 
 		react.WithContextBudgetConfig(effectiveContextRatio, resolvedLLM.OutputReserveTokens),
 		react.WithEffectiveVisionMode(visionMode),
 		react.WithCollabStore(collabStore),
+	}
+	if resolver, ok := opts.SkillExplicitLoader.(react.SkillInvocationBindingResolver); ok {
+		engineOpts = append(engineOpts, react.WithSkillInvocationBindingResolver(resolver))
 	}
 	turnOpts := turninput.DefaultOptionsForProduct(product)
 	if strings.TrimSpace(opts.WorkspaceRoot) != "" {

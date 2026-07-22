@@ -6,8 +6,6 @@ import (
 	"regexp"
 	"strings"
 	"time"
-
-	profilemodel "genesis-agent/internal/capabilities/profile/model"
 )
 
 const (
@@ -70,51 +68,13 @@ type PackageID string
 // ResourceID 是 Skill 包内不透明资源 ID。
 type ResourceID string
 
-// ContextMode 描述 Skill 注入方式。
-type ContextMode string
+// AgentMode 描述 Skill Invocation 的 Agent 运行模式。
+type AgentMode string
 
 const (
-	ContextModeInline ContextMode = "inline"
-	ContextModeFork   ContextMode = "fork"
+	AgentModeMain AgentMode = "main"
+	AgentModeFork AgentMode = "fork"
 )
-
-// Policy 描述 Skill 选择和可见性策略。
-type Policy struct {
-	AllowImplicitInvocation *bool                      `json:"allow_implicit_invocation,omitempty"`
-	Products                []profilemodel.ChannelType `json:"products,omitempty"`
-	DisableModelInvocation  bool                       `json:"disable_model_invocation,omitempty"`
-}
-
-// AllowsImplicitInvocation 返回是否允许隐式调用。
-func (p Policy) AllowsImplicitInvocation() bool {
-	if p.AllowImplicitInvocation == nil {
-		return true
-	}
-	return *p.AllowImplicitInvocation
-}
-
-// MatchesProduct 判断 Skill 是否适用于当前产品。
-func (p Policy) MatchesProduct(channel profilemodel.ChannelType) bool {
-	if len(p.Products) == 0 {
-		return true
-	}
-	for _, product := range p.Products {
-		if product == channel {
-			return true
-		}
-	}
-	return false
-}
-
-// Interface 描述 UI 展示和默认提示。
-type Interface struct {
-	DisplayName      string `json:"display_name,omitempty"`
-	ShortDescription string `json:"short_description,omitempty"`
-	IconSmall        string `json:"icon_small,omitempty"`
-	IconLarge        string `json:"icon_large,omitempty"`
-	BrandColor       string `json:"brand_color,omitempty"`
-	DefaultPrompt    string `json:"default_prompt,omitempty"`
-}
 
 // Dependencies 描述 Skill 依赖。
 type Dependencies struct {
@@ -189,35 +149,21 @@ func NormalizeResourceLocator(value string) string {
 	return value
 }
 
-// Metadata 是发现阶段暴露给模型和 UI 的 Skill 摘要。
+// Metadata 是 Source 发现阶段的标准物理 Skill 摘要。
+// 这里只保留可移植 SKILL.md 身份和来源事实；运行、权限、依赖、QA 与交付语义
+// 必须来自 RuntimeManifest / InvocationBinding。
 type Metadata struct {
-	ID                string            `json:"id"`
-	Name              string            `json:"name"`
-	QualifiedName     string            `json:"qualified_name"`
-	Description       string            `json:"description"`
-	ShortDescription  string            `json:"short_description,omitempty"`
-	Scope             Scope             `json:"scope"`
-	Authority         Authority         `json:"authority"`
-	PackageID         PackageID         `json:"package_id"`
-	MainResource      ResourceID        `json:"main_resource"`
-	DisplayPath       string            `json:"display_path,omitempty"`
-	Version           string            `json:"version,omitempty"`
-	Enabled           bool              `json:"enabled"`
-	PromptVisible     bool              `json:"prompt_visible"`
-	Policy            Policy            `json:"policy,omitempty"`
-	Interface         Interface         `json:"interface,omitempty"`
-	Dependencies      Dependencies      `json:"dependencies,omitempty"`
-	// Requires 声明运行所需能力门槛；仅 enforcement=required 会在加载时硬拒绝。
-	Requires []CapabilityRequirement `json:"requires,omitempty"`
-	// QA 是交付结账侧的可选质量策略声明；仅 enforcement=required 会阻塞完成。
-	QA                QADeclaration     `json:"qa,omitempty"`
-	AllowedTools      []string          `json:"allowed_tools,omitempty"`
-	Context           ContextMode       `json:"context,omitempty"`
-	Agent             string            `json:"agent,omitempty"`
-	Model             string            `json:"model,omitempty"`
-	MaxThinkingTokens int               `json:"max_thinking_tokens,omitempty"`
-	SourceRef         map[string]string `json:"source_ref,omitempty"`
-	UpdatedAt         time.Time         `json:"updated_at,omitempty"`
+	ID            string     `json:"id"`
+	Name          string     `json:"name"`
+	Description   string     `json:"description"`
+	Scope         Scope      `json:"scope"`
+	Authority     Authority  `json:"authority"`
+	PackageID     PackageID  `json:"package_id"`
+	MainResource  ResourceID `json:"main_resource"`
+	DisplayPath   string     `json:"display_path,omitempty"`
+	BaseDirectory string     `json:"-"`
+	Version       string     `json:"version,omitempty"`
+	UpdatedAt     time.Time  `json:"updated_at,omitempty"`
 }
 
 // Enforcement 描述能力/QA 门槛强度。
@@ -236,7 +182,7 @@ func IsRequiredEnforcement(value string) bool {
 
 // CapabilityRequirement 是技能启动前的能力门槛（如 vision）。
 type CapabilityRequirement struct {
-	Kind        string `json:"kind" yaml:"kind"`               // 如 vision
+	Kind        string `json:"kind" yaml:"kind"`                         // 如 vision
 	Enforcement string `json:"enforcement,omitempty" yaml:"enforcement"` // required | optional（默认）
 	Description string `json:"description,omitempty" yaml:"description"`
 }
@@ -249,20 +195,11 @@ type QADeclaration struct {
 
 // Normalize 填充默认值。
 func (m Metadata) Normalize() Metadata {
-	if m.QualifiedName == "" {
-		m.QualifiedName = m.Name
-	}
 	if m.ID == "" {
 		m.ID = m.Authority.String() + ":" + string(m.PackageID)
 	}
 	if m.MainResource == "" {
 		m.MainResource = ResourceID(string(m.PackageID) + "/SKILL.md")
-	}
-	if m.Context == "" {
-		m.Context = ContextModeInline
-	}
-	if m.ShortDescription == "" {
-		m.ShortDescription = m.Interface.ShortDescription
 	}
 	return m
 }
@@ -286,20 +223,17 @@ type Error struct {
 	Message string    `json:"message"`
 }
 
-// Catalog 是某一上下文下的 Skill 快照。
-type Catalog struct {
-	Entries  []Metadata `json:"entries"`
-	Errors   []Error    `json:"errors,omitempty"`
-	Warnings []string   `json:"warnings,omitempty"`
-}
+// Catalog 是某一上下文下的 Invocation 快照。
+type Catalog = InvocationCatalog
 
 // Injection 是加载 Skill 主体后的注入片段。
 type Injection struct {
-	Skill     Metadata   `json:"skill"`
-	Resource  ResourceID `json:"resource"`
-	Contents  string     `json:"contents"`
-	Args      string     `json:"args,omitempty"`
-	Truncated bool       `json:"truncated"`
+	Skill     InvocationMetadata `json:"skill"`
+	Binding   InvocationBinding  `json:"binding"`
+	Resource  ResourceID         `json:"resource"`
+	Contents  string             `json:"contents"`
+	Args      string             `json:"args,omitempty"`
+	Truncated bool               `json:"truncated"`
 }
 
 // ResourceContent 是 Skill 包内资源读取结果。

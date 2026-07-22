@@ -22,7 +22,7 @@ func TestSourceListReadSearch(t *testing.T) {
 		t.Fatal(err)
 	}
 	list, err := source.List(context.Background(), contract.ListQuery{})
-	if err != nil || len(list.Entries) != 1 {
+	if err != nil || len(list.Packages) != 1 {
 		t.Fatalf("list=%+v err=%v", list, err)
 	}
 	read, err := source.Read(context.Background(), contract.ReadRequest{PackageID: "review"})
@@ -65,8 +65,8 @@ func TestSystemFSIncludesSkillCreator(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, entry := range listed.Entries {
-		if entry.Name == "skill-creator" {
+	for _, entry := range listed.Packages {
+		if entry.Metadata.Name == "skill-creator" {
 			return
 		}
 	}
@@ -92,17 +92,14 @@ func TestSystemFSIncludesOfficeSkills(t *testing.T) {
 		"office-ppt":   false,
 		"office-pdf":   false,
 	}
-	for _, entry := range listed.Entries {
-		if strings.HasPrefix(entry.Name, "_") {
-			t.Fatalf("shared package should not appear in catalog: %s", entry.Name)
+	for _, entry := range listed.Packages {
+		if strings.HasPrefix(entry.Metadata.Name, "_") {
+			t.Fatalf("shared package should not appear in catalog: %s", entry.Metadata.Name)
 		}
-		if _, ok := want[entry.Name]; ok {
-			want[entry.Name] = true
-			if len(entry.AllowedTools) == 0 {
-				t.Fatalf("%s missing allowed tools", entry.Name)
-			}
-			if len(entry.Dependencies.Tools) == 0 && len(entry.Dependencies.Runtime.Node) == 0 && len(entry.Dependencies.Runtime.Python) == 0 && len(entry.Dependencies.Runtime.System) == 0 {
-				t.Fatalf("%s missing dependencies", entry.Name)
+		if _, ok := want[entry.Metadata.Name]; ok {
+			want[entry.Metadata.Name] = true
+			if entry.Manifest == nil || len(entry.Manifest.Invocations) == 0 || len(entry.Manifest.RuntimeProfiles) == 0 {
+				t.Fatalf("%s missing runtime sidecar", entry.Metadata.Name)
 			}
 		}
 	}

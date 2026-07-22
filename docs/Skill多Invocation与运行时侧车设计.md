@@ -1,13 +1,16 @@
 # Skill 多 Invocation 与运行时侧车设计
 
-> 状态：待实现（破坏式重构，不兼容旧 Genesis Skill 扩展字段）  
-> 日期：2026-07-22  
-> 适用范围：Genesis Agent 的内置、安装式及第三方 Skill 运行时  
-> 首个落地对象：`office-ppt`
+> 状态：核心链路已实现并通过三轮审查（破坏式重构，不兼容旧 Genesis Skill 扩展字段）
+>
+> 日期：2026-07-22
+>
+> 适用范围：Genesis Agent 的内置、安装式及第三方 Skill 运行时
+>
+> 已落地对象：`office-ppt`、`office-word`、`office-excel`、`office-pdf`
 
 ## 1. 背景与目标
 
-当前一个物理 Skill 只能暴露一套全局运行属性。以 `office-ppt` 为例：读取 PPT 只需要一次轻量文本提取，但创建、编辑、渲染和视觉检查需要子 Run、远程沙箱会话、多轮脚本执行和交付门禁。把整个 Skill 固定为 `context: fork` 会导致读取任务也承担完整工作链路的成本；拆成两个物理 Skill 又会复制 `SKILL.md`、脚本和依赖知识，形成长期漂移。
+旧实现中一个物理 Skill 只能暴露一套全局运行属性。以 `office-ppt` 为例：读取 PPT 只需要一次轻量文本提取，但创建、编辑、渲染和视觉检查需要子 Run、远程沙箱会话、多轮脚本执行和交付门禁。把整个 Skill 固定为 `context: fork` 会导致读取任务也承担完整工作链路的成本；拆成两个物理 Skill 又会复制 `SKILL.md`、脚本和依赖知识，形成长期漂移。
 
 本方案引入 **一个物理 Skill、多个逻辑 Invocation、一个 Genesis 运行时侧车文件**：
 
@@ -76,8 +79,6 @@ genesis.skill.yaml
 
 模型调用保持简单：
 
-```text
-
 模型侧固定网关只保留三个业务参数：
 
 ```text
@@ -90,7 +91,8 @@ Skill(skill, task?, inputs?)
 
 禁止从自然语言或工作区扫描猜测文件名；用户附件可以由产品层预绑定为可选输入，但进入 Invocation 前必须转成带版本/hash 的明确 ResourceRef。
 
-Skill(skill="office-ppt-read")
+```text
+Skill(skill="office-ppt-read", inputs=["report.pptx"])
 ```
 
 或：
@@ -137,7 +139,7 @@ office-ppt/
 - `requires`；
 - `qa`；
 - DeliverableSpec；
-- agent/model 选择与预算；
+- agent/model 选择；预算只允许作为 `cognition` 的受限请求；
 - 产品、租户和角色策略；
 - 具体 runtime profile、镜像、endpoint 或 credential。
 
@@ -179,8 +181,10 @@ skill: office-ppt
 runtime_profiles:
   read:
     sandbox:
-      required: true
       execution_mode: per_call
+      backends:
+        - remote_sandbox
+        - local_platform_sandbox
     dependencies:
       runtime:
         python:
@@ -189,8 +193,10 @@ runtime_profiles:
 
   work:
     sandbox:
-      required: true
       execution_mode: sandboxed_session
+      backends:
+        - remote_sandbox
+        - local_platform_sandbox
     dependencies:
       runtime:
         python:
@@ -213,8 +219,7 @@ invocations:
   - id: read
     handle: office-ppt-read
     description: 提取并总结已有 PPT 的文字、备注和表格，不渲染、不编辑
-    cognition:
-      mode: inline
+    agent_mode: main
     runtime_profile: read
     request:
       task:
@@ -244,8 +249,7 @@ invocations:
   - id: work
     handle: office-ppt
     description: 创建、编辑、渲染或视觉检查 PPT；不要用于只读提取或摘要
-    cognition:
-      mode: fork
+    agent_mode: fork
     runtime_profile: work
     request:
       task:
@@ -298,7 +302,7 @@ invocations:
 
 `tool_policy.required` 声明该 Invocation 启动所必需的 Tool；它必须是 `allow` 的子集。`view_image` 对 optional 视觉 QA 不是启动必需项，因此只在 allow 中；`run_skill_command` 等核心执行原语缺失时必须 fail closed。
 
-`cognition` 可扩展声明目标 agent/model 和 timeout、turn、token、tool-call 预算请求，但只能被产品策略进一步收紧。它们不进入模型的 `Skill` 参数；未声明时使用产品默认执行计划。
+`cognition` 只声明 `inline|fork` 及 timeout、turn、token、tool-call 预算请求，并且只能被产品策略进一步收紧。目标模型、Router 和 Agent 由平台执行计划决定，不允许 Skill 包自行指定。它们都不进入模型的 `Skill` 参数；未声明预算时使用产品默认值。
 
 `office-ppt/work` 不声明 `requires: vision`。没有视觉模型时，它仍然可以生成 PPT、做内容检查和渲染证明，只是不能声称已完成真正的视觉 QA。
 
@@ -320,7 +324,7 @@ requires:
 
 - 在创建子 Run、打开沙箱、安装依赖之前检查；
 - Runtime 必须先解析目标执行计划，再检查实际执行者的 EffectiveVisionMode；
-- inline 检查当前 Run 的主模型或 `router.vision`，fork 检查目标子 Agent/model/router；
+- inline 检查当前 Run 的有效视觉模式，fork 检查目标子执行计划的有效视觉模式；
 - 至少一条真实视觉路径必须声明 `supports_image=true`；
 - 无视觉能力时拒绝启动 Invocation；
 - 返回稳定错误码 `SKILL_CAPABILITY_REQUIRED`；
@@ -371,33 +375,32 @@ qa:
 
 `visual-qa/v1=passed` 必须来自真实视觉能力和可校验的结构化断言：
 
+- 主模型具备图像输入能力并输出符合协议的 checklist；或
+- Runtime 的 VisionExpert 通过 `router.vision` 完成检查并返回结构化结论。
+
 ### 5.5 QA 与交付顺序
 
-QA 必须绑定候选产物的不可变版本/hash，并在正式 Delivery 前完成决策：
+QA 必须绑定候选产物的不可变版本/hash，并在对用户可见的 Delivery 前完成决策。这里将 Publication 明确定义为内部不可变 Artifact 提交，不等于外部交付：
 
 ```text
 Produced candidate
   → 类型、二进制和 OOXML Gate
-  → 固定 subject version/hash
-  → content/render/visual QA
-  → required QA 通过，或 optional QA 明确 passed/skipped/degraded
   → Selection
-  → Publication Commit
+  → 内部 Publication Commit，固定 subject version/hash
+  → content/render/visual QA 形成精确版本证据
+  → required QA passed，或 optional QA 明确 passed/failed/skipped/degraded
   → Delivery
   → Completion
 ```
 
-禁止先把未通过 required QA 的产物交付给用户，再仅仅阻止 Run 进入 completed。若现有数据模型要求 `PublicationID` 才能写 QA，应引入 provisional publication 或允许 QA 先绑定 subject version/hash，不能倒置质量门禁。
+禁止先把未通过 required QA 的产物交付给用户，再仅仅阻止 Run 进入 completed。内部 Publication Commit 只用于生成不可变 Artifact、`PublicationID`、subject version/hash 和 QA 锚点，不产生用户可见文件；`DeliveryService` 会独立重验 QA 证据，不能只依赖上游 Finalizer。
 
 optional QA 也必须形成确定性记录：
 
 - 有视觉能力且执行成功：`passed`；
 - 有视觉能力但检查失败：`failed`，允许交付但必须披露缺陷；
 - 无视觉能力：`skipped` 或 `degraded`，`failure_code=vision_unavailable`；
-- Runtime 在 Finalize 前自动写入，不依赖模型自觉记账。
-
-- 主模型具备图像输入能力并输出符合协议的 checklist；或
-- Runtime 的 VisionExpert 通过 `router.vision` 完成检查并返回结构化结论。
+- Runtime 在外部 Delivery 前自动写入或由真实视觉检查桥接写入，不依赖模型用自然语言自觉记账；缺少确定性 outcome 时不得绕过 Delivery。
 
 以下证据均不能冒充视觉 QA 通过：
 
@@ -411,55 +414,50 @@ optional QA 也必须形成确定性记录：
 
 ## 6. Sandbox 与 Runtime Profile 分层
 
-### 6.1 侧车声明内在最低约束
+### 6.1 侧车声明 Backend 优先级与生命周期
 
-侧车只声明 Invocation 自身的最低执行要求：
-
-```yaml
-sandbox:
-  required: true
-  execution_mode: sandboxed_session
-```
-
-- `required`：必须在受控沙箱中执行；
-- `per_call`：每条离散命令独立绑定执行环境；
-- `sandboxed_session`：多轮命令复用同一受控工作区和 session。
-
-侧车是约束来源，不是授权来源。产品、租户、用户和 Run 策略与侧车按约束求交/取更严格值，禁止使用“后者整对象覆盖前者”的普通配置合并。
-
-### 6.2 产品配置决定部署拓扑
-
-以下配置属于 `configs/config.yaml` 或产品 bootstrap：
-
-- `preferred_backend` 和是否允许后端降级；
-- remote endpoint、API key、workspace；
-- 具体镜像和 Runtime Profile 映射；
-- 租户、环境、产品、角色和审批策略。
-
-新配置直接按 Invocation handle 覆盖，不保留旧 Skill 级双读：
+侧车通过 `sandbox` 节点声明 Invocation 的物理后端优先级与生命周期模式：
 
 ```yaml
 sandbox:
-  invocations_override:
-    office-ppt-read:
-      preferred_backend: local_platform_sandbox
-      allow_degradation: false
-    office-ppt:
-      preferred_backend: remote_sandbox
-      allow_degradation: false
+  execution_mode: per_call              # per_call | sandboxed_session
+  backends:
+    - remote_sandbox
+    - local_platform_sandbox
 ```
 
-有效策略求解顺序是：
+- `execution_mode`：
+  - `per_call`：单次离散命令独立绑定执行环境，用完销毁，适用于无状态提取/转换任务（在远程容器、本地沙箱和宿主环境均天然支持）；
+  - `sandboxed_session`：多轮命令复用同一受控工作区和 session。
+- `backends`（有序优先级列表）：
+  - 数组顺序即降级顺序（如 `[remote_sandbox, local_platform_sandbox]`）；
+  - 数组包含 `local_host` 时表示允许降级至宿主直跑；不包含 `local_host` 时即表达强制沙箱（Fail-Closed）；
+  - 兼容兜底：对于未声明 `backends` 的旧侧车文件或无侧车 Skill，若 `required: true` 自动展开为 `[remote_sandbox, local_platform_sandbox]`，若 `required: false` 或完全无侧车自动展开为 `[remote_sandbox, local_platform_sandbox, local_host]`。
+
+### 6.2 动态选型与 Staging 严格对齐 (SelectedBackend & Staging Alignment)
+
+在命令执行前，运行时根据 `backends` 优先级列表与当前环境的物理后端可用性（`RemoteSandboxAvailable` / `LocalSandboxAvailable`）求出实际调用的物理后端 `SelectedBackend`：
+
+- 当 `SelectedBackend == "remote_sandbox"`：走向 `runRemote`，执行远程 Package Materialize，并通过 `stageInputManifestRemote` 将输入资源同步至远程容器工作区；
+- 当 `SelectedBackend == "local_platform_sandbox"` 或 `"local_host"`：走向 `runLocal`，在宿主机/本地沙箱目录 Materialize，并通过 `stageInputManifestLocal` stage 文件，同时通过 Windows/Linux 本地沙箱 ACL 显式赋予该 Skill 工作目录的读写权限。
+
+物理选中结果 `SelectedBackend` 完整记入 `EffectiveExecutionPolicy` 和审计 Trace，保证上层选型与下层物理 Staging/执行策略绝对对齐，杜绝环境与文件流转错位。
+
+### 6.3 统一与单一事实源 (SSOT)
+
+Invocation 后端选型完全基于 Skill 包内 `genesis.skill.yaml` 的 `backends` 数组声明，废除异地 `invocations_override` 配置以消除规则冲突。
+
+有效策略求解顺序为：
 
 ```text
-侧车最低约束
+侧车最低约束 backends 列表
   + 全局/产品/租户安全上限
   + Invocation deployment policy
-  + 当前 Run 权限与可用性
-  → EffectiveExecutionPolicy
+  + 当前 Run 动态物理可用性检测
+  → SelectedBackend & EffectiveExecutionPolicy
 ```
 
-普通配置只能加强约束或选择满足约束的后端，不能把 `sandbox.required=true` 降为无沙箱执行。若无法满足，应返回 `SKILL_RUNTIME_PROFILE_UNAVAILABLE`，不能静默直跑。
+若 `backends` 列表中所有支持的后端在当前环境中均不可用，系统返回 `SKILL_RUNTIME_PROFILE_UNAVAILABLE` 阻断，禁止静默旁路直跑。
 
 ### 6.3 RuntimeProfileResolver
 
@@ -512,7 +510,8 @@ Skill(skill, task?, inputs?)
   → 检查产品/租户/用户/角色可见性
   → 校验 task 与显式 ResourceRef 输入契约
   → 固定 SkillPackageSnapshot 和输入版本/hash
-  → 解析目标 cognition、agent/model/router、预算与 Runtime Profile
+  → 将完整原始 Skill 包写入 package-digest 内容寻址存储（CAS）
+  → 解析 cognition、预算请求与 Runtime Profile
   → 求解 EffectiveToolPolicy 和 EffectiveExecutionPolicy
   → 按实际执行者计算 EffectiveVisionMode 等能力
   → 检查 requires.required
@@ -530,7 +529,7 @@ binding_id / tenant / run / parent_run
 source authority / package_id / package_version / package_digest
 manifest schema / manifest_digest / invocation_instruction_digest
 invocation_id / handle / cognition
-resolved agent / model / router / budgets
+cognition / bounded budgets / target execution capability snapshot
 runtime_profile / effective sandbox policy
 base tool set / effective tool policy
 requires and effective capability snapshot
@@ -540,7 +539,7 @@ DeliverableSpecs / QA policies / delivery policies
 policy snapshot version / created_at
 ```
 
-后续 `run_skill_command`、依赖安装、Tool Gateway、QA Recorder、Artifact Finalizer、子 Run Controller 和恢复流程都只读取 Binding，不重新解析当前磁盘上的 Skill，也不要求模型重复传递 profile、QA 或交付参数。
+后续 `run_skill_command`、依赖安装、Tool Gateway、QA Recorder、Artifact Finalizer、子 Run Controller 和恢复流程都只读取 Binding，不重新解析当前磁盘上的 Skill，也不要求模型重复传递 profile、QA 或交付参数。Binding 创建前必须先把完整原始包写入按 `package_digest` 寻址的不可变快照存储；本地和远端 materialize 只读 CAS 并逐文件复验 size/hash，不能回读已升级的 Source。输入 staging 不得覆盖包内文件。
 
 幂等键至少覆盖 `package_digest + invocation_id + normalized_task + input_versions/hashes + consumer_run`。重试不得重复创建子 Run、发布记录或投递记录。
 
@@ -605,7 +604,7 @@ Resolve office-ppt
   → 创建隔离子 Run并绑定 sandboxed_session
   → 按固定权限层级注入 SKILL.md + work.md + task/input manifest
   → 多轮生成、渲染、QA、修正
-  → Produced candidate / Gate / QA / Selection / Publish / Delivery
+  → Produced candidate / Gate / Selection / internal Publish / QA / Delivery
   → 子 Run 通过 Completion 门禁
   → 父 Run Adoption
   → 父 Run 总结结果、证据和降级状态
@@ -621,7 +620,7 @@ Resolve office-ppt
 - 产物 hash、owner run、deliverable id、QA 状态和 lineage 可验证；
 - 父子 tenant/scope/授权关系成立。
 
-AdoptionRecord 必须版本锁定并携带足够 lineage。父 Run 若有自己的 DeliverableSpec，只能由类型、角色和策略匹配的已接纳子交付销账；不能仅凭“子目录存在同后缀文件”完成。
+AdoptionRecord 必须版本锁定并携带足够 lineage。父 Run 若有自己的 DeliverableSpec，只能由类型、角色和策略匹配的已接纳子交付销账；不能仅凭“子目录存在同后缀文件”完成。AdoptionStore 必须按租户/工作空间实例化并经 Run Context 注入，禁止使用会被后续租户覆盖 state root 的进程级可变单例。
 
 ## 8. 建议领域模型
 
@@ -771,73 +770,67 @@ Trace/Audit 至少记录：
 - DeliverableSpec、候选、发布、交付和 Adoption ID；
 - 所有降级 warning。
 
-## 11. 当前实现对齐与必须清理的偏差
+## 11. 实现状态与代码落点
 
-### 11.1 可复用基础
+### 11.1 核心链路
 
-| 能力 | 状态 | 说明 |
+| 能力 | 状态 | 主要实现 |
 |---|---|---|
-| 固定 `Skill` 网关及 task/inputs 雏形 | `[/]` | schema 已有 `args/inputs`，需破坏式改为 `task/inputs` 和声明校验 |
-| inline/fork 与子 Run 委托 | `[/]` | 基础可复用，元数据来源和指令层级需重构 |
-| InputRef、快照、staging 与 hash 校验 | `[x]` | 可作为 request contract 的执行底座 |
-| `run_skill_command`、依赖安装、远程 session | `[/]` | 需改为只读 InvocationBinding/Runtime Profile |
-| Run 级视觉能力、VisionExpert、`requires.vision` | `[/]` | 需改为基于目标执行计划并提前门禁 |
-| content/render/visual QA 分轨和 degraded/skipped Recorder | `[/]` | 证据类型具备，自动触发点与 Delivery 顺序需调整 |
-| DeliverableSpec、ProducedResource、Selection、Publication、Delivery | `[/]` | 需接收复数声明式 Deliverable，required QA 前移到 Delivery 前 |
-| 子 Run result 与 Adoption | `[/]` | 已有版本锁，需强化成功终态、QA/Delivery lineage 条件 |
+| 严格 `SKILL.md` 与 Runtime Manifest | `[x]` | `skill/parser` 仅接受标准 frontmatter；`manifest.go` 严格校验 schema、重复键、枚举、资源边界与限制 |
+| 多 Invocation Catalog / Resolve | `[x]` | `skill/service` 展开 handle，使用 `authority + package_id + invocation_id` 稳定身份并拒绝冲突 |
+| 固定 `Skill(skill, task?, inputs?)` | `[x]` | 网关 schema 已删除 `args/entrypoint/model` 等控制面参数，RequestContract 在执行前校验 |
+| 不可变 Binding 与 package CAS | `[x]` | Binding 与 policy snapshot 持久化；完整原始包按 digest 存储，本地/远端执行只从 CAS materialize |
+| inline / fork | `[x]` | inline 在父 Run 注入低权限指令并单调收紧工具；fork 原子 claim 后创建隔离子 Run |
+| Tool / Capability / Sandbox 求解 | `[x]` | 权限取交集且缺 required tool fail closed；capability gate 早于安装、审批、Spawn；后端降级写入 Binding warning |
+| per-call / sandboxed-session | `[x]` | `run_skill_command` 只读 Binding；远端 session 支持持久 workspace、恢复、续租、关闭与回收 |
+| 显式输入快照 | `[x]` | ResourceRef、版本/hash、只读 staging、alias 冲突与 Skill 包文件覆盖检查均 fail closed |
+| Deliverable / Artifact / QA / Delivery | `[x]` | 声明式复数 Spec、确定性选择、内部 Publication、精确版本 QA、Delivery 独立重验与 Completion 门禁 |
+| optional / required visual QA | `[x]` | 无视觉自动 `degraded(vision_unavailable)`；真实 checklist 可写 passed/failed；required 只接受 exact passed |
+| 子 Run Adoption | `[x]` | 子 Completion 通过后才接纳；Adoption 版本锁定、持久化、按租户实例化并通过 Context 注入 |
+| 重启与并发幂等 | `[x]` | Binding、package CAS、Artifact ledger、SubAgent invocation claim 均持久化；CLI/Enterprise 使用 durable store |
+| Office 技能迁移 | `[x]` | PPT、Word、Excel、PDF 均已拆为 `read`/`work` Invocation，并各自提供侧车和指令文件 |
 
-### 11.2 不得沿用的现状
+### 11.2 已完成的破坏式清理
 
-1. 当前 `SKILL.md` Parser 混合解析 `context/allowed-tools/dependencies/requires/qa`；新实现删除这些字段，只解析标准 Skill。
-2. 当前 `sandbox` 节点语法上接受但没有进入 Skill Metadata；删除这条假声明链路。
-3. 当前 allowed-tools 求交为空时告警并保留原工具集；新实现必须 fail closed。
-4. 当前工具收窄在 inline Run 中永久生效却被描述为临时能力；新设计明确为 Run-scoped 单调收紧。
-5. 当前 fork 可把 Skill body 放入临时 Agent SystemPrompt；新实现改为低权限 Skill instruction 层。
-6. 当前会从 task 文本或工作区真实文件猜 inputs；新实现只接受显式 ResourceRef/可信附件绑定。
-7. 当前先做依赖检查/审批，再检查 required capability；新实现先解析目标执行计划和能力门禁。
-8. 当前 optional QA 不参与 Completion 查询，虽有 degraded/skipped Recorder 但不保证自动写入；新实现必须在 Finalize 前确定性记账。
-9. 当前 Completion 可以在 Publication/Delivery 之后才检查 required QA；新实现 required QA 必须成为 Delivery 前门禁。
-10. 当前 Prompt/ProducedResource 启发式可能补建 Deliverable；有 Invocation 声明时必须禁用启发式，以 Manifest/可信 App 声明为唯一来源。
-11. 当前单一 `skill.Metadata` 混合发现、提示、权限和执行字段；新实现拆成 PhysicalSkill、InvocationDefinition、Binding 与 Effective Policy。
+1. `[x]` 删除 `SKILL.md` 中 `context/allowed-tools/dependencies/requires/qa/sandbox` 等 Genesis 扩展解析，只保留 `name/description`。
+2. `[x]` 删除旧 Skill sandbox spec、旧 execution policy pipeline 和保留原工具集的回退行为。
+3. `[x]` 删除 `Skill.args`、动态 `entrypoint`、模型选择和控制面参数；模型只提交 handle、task、inputs。
+4. `[x]` fork 不再把 Skill body 当作原始 SystemPrompt，改为带来源和优先级的 Skill instruction。
+5. `[x]` Invocation Resolver 不从自然语言、目录扫描或后缀猜输入；产品入口只可预绑定明确 ResourceRef。
+6. `[x]` required capability 检查已前置到依赖安装、审批、Spawn 和沙箱启动之前。
+7. `[x]` required QA 已成为外部 Delivery 的独立门禁；optional outcome 必须明确记为 passed/failed/skipped/degraded。
+8. `[x]` 有 Invocation 声明时在子 Run 启动前建立 DeliverableSpec，不由 Prompt 猜测。
+9. `[x]` 下游执行只读 InvocationBinding 与 CAS，不在重试/恢复时重新解析当前 Source。
+10. `[x]` 不存在双读、deprecated alias、旧数据迁移或静默 sandbox fallback。
 
-### 11.3 新实现清单
+### 11.3 验证范围与尚未扩张的产品面
 
-1. 新建独立 Runtime Manifest Parser、strict validator 和包摘要器；
-2. 重构 Source，一次返回标准 Skill 定义、可选 Manifest 和不可变 PackageSnapshot；
-3. 建立 handle Catalog、qualified identity、冲突检测和选择评测；
-4. 将 `Skill` schema 重写为 `skill/task/inputs`，删除 args、旧 frontmatter invocation 和输入猜测；
-5. 实现 RequestContract、显式 ResourceRef 绑定和输入版本固定；
-6. 实现 Tool Policy 求交、fail-closed、Run-scoped inline Activation 和递归环检测；
-7. 实现指令权限分层与确定性 Prompt Composer；
-8. 实现 RuntimeProfileResolver、Invocation 级 sandbox policy 和 session 生命周期；
-9. 在实际目标模型/Router 上执行 capability gate，并前置于依赖审批和 Spawn；
-10. 将复数 Deliverable 声明转换为持久化 DeliverableSpecs；
-11. 调整 QA/Publication/Delivery 状态机，自动记录 optional 降级并前置 required QA；
-12. 强化 Adoption 成功终态、版本、QA、Delivery 和 lineage 校验；
-13. 持久化 InvocationBinding/policy snapshot，所有下游只读 Binding；
-14. CLI、API、UI、Trace、Audit、Usage、Marketplace 和 embedded/local Source 统一展示 Invocation；
-15. 删除旧模型、旧 parser 字段、旧配置键、旧测试和所有双读/回退分支。
+- `[x]` `go vet ./...`、`go test ./...`、`go build ./...` 和 `git diff --check` 通过。
+- `[x]` embedded/local/memory Source、CLI 与 Enterprise 装配、Office Manifest、脚本物化、远端 session、QA/Delivery、Adoption 和重启幂等均有自动化测试。
+- `[x]` 旧 Office `SKILL.md` 控制面字段残留扫描无匹配。
+- `[ ]` 独立的管理型 API/UI 页面和 Marketplace Invocation 展示不是本次 Runtime 切换的阻塞项；后续只消费现有 Catalog/Binding，不应新增第二套协议。
+- `[ ]` `go test -race` 在当前 Windows 环境因 CGO 未启用无法执行；并发路径已用原子 claim、revision CAS、锁和并发单测覆盖，CI 应在启用 CGO 的构建器补跑 race detector。
 
-## 12. 破坏式实施顺序
+## 12. 破坏式实施记录
 
 开发可以分阶段提交代码，但运行时切换必须是单路径，禁止双读、双写和旧数据迁移。
 
-### Phase 1：纯新领域模型与校验器
+### Phase 1 `[x]`：纯新领域模型与校验器
 
 1. 定义 PhysicalSkill、RuntimeManifest、InvocationDefinition、PackageSnapshot、InvocationBinding；
-2. 实现 strict YAML parser、包摘要器、签名/来源校验和 schema validator；
-3. 实现 Manifest fixtures、fuzz、duplicate key、越界和限制测试；
-4. 此阶段新代码不接入生产 Resolver，不修改旧路径行为。
+2. 实现 strict YAML parser、包摘要器、来源身份校验和 schema validator；
+3. 实现 Manifest fixtures、duplicate key、未知字段、越界和限制测试；
+4. 完成领域模型单测后，以单路径接入生产 Resolver；未保留旧解析路径。
 
-### Phase 2：新 Source、Catalog 与 Resolver
+### Phase 2 `[x]`：新 Source、Catalog 与 Resolver
 
-1. embedded/local/marketplace Source 统一返回标准 Skill + 可选 Manifest + PackageSnapshot；
+1. embedded/local/memory Source 统一返回标准 Skill + 可选 Manifest + PackageSnapshot；Marketplace 安装后的包进入同一 local Source 路径；
 2. 构建 Invocation Catalog、qualified identity、handle 冲突检测；
 3. 实现 `Skill(skill, task, inputs)`、RequestContract 和 ResourceRef binding；
 4. 实现无侧车标准默认 Invocation；
 5. 持久化完整 Binding/policy snapshot。
 
-### Phase 3：执行安全边界
+### Phase 3 `[x]`：执行安全边界
 
 1. 实现 Prompt Composer 和指令权限分层；
 2. 实现 Tool Policy 求交、fail-closed、inline Run-scoped Activation、递归/环检测；
@@ -845,40 +838,40 @@ Trace/Audit 至少记录：
 4. capability gate 基于目标执行计划并前置于依赖审批、Spawn 和沙箱；
 5. 命令、依赖、资源工具全部改为只读 Binding。
 
-### Phase 4：交付状态机
+### Phase 4 `[x]`：交付状态机
 
 1. Invocation 复数 Deliverable 在执行前建立 DeliverableSpecs；
 2. 禁用 Invocation Run 的 Prompt/ProducedResource 启发式建约；
-3. 调整 Gate/QA/Selection/Publication/Delivery 顺序；
+3. 调整为 Gate/Selection/内部 Publication/QA/外部 Delivery 顺序；
 4. optional QA 自动记账，required QA 在 Delivery 前阻塞；
 5. Adoption 校验成功终态、版本、QA、Delivery 与 lineage；
 6. 重试、恢复和投递使用 Binding 幂等键。
 
-### Phase 5：一次性切换 `office-ppt`
+### Phase 5 `[x]`：一次性切换 Office Skills
 
 同一个变更中完成：
 
 1. 增加最终版 `genesis.skill.yaml` 和 Invocation instructions；
 2. `SKILL.md` frontmatter 收敛为标准字段；
-3. 配置切换为 `invocations_override`；
-4. Catalog/API/UI/Trace 切换为 Invocation；
+3. 物理后端策略完全收敛至 `genesis.skill.yaml`；
+4. Runtime Catalog、模型 prompt、CLI 与 Enterprise 装配切换为 Invocation；
 5. 删除旧 parser 字段、`Metadata` 混合字段、输入猜测、Skill 级 sandbox override、旧启发式和旧测试；
-6. 全量编译、单元测试、集成测试和真实 PPT fixture 验收通过后合并。
+6. PPT、Word、Excel、PDF 的 read/work Manifest、编译、单元测试和装配测试已通过。
 
 不允许“先双读观察一段时间”。若新链路不满足验收，整个变更不合并，而不是保留旧分支作为兜底。
 
-### Phase 6：推广
+### Phase 6 `[x]`：推广到 Word、Excel、PDF
 
-按相同模型迁移 Word、Excel、PDF。只有确有差异化 Invocation 的 Skill 才创建侧车；简单第三方 Skill 使用正式默认 Invocation，不生成空 Manifest。
+已按相同模型迁移 Word、Excel、PDF。只有确有差异化 Invocation 的 Skill 才创建侧车；简单第三方 Skill 使用正式默认 Invocation，不生成空 Manifest。
 
 ## 13. 测试与验收标准
 
 ### 13.1 Parser、包与 Catalog
 
 - 有效 Manifest 展开两个 handle；无 Manifest 生成一个正式默认 Invocation；
-- duplicate key、未知核心字段、非法枚举、超限、越界引用、摘要/签名错误均 fail closed；
+- duplicate key、未知核心字段、非法枚举、超限、越界引用和摘要错误均 fail closed；
 - skill 名、profile、资源路径、handle 冲突稳定失败；
-- embedded、本地和 marketplace Source 产生相同领域对象；
+- embedded、本地和 memory Source 产生相同领域对象；Marketplace 安装结果通过 local Source 进入同一模型；
 - Manifest 不被注入模型正文，Skill 指令不进入原始 SystemPrompt；
 - 安装后修改包内任一执行资源都会改变 package digest 并使旧 Binding 拒绝重解析。
 
@@ -917,7 +910,7 @@ Trace/Audit 至少记录：
 - DeliverableSpecs 在模型执行前持久化，不使用 Prompt/ProducedResource 启发式；
 - 多次命令复用同一 session，命令默认串行；
 - 取消、超时、lease 过期和恢复都遵守固定 Binding 并完成资源清理；
-- 未通过 Gate/required QA/Selection/Publication/Delivery 任一环节时不能成功交付；
+- 未通过 Gate/required QA/Selection/内部 Publication/外部 Delivery 任一环节时不能成功交付；
 - 子 Run 成功后父 Run 只 Adoption 和总结，不重复 QA、不扫目录。
 
 ### 13.6 Vision 与 QA
@@ -926,7 +919,7 @@ Trace/Audit 至少记录：
 - required capability 在依赖审批、Spawn 和沙箱前失败；
 - optional visual QA 无视觉时自动记录 skipped/degraded + `vision_unavailable`，仍可交付并披露；
 - 渲染、文本或 OOXML 成功不能写入 `visual-qa/v1=passed`；
-- required visual QA 未通过时 Publication/Delivery 不发生；
+- required visual QA 未通过时外部 Delivery 不发生；内部 Publication 只作为不可变 QA subject 存在；
 - 只有结构化 checklist 或 VisionExpert 结论能产生匹配 exact subject version/hash 的 passed 证据。
 
 ### 13.7 权限、递归与降级

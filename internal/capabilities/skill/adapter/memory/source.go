@@ -12,12 +12,15 @@ import (
 
 	"genesis-agent/internal/capabilities/skill/contract"
 	"genesis-agent/internal/capabilities/skill/model"
+	"genesis-agent/internal/capabilities/skill/packaging"
+	"gopkg.in/yaml.v3"
 )
 
 // Skill 描述一个内存 Skill 包。
 type Skill struct {
 	Metadata  model.Metadata
 	Body      string
+	Manifest  *model.RuntimeManifest
 	Resources map[model.ResourceID]string
 }
 
@@ -72,12 +75,46 @@ func (s *Source) List(ctx context.Context, query contract.ListQuery) (contract.L
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	entries := make([]model.Metadata, 0, len(s.skills))
+	packages := make([]model.PhysicalSkillDefinition, 0, len(s.skills))
 	for _, skill := range s.skills {
-		entries = append(entries, skill.Metadata.Normalize())
+		physical, err := physicalFromMemorySkill(s.authority, skill)
+		if err != nil {
+			return contract.ListResult{}, err
+		}
+		packages = append(packages, physical)
 	}
-	sort.SliceStable(entries, func(i, j int) bool { return entries[i].QualifiedName < entries[j].QualifiedName })
-	return contract.ListResult{Entries: entries}, nil
+	sort.SliceStable(packages, func(i, j int) bool { return packages[i].Metadata.Name < packages[j].Metadata.Name })
+	return contract.ListResult{Packages: packages}, nil
+}
+
+func physicalFromMemorySkill(authority model.Authority, skill Skill) (model.PhysicalSkillDefinition, error) {
+	files, err := packageFilesFromMemorySkill(skill)
+	if err != nil {
+		return model.PhysicalSkillDefinition{}, err
+	}
+	meta := skill.Metadata.Normalize()
+	snapshot, err := packaging.BuildSnapshot(authority, meta.PackageID, meta.Version, files)
+	if err != nil {
+		return model.PhysicalSkillDefinition{}, err
+	}
+	return model.PhysicalSkillDefinition{Metadata: meta, Manifest: skill.Manifest, Snapshot: snapshot}, nil
+}
+
+func packageFilesFromMemorySkill(skill Skill) ([]packaging.File, error) {
+	meta := skill.Metadata.Normalize()
+	frontmatter := "---\nname: " + meta.Name + "\ndescription: " + meta.Description + "\n---\n"
+	files := []packaging.File{{Resource: meta.MainResource, Content: []byte(frontmatter + skill.Body)}}
+	for resource, content := range skill.Resources {
+		files = append(files, packaging.File{Resource: resource, Content: []byte(content)})
+	}
+	if skill.Manifest != nil {
+		data, err := yaml.Marshal(skill.Manifest)
+		if err != nil {
+			return nil, err
+		}
+		files = append(files, packaging.File{Resource: model.ResourceID(string(meta.PackageID) + "/" + model.RuntimeManifestFileName), Content: data})
+	}
+	return files, nil
 }
 
 func (s *Source) Read(ctx context.Context, req contract.ReadRequest) (contract.ReadResult, error) {
@@ -103,6 +140,32 @@ func (s *Source) Read(ctx context.Context, req contract.ReadRequest) (contract.R
 	}
 	content, truncated := truncateUTF8(content, req.MaxBytes)
 	return contract.ReadResult{Metadata: skill.Metadata, Resource: resource, Content: content, Truncated: truncated, Version: skill.Metadata.Version}, nil
+}
+
+func (s *Source) ReadPackageSnapshot(ctx context.Context, expected model.SkillPackageSnapshot) ([]model.SkillPackageFile, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+	s.mu.RLock()
+	skill, ok := s.skills[expected.PackageID]
+	s.mu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("未找到skill package: %s", expected.PackageID)
+	}
+	raw, err := packageFilesFromMemorySkill(skill)
+	if err != nil {
+		return nil, err
+	}
+	if err := packaging.ValidateSnapshot(expected, raw); err != nil {
+		return nil, err
+	}
+	files := make([]model.SkillPackageFile, 0, len(raw))
+	for _, file := range raw {
+		files = append(files, model.SkillPackageFile{Resource: file.Resource, Content: append([]byte(nil), file.Content...)})
+	}
+	return files, nil
 }
 
 func (s *Source) ListResources(ctx context.Context, req contract.SourceListResourcesRequest) (contract.ListResourcesResult, error) {

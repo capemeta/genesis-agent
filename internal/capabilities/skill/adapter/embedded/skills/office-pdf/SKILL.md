@@ -1,46 +1,6 @@
 ---
 name: office-pdf
 description: "Use this skill whenever the user wants to do anything with PDF files. This includes reading or extracting text/tables from PDFs, combining or merging multiple PDFs into one, splitting PDFs apart, rotating pages, adding watermarks, creating new PDFs, filling PDF forms, encrypting/decrypting PDFs, extracting images, and OCR on scanned PDFs to make them searchable. If the user mentions a .pdf file or asks to produce one, use this skill."
-license: Proprietary. LICENSE.txt has complete terms
-allowed-tools:
-  - Skill
-  - list_skill_resources
-  - read_skill_resource
-  - search_skill_resources
-  - run_skill_command
-  - install_skill_dependencies
-  - read_file
-  - write_file
-  - edit_file
-dependencies:
-  runtime:
-    python:
-      - name: pypdf
-        import: pypdf
-      - name: pdfplumber
-        import: pdfplumber
-      - name: reportlab
-        import: reportlab
-      - name: pdf2image
-        import: pdf2image
-      - name: Pillow
-        import: PIL
-      - name: pytesseract
-        import: pytesseract
-    node:
-      - name: pdf-lib
-        require: pdf-lib
-    system:
-      - name: pdftoppm
-        command: pdftoppm
-      - name: pdftotext
-        command: pdftotext
-      - name: pdfimages
-        command: pdfimages
-      - name: qpdf
-        command: qpdf
-      - name: tesseract
-        command: tesseract
 ---
 
 # PDF Processing Guide

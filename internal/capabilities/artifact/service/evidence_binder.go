@@ -56,7 +56,7 @@ func EnsurePrimaryDeliverableFromProduced(
 	digest := sha256.Sum256([]byte(tenantID + "\x00" + runID + "\x00evidence-primary"))
 	spec := artifactmodel.DeliverableSpec{
 		ID: "deliverable-" + hex.EncodeToString(digest[:8]), TenantID: tenantID, RunID: runID,
-		Required: true, Role: artifactmodel.DeliverableRolePrimary, DesiredName: "",
+		Required: true, Cardinality: "exactly_one", Role: artifactmodel.DeliverableRolePrimary, DesiredName: "",
 		// 仅约束后缀：避免 MIME 字符串变体（短名/长名）导致唯一产物无法匹配。
 		AcceptedSuffix: suffixes, DeliveryPolicy: "run-output",
 		CreatedAt: now,

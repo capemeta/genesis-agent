@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"strings"
 
-	planmodeprompt "genesis-agent/internal/capabilities/planmode/prompt"
 	"genesis-agent/internal/capabilities/llm/vision"
+	planmodeprompt "genesis-agent/internal/capabilities/planmode/prompt"
 	"genesis-agent/internal/capabilities/tool/contract"
 	"genesis-agent/internal/domain"
 	"genesis-agent/internal/platform/logger"

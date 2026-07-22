@@ -5,6 +5,8 @@ import (
 	"context"
 	"time"
 
+	artifactcontract "genesis-agent/internal/capabilities/artifact/contract"
+	skillmodel "genesis-agent/internal/capabilities/skill/model"
 	workmodel "genesis-agent/internal/capabilities/workspace/model"
 	"genesis-agent/internal/domain"
 	"genesis-agent/internal/runtime/multiagent/model"
@@ -12,22 +14,20 @@ import (
 
 // SpawnRequest 描述一次子智能体启动请求。
 type SpawnRequest struct {
-	SessionID    string
-	TenantID     string
-	ParentRunID  string
-	Depth        int
-	MaxDepth     int
-	ReadOnly     bool
-	SubagentType string
-	Prompt       string
-	Agent        *domain.Agent
-	Timeout      time.Duration
-	Budget       *TreeBudget
-	Inputs       []workmodel.ResourceRef
-	// SkillQA* 来自 Skill frontmatter qa:；经 EvidenceQAHints 注入子 Run，
-	// 仅在产物证据建约时写入 Spec（不再按 Intent 预建交付契约）。
-	SkillQAPolicy      string
-	SkillQAEnforcement string
+	SessionID         string
+	TenantID          string
+	ParentRunID       string
+	Depth             int
+	MaxDepth          int
+	ReadOnly          bool
+	SubagentType      string
+	Prompt            string
+	Agent             *domain.Agent
+	Timeout           time.Duration
+	Budget            *TreeBudget
+	Inputs            []workmodel.ResourceRef
+	InvocationBinding skillmodel.InvocationBinding
+	Deliverables      []artifactcontract.DeclaredDeliverable
 }
 
 // SlotToken 是限流器创建的不可透明预留凭据。

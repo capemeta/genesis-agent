@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	approvalmodel "genesis-agent/internal/capabilities/approval/model"
 	execcontract "genesis-agent/internal/capabilities/execution/contract"
@@ -64,23 +65,21 @@ func (r *recordingRunner) Run(ctx context.Context, cmd execmodel.Command, opts e
 }
 
 type fakeSkills struct {
-	meta skillmodel.Metadata
+	meta skillmodel.ResolvedInvocation
 }
 
-func (f fakeSkills) Resolve(context.Context, skillcontract.ResolveRequest) (skillmodel.Metadata, error) {
+func (f fakeSkills) Resolve(context.Context, skillcontract.ResolveRequest) (skillmodel.ResolvedInvocation, error) {
 	return f.meta, nil
 }
 
-func testMeta(runtime skillmodel.RuntimeDeps) skillmodel.Metadata {
-	return skillmodel.Metadata{
-		Name:          "office-ppt",
-		QualifiedName: "office-ppt",
-		PackageID:     "office-ppt",
-		Enabled:       true,
-		Dependencies: skillmodel.Dependencies{
-			Runtime: runtime,
-		},
-	}.Normalize()
+func testMeta(runtime skillmodel.RuntimeDeps) skillmodel.ResolvedInvocation {
+	meta := skillmodel.Metadata{Name: "office-ppt", PackageID: "office-ppt", MainResource: "office-ppt/SKILL.md"}.Normalize()
+	return skillmodel.ResolvedInvocation{
+		CatalogItem: skillmodel.InvocationMetadata{Name: "office-ppt", QualifiedName: "office-ppt", PhysicalSkill: "office-ppt", PackageID: "office-ppt"},
+		Physical:    skillmodel.PhysicalSkillDefinition{Metadata: meta},
+		Definition:  skillmodel.InvocationDefinition{ID: "work", Handle: "office-ppt", RuntimeProfile: "work"},
+		Profile:     skillmodel.RuntimeProfile{Dependencies: skillmodel.Dependencies{Runtime: runtime}},
+	}
 }
 
 func TestInstallRejectsPackageNotInWhitelist(t *testing.T) {
@@ -107,7 +106,7 @@ func TestInstallRejectsWhenNoRuntimeDeclared(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = tool.Execute(installTestContext(), `{"skill":"office-ppt","packages":[{"manager":"npm","name":"pptxgenjs"}]}`)
+	_, err = tool.Execute(installTestContextWithRuntime(skillmodel.RuntimeDeps{}), `{"skill":"office-ppt","packages":[{"manager":"npm","name":"pptxgenjs"}]}`)
 	if err == nil || !strings.Contains(err.Error(), "未声明") {
 		t.Fatalf("err=%v", err)
 	}
@@ -347,6 +346,13 @@ func TestRejectUnsafePackageName(t *testing.T) {
 }
 
 func installTestContext(roots ...string) context.Context {
+	return installTestContextWithRuntime(skillmodel.RuntimeDeps{
+		Node:   []skillmodel.RuntimePackage{{Name: "pptxgenjs"}},
+		Python: []skillmodel.RuntimePackage{{Name: "markitdown"}},
+	}, roots...)
+}
+
+func installTestContextWithRuntime(runtimeDeps skillmodel.RuntimeDeps, roots ...string) context.Context {
 	workspaceRoot := "test-project"
 	if len(roots) > 0 {
 		workspaceRoot = roots[0]
@@ -354,5 +360,12 @@ func installTestContext(roots ...string) context.Context {
 	binding := execmodel.ExecutionBinding{ID: "skill-deps-binding", Mode: execmodel.WorkspaceModeProject, Access: execmodel.WorkspaceAccessReadWrite, PathPolicy: execmodel.PathPolicyPermissionOnly, Owner: execmodel.ExecutionOwnerRef{RunID: "run-install-test", TaskID: "skill-deps:office-ppt"}}
 	execution := workmodel.PreparedExecutionSnapshot{Binding: binding, Workspace: execmodel.ExecutionWorkspace{WorkDir: workspaceRoot}}
 	ctx := workcontract.WithPreparedRun(context.Background(), workmodel.PreparedRun{Manifest: workmodel.RunManifest{RunID: "run-install-test"}, Execution: execution})
-	return workcontract.WithControlPlane(ctx, installTestControl{execution: execution})
+	ctx = workcontract.WithControlPlane(ctx, installTestControl{execution: execution})
+	invocation := skillmodel.InvocationBinding{
+		ID: "invocation-install", RunID: "run-install-test", InvocationID: "work", Handle: "office-ppt", PhysicalSkill: "office-ppt",
+		Package:   skillmodel.SkillPackageSnapshot{Authority: skillmodel.Authority{Kind: skillmodel.SourceKindEmbedded, ID: "test"}, PackageID: "office-ppt", Digest: strings.Repeat("a", 64)},
+		AgentMode: skillmodel.AgentModeSpec{Mode: skillmodel.AgentModeMain}, RuntimeProfile: skillmodel.RuntimeProfile{Dependencies: skillmodel.Dependencies{Runtime: runtimeDeps}},
+		IdempotencyKey: "install-test", CreatedAt: time.Now(),
+	}
+	return skillcontract.WithInvocationBinding(ctx, invocation)
 }

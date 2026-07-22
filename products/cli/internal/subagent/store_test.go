@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	skillmodel "genesis-agent/internal/capabilities/skill/model"
 	"genesis-agent/internal/domain"
 	"genesis-agent/internal/runtime/multiagent/contract"
 	"genesis-agent/internal/runtime/multiagent/model"
@@ -37,6 +38,37 @@ func TestFileStorePersistsInstanceForAnotherStore(t *testing.T) {
 	}
 	if got.Instance.Result == nil || got.Instance.Result.Summary != "done" || got.Request.Agent.Name != "explore" {
 		t.Fatalf("unexpected stored instance: %+v", got)
+	}
+}
+
+func TestFileStoreInvocationClaimIsIdempotentAcrossStoreInstances(t *testing.T) {
+	root := t.TempDir()
+	firstStore, err := NewFileStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := contract.StoredInstance{
+		Instance: model.Instance{AgentID: "agent-first", Status: model.StatusRunning},
+		Request:  contract.SpawnRequest{TenantID: "tenant", ParentRunID: "parent", InvocationBinding: skillmodel.InvocationBinding{ID: "binding-1"}},
+	}
+	stored, created, err := firstStore.SaveIfInvocationAbsent(context.Background(), first)
+	if err != nil || !created || stored.Instance.AgentID != first.Instance.AgentID {
+		t.Fatalf("first claim stored=%+v created=%v err=%v", stored, created, err)
+	}
+	first.Instance.Status = model.StatusCompleted
+	if err := firstStore.Save(context.Background(), first); err != nil {
+		t.Fatal(err)
+	}
+
+	secondStore, err := NewFileStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replay := first
+	replay.Instance.AgentID = "agent-second"
+	stored, created, err = secondStore.SaveIfInvocationAbsent(context.Background(), replay)
+	if err != nil || created || stored.Instance.AgentID != "agent-first" || stored.Instance.Status != model.StatusCompleted {
+		t.Fatalf("replay stored=%+v created=%v err=%v", stored, created, err)
 	}
 }
 

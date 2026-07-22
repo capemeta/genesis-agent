@@ -163,6 +163,10 @@ type publicationFixture struct {
 }
 
 func newPublicationFixture(t *testing.T) publicationFixture {
+	return newPublicationFixtureWithQA(t, "", "")
+}
+
+func newPublicationFixtureWithQA(t *testing.T, qaPolicy, qaEnforcement string) publicationFixture {
 	t.Helper()
 	ctx := context.Background()
 	now := time.Now().UTC()
@@ -181,7 +185,7 @@ func newPublicationFixture(t *testing.T) publicationFixture {
 		t.Fatal(err)
 	}
 	control := artifactmemory.NewStore()
-	spec := artifactmodel.DeliverableSpec{ID: "deliverable", TenantID: "tenant", RunID: "run", Required: true, Role: artifactmodel.DeliverableRolePrimary, DesiredName: "result.txt", AcceptedMIMEs: []string{"text/plain"}, AcceptedSuffix: []string{".txt"}, DeliveryPolicy: "download", CreatedAt: now}
+	spec := artifactmodel.DeliverableSpec{ID: "deliverable", TenantID: "tenant", RunID: "run", Required: true, Role: artifactmodel.DeliverableRolePrimary, DesiredName: "result.txt", AcceptedMIMEs: []string{"text/plain"}, AcceptedSuffix: []string{".txt"}, QAPolicy: qaPolicy, QAEnforcement: qaEnforcement, DeliveryPolicy: "download", CreatedAt: now}
 	if err := control.CreateDeliverable(ctx, spec); err != nil {
 		t.Fatal(err)
 	}

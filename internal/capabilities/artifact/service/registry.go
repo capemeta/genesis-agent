@@ -10,146 +10,126 @@ import (
 	"strings"
 	"sync"
 	"time"
-)
 
-// AdoptionRecord 是「消费者 Run（父）」对「生产者 Run（子）产物」的显式、版本锁定、可审计接纳记录。
-//
-// 它替代旧的「创建即全局可读」隐式索引：跨 Run 可读性只来自一次显式 Adopt，
-// 而这次 Adopt 只发生在父子边界（Controller.finish），且只针对已过滤的交付候选（QA/中间物在归约层剔除）。
-// 授权由父子派生关系保证（父 spawn 子、同 scope）；读取按资源所属 backend 完成。
-type AdoptionRecord struct {
-	ConsumerTenantID string    `json:"consumer_tenant_id"`
-	ConsumerRunID    string    `json:"consumer_run_id"`
-	ProducedID       string    `json:"produced_id"`
-	OwnerTenantID    string    `json:"owner_tenant_id"`
-	OwnerRunID       string    `json:"owner_run_id"`
-	AgentID          string    `json:"agent_id,omitempty"`
-	ContentHash      string    `json:"content_hash,omitempty"`
-	Role             string    `json:"role,omitempty"`
-	CreatedAt        time.Time `json:"created_at"`
-}
+	artifactcontract "genesis-agent/internal/capabilities/artifact/contract"
+)
 
 // AdoptionStore 是 Harness 级、磁盘持久化的接纳记录存储（内存缓存 + 落盘），按 (consumer_run, produced_id) 排他。
 type AdoptionStore struct {
 	mu        sync.RWMutex
-	items     map[string]AdoptionRecord
+	items     map[string]artifactcontract.AdoptionRecord
 	stateRoot string
 }
 
-// GlobalAdoptionStore 是 Harness 级全局接纳存储实例。
-var GlobalAdoptionStore = NewAdoptionStore()
-
-// NewAdoptionStore 创建新的接纳存储。
-func NewAdoptionStore() *AdoptionStore {
-	return &AdoptionStore{items: make(map[string]AdoptionRecord)}
-}
-
-// SetStateRoot 配置接纳记录落盘根目录（如 .genesis）。
-func (s *AdoptionStore) SetStateRoot(stateRoot string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if root, err := filepath.Abs(strings.TrimSpace(stateRoot)); err == nil && root != "" {
-		s.stateRoot = root
+// NewAdoptionStore 创建绑定到单一租户/工作空间 state root 的接纳存储。
+func NewAdoptionStore(stateRoot string) (*AdoptionStore, error) {
+	stateRoot = strings.TrimSpace(stateRoot)
+	if stateRoot == "" {
+		return nil, fmt.Errorf("adoption state root不能为空")
 	}
+	root, err := filepath.Abs(stateRoot)
+	if err != nil || root == "" {
+		return nil, fmt.Errorf("解析 adoption state root: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "runtime", "adoptions"), 0o700); err != nil {
+		return nil, fmt.Errorf("创建 adoption state root: %w", err)
+	}
+	return &AdoptionStore{items: make(map[string]artifactcontract.AdoptionRecord), stateRoot: root}, nil
 }
 
-func adoptionMemKey(consumerRunID, producedID string) string {
-	return strings.TrimSpace(consumerRunID) + "\x00" + strings.TrimSpace(producedID)
+func adoptionMemKey(consumerTenantID, consumerRunID, producedID string) string {
+	return strings.TrimSpace(consumerTenantID) + "\x00" + strings.TrimSpace(consumerRunID) + "\x00" + strings.TrimSpace(producedID)
 }
 
-func adoptionFilename(stateRoot, consumerRunID, producedID string) string {
+func adoptionFilename(stateRoot, consumerTenantID, consumerRunID, producedID string) string {
 	if strings.TrimSpace(stateRoot) == "" {
 		return ""
 	}
-	sum := sha256.Sum256([]byte(adoptionMemKey(consumerRunID, producedID)))
+	sum := sha256.Sum256([]byte(adoptionMemKey(consumerTenantID, consumerRunID, producedID)))
 	return filepath.Join(stateRoot, "runtime", "adoptions", hex.EncodeToString(sum[:])+".json")
 }
 
 // Adopt 幂等写入接纳记录并做版本锁校验：
 // 同 (consumer_run, produced_id) 已存在且内容哈希不同 → 版本冲突（防止子被重跑后父静默读到旧版本）；
 // 相同则返回既有记录（幂等）。
-func (s *AdoptionStore) Adopt(record AdoptionRecord) (AdoptionRecord, error) {
+func (s *AdoptionStore) Adopt(record artifactcontract.AdoptionRecord) (artifactcontract.AdoptionRecord, error) {
 	record.ConsumerTenantID = strings.TrimSpace(record.ConsumerTenantID)
 	record.ConsumerRunID = strings.TrimSpace(record.ConsumerRunID)
 	record.ProducedID = strings.TrimSpace(record.ProducedID)
 	record.OwnerTenantID = strings.TrimSpace(record.OwnerTenantID)
 	record.OwnerRunID = strings.TrimSpace(record.OwnerRunID)
-	if record.ConsumerRunID == "" || record.ProducedID == "" || record.OwnerRunID == "" {
-		return AdoptionRecord{}, fmt.Errorf("adoption 记录缺少 consumer_run/produced_id/owner_run")
+	if record.ConsumerTenantID == "" || record.ConsumerRunID == "" || record.ProducedID == "" || record.OwnerTenantID == "" || record.OwnerRunID == "" || strings.TrimSpace(record.ContentHash) == "" {
+		return artifactcontract.AdoptionRecord{}, fmt.Errorf("adoption 记录缺少 consumer_tenant/consumer_run/produced_id/owner_tenant/owner_run/content_hash")
 	}
 	if record.CreatedAt.IsZero() {
 		record.CreatedAt = time.Now().UTC()
 	}
-	memKey := adoptionMemKey(record.ConsumerRunID, record.ProducedID)
+	memKey := adoptionMemKey(record.ConsumerTenantID, record.ConsumerRunID, record.ProducedID)
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	stateRoot := s.stateRoot
 	existing, ok := s.items[memKey]
 	if !ok {
-		if loaded, found := readAdoptionRecord(adoptionFilename(stateRoot, record.ConsumerRunID, record.ProducedID)); found {
+		if loaded, found := readAdoptionRecord(adoptionFilename(stateRoot, record.ConsumerTenantID, record.ConsumerRunID, record.ProducedID)); found {
 			existing, ok = loaded, true
 		}
 	}
 	if ok {
-		if existing.ContentHash != "" && record.ContentHash != "" && existing.ContentHash != record.ContentHash {
-			s.mu.Unlock()
-			return AdoptionRecord{}, fmt.Errorf("adoption 版本冲突: produced %q 在 Run %q 已接纳不同版本内容", record.ProducedID, record.ConsumerRunID)
+		if existing.ConsumerTenantID != record.ConsumerTenantID || existing.OwnerTenantID != record.OwnerTenantID || existing.OwnerRunID != record.OwnerRunID || existing.ContentHash != record.ContentHash {
+			return artifactcontract.AdoptionRecord{}, fmt.Errorf("adoption 版本冲突: produced %q 在 Run %q 已接纳不同版本内容", record.ProducedID, record.ConsumerRunID)
 		}
 		s.items[memKey] = existing
-		s.mu.Unlock()
 		return existing, nil
 	}
-	s.items[memKey] = record
-	filename := adoptionFilename(stateRoot, record.ConsumerRunID, record.ProducedID)
-	s.mu.Unlock()
-
+	filename := adoptionFilename(stateRoot, record.ConsumerTenantID, record.ConsumerRunID, record.ProducedID)
 	if filename != "" {
-		if data, err := json.Marshal(record); err == nil {
-			_ = os.MkdirAll(filepath.Dir(filename), 0o700)
-			_ = os.WriteFile(filename, data, 0o600)
+		if err := writeAdoptionRecord(filename, record); err != nil {
+			return artifactcontract.AdoptionRecord{}, err
 		}
 	}
+	s.items[memKey] = record
 	return record, nil
 }
 
 // Resolve 在消费者作用域解析被接纳产物的真实所属 Run；未接纳则返回 false（不再有「假跨 Run 可读」）。
 // stateRoot 为可选覆盖：调用方可传 prepared.Manifest.StateRoot.Path，未传则用已配置根目录。
-func (s *AdoptionStore) Resolve(consumerTenantID, consumerRunID, producedID, stateRoot string) (AdoptionRecord, bool) {
+func (s *AdoptionStore) Resolve(consumerTenantID, consumerRunID, producedID string) (artifactcontract.AdoptionRecord, bool) {
 	consumerRunID = strings.TrimSpace(consumerRunID)
 	producedID = strings.TrimSpace(producedID)
 	if consumerRunID == "" || producedID == "" {
-		return AdoptionRecord{}, false
+		return artifactcontract.AdoptionRecord{}, false
 	}
-	memKey := adoptionMemKey(consumerRunID, producedID)
+	consumerTenantID = strings.TrimSpace(consumerTenantID)
+	memKey := adoptionMemKey(consumerTenantID, consumerRunID, producedID)
 	s.mu.RLock()
 	rec, ok := s.items[memKey]
-	if strings.TrimSpace(stateRoot) == "" {
-		stateRoot = s.stateRoot
-	}
+	stateRoot := s.stateRoot
 	s.mu.RUnlock()
-	if ok {
+	if ok && rec.ConsumerTenantID == consumerTenantID {
 		return rec, true
 	}
-	if loaded, found := readAdoptionRecord(adoptionFilename(stateRoot, consumerRunID, producedID)); found {
+	if loaded, found := readAdoptionRecord(adoptionFilename(stateRoot, consumerTenantID, consumerRunID, producedID)); found && loaded.ConsumerTenantID == consumerTenantID {
 		s.mu.Lock()
 		s.items[memKey] = loaded
 		s.mu.Unlock()
 		return loaded, true
 	}
-	return AdoptionRecord{}, false
+	return artifactcontract.AdoptionRecord{}, false
 }
 
 // ListByConsumer 列出某消费者 Run 已接纳的全部记录（内存 + 落盘扫描）。
 // 用于父完成门禁：以「已接纳且子已交付」销父侧 required deliverable。
-func (s *AdoptionStore) ListByConsumer(consumerRunID string) []AdoptionRecord {
+func (s *AdoptionStore) ListByConsumer(consumerTenantID, consumerRunID string) []artifactcontract.AdoptionRecord {
+	consumerTenantID = strings.TrimSpace(consumerTenantID)
 	consumerRunID = strings.TrimSpace(consumerRunID)
 	if consumerRunID == "" {
 		return nil
 	}
-	out := map[string]AdoptionRecord{}
+	out := map[string]artifactcontract.AdoptionRecord{}
 	s.mu.RLock()
 	stateRoot := s.stateRoot
 	for _, rec := range s.items {
-		if strings.TrimSpace(rec.ConsumerRunID) == consumerRunID {
+		if strings.TrimSpace(rec.ConsumerTenantID) == consumerTenantID && strings.TrimSpace(rec.ConsumerRunID) == consumerRunID {
 			out[rec.ProducedID] = rec
 		}
 	}
@@ -163,7 +143,7 @@ func (s *AdoptionStore) ListByConsumer(consumerRunID string) []AdoptionRecord {
 					continue
 				}
 				loaded, ok := readAdoptionRecord(filepath.Join(dir, entry.Name()))
-				if !ok || strings.TrimSpace(loaded.ConsumerRunID) != consumerRunID {
+				if !ok || strings.TrimSpace(loaded.ConsumerTenantID) != consumerTenantID || strings.TrimSpace(loaded.ConsumerRunID) != consumerRunID {
 					continue
 				}
 				if _, exists := out[loaded.ProducedID]; !exists {
@@ -175,24 +155,58 @@ func (s *AdoptionStore) ListByConsumer(consumerRunID string) []AdoptionRecord {
 	if len(out) == 0 {
 		return nil
 	}
-	result := make([]AdoptionRecord, 0, len(out))
+	result := make([]artifactcontract.AdoptionRecord, 0, len(out))
 	for _, rec := range out {
 		result = append(result, rec)
 	}
 	return result
 }
 
-func readAdoptionRecord(filename string) (AdoptionRecord, bool) {
+func readAdoptionRecord(filename string) (artifactcontract.AdoptionRecord, bool) {
 	if filename == "" {
-		return AdoptionRecord{}, false
+		return artifactcontract.AdoptionRecord{}, false
 	}
 	data, err := os.ReadFile(filename)
 	if err != nil {
-		return AdoptionRecord{}, false
+		return artifactcontract.AdoptionRecord{}, false
 	}
-	var rec AdoptionRecord
-	if json.Unmarshal(data, &rec) != nil || strings.TrimSpace(rec.OwnerRunID) == "" {
-		return AdoptionRecord{}, false
+	var rec artifactcontract.AdoptionRecord
+	if json.Unmarshal(data, &rec) != nil || strings.TrimSpace(rec.ConsumerTenantID) == "" || strings.TrimSpace(rec.OwnerRunID) == "" || strings.TrimSpace(rec.ContentHash) == "" {
+		return artifactcontract.AdoptionRecord{}, false
 	}
 	return rec, true
 }
+
+func writeAdoptionRecord(filename string, record artifactcontract.AdoptionRecord) error {
+	data, err := json.Marshal(record)
+	if err != nil {
+		return fmt.Errorf("编码 adoption record: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(filename), 0o700); err != nil {
+		return fmt.Errorf("创建 adoption 目录: %w", err)
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(filename), ".adoption-*.tmp")
+	if err != nil {
+		return fmt.Errorf("创建 adoption 临时文件: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0o600); err == nil {
+		_, err = tmp.Write(data)
+	}
+	if err == nil {
+		err = tmp.Sync()
+	}
+	if closeErr := tmp.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return fmt.Errorf("写入 adoption record: %w", err)
+	}
+	if err := os.Rename(tmpName, filename); err != nil {
+		return fmt.Errorf("提交 adoption record: %w", err)
+	}
+	return nil
+}
+
+var _ artifactcontract.AdoptionStore = (*AdoptionStore)(nil)

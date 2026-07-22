@@ -10,12 +10,12 @@ import (
 	artifactmodel "genesis-agent/internal/capabilities/artifact/model"
 	artifactservice "genesis-agent/internal/capabilities/artifact/service"
 	selectartifact "genesis-agent/internal/capabilities/artifact/tool/select_deliverable_candidate"
+	execmodel "genesis-agent/internal/capabilities/execution/model"
 	sandboxcontract "genesis-agent/internal/capabilities/sandbox/contract"
 	scriptservice "genesis-agent/internal/capabilities/skill/script/service"
 	toolcontract "genesis-agent/internal/capabilities/tool/contract"
 	workspaceadapter "genesis-agent/internal/capabilities/workspace/adapter/sandbox"
 	workcontract "genesis-agent/internal/capabilities/workspace/contract"
-	execmodel "genesis-agent/internal/capabilities/execution/model"
 	workmodel "genesis-agent/internal/capabilities/workspace/model"
 	workservice "genesis-agent/internal/capabilities/workspace/service"
 	"genesis-agent/internal/platform/idgen"
@@ -52,6 +52,7 @@ type Control struct {
 	Initializer    artifactcontract.RunInitializer
 	Completion     artifactcontract.CompletionPolicy
 	QAEvidence     artifactcontract.QAEvidenceRecorder
+	Adoptions      artifactcontract.AdoptionStore
 	Selector       toolcontract.Tool
 }
 
@@ -65,7 +66,10 @@ func Build(opts Options) (Control, error) {
 		maxBytes = defaultBufferedObjectMaxBytes
 	}
 	ids := idgen.NewUUIDGenerator()
-	artifactservice.GlobalAdoptionStore.SetStateRoot(opts.StateRoot)
+	adoptions, err := artifactservice.NewAdoptionStore(opts.StateRoot)
+	if err != nil {
+		return Control{}, err
+	}
 	manifests, err := localworkspace.NewManifestStore(opts.StateRoot)
 	if err != nil {
 		return Control{}, err
@@ -203,11 +207,11 @@ func Build(opts Options) (Control, error) {
 	if err != nil {
 		return Control{}, err
 	}
-	delivery, err := artifactservice.NewDeliveryService(ledger, ledger, ledger, ledger, store, planner, materializer)
+	delivery, err := artifactservice.NewDeliveryService(ledger, ledger, ledger, ledger, ledger, store, planner, materializer)
 	if err != nil {
 		return Control{}, err
 	}
-	finalizer, err := artifactservice.NewDeterministicFinalizer(ledger, ledger, producedStore, publisher, delivery)
+	finalizer, err := artifactservice.NewDeterministicFinalizer(ledger, ledger, producedStore, publisher, ledger, ledger, delivery)
 	if err != nil {
 		return Control{}, err
 	}
@@ -219,6 +223,7 @@ func Build(opts Options) (Control, error) {
 	if err != nil {
 		return Control{}, err
 	}
+	completion.WithAdoptions(adoptions)
 	qaEvidence, err := artifactservice.NewQAEvidenceRecorder(ledger, ledger, ledger, ledger)
 	if err != nil {
 		return Control{}, err
@@ -243,6 +248,7 @@ func Build(opts Options) (Control, error) {
 		Initializer:    initializer,
 		Completion:     completion,
 		QAEvidence:     qaEvidence,
+		Adoptions:      adoptions,
 		Selector:       selector,
 	}, nil
 }

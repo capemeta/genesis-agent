@@ -1,8 +1,6 @@
 ---
 name: skill-creator
 description: Use this skill when the user wants to create, migrate, validate, package, or improve an agent skill for Genesis. Use for turning repeated workflows into SKILL.md packages, checking Claude/Codex/Kode skill compatibility, designing trigger descriptions, choosing references/scripts/assets, drafting eval prompts, or deciding that a request should be a document, script, tool, MCP, or plugin instead of a skill.
-metadata:
-  author: Genesis
 ---
 
 # Skill Creator

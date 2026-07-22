@@ -8,15 +8,16 @@ import (
 )
 
 func TestResolveRuntimeProfileUsesDeclaredOfficeDeps(t *testing.T) {
-	meta := skillmodel.Metadata{Dependencies: skillmodel.Dependencies{Runtime: skillmodel.RuntimeDeps{System: []skillmodel.RuntimePackage{{Name: "libreoffice", Command: "soffice"}}}}}
-	if got := resolveRuntimeProfile(meta, resolveTaskType(meta)); got != execmodel.RuntimeProfileOfficeBasic {
-		t.Fatalf("profile=%s", got)
+	deps := skillmodel.RuntimeDeps{System: []skillmodel.RuntimePackage{{Name: "libreoffice", Command: "soffice"}}}
+	taskType := resolveTaskType(deps)
+	if taskType != execmodel.SandboxTaskOffice || resolveRuntimeProfile(taskType) != execmodel.RuntimeProfileOfficeBasic {
+		t.Fatalf("task=%s profile=%s", taskType, resolveRuntimeProfile(taskType))
 	}
 }
 
 func TestResolveRuntimeProfileFallsBackToPolyglot(t *testing.T) {
-	meta := skillmodel.Metadata{}
-	if got := resolveRuntimeProfile(meta, resolveTaskType(meta)); got != execmodel.RuntimeProfileSkillPolyglotBasic {
-		t.Fatalf("profile=%s", got)
+	taskType := resolveTaskType(skillmodel.RuntimeDeps{})
+	if resolveRuntimeProfile(taskType) != execmodel.RuntimeProfileSkillPolyglotBasic {
+		t.Fatalf("profile=%s", resolveRuntimeProfile(taskType))
 	}
 }

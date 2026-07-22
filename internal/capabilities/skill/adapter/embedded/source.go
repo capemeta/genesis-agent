@@ -14,6 +14,7 @@ import (
 
 	"genesis-agent/internal/capabilities/skill/contract"
 	"genesis-agent/internal/capabilities/skill/model"
+	"genesis-agent/internal/capabilities/skill/packaging"
 )
 
 const skillFileName = "SKILL.md"
@@ -59,7 +60,7 @@ func (s *Source) List(ctx context.Context, query contract.ListQuery) (contract.L
 		}
 		return contract.ListResult{}, err
 	}
-	result := contract.ListResult{Entries: make([]model.Metadata, 0)}
+	result := contract.ListResult{Packages: make([]model.PhysicalSkillDefinition, 0)}
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -68,14 +69,14 @@ func (s *Source) List(ctx context.Context, query contract.ListQuery) (contract.L
 		if strings.HasPrefix(name, "_") {
 			continue
 		}
-		meta, err := s.readMetadata(name)
+		physical, err := s.readPhysical(name)
 		if err != nil {
 			result.Errors = append(result.Errors, model.Error{Source: s.authority, Path: name, Message: err.Error()})
 			continue
 		}
-		result.Entries = append(result.Entries, meta)
+		result.Packages = append(result.Packages, physical)
 	}
-	sort.SliceStable(result.Entries, func(i, j int) bool { return result.Entries[i].QualifiedName < result.Entries[j].QualifiedName })
+	sort.SliceStable(result.Packages, func(i, j int) bool { return result.Packages[i].Metadata.Name < result.Packages[j].Metadata.Name })
 	return result, nil
 }
 
@@ -106,6 +107,48 @@ func (s *Source) Read(ctx context.Context, req contract.ReadRequest) (contract.R
 		return contract.ReadResult{}, err
 	}
 	return contract.ReadResult{Metadata: meta, Resource: model.ResourceID(resource), Content: content, Truncated: truncated, Version: meta.Version}, nil
+}
+
+// ReadPackageSnapshot 返回嵌入文件系统中的原始包字节。
+func (s *Source) ReadPackageSnapshot(ctx context.Context, expected model.SkillPackageSnapshot) ([]model.SkillPackageFile, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+	pkg := strings.TrimSpace(string(expected.PackageID))
+	files := make([]model.SkillPackageFile, 0, len(expected.Files))
+	err := fs.WalkDir(s.root, pkg, func(resourcePath string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			if entry.Name() == "__pycache__" {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if strings.HasSuffix(strings.ToLower(entry.Name()), ".pyc") {
+			return nil
+		}
+		content, err := fs.ReadFile(s.root, resourcePath)
+		if err != nil {
+			return err
+		}
+		files = append(files, model.SkillPackageFile{Resource: model.ResourceID(resourcePath), Content: content})
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	raw := make([]packaging.File, 0, len(files))
+	for _, file := range files {
+		raw = append(raw, packaging.File{Resource: file.Resource, Content: file.Content})
+	}
+	if err := packaging.ValidateSnapshot(expected, raw); err != nil {
+		return nil, err
+	}
+	return files, nil
 }
 
 func (s *Source) ListResources(ctx context.Context, req contract.SourceListResourcesRequest) (contract.ListResourcesResult, error) {
@@ -198,14 +241,59 @@ func (s *Source) Search(ctx context.Context, req contract.SearchRequest) (contra
 }
 
 func (s *Source) readMetadata(pkg string) (model.Metadata, error) {
+	physical, err := s.readPhysical(pkg)
+	return physical.Metadata, err
+}
+
+func (s *Source) readPhysical(pkg string) (model.PhysicalSkillDefinition, error) {
 	if err := model.ValidateName(pkg); err != nil {
-		return model.Metadata{}, err
+		return model.PhysicalSkillDefinition{}, err
 	}
-	data, err := readSkillFile(s.root, pkg, 64*1024)
+	data, err := readSkillFile(s.root, pkg, model.MaxPromptBytes)
 	if err != nil {
-		return model.Metadata{}, err
+		return model.PhysicalSkillDefinition{}, err
 	}
-	return s.parser.ParseFrontmatter(data, contract.ParseSource{Authority: s.authority, Scope: s.scope, PackageID: model.PackageID(pkg), MainResource: model.ResourceID(pkg + "/SKILL.md"), DisplayPath: pkg + "/SKILL.md", DirectoryName: pkg})
+	meta, err := s.parser.ParseFrontmatter(data, contract.ParseSource{Authority: s.authority, Scope: s.scope, PackageID: model.PackageID(pkg), MainResource: model.ResourceID(pkg + "/SKILL.md"), DisplayPath: pkg + "/SKILL.md", DirectoryName: pkg})
+	if err != nil {
+		return model.PhysicalSkillDefinition{}, err
+	}
+	files := make([]packaging.File, 0, 32)
+	var manifest *model.RuntimeManifest
+	err = fs.WalkDir(s.root, pkg, func(resourcePath string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			if entry.Name() == "__pycache__" {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if strings.HasSuffix(strings.ToLower(entry.Name()), ".pyc") {
+			return nil
+		}
+		content, readErr := fs.ReadFile(s.root, resourcePath)
+		if readErr != nil {
+			return readErr
+		}
+		files = append(files, packaging.File{Resource: model.ResourceID(resourcePath), Content: content})
+		if path.Base(resourcePath) == model.RuntimeManifestFileName {
+			parsed, parseErr := s.parser.ParseRuntimeManifest(content, meta.Name)
+			if parseErr != nil {
+				return parseErr
+			}
+			manifest = &parsed
+		}
+		return nil
+	})
+	if err != nil {
+		return model.PhysicalSkillDefinition{}, err
+	}
+	snapshot, err := packaging.BuildSnapshot(s.authority, meta.PackageID, meta.Version, files)
+	if err != nil {
+		return model.PhysicalSkillDefinition{}, err
+	}
+	return model.PhysicalSkillDefinition{Metadata: meta, Manifest: manifest, Snapshot: snapshot}, nil
 }
 
 func (s *Source) readFull(pkg string) (model.Metadata, string, error) {

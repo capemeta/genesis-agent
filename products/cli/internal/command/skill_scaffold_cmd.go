@@ -21,7 +21,6 @@ import (
 func newSkillCreateCmd() *cobra.Command {
 	var basePath string
 	var description string
-	var author string
 	var resources string
 	var evals bool
 	var force bool
@@ -51,7 +50,7 @@ func newSkillCreateCmd() *cobra.Command {
 			if err := os.MkdirAll(skillDir, 0o755); err != nil {
 				return err
 			}
-			if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(skillTemplate(name, description, author)), 0o644); err != nil {
+			if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(skillTemplate(name, description)), 0o644); err != nil {
 				return err
 			}
 			for _, dir := range parseResourceDirs(resources) {
@@ -73,7 +72,6 @@ func newSkillCreateCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&basePath, "path", "", "创建到指定根目录，默认 .genesis/skills")
 	cmd.Flags().StringVar(&description, "description", "", "Skill description")
-	cmd.Flags().StringVar(&author, "author", "Genesis", "metadata.author")
 	cmd.Flags().StringVar(&resources, "resources", "", "创建资源目录，逗号分隔：references,scripts,assets")
 	cmd.Flags().BoolVar(&evals, "evals", false, "创建 evals/evals.json 初稿")
 	cmd.Flags().BoolVar(&force, "force", false, "覆盖已存在目录")
@@ -222,12 +220,10 @@ func isDangerousOverwriteTarget(path string) bool {
 	return false
 }
 
-func skillTemplate(name, description, author string) string {
+func skillTemplate(name, description string) string {
 	return fmt.Sprintf(`---
 name: %s
 description: %s
-metadata:
-  author: %s
 ---
 
 # %s
@@ -246,7 +242,7 @@ metadata:
 ## Resource Map
 
 - Add references or scripts only when they are actually needed.
-`, name, description, author, skillDisplayName(name))
+`, name, description, skillDisplayName(name))
 }
 func skillDisplayName(name string) string {
 	words := strings.Split(name, "-")

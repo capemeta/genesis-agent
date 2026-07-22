@@ -277,15 +277,15 @@ func TestApplyProgressSubagentTagPreservedOnReplace(t *testing.T) {
 
 	// 1. Subagent Tool Input Start
 	m.applyProgress(progress.Event{
-		Kind:        progress.KindTool,
-		Phase:       progress.PhaseStart,
-		CallID:      "call-sub-1",
-		SubAgentID:  "skill-fork:office-ppt",
-		Depth:       1,
-		Name:        "run_skill_command",
-		Detail:      `{"command":"node build.js"}`,
-		BlockType:   "tool_input",
-		Display:     &display,
+		Kind:       progress.KindTool,
+		Phase:      progress.PhaseStart,
+		CallID:     "call-sub-1",
+		SubAgentID: "skill-fork:office-ppt",
+		Depth:      1,
+		Name:       "run_skill_command",
+		Detail:     `{"command":"node build.js"}`,
+		BlockType:  "tool_input",
+		Display:    &display,
 	})
 
 	if len(m.progressLog) != 1 || !strings.HasPrefix(m.progressLog[0], "[Sub-Agent: skill-fork:office-ppt]") {
@@ -294,15 +294,15 @@ func TestApplyProgressSubagentTagPreservedOnReplace(t *testing.T) {
 
 	// 2. Tool Result Complete -> Replaces CallID and retains subagent tag
 	m.applyProgress(progress.Event{
-		Kind:        progress.KindTool,
-		Phase:       progress.PhaseComplete,
-		CallID:      "call-sub-1",
-		SubAgentID:  "skill-fork:office-ppt",
-		Depth:       1,
-		Name:        "run_skill_command",
-		Detail:      `{"command":"node build.js"}`,
-		BlockType:   "tool_result",
-		Display:     &display,
+		Kind:       progress.KindTool,
+		Phase:      progress.PhaseComplete,
+		CallID:     "call-sub-1",
+		SubAgentID: "skill-fork:office-ppt",
+		Depth:      1,
+		Name:       "run_skill_command",
+		Detail:     `{"command":"node build.js"}`,
+		BlockType:  "tool_result",
+		Display:    &display,
 	})
 
 	if len(m.progressLog) != 1 || !strings.HasPrefix(m.progressLog[0], "[Sub-Agent: skill-fork:office-ppt]") {
@@ -313,7 +313,7 @@ func TestApplyProgressSubagentTagPreservedOnReplace(t *testing.T) {
 func TestApplyProgressSubagentThinkingInPlaceStreaming(t *testing.T) {
 	m := Model{}
 	subAgentID := "skill-fork:office-ppt"
-	
+
 	// Stream 3 thinking delta tokens
 	for _, chunk := range []string{"the input", " file to", " understand"} {
 		m.applyProgress(progress.Event{

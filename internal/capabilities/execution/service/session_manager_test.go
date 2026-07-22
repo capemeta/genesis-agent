@@ -209,7 +209,7 @@ func (m *mockApproval) Authorize(ctx context.Context, req approvalmodel.Request)
 
 func TestSessionManager_DynamicScannerWithApproval(t *testing.T) {
 	runner := newMockRunner()
-	
+
 	ctx := context.Background()
 	sessionID := "approved_session"
 

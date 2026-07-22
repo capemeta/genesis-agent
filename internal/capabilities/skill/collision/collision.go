@@ -7,7 +7,12 @@ import (
 	"strings"
 
 	skillcontract "genesis-agent/internal/capabilities/skill/contract"
+	skillmodel "genesis-agent/internal/capabilities/skill/model"
 )
+
+type Cataloger interface {
+	Catalog(context.Context, skillcontract.CatalogRequest) (skillmodel.Catalog, error)
+}
 
 // Result 是结构化纠错结果，作为 ToolResult 返回给模型（仅在不改写时使用）。
 type Result struct {
@@ -21,7 +26,7 @@ type Result struct {
 
 // Matcher 用本 turn 的 Skill Catalog 判断名称是否为 skill。
 type Matcher struct {
-	Service        skillcontract.Service
+	Service        Cataloger
 	CatalogRequest skillcontract.CatalogRequest
 }
 
@@ -66,13 +71,13 @@ func FormatResult(requested, canonical string) string {
 }
 
 // RewriteArgs 将误调用改写为 Skill 网关参数。
-// 默认丢弃伪造业务 JSON，仅保留 skill 名；若原参数是纯字符串则作为 args。
+// 默认丢弃伪造业务 JSON，仅保留 skill 名；若原参数是纯字符串则作为显式 task。
 func RewriteArgs(canonical, originalArgs string) string {
 	canonical = strings.TrimSpace(canonical)
 	payload := map[string]string{"skill": canonical}
 	trimmed := strings.TrimSpace(originalArgs)
 	if trimmed != "" && trimmed[0] != '{' && trimmed[0] != '[' {
-		payload["args"] = trimmed
+		payload["task"] = trimmed
 	}
 	data, err := json.Marshal(payload)
 	if err != nil {

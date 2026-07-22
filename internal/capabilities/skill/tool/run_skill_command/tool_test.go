@@ -7,8 +7,11 @@ import (
 	"testing"
 	"time"
 
+	artifactcontract "genesis-agent/internal/capabilities/artifact/contract"
 	artifactmodel "genesis-agent/internal/capabilities/artifact/model"
 	execmodel "genesis-agent/internal/capabilities/execution/model"
+	skillcontract "genesis-agent/internal/capabilities/skill/contract"
+	skillmodel "genesis-agent/internal/capabilities/skill/model"
 	scriptcontract "genesis-agent/internal/capabilities/skill/script/contract"
 	workcontract "genesis-agent/internal/capabilities/workspace/contract"
 	workmodel "genesis-agent/internal/capabilities/workspace/model"
@@ -36,7 +39,15 @@ func skillTestContext() context.Context {
 	execution := workmodel.PreparedExecutionSnapshot{Binding: binding, Workspace: execmodel.ExecutionWorkspace{WorkDir: "/workspace/work/skill-binding"}}
 	manifest := workmodel.RunManifest{RunID: "run-1", StateRoot: workmodel.StateRoot{ID: "state", Authority: "test"}, Executions: []workmodel.PreparedExecutionSnapshot{execution}}
 	ctx := workcontract.WithPreparedRun(context.Background(), workmodel.PreparedRun{Manifest: manifest, Execution: execution})
-	return workcontract.WithControlPlane(ctx, &skillTestControl{execution: execution, manifest: manifest})
+	return withInvocation(workcontract.WithControlPlane(ctx, &skillTestControl{execution: execution, manifest: manifest}))
+}
+
+func withInvocation(ctx context.Context) context.Context {
+	return skillcontract.WithInvocationBinding(ctx, skillmodel.InvocationBinding{
+		ID: "invocation-binding", RunID: "run-1", Handle: "demo", PhysicalSkill: "demo", InvocationID: "work",
+		Package: skillmodel.SkillPackageSnapshot{Digest: "sha256:package"}, IdempotencyKey: "invocation-key",
+		ExecutionPolicy: skillmodel.EffectiveExecutionPolicy{SandboxRequired: false, ExecutionMode: skillmodel.ExecutionModePerCall},
+	})
 }
 
 func TestExecuteRequestsTaskWorkspaceBinding(t *testing.T) {
@@ -46,6 +57,7 @@ func TestExecuteRequestsTaskWorkspaceBinding(t *testing.T) {
 	control := &skillTestControl{execution: execution, manifest: manifest}
 	ctx := workcontract.WithPreparedRun(context.Background(), workmodel.PreparedRun{Manifest: manifest, Execution: execution})
 	ctx = workcontract.WithControlPlane(ctx, control)
+	ctx = withInvocation(ctx)
 	tool, err := New(Deps{Runner: &captureRunner{}})
 	if err != nil {
 		t.Fatal(err)
@@ -159,6 +171,7 @@ func TestExecuteExpandsCallerWorkDirBeforeResolvingInput(t *testing.T) {
 	control := &skillTestControl{execution: skillExecution, manifest: manifest}
 	ctx := workcontract.WithPreparedRun(context.Background(), workmodel.PreparedRun{Manifest: manifest, Execution: rootExecution})
 	ctx = workcontract.WithControlPlane(ctx, control)
+	ctx = withInvocation(ctx)
 
 	if _, err := tool.Execute(ctx, `{"skill":"demo","command":"node create.js","inputs":["$WORK_DIR/create.js"]}`); err != nil {
 		t.Fatal(err)
@@ -195,6 +208,62 @@ func TestApplyFinalizationKeepsOKOnDeliveryConflict(t *testing.T) {
 	}
 }
 
+func TestExecuteAutomaticallyRecordsOptionalVisionDegradeBeforeDelivery(t *testing.T) {
+	ctx := skillTestContext()
+	binding, ok := skillcontract.InvocationBindingFromContext(ctx)
+	if !ok {
+		t.Fatal("missing invocation binding")
+	}
+	binding.Capabilities.VisionMode = "degraded_text"
+	binding.Result = skillmodel.ResultContract{Kind: skillmodel.ResultKindDeliverables, Deliverables: []skillmodel.DeliverableDeclaration{{
+		ID: "deck", Role: skillmodel.DeliverableRolePrimary, Required: true, Cardinality: skillmodel.DeliverableExactlyOne,
+		QA: skillmodel.QADeclaration{Policy: "visual-qa/v1", Enforcement: "optional"},
+	}}}
+	ctx = skillcontract.WithInvocationBinding(ctx, binding)
+	finalizer := &sequencedFinalizer{}
+	recorder := &recordingQADegrade{}
+	created, err := New(Deps{Runner: &captureRunner{}, Finalizer: finalizer, QAEvidence: recorder})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := created.Execute(ctx, `{"skill":"demo","command":"python script.py"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if finalizer.calls != 2 || recorder.calls != 1 || recorder.request.FailureCode != "vision_unavailable" {
+		t.Fatalf("finalizer=%d recorder=%d request=%+v", finalizer.calls, recorder.calls, recorder.request)
+	}
+	if !strings.Contains(result, "已由 Harness 发布并交付") {
+		t.Fatalf("expected delivered result after automatic degrade: %s", result)
+	}
+}
+
+type sequencedFinalizer struct{ calls int }
+
+func (f *sequencedFinalizer) FinalizeRequired(context.Context, string, string) (artifactmodel.FinalizationResult, error) {
+	f.calls++
+	status := "qa_pending"
+	if f.calls > 1 {
+		status = "delivered"
+	}
+	return artifactmodel.FinalizationResult{Resolutions: []artifactmodel.DeliverableResolution{{DeliverableID: "deck", Status: status}}}, nil
+}
+
+func (f *sequencedFinalizer) SelectAndFinalize(context.Context, string, string, string, string) (artifactmodel.DeliveryResult, error) {
+	return artifactmodel.DeliveryResult{}, nil
+}
+
+type recordingQADegrade struct {
+	calls   int
+	request artifactcontract.QAOutcomeRequest
+}
+
+func (r *recordingQADegrade) RecordOutcome(_ context.Context, request artifactcontract.QAOutcomeRequest) error {
+	r.calls++
+	r.request = request
+	return nil
+}
+
 func TestCollectWorkspaceInputsIncludesBoundInputAndCommandEntry(t *testing.T) {
 	view := workmodel.WorkspaceViewManifest{Entries: []workmodel.WorkspaceViewEntry{{Path: "2026笔记本选型比较.pptx"}}}
 	required, optional := collectWorkspaceInputs(`node create.js "2026笔记本选型比较.pptx"`, []string{"notes.json"}, view)
@@ -204,5 +273,12 @@ func TestCollectWorkspaceInputsIncludesBoundInputAndCommandEntry(t *testing.T) {
 	}
 	if len(optional) != 1 || optional[0] != "create.js" {
 		t.Fatalf("collectWorkspaceInputs() optional = %v", optional)
+	}
+}
+
+func TestTrustedExecutionBackendRecognizesCanonicalLocalPlatformProvider(t *testing.T) {
+	backend := trustedExecutionBackend(execmodel.SandboxProfile{Mode: execmodel.SandboxRequired, Provider: "local-platform"})
+	if backend.Kind != execmodel.BackendKindLocalSandbox || backend.Authority != "host" {
+		t.Fatalf("backend=%+v", backend)
 	}
 }

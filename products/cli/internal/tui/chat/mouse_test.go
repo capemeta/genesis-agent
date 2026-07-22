@@ -17,10 +17,10 @@ func TestByteOffsetAtCol(t *testing.T) {
 		{"ascii-mid", "Hello", 2, 2},
 		{"ascii-beyond", "Hello", 10, 5},
 		{"cjk-start", "世界", 0, 0},
-		{"cjk-after-first", "世界", 2, 3},       // 全角宽 2，col=2 落在第二个字前
-		{"cjk-mid-rounds-up", "世界", 1, 3},     // col 落在首字中间，按 rune 边界向后取整
-		{"cjk-end", "世界", 4, 6},               // 两字共 6 字节
-		{"mixed", "a世b", 3, 4},                 // a(1) 世(2) → col3 落在 b 前，字节 4
+		{"cjk-after-first", "世界", 2, 3},   // 全角宽 2，col=2 落在第二个字前
+		{"cjk-mid-rounds-up", "世界", 1, 3}, // col 落在首字中间，按 rune 边界向后取整
+		{"cjk-end", "世界", 4, 6},           // 两字共 6 字节
+		{"mixed", "a世b", 3, 4},            // a(1) 世(2) → col3 落在 b 前，字节 4
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

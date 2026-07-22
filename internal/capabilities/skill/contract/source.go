@@ -18,6 +18,12 @@ type Source interface {
 	Search(ctx context.Context, req SearchRequest) (SearchResult, error)
 }
 
+// PackageSnapshotSource 由能够返回原始包字节的 Source 实现。普通 Read 会按
+// Skill 语义返回去除 frontmatter 的正文，不能替代不可变包快照读取。
+type PackageSnapshotSource interface {
+	ReadPackageSnapshot(ctx context.Context, expected model.SkillPackageSnapshot) ([]model.SkillPackageFile, error)
+}
+
 // Watcher 是可选的本地变更监听器，不强加给 DB/远程 source。
 type Watcher interface {
 	Watch(ctx context.Context, roots []WatchRoot) (<-chan ChangeEvent, error)
@@ -46,7 +52,7 @@ type ListQuery struct {
 }
 
 type ListResult struct {
-	Entries  []model.Metadata
+	Packages []model.PhysicalSkillDefinition
 	Errors   []model.Error
 	Warnings []string
 	Version  string

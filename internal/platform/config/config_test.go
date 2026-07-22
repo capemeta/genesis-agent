@@ -315,6 +315,7 @@ func TestLoadSandboxDefaultsDisabled(t *testing.T) {
 	}
 }
 
+
 func TestLoadSandboxExternalConfig(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("GENESIS_TEST_SANDBOX_KEY", "sandbox-key")

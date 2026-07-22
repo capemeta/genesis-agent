@@ -2,14 +2,11 @@ package skill
 
 import (
 	"context"
-	"fmt"
+	"encoding/json"
 	"strings"
 	"testing"
 
-	approvaldeny "genesis-agent/internal/capabilities/approval/adapter/deny"
-	approvalmemory "genesis-agent/internal/capabilities/approval/adapter/memory"
-	approvalstatic "genesis-agent/internal/capabilities/approval/adapter/static"
-	approvalservice "genesis-agent/internal/capabilities/approval/service"
+	approvalmodel "genesis-agent/internal/capabilities/approval/model"
 	"genesis-agent/internal/capabilities/llm/vision"
 	viewimage "genesis-agent/internal/capabilities/media/tool/view_image"
 	skillmemory "genesis-agent/internal/capabilities/skill/adapter/memory"
@@ -17,290 +14,168 @@ import (
 	skillmodel "genesis-agent/internal/capabilities/skill/model"
 	skillservice "genesis-agent/internal/capabilities/skill/service"
 	subagentcontract "genesis-agent/internal/capabilities/subagent/contract"
-	tool "genesis-agent/internal/capabilities/tool/contract"
-	"genesis-agent/internal/platform/logger"
+	toolcontract "genesis-agent/internal/capabilities/tool/contract"
+	workmodel "genesis-agent/internal/capabilities/workspace/model"
+	"genesis-agent/internal/platform/contextutil"
 )
 
-func TestSkillAllowsAvailableToolDependency(t *testing.T) {
-	tool := newTestTool(t, skillmodel.Dependencies{Tools: []skillmodel.ToolDependency{{Type: "tool", Value: "read_file"}}}, []string{"read_file"})
-	out, err := tool.Execute(context.Background(), `{"skill":"review"}`)
+type allowApproval struct{}
+
+func (allowApproval) Authorize(context.Context, approvalmodel.Request) (approvalmodel.Decision, error) {
+	return approvalmodel.Decision{Type: approvalmodel.DecisionApproved}, nil
+}
+
+type fixedInputs struct{}
+
+func (fixedInputs) ResolveInputs(_ context.Context, inputs []string) ([]workmodel.ResourceRef, error) {
+	out := make([]workmodel.ResourceRef, 0, len(inputs))
+	for _, input := range inputs {
+		out = append(out, workmodel.ResourceRef{Authority: "host", Scheme: "run-input", ID: input, Version: "sha256:abc", Path: input})
+	}
+	return out, nil
+}
+
+type captureDelegator struct {
+	request subagentcontract.DelegateRequest
+}
+
+func (d *captureDelegator) Delegate(_ context.Context, req subagentcontract.DelegateRequest) (string, error) {
+	d.request = req
+	return `{"status":"completed"}`, nil
+}
+func (d *captureDelegator) GetInfo() *toolcontract.Info {
+	return &toolcontract.Info{Name: "Task", Parameters: &toolcontract.ParameterSchema{Type: "object"}}
+}
+func (d *captureDelegator) Execute(context.Context, string) (string, error) { return "", nil }
+
+func TestSkillSchemaIsStableAndInlineBindingUsesOnlyPublicParameters(t *testing.T) {
+	created := newInvocationTool(t, false)
+	info := created.GetInfo()
+	if info.Name != "Skill" || len(info.Parameters.Properties) != 3 {
+		t.Fatalf("info=%+v", info)
+	}
+	for _, name := range []string{"skill", "task", "inputs"} {
+		if info.Parameters.Properties[name] == nil {
+			t.Fatalf("missing public parameter %s", name)
+		}
+	}
+	if _, ok := info.Parameters.Properties["entrypoint"]; ok {
+		t.Fatal("entrypoint must not enter model schema")
+	}
+	ctx := testContext(vision.ModeDegradedText)
+	out, err := created.Execute(ctx, `{"skill":"demo-read","inputs":["deck.pptx"]}`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out, `"dependencies"`) || !strings.Contains(out, `"status":"available"`) {
-		t.Fatalf("output = %s", out)
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(out), &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded["context"] != "main" || decoded["physical_skill"] != "demo" || decoded["binding_id"] == "" {
+		t.Fatalf("output=%s", out)
+	}
+	if _, err := created.Execute(ctx, `{"skill":"demo-read","entrypoint":"read"}`); err == nil {
+		t.Fatal("unknown model parameter must fail")
 	}
 }
 
-func TestSkillAcceptsSkillParam(t *testing.T) {
-	tool := newTestTool(t, skillmodel.Dependencies{}, []string{"read_file"})
-	out, err := tool.Execute(context.Background(), `{"skill":"review"}`)
+func TestSkillForkDelegatesIsolatedBindingAndDeclarativeDeliverable(t *testing.T) {
+	created := newInvocationTool(t, false)
+	delegate := &captureDelegator{}
+	created.SetForkTask(delegate)
+	ctx := testContext(vision.ModeDirectInject)
+	out, err := created.Execute(ctx, `{"skill":"demo","task":"生成项目汇报","inputs":["requirements.md"]}`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out, `"type":"skill_injection"`) || !strings.Contains(out, `"name":"review"`) {
-		t.Fatalf("output = %s", out)
+	if !strings.Contains(out, `"completed"`) {
+		t.Fatalf("out=%s", out)
+	}
+	req := delegate.request
+	if req.SnapshotMode != subagentcontract.SnapshotModeSkillIsolated || req.InvocationBinding.Handle != "demo" || req.InvocationBinding.RunID != "parent-run" {
+		t.Fatalf("request=%+v", req)
+	}
+	if len(req.Deliverables) != 1 || req.Deliverables[0].ID != "deck" || req.Deliverables[0].QAPolicy != "visual-qa/v1" {
+		t.Fatalf("deliverables=%+v", req.Deliverables)
+	}
+	if len(req.AllowedTools) != 3 || len(req.InputRefs) != 1 {
+		t.Fatalf("tools=%v inputs=%v", req.AllowedTools, req.InputRefs)
 	}
 }
 
-func TestSkillRejectsLegacyNameParam(t *testing.T) {
-	tool := newTestTool(t, skillmodel.Dependencies{}, []string{"read_file"})
-	_, err := tool.Execute(context.Background(), `{"name":"review"}`)
-	if err == nil || !strings.Contains(err.Error(), "skill或resource") {
-		t.Fatalf("err = %v", err)
+func TestSkillRequiredVisionChecksTargetBeforeFork(t *testing.T) {
+	created := newInvocationTool(t, true)
+	delegate := &captureDelegator{}
+	created.SetForkTask(delegate)
+	_, err := created.Execute(testContext(vision.ModeDegradedText), `{"skill":"demo","task":"生成"}`)
+	if err == nil || !strings.Contains(err.Error(), "SKILL_CAPABILITY_REQUIRED") {
+		t.Fatalf("err=%v", err)
+	}
+	if delegate.request.Prompt != "" {
+		t.Fatal("capability gate must run before child creation")
 	}
 }
 
-func TestSkillToolExposesGatewayNameAndDescriptionFunc(t *testing.T) {
-	tool := newTestTool(t, skillmodel.Dependencies{}, []string{"read_file"})
-	info := tool.GetInfo()
-	if info.Name != "Skill" {
-		t.Fatalf("Name = %q, want Skill", info.Name)
+func TestResolveToolPolicyFailsClosed(t *testing.T) {
+	if _, err := resolveToolPolicy([]string{"read_file"}, skillmodel.ToolPolicy{Allow: []string{"run_skill_command"}, Required: []string{"run_skill_command"}}); err == nil {
+		t.Fatal("empty intersection must fail")
 	}
-	if _, ok := info.Parameters.Properties["name"]; ok {
-		t.Fatal("legacy name parameter should be removed")
-	}
-	if info.DescriptionFunc == nil {
-		t.Fatal("DescriptionFunc is nil")
-	}
-	desc, err := info.DescriptionFunc(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(desc, "<available_skills>") || !strings.Contains(desc, "review") {
-		t.Fatalf("description = %q", desc)
+	if _, err := resolveToolPolicy([]string{"run_skill_command"}, skillmodel.ToolPolicy{Allow: []string{"run_skill_command", "view_image"}, Required: []string{"view_image"}}); err == nil {
+		t.Fatal("missing required tool must fail")
 	}
 }
 
-func TestSkillExplicitLoadAllowsDisableModelInvocation(t *testing.T) {
-	meta := skillmodel.Metadata{
-		Name: "manual", QualifiedName: "manual", Description: "Manual", Enabled: true, PromptVisible: true,
-		Authority: skillmodel.Authority{Kind: skillmodel.SourceKindEmbedded, ID: "test"}, PackageID: "manual", MainResource: "manual/SKILL.md",
-		Policy: skillmodel.Policy{DisableModelInvocation: true},
-	}.Normalize()
-	source := skillmemory.NewSource(meta.Authority, []skillmemory.Skill{{Metadata: meta, Body: "Manual body"}})
-	svc := skillservice.New([]skillcontract.Source{source}, skillservice.Options{})
-	approval, err := approvalservice.New(approvalstatic.NewPolicyEngine(), approvaldeny.NewRequester(), approvalmemory.NewStore(), logger.NewNop())
+func TestResolveExecutionPolicyPinsSafeDegradationInBindingFact(t *testing.T) {
+	resolved := skillmodel.ResolvedInvocation{Definition: skillmodel.InvocationDefinition{Handle: "demo"}, Profile: skillmodel.RuntimeProfile{Sandbox: skillmodel.SandboxRequirement{ExecutionMode: skillmodel.ExecutionModeSandboxedSession, Backends: []string{"remote_sandbox", "local_platform_sandbox"}}}}
+	tool := &Tool{deps: Deps{
+		LocalSandboxAvailable: true, RemoteSandboxAvailable: false,
+	}}
+	policy, err := tool.resolveExecutionPolicy(resolved)
 	if err != nil {
 		t.Fatal(err)
 	}
-	created, err := New(Deps{Service: svc, Approval: approval, EnabledTools: []string{"read_file"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	gateway := created.(*Tool)
-	if _, err := gateway.Execute(context.Background(), `{"skill":"manual"}`); err == nil {
-		t.Fatal("model path should reject manual-only skill")
-	}
-	out, err := gateway.LoadExplicitSkill(context.Background(), skillcontract.ExplicitLoadRequest{Skill: "manual"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(out, `"type":"skill_injection"`) || !strings.Contains(out, "Manual body") {
-		t.Fatalf("output = %s", out)
-	}
-}
-func TestSkillRejectsMissingToolDependency(t *testing.T) {
-	tool := newTestTool(t, skillmodel.Dependencies{Tools: []skillmodel.ToolDependency{{Type: "tool", Value: "grep"}}}, []string{"read_file"})
-	_, err := tool.Execute(context.Background(), `{"skill":"review"}`)
-	if err == nil || !strings.Contains(err.Error(), "依赖未启用工具") {
-		t.Fatalf("err = %v", err)
+	if !policy.Degraded || policy.SelectedBackend != "local_platform_sandbox" || policy.PreferredBackend != "remote_sandbox" || len(policy.Warnings) != 1 {
+		t.Fatalf("policy=%+v", policy)
 	}
 }
 
-func TestSkillAsksForExternalDependency(t *testing.T) {
-	tool := newTestTool(t, skillmodel.Dependencies{Tools: []skillmodel.ToolDependency{{Type: "mcp", Value: "github"}}}, []string{"read_file"})
-	_, err := tool.Execute(context.Background(), `{"skill":"review"}`)
-	if err == nil || !strings.Contains(err.Error(), "依赖未通过审批") {
-		t.Fatalf("err = %v", err)
+func TestResolveExecutionPolicyFailsClosedWhenBackendUnavailable(t *testing.T) {
+	resolved := skillmodel.ResolvedInvocation{Definition: skillmodel.InvocationDefinition{Handle: "demo"}, Profile: skillmodel.RuntimeProfile{Sandbox: skillmodel.SandboxRequirement{ExecutionMode: skillmodel.ExecutionModePerCall, Backends: []string{"remote_sandbox"}}}}
+	tool := &Tool{deps: Deps{LocalSandboxAvailable: true, RemoteSandboxAvailable: false}}
+	if _, err := tool.resolveExecutionPolicy(resolved); err == nil || !strings.Contains(err.Error(), "SKILL_RUNTIME_PROFILE_UNAVAILABLE") {
+		t.Fatalf("expected unavailable error, got %v", err)
 	}
 }
 
-func TestSkillForkRequiresTaskGateway(t *testing.T) {
-	meta := skillmodel.Metadata{
-		Name: "forked", QualifiedName: "forked", Description: "Forked", Enabled: true, PromptVisible: true,
-		Authority: skillmodel.Authority{Kind: skillmodel.SourceKindEmbedded, ID: "test"}, PackageID: "forked",
-		MainResource: "forked/SKILL.md", Context: skillmodel.ContextModeFork, AllowedTools: []string{"read_file"},
-	}.Normalize()
-	source := skillmemory.NewSource(meta.Authority, []skillmemory.Skill{{Metadata: meta, Body: "Body"}})
-	svc := skillservice.New([]skillcontract.Source{source}, skillservice.Options{})
-	approval, err := approvalservice.New(approvalstatic.NewPolicyEngine(), approvaldeny.NewRequester(), approvalmemory.NewStore(), logger.NewNop())
-	if err != nil {
-		t.Fatal(err)
-	}
-	created, err := New(Deps{Service: svc, Approval: approval, EnabledTools: []string{"read_file"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = created.Execute(context.Background(), `{"skill":"forked"}`)
-	if err == nil || !strings.Contains(err.Error(), "fork") {
-		t.Fatalf("err = %v", err)
-	}
-}
-
-type recordingForkTask struct{ last subagentcontract.DelegateRequest }
-
-func (t *recordingForkTask) GetInfo() *tool.Info { return &tool.Info{Name: "Task"} }
-func (t *recordingForkTask) Execute(context.Context, string) (string, error) {
-	return "", fmt.Errorf("Skill fork 必须走 Delegator.Delegate")
-}
-func (t *recordingForkTask) Delegate(_ context.Context, req subagentcontract.DelegateRequest) (string, error) {
-	t.last = req
-	return `{"status":"completed","agent_id":"agent-1","summary":"done"}`, nil
-}
-
-func TestSkillForkDelegatesThroughTaskGateway(t *testing.T) {
-	meta := skillmodel.Metadata{
-		Name: "forked", QualifiedName: "forked", Description: "Forked", Enabled: true, PromptVisible: true,
-		Authority: skillmodel.Authority{Kind: skillmodel.SourceKindEmbedded, ID: "test"}, PackageID: "forked",
-		MainResource: "forked/SKILL.md", Context: skillmodel.ContextModeFork, AllowedTools: []string{"read_file"},
-	}.Normalize()
-	source := skillmemory.NewSource(meta.Authority, []skillmemory.Skill{{Metadata: meta, Body: "Skill body"}})
-	svc := skillservice.New([]skillcontract.Source{source}, skillservice.Options{})
-	approval, err := approvalservice.New(approvalstatic.NewPolicyEngine(), approvaldeny.NewRequester(), approvalmemory.NewStore(), logger.NewNop())
-	if err != nil {
-		t.Fatal(err)
-	}
-	created, err := New(Deps{Service: svc, Approval: approval, EnabledTools: []string{"read_file"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	gateway := &recordingForkTask{}
-	created.(*Tool).SetForkTask(gateway)
-	out, err := created.Execute(context.Background(), `{"skill":"forked","args":"inspect config"}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(out, `"agent_id":"agent-1"`) {
-		t.Fatalf("fork output missing agent_id: %q", out)
-	}
-	if gateway.last.Definition == nil || gateway.last.Definition.Name != "skill-fork:forked" {
-		t.Fatalf("expected synthetic skill-fork definition, got %#v", gateway.last.Definition)
-	}
-	if gateway.last.Definition.SystemPrompt != "Skill body" {
-		t.Fatalf("skill body should be definition system: %#v", gateway.last.Definition)
-	}
-	if gateway.last.Prompt != "inspect config" || gateway.last.SnapshotMode != subagentcontract.SnapshotModeSkillIsolated {
-		t.Fatalf("unexpected fork request: %#v", gateway.last)
-	}
-	if len(gateway.last.AllowedTools) != 1 || gateway.last.AllowedTools[0] != "read_file" {
-		t.Fatalf("unexpected allowed tools: %#v", gateway.last.AllowedTools)
-	}
-}
-
-func TestSkillForkNamedAgentKeepsSkillIsolated(t *testing.T) {
-	meta := skillmodel.Metadata{
-		Name: "forked", QualifiedName: "forked", Description: "Forked", Enabled: true, PromptVisible: true,
-		Authority: skillmodel.Authority{Kind: skillmodel.SourceKindEmbedded, ID: "test"}, PackageID: "forked",
-		MainResource: "forked/SKILL.md", Context: skillmodel.ContextModeFork, Agent: "explore", AllowedTools: []string{"read_file"},
-	}.Normalize()
-	source := skillmemory.NewSource(meta.Authority, []skillmemory.Skill{{Metadata: meta, Body: "Skill body"}})
-	svc := skillservice.New([]skillcontract.Source{source}, skillservice.Options{})
-	approval, err := approvalservice.New(approvalstatic.NewPolicyEngine(), approvaldeny.NewRequester(), approvalmemory.NewStore(), logger.NewNop())
-	if err != nil {
-		t.Fatal(err)
-	}
-	created, err := New(Deps{Service: svc, Approval: approval, EnabledTools: []string{"read_file"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	gateway := &recordingForkTask{}
-	created.(*Tool).SetForkTask(gateway)
-	if _, err := created.Execute(context.Background(), `{"skill":"forked","args":"inspect"}`); err != nil {
-		t.Fatal(err)
-	}
-	if gateway.last.SubagentType != "explore" || gateway.last.Definition != nil {
-		t.Fatalf("named agent must use Catalog type: %#v", gateway.last)
-	}
-	if gateway.last.SnapshotMode != subagentcontract.SnapshotModeSkillIsolated {
-		t.Fatalf("named skill fork must stay skill_isolated: %#v", gateway.last)
-	}
-	if !strings.Contains(gateway.last.Prompt, "Skill body") || !strings.Contains(gateway.last.Prompt, "inspect") {
-		t.Fatalf("prompt should carry body + args: %#v", gateway.last.Prompt)
-	}
-}
-
-func TestSkillRejectsRequiredVisionWithoutCapability(t *testing.T) {
-	meta := skillmodel.Metadata{
-		Name: "vision-review", QualifiedName: "vision-review", Description: "Need vision",
-		Enabled: true, PromptVisible: true,
-		Authority: skillmodel.Authority{Kind: skillmodel.SourceKindEmbedded, ID: "test"},
-		PackageID: "vision-review", MainResource: "vision-review/SKILL.md",
-		Requires: []skillmodel.CapabilityRequirement{{Kind: "vision", Enforcement: "required"}},
-	}.Normalize()
-	source := skillmemory.NewSource(meta.Authority, []skillmemory.Skill{{Metadata: meta, Body: "Body"}})
-	svc := skillservice.New([]skillcontract.Source{source}, skillservice.Options{})
-	approval, err := approvalservice.New(approvalstatic.NewPolicyEngine(), approvaldeny.NewRequester(), approvalmemory.NewStore(), logger.NewNop())
-	if err != nil {
-		t.Fatal(err)
-	}
-	created, err := New(Deps{Service: svc, Approval: approval, EnabledTools: []string{"view_image"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	// 无 VisionMode 注入 → 视为 degraded_text
-	if _, err := created.Execute(context.Background(), `{"skill":"vision-review"}`); err == nil || !strings.Contains(err.Error(), "SKILL_CAPABILITY_REQUIRED") {
-		t.Fatalf("expected vision required failure, got %v", err)
-	}
-	ctx := viewimage.WithVisionMode(context.Background(), vision.ModeDirectInject)
-	out, err := created.Execute(ctx, `{"skill":"vision-review"}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(out, `"type":"skill_injection"`) {
-		t.Fatalf("with vision capability should load: %s", out)
-	}
-}
-
-func newTestTool(t *testing.T, deps skillmodel.Dependencies, enabledTools []string) *Tool {
+func newInvocationTool(t *testing.T, requiresVision bool) *Tool {
 	t.Helper()
-	meta := skillmodel.Metadata{Name: "review", QualifiedName: "review", Description: "Review", Enabled: true, PromptVisible: true, Authority: skillmodel.Authority{Kind: skillmodel.SourceKindEmbedded, ID: "test"}, PackageID: "review", MainResource: "review/SKILL.md", Dependencies: deps}.Normalize()
-	source := skillmemory.NewSource(meta.Authority, []skillmemory.Skill{{Metadata: meta, Body: "Body"}})
-	svc := skillservice.New([]skillcontract.Source{source}, skillservice.Options{})
-	approval, err := approvalservice.New(approvalstatic.NewPolicyEngine(), approvaldeny.NewRequester(), approvalmemory.NewStore(), logger.NewNop())
-	if err != nil {
-		t.Fatal(err)
+	authority := skillmodel.Authority{Kind: skillmodel.SourceKindEmbedded, ID: "test"}
+	requires := []skillmodel.CapabilityRequirement(nil)
+	if requiresVision {
+		requires = []skillmodel.CapabilityRequirement{{Kind: "vision", Enforcement: "required"}}
 	}
-	created, err := New(Deps{Service: svc, Approval: approval, EnabledTools: enabledTools})
+	manifest := skillmodel.RuntimeManifest{
+		Schema: skillmodel.RuntimeManifestSchemaV1, Skill: "demo",
+		RuntimeProfiles: map[string]skillmodel.RuntimeProfile{
+			"read": {Sandbox: skillmodel.SandboxRequirement{ExecutionMode: skillmodel.ExecutionModePerCall, Backends: []string{"remote_sandbox", "local_platform_sandbox"}}},
+			"work": {Sandbox: skillmodel.SandboxRequirement{ExecutionMode: skillmodel.ExecutionModeSandboxedSession, Backends: []string{"remote_sandbox", "local_platform_sandbox"}}},
+		},
+		Invocations: []skillmodel.InvocationDefinition{
+			{ID: "read", Handle: "demo-read", Description: "Read demo", AgentMode: skillmodel.AgentModeSpec{Mode: skillmodel.AgentModeMain}, RuntimeProfile: "read", Request: skillmodel.RequestContract{Inputs: skillmodel.InputContract{MinItems: 1, MaxItems: 1, Access: skillmodel.InputAccessReadOnly, AcceptedSuffixes: []string{".pptx"}}}, Prompt: skillmodel.InvocationPrompt{SkillBody: skillmodel.SkillBodyOmit}, ToolPolicy: skillmodel.ToolPolicy{Allow: []string{"run_skill_command"}, Required: []string{"run_skill_command"}}, Result: skillmodel.ResultContract{Kind: skillmodel.ResultKindMessage}},
+			{ID: "work", Handle: "demo", Description: "Create demo", AgentMode: skillmodel.AgentModeSpec{Mode: skillmodel.AgentModeFork}, RuntimeProfile: "work", Request: skillmodel.RequestContract{Task: skillmodel.TaskContract{Required: true}, Inputs: skillmodel.InputContract{MaxItems: 2, Access: skillmodel.InputAccessReadOnly}}, Prompt: skillmodel.InvocationPrompt{SkillBody: skillmodel.SkillBodyInclude}, ToolPolicy: skillmodel.ToolPolicy{Allow: []string{"run_skill_command", "view_image", "select_deliverable_candidate"}, Required: []string{"run_skill_command", "select_deliverable_candidate"}}, Requires: requires, Result: skillmodel.ResultContract{Kind: skillmodel.ResultKindDeliverables, Deliverables: []skillmodel.DeliverableDeclaration{{ID: "deck", Role: skillmodel.DeliverableRolePrimary, Required: true, Cardinality: skillmodel.DeliverableExactlyOne, AcceptedSuffixes: []string{".pptx"}, DeliveryPolicy: skillmodel.DeliveryPolicyRunOutput, QA: skillmodel.QADeclaration{Policy: "visual-qa/v1", Enforcement: "optional"}}}}},
+		},
+	}
+	source := skillmemory.NewSource(authority, []skillmemory.Skill{{Metadata: skillmodel.Metadata{Name: "demo", Description: "Demo", Authority: authority, Scope: skillmodel.ScopeSystem, PackageID: "demo", MainResource: "demo/SKILL.md"}, Body: "portable instructions", Manifest: &manifest}})
+	svc := skillservice.New([]skillcontract.Source{source}, skillservice.Options{KnownTools: []string{"run_skill_command", "view_image", "select_deliverable_candidate"}, BindingStore: skillmemory.NewBindingStore()})
+	created, err := New(Deps{Service: svc, Approval: allowApproval{}, EnabledTools: []string{"run_skill_command", "view_image", "select_deliverable_candidate"}, InputResolver: fixedInputs{}, LocalSandboxAvailable: true, RemoteSandboxAvailable: true, PolicyVersion: "test/v1"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return created.(*Tool)
 }
 
-func TestSkillForkAcceptsExplicitInputs(t *testing.T) {
-	meta := skillmodel.Metadata{
-		Name: "forked", QualifiedName: "forked", Description: "Forked", Enabled: true, PromptVisible: true,
-		Authority: skillmodel.Authority{Kind: skillmodel.SourceKindEmbedded, ID: "test"}, PackageID: "forked",
-		MainResource: "forked/SKILL.md", Context: skillmodel.ContextModeFork, AllowedTools: []string{"read_file"},
-	}.Normalize()
-	source := skillmemory.NewSource(meta.Authority, []skillmemory.Skill{{Metadata: meta, Body: "Skill body"}})
-	svc := skillservice.New([]skillcontract.Source{source}, skillservice.Options{})
-	approval, err := approvalservice.New(approvalstatic.NewPolicyEngine(), approvaldeny.NewRequester(), approvalmemory.NewStore(), logger.NewNop())
-	if err != nil {
-		t.Fatal(err)
-	}
-	created, err := New(Deps{Service: svc, Approval: approval, EnabledTools: []string{"read_file"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	gateway := &recordingForkTask{}
-	created.(*Tool).SetForkTask(gateway)
-
-	// Explicit inputs parameter passed by LLM
-	_, err = created.Execute(context.Background(), `{"skill":"forked","args":"create ppt","inputs":["explicit_doc.md"]}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(gateway.last.InputFiles) != 1 || gateway.last.InputFiles[0] != "explicit_doc.md" {
-		t.Fatalf("expected explicit input file [explicit_doc.md], got %#v", gateway.last.InputFiles)
-	}
-}
-
-func TestExtractWorkspaceInputFilesIntersection(t *testing.T) {
-	text := "根据ultra5-comparison-summary.md创建PPT，主题色红色，文件名2026笔记本选型比较.pptx"
-	inputs := extractFallbackInputFiles(text)
-	if len(inputs) == 0 {
-		t.Fatalf("expected fallback input extraction, got empty")
-	}
+func testContext(mode vision.Mode) context.Context {
+	ctx := contextutil.WithRunID(context.Background(), "parent-run")
+	ctx = contextutil.WithTenantID(ctx, "tenant")
+	return viewimage.WithVisionMode(ctx, mode)
 }

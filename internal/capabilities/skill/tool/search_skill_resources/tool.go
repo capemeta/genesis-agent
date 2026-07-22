@@ -16,7 +16,10 @@ import (
 )
 
 type Deps struct {
-	Service        skillcontract.Service
+	Service interface {
+		SearchResources(context.Context, skillcontract.SearchResourcesRequest) (model.SearchResult, error)
+		SearchBoundResources(context.Context, skillcontract.BoundResourceSearchRequest) (model.SearchResult, error)
+	}
 	Approval       approvalcontract.Service
 	CatalogRequest skillcontract.CatalogRequest
 }
@@ -59,14 +62,28 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 	}
 	name := strings.TrimSpace(in.Skill)
 	pkg := model.PackageID(strings.TrimSpace(in.Package))
+	binding, bound := skillcontract.InvocationBindingFromContext(ctx)
+	if bound {
+		if err := skillcontract.ValidateBoundTarget(binding, name, pkg); err != nil {
+			return "", err
+		}
+		name = binding.Handle
+		pkg = binding.Package.PackageID
+	}
 	if err := t.authorize(ctx, pkg, in.Query); err != nil {
 		return "", err
 	}
-	result, err := t.deps.Service.SearchResources(ctx, skillcontract.SearchResourcesRequest{ResolveRequest: skillcontract.ResolveRequest{CatalogRequest: t.deps.CatalogRequest, Name: name}, PackageID: pkg, Query: in.Query, Limit: in.Limit})
+	var result model.SearchResult
+	var err error
+	if bound {
+		result, err = t.deps.Service.SearchBoundResources(ctx, skillcontract.BoundResourceSearchRequest{Binding: binding, Query: in.Query, Limit: in.Limit})
+	} else {
+		result, err = t.deps.Service.SearchResources(ctx, skillcontract.SearchResourcesRequest{ResolveRequest: skillcontract.ResolveRequest{CatalogRequest: t.deps.CatalogRequest, Name: name}, PackageID: pkg, Query: in.Query, Limit: in.Limit})
+	}
 	if err != nil {
 		return "", err
 	}
-	data, err := json.Marshal(output{SkillQualifiedName: result.Skill.QualifiedName, Matches: result.Matches})
+	data, err := json.Marshal(output{SkillQualifiedName: result.Skill.Name, Matches: result.Matches})
 	if err != nil {
 		return "", err
 	}

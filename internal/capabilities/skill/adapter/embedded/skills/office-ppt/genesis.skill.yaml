@@ -1,0 +1,118 @@
+schema: genesis.skill/v1
+skill: office-ppt
+
+runtime_profiles:
+  read:
+    sandbox:
+      execution_mode: per_call
+      backends:
+        - remote_sandbox
+        - local_platform_sandbox
+    dependencies:
+      runtime:
+        python:
+          - name: markitdown
+            import: markitdown
+  work:
+    sandbox:
+      execution_mode: sandboxed_session
+      backends:
+        - remote_sandbox
+        - local_platform_sandbox
+    dependencies:
+      runtime:
+        python:
+          - name: markitdown
+            import: markitdown
+          - name: Pillow
+            import: PIL
+          - name: defusedxml
+            import: defusedxml
+        node:
+          - name: pptxgenjs
+            require: pptxgenjs
+        system:
+          - name: libreoffice
+            command: soffice
+          - name: poppler
+            command: pdftoppm
+
+invocations:
+  - id: read
+    handle: office-ppt-read
+    description: 提取并总结已有 PPT 的文字、备注和表格，不渲染、不编辑
+    agent_mode:
+      mode: main
+    runtime_profile: read
+    request:
+      task:
+        required: false
+      inputs:
+        min_items: 1
+        max_items: 1
+        access: read_only
+        accepted_suffixes: [.pptx]
+        accepted_mimes:
+          - application/vnd.openxmlformats-officedocument.presentationml.presentation
+    prompt:
+      instructions: references/invocations/read.md
+      skill_body: omit
+    tool_policy:
+      allow:
+        - list_skill_resources
+        - read_skill_resource
+        - search_skill_resources
+        - run_skill_command
+        - install_skill_dependencies
+      required:
+        - run_skill_command
+    result:
+      kind: message
+
+  - id: work
+    handle: office-ppt
+    description: 创建、编辑、渲染或视觉检查 PPT；不要用于只读提取或摘要
+    agent_mode:
+      mode: fork
+    runtime_profile: work
+    request:
+      task:
+        required: true
+      inputs:
+        min_items: 0
+        max_items: 16
+        access: read_only
+        accepted_suffixes: [.md, .txt, .pptx, .docx, .xlsx, .pdf]
+    prompt:
+      instructions: references/invocations/work.md
+      skill_body: include
+    tool_policy:
+      allow:
+        - list_skill_resources
+        - read_skill_resource
+        - search_skill_resources
+        - run_skill_command
+        - install_skill_dependencies
+        - read_file
+        - write_file
+        - edit_file
+        - view_image
+        - select_deliverable_candidate
+      required:
+        - run_skill_command
+        - write_file
+        - select_deliverable_candidate
+    result:
+      kind: deliverables
+      deliverables:
+        - id: deck
+          role: primary
+          required: true
+          cardinality: exactly_one
+          accepted_suffixes: [.pptx]
+          accepted_mimes:
+            - application/vnd.openxmlformats-officedocument.presentationml.presentation
+          delivery_policy: run-output
+          qa:
+            policy: visual-qa/v1
+            enforcement: optional

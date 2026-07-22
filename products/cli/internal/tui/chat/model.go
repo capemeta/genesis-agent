@@ -72,9 +72,9 @@ type Model struct {
 	ready  bool // viewport 是否已完成首次初始化
 
 	// ── 审批流状态 ────────────────────────────────────────────
-	activeApproval   *approval.ApprovalRequiredMsg   // 当前等待人工确认的审批请求
-	pendingApprovals []approval.ApprovalRequiredMsg  // 排队中的并行审批（防覆盖丢单）
-	approvalFocus    bool                            // 当前是否为审批输入拦截状态
+	activeApproval   *approval.ApprovalRequiredMsg  // 当前等待人工确认的审批请求
+	pendingApprovals []approval.ApprovalRequiredMsg // 排队中的并行审批（防覆盖丢单）
+	approvalFocus    bool                           // 当前是否为审批输入拦截状态
 
 	// ── 计划状态 ──────────────────────────────────────────────
 	currentPlan  *domain.TaskList            // 当前活跃任务清单（nil 表示无清单）

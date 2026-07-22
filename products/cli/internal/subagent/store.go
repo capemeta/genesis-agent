@@ -83,14 +83,18 @@ func (s *FileStore) Save(ctx context.Context, value contract.StoredInstance) err
 	if !safeAgentID.MatchString(agentID) {
 		return fmt.Errorf("非法 subagent agent_id %q", agentID)
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.saveLocked(value)
+}
+
+func (s *FileStore) saveLocked(value contract.StoredInstance) error {
 	payload, err := json.MarshalIndent(record{SchemaVersion: storeSchemaVersion, Stored: value}, "", "  ")
 	if err != nil {
 		return fmt.Errorf("编码 subagent 实例失败: %w", err)
 	}
-	path := s.path(agentID)
+	path := s.path(value.Instance.AgentID)
 	temp := path + ".tmp"
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if err := os.WriteFile(temp, payload, 0o600); err != nil {
 		return fmt.Errorf("写入 subagent 实例临时文件失败: %w", err)
 	}
@@ -101,6 +105,73 @@ func (s *FileStore) Save(ctx context.Context, value contract.StoredInstance) err
 	return nil
 }
 
+func (s *FileStore) SaveIfInvocationAbsent(ctx context.Context, value contract.StoredInstance) (contract.StoredInstance, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return contract.StoredInstance{}, false, err
+	}
+	bindingID := strings.TrimSpace(value.Request.InvocationBinding.ID)
+	if bindingID == "" {
+		return value, true, s.Save(ctx, value)
+	}
+	if !safeAgentID.MatchString(strings.TrimSpace(value.Instance.AgentID)) {
+		return contract.StoredInstance{}, false, fmt.Errorf("非法 subagent agent_id %q", value.Instance.AgentID)
+	}
+	claimDir := filepath.Join(s.dir, "invocations")
+	claimPath := filepath.Join(claimDir, invocationClaimHash(value)+".json")
+	payload, err := json.MarshalIndent(record{SchemaVersion: storeSchemaVersion, Stored: value}, "", "  ")
+	if err != nil {
+		return contract.StoredInstance{}, false, fmt.Errorf("编码 invocation claim 失败: %w", err)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := os.MkdirAll(claimDir, 0o700); err != nil {
+		return contract.StoredInstance{}, false, fmt.Errorf("创建 invocation claim 目录失败: %w", err)
+	}
+	file, err := os.OpenFile(claimPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		if !os.IsExist(err) {
+			return contract.StoredInstance{}, false, fmt.Errorf("创建 invocation claim 失败: %w", err)
+		}
+		existing, readErr := s.readClaimLocked(claimPath)
+		if readErr != nil {
+			return contract.StoredInstance{}, false, readErr
+		}
+		if invocationClaimHash(existing) != invocationClaimHash(value) {
+			return contract.StoredInstance{}, false, fmt.Errorf("invocation claim身份冲突")
+		}
+		if latest, getErr := s.getUnlocked(existing.Instance.AgentID); getErr == nil {
+			existing = latest
+		}
+		return existing, false, nil
+	}
+	if _, err := file.Write(payload); err != nil {
+		_ = file.Close()
+		_ = os.Remove(claimPath)
+		return contract.StoredInstance{}, false, fmt.Errorf("写入 invocation claim 失败: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		_ = os.Remove(claimPath)
+		return contract.StoredInstance{}, false, fmt.Errorf("关闭 invocation claim 失败: %w", err)
+	}
+	if err := s.saveLocked(value); err != nil {
+		_ = os.Remove(claimPath)
+		return contract.StoredInstance{}, false, err
+	}
+	return value, true, nil
+}
+
+func (s *FileStore) readClaimLocked(path string) (contract.StoredInstance, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return contract.StoredInstance{}, fmt.Errorf("读取 invocation claim 失败: %w", err)
+	}
+	var stored record
+	if err := json.Unmarshal(raw, &stored); err != nil || stored.SchemaVersion != storeSchemaVersion || strings.TrimSpace(stored.Stored.Request.InvocationBinding.ID) == "" {
+		return contract.StoredInstance{}, fmt.Errorf("解析 invocation claim 失败")
+	}
+	return stored.Stored, nil
+}
+
 func (s *FileStore) Get(ctx context.Context, agentID string) (contract.StoredInstance, error) {
 	if err := ctx.Err(); err != nil {
 		return contract.StoredInstance{}, err
@@ -109,6 +180,10 @@ func (s *FileStore) Get(ctx context.Context, agentID string) (contract.StoredIns
 	if !safeAgentID.MatchString(agentID) {
 		return contract.StoredInstance{}, fmt.Errorf("非法 subagent agent_id %q", agentID)
 	}
+	return s.getUnlocked(agentID)
+}
+
+func (s *FileStore) getUnlocked(agentID string) (contract.StoredInstance, error) {
 	raw, err := os.ReadFile(s.path(agentID))
 	if err != nil {
 		return contract.StoredInstance{}, fmt.Errorf("读取 subagent 实例失败: %w", err)
@@ -124,6 +199,12 @@ func (s *FileStore) Get(ctx context.Context, agentID string) (contract.StoredIns
 		return contract.StoredInstance{}, fmt.Errorf("subagent 实例文件与 agent_id 不一致")
 	}
 	return stored.Stored, nil
+}
+
+func invocationClaimHash(value contract.StoredInstance) string {
+	raw := strings.TrimSpace(value.Request.TenantID) + "\x00" + strings.TrimSpace(value.Request.ParentRunID) + "\x00" + strings.TrimSpace(value.Request.InvocationBinding.ID)
+	sum := sha256.Sum256([]byte(raw))
+	return hex.EncodeToString(sum[:])
 }
 
 // List 返回当前工作区记录，按更新时间倒序排列。
@@ -173,14 +254,34 @@ func (s *FileStore) Cleanup(ctx context.Context, options CleanupOptions) (Cleanu
 	if err != nil {
 		return CleanupResult{}, err
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	cutoff := time.Now().Add(-options.OlderThan)
 	var result CleanupResult
 	for _, item := range items {
-		instance := item.Stored.Instance
+		// List 与删除之间实例可能刚写入新终态；锁内重读并重新计算时间，禁止
+		// 清理线程删除并发保存或刚恢复的 invocation claim。
+		current, readErr := s.getUnlocked(item.Stored.Instance.AgentID)
+		if readErr != nil {
+			if os.IsNotExist(readErr) {
+				continue
+			}
+			result.Errors++
+			continue
+		}
+		info, statErr := os.Stat(s.path(current.Instance.AgentID))
+		if statErr != nil {
+			if os.IsNotExist(statErr) {
+				continue
+			}
+			result.Errors++
+			continue
+		}
+		instance := current.Instance
 		if !options.IncludeRunning && instance.Status == model.StatusRunning {
 			continue
 		}
-		if cleanupTime(instance, item.ModTime).After(cutoff) {
+		if cleanupTime(instance, info.ModTime()).After(cutoff) {
 			continue
 		}
 		if err := ctx.Err(); err != nil {
@@ -193,6 +294,9 @@ func (s *FileStore) Cleanup(ctx context.Context, options CleanupOptions) (Cleanu
 			}
 			result.Errors++
 			continue
+		}
+		if strings.TrimSpace(current.Request.InvocationBinding.ID) != "" {
+			_ = os.Remove(filepath.Join(s.dir, "invocations", invocationClaimHash(current)+".json"))
 		}
 		result.Deleted++
 	}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	execmodel "genesis-agent/internal/capabilities/execution/model"
 	hookcontract "genesis-agent/internal/capabilities/hook/contract"
 	hookmodel "genesis-agent/internal/capabilities/hook/model"
+	skillmodel "genesis-agent/internal/capabilities/skill/model"
 	workcontract "genesis-agent/internal/capabilities/workspace/contract"
 	workmodel "genesis-agent/internal/capabilities/workspace/model"
 	"genesis-agent/internal/domain"
@@ -24,6 +26,14 @@ import (
 )
 
 type fakeEngine struct{}
+
+type countingEngine struct{ calls atomic.Int32 }
+
+func (e *countingEngine) GetStrategyName() string { return "counting" }
+func (e *countingEngine) Start(context.Context, domain.StartRunRequest) (*domain.Run, error) {
+	e.calls.Add(1)
+	return &domain.Run{ID: "child-run", TenantID: "tenant", Status: domain.RunStatusCompleted, FinalAnswer: "done"}, nil
+}
 
 type fakeRunPreparer struct{}
 
@@ -46,8 +56,19 @@ func testWorkspaceOption() Option {
 }
 
 func testParentContext() context.Context {
-	return workcontract.WithPreparedRun(context.Background(), testParentPrepared())
+	ctx := workcontract.WithPreparedRun(context.Background(), testParentPrepared())
+	return artifactcontract.WithAdoptionStore(ctx, noopAdoptionStore{})
 }
+
+type noopAdoptionStore struct{}
+
+func (noopAdoptionStore) Adopt(value artifactcontract.AdoptionRecord) (artifactcontract.AdoptionRecord, error) {
+	return value, nil
+}
+func (noopAdoptionStore) Resolve(string, string, string) (artifactcontract.AdoptionRecord, bool) {
+	return artifactcontract.AdoptionRecord{}, false
+}
+func (noopAdoptionStore) ListByConsumer(string, string) []artifactcontract.AdoptionRecord { return nil }
 
 func testParentPrepared() workmodel.PreparedRun {
 	binding := execmodel.ExecutionBinding{ID: "parent-binding", Mode: execmodel.WorkspaceModeTask, Access: execmodel.WorkspaceAccessReadWrite, Owner: execmodel.ExecutionOwnerRef{RunID: "parent-run", SessionID: "session"}}
@@ -98,6 +119,36 @@ func TestControllerDispatchesSubagentLifecycleHooks(t *testing.T) {
 	}
 }
 
+func TestControllerReplaysExistingInvocationWithoutDuplicateSpawn(t *testing.T) {
+	limiter, err := NewMemorySlotLimiter(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := &countingEngine{}
+	c, err := New(engine, limiter, nil, testWorkspaceOption())
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := contract.SpawnRequest{SessionID: "session", TenantID: "tenant", ParentRunID: "parent-run", Prompt: "work", Agent: &domain.Agent{Name: "worker"}, InvocationBinding: skillmodel.InvocationBinding{ID: "binding-1"}}
+	first, err := c.Spawn(testParentContext(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Wait(context.Background(), first.AgentID); err != nil {
+		t.Fatal(err)
+	}
+	replayed, err := c.Spawn(testParentContext(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replayed.AgentID != first.AgentID || engine.calls.Load() != 1 {
+		t.Fatalf("first=%+v replayed=%+v calls=%d", first, replayed, engine.calls.Load())
+	}
+	if _, err := c.Wait(context.Background(), replayed.AgentID); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestControllerSubagentStartHookBlocksBeforeSlotReservation(t *testing.T) {
 	limiter, err := NewMemorySlotLimiter(1)
 	if err != nil {
@@ -139,19 +190,51 @@ func (snapshotCheckingEngine) Start(ctx context.Context, _ domain.StartRunReques
 type artifactRegisteringEngine struct{ fakeEngine }
 
 func (artifactRegisteringEngine) Start(ctx context.Context, _ domain.StartRunRequest) (*domain.Run, error) {
-	if !result.RegisterArtifact(ctx, model.Artifact{ResourceID: "res-report", Kind: "file"}) {
+	if !result.RegisterArtifact(ctx, model.Artifact{ResourceID: "res-report", Kind: "file", ContentHash: "sha256:report"}) {
 		return nil, fmt.Errorf("artifact manifest registry missing")
 	}
 	if !result.RegisterFinding(ctx, model.Finding{Claim: "报告已生成", Evidence: []string{"res-report"}}) {
 		return nil, fmt.Errorf("finding manifest registry missing")
 	}
-	return &domain.Run{ID: "child-run", Status: domain.RunStatusCompleted, FinalAnswer: "已生成报告"}, nil
+	return &domain.Run{ID: "child-run", TenantID: "tenant", Status: domain.RunStatusCompleted, FinalAnswer: "已生成报告"}, nil
 }
 
 type acceptingEvidenceValidator struct{}
 
 func (acceptingEvidenceValidator) Validate(_ context.Context, manifest model.ArtifactManifest, findings []model.Finding) (result.ValidatedEvidence, error) {
 	return result.ValidatedEvidence{Artifacts: append([]model.Artifact(nil), manifest.Artifacts...), Findings: append([]model.Finding(nil), findings...)}, nil
+}
+
+type incompleteCompletionPolicy struct{}
+
+func (incompleteCompletionPolicy) EvaluateCompletion(context.Context, string, string) (artifactcontract.CompletionDecision, error) {
+	return artifactcontract.CompletionDecision{Complete: false, MissingDeliverableIDs: []string{"deck"}}, nil
+}
+
+func TestControllerRejectsSkillAdoptionWhenChildDeliveryGateIsIncomplete(t *testing.T) {
+	limiter, err := NewMemorySlotLimiter(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := New(fakeEngine{}, limiter, nil, testWorkspaceOption())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := artifactcontract.WithCompletionPolicy(testParentContext(), incompleteCompletionPolicy{})
+	instance, err := c.Spawn(ctx, contract.SpawnRequest{
+		SessionID: "session", TenantID: "tenant", ParentRunID: "parent-run", Prompt: "生成PPT", Agent: &domain.Agent{Name: "worker"},
+		InvocationBinding: skillmodel.InvocationBinding{Result: skillmodel.ResultContract{Kind: skillmodel.ResultKindDeliverables}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	completed, err := c.Wait(context.Background(), instance.AgentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completed.Status != model.StatusFailed || completed.Result == nil || completed.Result.Status != model.ResultStatusFailed || !strings.Contains(completed.Error, "交付门禁未满足") {
+		t.Fatalf("skill child must fail before adoption: %+v", completed)
+	}
 }
 
 type passthroughResourceProjector struct{}
@@ -189,6 +272,13 @@ func (s *contextCheckingStore) Save(ctx context.Context, value contract.StoredIn
 	}
 	s.saves++
 	return s.delegate.Save(ctx, value)
+}
+
+func (s *contextCheckingStore) SaveIfInvocationAbsent(ctx context.Context, value contract.StoredInstance) (contract.StoredInstance, bool, error) {
+	if err := s.Save(ctx, value); err != nil {
+		return contract.StoredInstance{}, false, err
+	}
+	return value, true, nil
 }
 
 func (s *contextCheckingStore) Get(ctx context.Context, agentID string) (contract.StoredInstance, error) {
@@ -623,7 +713,6 @@ func TestControllerDoesNotPreinitializeDeliverableFromIntent(t *testing.T) {
 	}
 	instance, err := c.Spawn(testParentContext(), contract.SpawnRequest{
 		SessionID: "session", ParentRunID: "parent-run", Prompt: "生成PPT",
-		SkillQAPolicy: "visual-qa/v1", SkillQAEnforcement: "optional",
 		Agent: &domain.Agent{Name: "worker"},
 	})
 	if err != nil {

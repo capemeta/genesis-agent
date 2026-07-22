@@ -105,14 +105,14 @@ func (s *fakeRemoteSession) ExpiresAt() time.Time { return time.Now().Add(time.H
 
 func TestSkillCommandServiceRunsInRemoteTaskWorkspace(t *testing.T) {
 	client := newFakeRemoteClient()
-	source, err := embedded.NewSource(skillmodel.Authority{Kind: skillmodel.SourceKindEmbedded, ID: "test"}, skillmodel.ScopeSystem, fstest.MapFS{
+	source, err := embedded.NewSource(skillmodel.Authority{Kind: skillmodel.SourceKindEmbedded, ID: "test"}, skillmodel.ScopeSystem, testRuntimeSkillFS(fstest.MapFS{
 		"demo/SKILL.md":                {Data: []byte("---\nname: demo\ndescription: demo skill\nallowed-tools:\n  - run_skill_command\ndependencies:\n  runtime:\n    system:\n      - name: libreoffice\n        command: soffice\n---\nDemo")},
 		"demo/scripts/make_output.cmd": {Data: []byte("@echo off\r\necho remote>output.txt\r\n")},
-	}, skillparser.New())
+	}), skillparser.New())
 	if err != nil {
 		t.Fatal(err)
 	}
-	skills := skillservice.New([]skillcontract.Source{source}, skillservice.Options{})
+	skills := testSkillService{Service: skillservice.New([]skillcontract.Source{source}, skillservice.Options{KnownTools: []string{"run_skill_command"}})}
 	registrar := &collectingProducedRegistrar{}
 	remoteStore := noOpRemoteSessionBinder{}
 	manager, err := sandboxsession.NewManager(sandboxsession.ManagerDeps{
@@ -228,14 +228,14 @@ func TestExecutionSessionKeyReusesConversationAndSeparatesUsers(t *testing.T) {
 
 func TestSkillCommandServiceRestagesInputsOverExistingRemoteFiles(t *testing.T) {
 	client := newFakeRemoteClient()
-	source, err := embedded.NewSource(skillmodel.Authority{Kind: skillmodel.SourceKindEmbedded, ID: "test"}, skillmodel.ScopeSystem, fstest.MapFS{
+	source, err := embedded.NewSource(skillmodel.Authority{Kind: skillmodel.SourceKindEmbedded, ID: "test"}, skillmodel.ScopeSystem, testRuntimeSkillFS(fstest.MapFS{
 		"demo/SKILL.md":                {Data: []byte("---\nname: demo\ndescription: demo skill\nallowed-tools:\n  - run_skill_command\n---\nDemo")},
 		"demo/scripts/make_output.cmd": {Data: []byte("@echo off\r\necho remote>output.txt\r\n")},
-	}, skillparser.New())
+	}), skillparser.New())
 	if err != nil {
 		t.Fatal(err)
 	}
-	skills := skillservice.New([]skillcontract.Source{source}, skillservice.Options{})
+	skills := testSkillService{Service: skillservice.New([]skillcontract.Source{source}, skillservice.Options{KnownTools: []string{"run_skill_command"}})}
 	svc, err := New(Deps{Skills: skills, Runner: nilRunner{}, Approval: allowAllApproval{}, SessionClient: client, FileClient: client, WorkspaceRef: sandboxcontract.WorkspaceRef{ID: "w1", Provider: "genesis-sandbox"}, Provisioner: testProvisioner{}, ProducedResources: &collectingProducedRegistrar{}, RemoteSessions: noOpRemoteSessionBinder{}})
 	if err != nil {
 		t.Fatal(err)
@@ -262,6 +262,57 @@ func TestSkillCommandServiceRestagesInputsOverExistingRemoteFiles(t *testing.T) 
 	}
 	if !second.OK {
 		t.Fatalf("second result=%+v", second)
+	}
+}
+
+func TestSkillCommandServicePerCallUsesRemoteSessionInGenesisSandbox(t *testing.T) {
+	client := newFakeRemoteClient()
+	source, err := embedded.NewSource(skillmodel.Authority{Kind: skillmodel.SourceKindEmbedded, ID: "test"}, skillmodel.ScopeSystem, testRuntimeSkillFS(fstest.MapFS{
+		"demo/SKILL.md":                {Data: []byte("---\nname: demo\ndescription: demo skill\nallowed-tools:\n  - run_skill_command\n---\nDemo")},
+		"demo/scripts/make_output.cmd": {Data: []byte("@echo off\r\necho remote>output.txt\r\n")},
+	}), skillparser.New())
+	if err != nil {
+		t.Fatal(err)
+	}
+	skills := testSkillService{Service: skillservice.New([]skillcontract.Source{source}, skillservice.Options{KnownTools: []string{"run_skill_command"}})}
+	manager, err := sandboxsession.NewManager(sandboxsession.ManagerDeps{
+		Sessions: client, Files: client, Workspace: sandboxcontract.WorkspaceRef{ID: "w1", Provider: "genesis-sandbox"},
+		Store: noOpRemoteSessionBinder{}, IdleTTL: time.Millisecond, CacheTTL: time.Hour, CleanupInterval: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Close(context.Background()) })
+	svc, err := New(Deps{Skills: skills, Runner: nilRunner{}, Approval: allowAllApproval{}, SessionClient: client, FileClient: client, WorkspaceRef: sandboxcontract.WorkspaceRef{ID: "w1", Provider: "genesis-sandbox"}, Provisioner: testProvisioner{}, ProducedResources: &collectingProducedRegistrar{}, RemoteSessions: noOpRemoteSessionBinder{}, SessionManager: manager})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = svc.Close(context.Background()) })
+	root := t.TempDir()
+	req := scriptcontract.RunRequest{
+		Catalog:    skillcontract.CatalogRequest{},
+		Skill:      "demo",
+		Command:    `./scripts/make_output.cmd`,
+		Binding:    testBinding("remote-per-call-run"),
+		StateRoot:  testStateRoot(root),
+		ProjectDir: root,
+		Sandbox: execmodel.SandboxProfile{
+			Mode:     execmodel.SandboxRequired,
+			Provider: "genesis-sandbox",
+			Metadata: map[string]string{
+				"invocation_execution_mode": string(skillmodel.ExecutionModePerCall),
+			},
+		},
+	}
+	res, err := svc.Run(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.OK {
+		t.Fatalf("per_call remote run failed: %+v", res)
+	}
+	if client.openCount == 0 || client.runCount == 0 {
+		t.Fatalf("expected remote session open & run, got openCount=%d, runCount=%d", client.openCount, client.runCount)
 	}
 }
 

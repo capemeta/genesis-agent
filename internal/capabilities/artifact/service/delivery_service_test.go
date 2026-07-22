@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -166,6 +167,74 @@ func TestDeliveryServicePersistsArtifactOnlyDelivery(t *testing.T) {
 	}
 }
 
+func TestDeliveryServiceRequiredQAGatesExactPublicationVersion(t *testing.T) {
+	fixture := newDeliveryFixtureWithQA(t, ValidatorVisualQA, "required")
+	_, err := fixture.service.Deliver(context.Background(), fixture.request)
+	var artifactErr *artifactcontract.Error
+	if !errors.As(err, &artifactErr) || artifactErr.Code != artifactcontract.ErrCodeQARequired {
+		t.Fatalf("expected QA_REQUIRED before evidence, got %v", err)
+	}
+	if fixture.materializer.calls != 0 {
+		t.Fatalf("required QA must gate before materialization, calls=%d", fixture.materializer.calls)
+	}
+
+	publication := currentPublication(t, fixture)
+	degraded := exactQAEvidence(publication, artifactmodel.QAEvidenceDegraded)
+	degraded.ID = "qa-degraded"
+	degraded.FailureCode = "vision_unavailable"
+	if err := fixture.control.CreateQAEvidence(context.Background(), degraded); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.service.Deliver(context.Background(), fixture.request); !errors.As(err, &artifactErr) || artifactErr.Code != artifactcontract.ErrCodeQARequired {
+		t.Fatalf("degraded evidence must not satisfy required QA, got %v", err)
+	}
+
+	passed := exactQAEvidence(publication, artifactmodel.QAEvidencePassed)
+	passed.ID = "qa-passed"
+	if err := fixture.control.CreateQAEvidence(context.Background(), passed); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.service.Deliver(context.Background(), fixture.request); err != nil {
+		t.Fatalf("exact passed evidence should release delivery: %v", err)
+	}
+	if fixture.materializer.calls != 1 {
+		t.Fatalf("delivery should materialize exactly once, calls=%d", fixture.materializer.calls)
+	}
+}
+
+func TestDeliveryServiceOptionalQARequiresExplicitDegradedEvidence(t *testing.T) {
+	fixture := newDeliveryFixtureWithQA(t, ValidatorVisualQA, "optional")
+	_, err := fixture.service.Deliver(context.Background(), fixture.request)
+	var artifactErr *artifactcontract.Error
+	if !errors.As(err, &artifactErr) || artifactErr.Code != artifactcontract.ErrCodeQARequired {
+		t.Fatalf("missing optional QA evidence must still block bypass delivery, got %v", err)
+	}
+	publication := currentPublication(t, fixture)
+	degraded := exactQAEvidence(publication, artifactmodel.QAEvidenceDegraded)
+	degraded.ID = "qa-optional-degraded"
+	degraded.FailureCode = "vision_unavailable"
+	if err := fixture.control.CreateQAEvidence(context.Background(), degraded); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.service.Deliver(context.Background(), fixture.request); err != nil {
+		t.Fatalf("optional QA should accept exact degraded evidence: %v", err)
+	}
+}
+
+func TestDeliveryServiceOptionalQAAcceptsExactFailedEvidence(t *testing.T) {
+	fixture := newDeliveryFixtureWithQA(t, ValidatorVisualQA, "optional")
+	publication := currentPublication(t, fixture)
+	failed := exactQAEvidence(publication, artifactmodel.QAEvidenceFailed)
+	failed.ID = "qa-optional-failed"
+	failed.FailureCode = "visual_qa_failed"
+	if err := fixture.control.CreateQAEvidence(context.Background(), failed); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.service.Deliver(context.Background(), fixture.request); err != nil {
+		t.Fatalf("optional QA should disclose but not block exact failed evidence: %v", err)
+	}
+}
+
 type deliveryFixture struct {
 	service *DeliveryService
 	request DeliveryRequest
@@ -173,6 +242,7 @@ type deliveryFixture struct {
 		artifactcontract.DeliverableSpecStore
 		artifactcontract.DeliverableSelectionStore
 		artifactcontract.ArtifactPublicationStore
+		artifactcontract.QAEvidenceStore
 		artifactcontract.DeliveryRecordStore
 	}
 	materializer *testRecoverableMaterializer
@@ -182,19 +252,40 @@ type deliveryFixture struct {
 }
 
 func newDeliveryFixture(t *testing.T) deliveryFixture {
+	return newDeliveryFixtureWithQA(t, "", "")
+}
+
+func newDeliveryFixtureWithQA(t *testing.T, qaPolicy, qaEnforcement string) deliveryFixture {
 	t.Helper()
-	publication := newPublicationFixture(t)
+	publication := newPublicationFixtureWithQA(t, qaPolicy, qaEnforcement)
 	artifact, err := publication.service.Publish(context.Background(), publication.request)
 	if err != nil {
 		t.Fatal(err)
 	}
 	planner := &staticPlanner{target: artifactmodel.DeliveryTarget{Kind: artifactmodel.DeliveryProductInbox, Resource: workmodel.ResourceRef{Authority: "product", Scheme: "inbox", ID: "target", Scope: artifact.Scope}, Name: "result.txt"}}
 	materializer := &testRecoverableMaterializer{}
-	service, err := NewDeliveryService(publication.control, publication.control, publication.control, publication.control, publication.store, planner, materializer)
+	service, err := NewDeliveryService(publication.control, publication.control, publication.control, publication.control, publication.control, publication.store, planner, materializer)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return deliveryFixture{service: service, request: DeliveryRequest{TenantID: "tenant", RunID: "run", DeliverableID: "deliverable"}, control: publication.control, materializer: materializer, planner: planner, publication: publication, artifact: artifact}
+}
+
+func currentPublication(t *testing.T, fixture deliveryFixture) artifactmodel.ArtifactPublicationRecord {
+	t.Helper()
+	records, err := fixture.control.ListPublications(context.Background(), "tenant", "run", "deliverable")
+	if err != nil || len(records) != 1 {
+		t.Fatalf("publications=%+v err=%v", records, err)
+	}
+	return records[0]
+}
+
+func exactQAEvidence(publication artifactmodel.ArtifactPublicationRecord, status artifactmodel.QAEvidenceStatus) artifactmodel.QAEvidenceRecord {
+	return artifactmodel.QAEvidenceRecord{
+		TenantID: "tenant", RunID: "run", DeliverableID: "deliverable", ProducedResourceID: publication.ProducedResourceID,
+		PublicationID: publication.ID, SubjectVersion: publication.SubjectVersion, SubjectSHA256: publication.SubjectSHA256,
+		PolicyID: ValidatorVisualQA, Validator: ValidatorVisualQA, ValidatorVersion: "visual-checklist/v1", Status: status, CreatedAt: time.Now().UTC(),
+	}
 }
 
 type staticPlanner struct{ target artifactmodel.DeliveryTarget }
@@ -204,14 +295,14 @@ func (p *staticPlanner) PlanDelivery(context.Context, artifactmodel.DeliverableS
 }
 
 type testRecoverableMaterializer struct {
-	mu            sync.Mutex
-	calls         int
-	replaceCalls  int
-	failNext      bool
-	loseResponse  bool
-	conflictOnce  bool
-	occupied      map[string]bool
-	result        *artifactmodel.DeliveryResult
+	mu           sync.Mutex
+	calls        int
+	replaceCalls int
+	failNext     bool
+	loseResponse bool
+	conflictOnce bool
+	occupied     map[string]bool
+	result       *artifactmodel.DeliveryResult
 }
 
 type failSucceededDeliveryLedger struct {

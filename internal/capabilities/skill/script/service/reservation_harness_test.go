@@ -106,14 +106,14 @@ func TestFilterProducedByDeliverablesKeepsReservationAndMatchingDiff(t *testing.
 
 func TestIsQAPreviewAsset(t *testing.T) {
 	cases := map[string]bool{
-		"slide-1.jpg":      true,
-		"slide-12.JPEG":    true,
-		"thumbnails.png":   true,
-		"thumbnail.webp":   true,
-		"qa.png":           false,
-		"deck.pptx":        false,
-		"notes.txt":        false,
-		"slide.pptx":       false,
+		"slide-1.jpg":    true,
+		"slide-12.JPEG":  true,
+		"thumbnails.png": true,
+		"thumbnail.webp": true,
+		"qa.png":         false,
+		"deck.pptx":      false,
+		"notes.txt":      false,
+		"slide.pptx":     false,
 	}
 	for name, want := range cases {
 		if got := isQAPreviewAsset(name); got != want {

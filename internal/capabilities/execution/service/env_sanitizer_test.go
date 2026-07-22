@@ -8,11 +8,11 @@ func TestEnvSanitizer(t *testing.T) {
 	sanitizer := NewEnvSanitizer()
 
 	input := map[string]string{
-		"PATH":                   "/usr/bin:/bin",
+		"PATH":                  "/usr/bin:/bin",
 		"AWS_SECRET_ACCESS_KEY": "supersecretkey",
-		"DATABASE_PASSWORD":      "123456",
-		"HOME":                   "/home/user",
-		"API_TOKEN":              "abcdef",
+		"DATABASE_PASSWORD":     "123456",
+		"HOME":                  "/home/user",
+		"API_TOKEN":             "abcdef",
 	}
 
 	got := sanitizer.Sanitize(input)

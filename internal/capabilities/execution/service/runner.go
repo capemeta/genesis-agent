@@ -22,7 +22,6 @@ type Runner struct {
 	sandbox       execcontract.SandboxRunner
 	pathValidator commandPathValidator
 	astAnalyzer   *ScriptASTAnalyzer
-	policyPipeline *PolicyPipeline
 	logger        logger.Logger
 }
 
@@ -264,8 +263,12 @@ func addWarning(result *execmodel.Result, warning string) {
 
 func resolveSandboxType(provider string) string {
 	provider = strings.TrimSpace(strings.ToLower(provider))
-	if provider == "local" || provider == "local_host" || provider == "host" || provider == "" {
-		return "本地平台沙箱 (bwrap/landlock/seatbelt)"
+	switch provider {
+	case "local", "local-platform", "local_platform", "local_platform_sandbox", "bwrap", "landlock", "seatbelt", "windows", "":
+		return "本地平台沙箱 (ProcessConstrained/AppContainer/bwrap/seatbelt)"
+	case "local-host", "local_host", "host":
+		return "宿主环境直跑 (local_host)"
+	default:
+		return "沙箱容器API (genesis-sandbox)"
 	}
-	return "沙箱容器API (genesis-sandbox)"
 }

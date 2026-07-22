@@ -22,10 +22,18 @@ func TestMaterializeEmbeddedOfficePPT(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := svc.CreateBinding(context.Background(), skillcontract.BindingRequest{
+		Resolved: meta, RunID: "run-materialize-test", Task: "测试物化",
+		ToolPolicy:      skillmodel.EffectiveToolPolicy{Base: []string{"run_skill_command"}, Allowed: []string{"run_skill_command"}, Required: []string{"run_skill_command"}},
+		ExecutionPolicy: skillmodel.EffectiveExecutionPolicy{SandboxRequired: true, ExecutionMode: skillmodel.ExecutionModeSandboxedSession, PreferredBackend: "remote_sandbox"},
+		Capabilities:    skillmodel.EffectiveCapabilitySnapshot{}, PolicySnapshotVersion: "test/v1",
+	}); err != nil {
+		t.Fatal(err)
+	}
 	dir := t.TempDir()
-	skillDir := filepath.Join(dir, "skills", string(meta.PackageID))
+	skillDir := filepath.Join(dir, "skills", string(meta.Physical.Metadata.PackageID))
 	mat := &materialize.Materializer{Service: svc}
-	result, err := mat.MaterializePackageScripts(context.Background(), catalog, meta, skillDir)
+	result, err := mat.MaterializePackageScripts(context.Background(), catalog, meta.Physical.Metadata, meta.Physical.Snapshot, skillDir)
 	if err != nil {
 		t.Fatal(err)
 	}

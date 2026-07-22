@@ -246,16 +246,33 @@ func (s *Service) Run(ctx context.Context, req scriptcontract.RunRequest) (*scri
 		classifyFailure(out)
 		return out, nil
 	}
-	meta, err := s.skills.Resolve(ctx, skillcontract.ResolveRequest{CatalogRequest: req.Catalog, Name: skillName})
+	resolved, err := s.skills.Resolve(ctx, skillcontract.ResolveRequest{CatalogRequest: req.Catalog, Name: skillName})
 	if err != nil {
 		return nil, err
 	}
-	if meta.Context == skillmodel.ContextModeFork && req.Binding.Owner.ParentRunID == "" {
+	meta := resolved.Physical.Metadata
+	invocation := req.Invocation
+	if invocation.ID == "" {
+		if contextual, ok := skillcontract.InvocationBindingFromContext(ctx); ok {
+			invocation = contextual
+		}
+	}
+	if invocation.ID == "" {
+		invocation, err = s.skills.GetBinding(ctx, skillcontract.BindingLookup{TenantID: req.Binding.Owner.TenantID, RunID: req.Binding.Owner.RunID, Handle: skillName})
+		if err != nil {
+			return nil, fmt.Errorf("SKILL_BINDING_REQUIRED: run_skill_command必须在已解析InvocationBinding内执行: %w", err)
+		}
+	}
+	if invocation.Package.Digest != resolved.Physical.Snapshot.Digest || invocation.PhysicalSkill != meta.Name {
+		return nil, fmt.Errorf("SKILL_BINDING_VERSION_CONFLICT: command请求与固定Skill包不一致")
+	}
+	req.Invocation = invocation
+	if invocation.AgentMode.Mode == skillmodel.AgentModeFork && req.Binding.Owner.ParentRunID == "" {
 		out := &scriptcontract.RunResult{
 			OK:          false,
 			Skill:       meta.Name,
 			Command:     command,
-			Error:       fmt.Sprintf("FORBIDDEN_FORK_SKILL_EXECUTION: Skill %q 声明为 context: fork 物理沙箱隔离，父 Agent 禁止直接执行 run_skill_command。请调用 Skill(skill=%q, args=...) 委派子 Agent 处理。", meta.QualifiedName, meta.QualifiedName),
+			Error:       fmt.Sprintf("FORBIDDEN_FORK_SKILL_EXECUTION: Invocation %q必须在隔离子Run执行；请调用Skill(skill=%q, task=...)", invocation.Handle, invocation.Handle),
 			FailureKind: "forbidden_fork_execution",
 			DurationMS:  time.Since(started).Milliseconds(),
 		}
@@ -291,7 +308,7 @@ func (s *Service) Run(ctx context.Context, req scriptcontract.RunRequest) (*scri
 			return out, nil
 		}
 	}
-	if reason, redundant := redundantRuntimeProbe(command, meta.Dependencies.Runtime); redundant {
+	if reason, redundant := redundantRuntimeProbe(command, invocation.RuntimeProfile.Dependencies.Runtime); redundant {
 		out := &scriptcontract.RunResult{
 			OK:              false,
 			Skill:           meta.Name,
@@ -308,9 +325,12 @@ func (s *Service) Run(ctx context.Context, req scriptcontract.RunRequest) (*scri
 		return out, nil
 	}
 	sandbox := req.Sandbox
-	sandbox.TaskType = resolveTaskType(meta)
+	if invocation.ExecutionPolicy.SandboxRequired && (sandbox.Mode == "" || sandbox.Mode == execmodel.SandboxDisabled) {
+		return nil, fmt.Errorf("SKILL_RUNTIME_PROFILE_UNAVAILABLE: invocation %q要求沙箱，当前执行配置为disabled", invocation.Handle)
+	}
+	sandbox.TaskType = resolveTaskType(invocation.RuntimeProfile.Dependencies.Runtime)
 	sandbox.Operation = execmodel.SandboxOperationRunSkill
-	sandbox.RuntimeProfile = resolveRuntimeProfile(meta, sandbox.TaskType)
+	sandbox.RuntimeProfile = resolveRuntimeProfile(sandbox.TaskType)
 	if sandbox.Metadata == nil {
 		sandbox.Metadata = map[string]string{}
 	}
@@ -341,7 +361,7 @@ func (s *Service) Run(ctx context.Context, req scriptcontract.RunRequest) (*scri
 			out.SuggestedAction = "use_install_skill_dependencies_or_preinstall_profile"
 			out.SuggestedInstall = buildSuggestedInstall(meta.Name, out.Missing)
 		}
-		classifyFailureForSkill(out, meta.Dependencies)
+		classifyFailureForSkill(out, invocation.RuntimeProfile.Dependencies)
 		return out, nil
 	}
 	if err := req.Binding.Validate(); err != nil {
@@ -396,7 +416,7 @@ func (s *Service) Run(ctx context.Context, req scriptcontract.RunRequest) (*scri
 	}
 
 	if s.enablePreflight && !useRemoteSession(sandbox) {
-		if miss := s.preflightRuntime(ctx, meta, out.Script, req.ProjectDir); len(miss) > 0 {
+		if miss := s.preflightRuntime(ctx, invocation.RuntimeProfile.Dependencies.Runtime, out.Script, req.ProjectDir); len(miss) > 0 {
 			installable := installableMissing(miss)
 			if len(installable) == 0 {
 				for _, m := range miss {
@@ -536,11 +556,11 @@ func (s *Service) runLocal(ctx context.Context, meta skillmodel.Metadata, runID 
 		return skillExecutionAttempt{Workspace: executionWorkspace, Err: err}
 	}
 	mat := &materialize.Materializer{Service: s.skills}
-	if _, err := mat.MaterializePackageScripts(ctx, req.Catalog, meta, skillDir); err != nil {
+	if _, err := mat.MaterializePackageScripts(ctx, req.Catalog, meta, req.Invocation.Package, skillDir); err != nil {
 		return skillExecutionAttempt{Workspace: executionWorkspace, Err: err}
 	}
 	stagingStarted := time.Now()
-	staged, err := stageInputManifestLocal(ctx, s.inputSnapshots, req.Binding, req.Inputs, skillDir)
+	staged, err := stageInputManifestLocal(ctx, s.inputSnapshots, req.Binding, req.Invocation.Package, req.Inputs, skillDir)
 	stagingDurationMS := time.Since(stagingStarted).Milliseconds()
 	if err != nil {
 		return skillExecutionAttempt{WorkDir: skillDir, Workspace: executionWorkspace, StagingDurationMS: stagingDurationMS, Err: err}
@@ -601,7 +621,7 @@ func (s *Service) runRemote(ctx context.Context, meta skillmodel.Metadata, runID
 	if workspaceIdentity == "" {
 		workspaceIdentity = strings.TrimSpace(sess.Workspace().ID)
 	}
-	materializationKey := workspaceIdentity + "\x00" + remoteWorkspace.SkillDir + "\x00" + string(meta.PackageID)
+	materializationKey := workspaceIdentity + "\x00" + remoteWorkspace.SkillDir + "\x00" + req.Invocation.Package.Digest
 	s.mu.Lock()
 	if s.materialized[key] == nil {
 		s.materialized[key] = make(map[string]bool)
@@ -609,7 +629,7 @@ func (s *Service) runRemote(ctx context.Context, meta skillmodel.Metadata, runID
 	alreadyMaterialized := s.materialized[key][materializationKey]
 	s.mu.Unlock()
 	if !alreadyMaterialized {
-		if err := s.materializePackageRemote(ctx, req.Catalog, meta, sess, remoteWorkspace.SkillDir); err != nil {
+		if err := s.materializePackageRemote(ctx, meta, req.Invocation.Package, sess, remoteWorkspace.SkillDir); err != nil {
 			return skillExecutionAttempt{WorkDir: remoteWorkspace.SkillDir, Workspace: remoteWorkspace, Err: err}
 		}
 		s.mu.Lock()
@@ -617,7 +637,7 @@ func (s *Service) runRemote(ctx context.Context, meta skillmodel.Metadata, runID
 		s.mu.Unlock()
 	}
 	stagingStarted := time.Now()
-	staged, err := stageInputManifestRemote(ctx, s.inputSnapshots, req.Binding, req.Inputs, sess, remoteWorkspace.SkillDir)
+	staged, err := stageInputManifestRemote(ctx, s.inputSnapshots, req.Binding, req.Invocation.Package, req.Inputs, sess, remoteWorkspace.SkillDir)
 	stagingDurationMS := time.Since(stagingStarted).Milliseconds()
 	if err != nil {
 		return skillExecutionAttempt{WorkDir: remoteWorkspace.SkillDir, Workspace: remoteWorkspace, StagingDurationMS: stagingDurationMS, Err: err}
@@ -814,14 +834,14 @@ func remoteSkillEnv(workspace execmodel.ExecutionWorkspace) map[string]string {
 	return env
 }
 
-func resolveTaskType(meta skillmodel.Metadata) execmodel.SandboxTaskType {
-	if isOfficeRuntime(meta.Dependencies.Runtime) {
+func resolveTaskType(deps skillmodel.RuntimeDeps) execmodel.SandboxTaskType {
+	if isOfficeRuntime(deps) {
 		return execmodel.SandboxTaskOffice
 	}
 	return execmodel.SandboxTaskSkill
 }
 
-func resolveRuntimeProfile(meta skillmodel.Metadata, taskType execmodel.SandboxTaskType) execmodel.SandboxRuntimeProfile {
+func resolveRuntimeProfile(taskType execmodel.SandboxTaskType) execmodel.SandboxRuntimeProfile {
 	if taskType == execmodel.SandboxTaskOffice {
 		return execmodel.RuntimeProfileOfficeBasic
 	}
@@ -1005,36 +1025,41 @@ func uniqueMatchingDeliverableID(specs []artifactmodel.DeliverableSpec, descript
 
 // materializePackageRemote 直接把不可变 SkillPackageRef 投影到 executor WorkspaceFS，
 // 禁止先借宿主 /workspace 或进程 cwd 建立临时副本。
-func (s *Service) materializePackageRemote(ctx context.Context, catalog skillcontract.CatalogRequest, meta skillmodel.Metadata, session *sandboxsession.Session, skillDir string) error {
-	listed, err := s.skills.ListResources(ctx, skillcontract.ListResourcesRequest{
-		ResolveRequest: skillcontract.ResolveRequest{CatalogRequest: catalog, Name: meta.Name, Resource: string(meta.MainResource)},
-		PackageID:      meta.PackageID,
-	})
+func (s *Service) materializePackageRemote(ctx context.Context, meta skillmodel.Metadata, expected skillmodel.SkillPackageSnapshot, session *sandboxsession.Session, skillDir string) error {
+	reader, ok := s.skills.(skillcontract.PackageSnapshotReader)
+	if !ok {
+		return fmt.Errorf("SKILL_BINDING_VERSION_CONFLICT: skill service不支持包快照读取")
+	}
+	stored, files, err := reader.GetPackageSnapshot(ctx, expected.Digest)
 	if err != nil {
-		return fmt.Errorf("列出远程 skill 资源失败: %w", err)
+		return fmt.Errorf("读取固定 skill package snapshot失败: %w", err)
+	}
+	if stored.Digest != expected.Digest || stored.PackageID != expected.PackageID || stored.Authority != expected.Authority {
+		return fmt.Errorf("SKILL_BINDING_VERSION_CONFLICT: package snapshot identity不一致")
 	}
 	prefix := string(meta.PackageID) + "/"
 	scriptCount := 0
-	for _, info := range listed.Resources {
-		rel := strings.TrimPrefix(string(info.Resource), prefix)
-		if rel == "" || rel == string(info.Resource) || !safeRemoteRelativePath(rel) {
-			continue
-		}
-		content, err := s.skills.ReadResource(ctx, skillcontract.ResourceRequest{
-			ResolveRequest: skillcontract.ResolveRequest{CatalogRequest: catalog, Name: meta.Name, Resource: string(info.Resource)},
-			PackageID:      meta.PackageID,
-			Resource:       info.Resource,
-			MaxBytes:       64 * 1024 * 1024,
-		})
-		if err != nil {
-			return fmt.Errorf("读取远程 skill 资源 %s 失败: %w", info.Resource, err)
+	for _, file := range files {
+		rel := strings.TrimPrefix(string(file.Resource), prefix)
+		if rel == "" || rel == string(file.Resource) || !safeRemoteRelativePath(rel) {
+			return fmt.Errorf("skill package resource非法: %s", file.Resource)
 		}
 		// materialize 必须可重入：上一次上传可能只完成了部分文件，重试时以权威的
 		// 不可变 SkillPackage 覆盖同路径，不能因半成品 AlreadyExists 永久卡死。
-		if err := session.WriteFile(ctx, sandboxsession.RelativePath(skillDir, rel), []byte(content.Content), fscontract.WriteOptions{CreateParents: true, Overwrite: true}); err != nil {
-			return fmt.Errorf("写入远程 skill 资源 %s 失败: %w", info.Resource, err)
+		target := sandboxsession.RelativePath(skillDir, rel)
+		if err := session.WriteFile(ctx, target, file.Content, fscontract.WriteOptions{CreateParents: true, Overwrite: true, Atomic: true}); err != nil {
+			return fmt.Errorf("写入远程 skill 资源 %s 失败: %w", file.Resource, err)
 		}
-		if info.Kind == skillmodel.ResourceKindScript && strings.HasPrefix(rel, "scripts/") {
+		actual, err := session.ReadFile(ctx, target, fscontract.ReadOptions{MaxBytes: int64(len(file.Content)) + 1})
+		if err != nil {
+			return fmt.Errorf("校验远程 skill 资源 %s 失败: %w", file.Resource, err)
+		}
+		digest := sha256.Sum256(actual)
+		expectedDigest := sha256.Sum256(file.Content)
+		if digest != expectedDigest {
+			return fmt.Errorf("SKILL_BINDING_VERSION_CONFLICT: 远程materialized resource摘要不一致: %s", file.Resource)
+		}
+		if strings.HasPrefix(rel, "scripts/") {
 			scriptCount++
 		}
 	}
@@ -1044,11 +1069,11 @@ func (s *Service) materializePackageRemote(ctx context.Context, catalog skillcon
 	return nil
 }
 
-func stageInputManifestRemote(ctx context.Context, reader workcontract.InputSnapshotReader, binding execmodel.ExecutionBinding, manifest workmodel.InputManifest, session *sandboxsession.Session, skillDir string) ([]string, error) {
+func stageInputManifestRemote(ctx context.Context, reader workcontract.InputSnapshotReader, binding execmodel.ExecutionBinding, pkg skillmodel.SkillPackageSnapshot, manifest workmodel.InputManifest, session *sandboxsession.Session, skillDir string) ([]string, error) {
 	if len(manifest.Inputs) == 0 {
 		return nil, nil
 	}
-	if err := validateInputManifest(binding, manifest); err != nil {
+	if err := validateInputManifest(binding, pkg, manifest); err != nil {
 		return nil, err
 	}
 	if reader == nil {
@@ -1082,11 +1107,11 @@ func safeRemoteRelativePath(value string) bool {
 	return true
 }
 
-func stageInputManifestLocal(ctx context.Context, reader workcontract.InputSnapshotReader, binding execmodel.ExecutionBinding, manifest workmodel.InputManifest, destDir string) ([]string, error) {
+func stageInputManifestLocal(ctx context.Context, reader workcontract.InputSnapshotReader, binding execmodel.ExecutionBinding, pkg skillmodel.SkillPackageSnapshot, manifest workmodel.InputManifest, destDir string) ([]string, error) {
 	if len(manifest.Inputs) == 0 {
 		return nil, nil
 	}
-	if err := validateInputManifest(binding, manifest); err != nil {
+	if err := validateInputManifest(binding, pkg, manifest); err != nil {
 		return nil, err
 	}
 	if reader == nil {
@@ -1144,16 +1169,27 @@ func inputAlias(input workmodel.InputRef) string {
 	return string(input.Alias)
 }
 
-func validateInputManifest(binding execmodel.ExecutionBinding, manifest workmodel.InputManifest) error {
+func validateInputManifest(binding execmodel.ExecutionBinding, pkg skillmodel.SkillPackageSnapshot, manifest workmodel.InputManifest) error {
 	if manifest.RunID != binding.Owner.RunID || manifest.BindingID != binding.ID {
 		return workcontract.NewError(workcontract.ErrCodeWorkspaceNotAvailable, fmt.Errorf("InputManifest 与 ExecutionBinding 不匹配"))
 	}
 	seen := make(map[string]struct{}, len(manifest.Inputs))
+	packageFiles := make(map[string]struct{}, len(pkg.Files))
+	prefix := string(pkg.PackageID) + "/"
+	for _, file := range pkg.Files {
+		rel := strings.TrimPrefix(normalizeSlash(string(file.Resource)), prefix)
+		if rel != "" && rel != string(file.Resource) {
+			packageFiles[strings.ToLower(rel)] = struct{}{}
+		}
+	}
 	for _, input := range manifest.Inputs {
 		if err := input.Alias.Validate(); err != nil {
 			return workcontract.NewError(workcontract.ErrCodePathNamespaceMismatch, fmt.Errorf("InputRef %s alias 无效: %w", input.ID, err))
 		}
 		key := strings.ToLower(string(input.Alias))
+		if _, reserved := packageFiles[key]; reserved {
+			return workcontract.NewError(workcontract.ErrCodeInputNameConflict, fmt.Errorf("InputManifest alias与不可变Skill包文件冲突: %s", input.Alias))
+		}
 		if _, exists := seen[key]; exists {
 			return workcontract.NewError(workcontract.ErrCodeInputNameConflict, fmt.Errorf("InputManifest alias 重复: %s", input.Alias))
 		}

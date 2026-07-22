@@ -13,8 +13,7 @@ import (
 
 // preflightRuntime 对 Skill 声明的 runtime 做轻量探测；失败返回 missing 列表。
 // 对齐设计 §6.9；借鉴 Kode ensureRipgrepReady 的「探测 + 可读 Fix」，不做静默安装。
-func (s *Service) preflightRuntime(ctx context.Context, meta model.Metadata, scriptRel, workspaceRoot string) []scriptcontract.MissingDep {
-	rt := meta.Dependencies.Runtime
+func (s *Service) preflightRuntime(ctx context.Context, rt model.RuntimeDeps, scriptRel, workspaceRoot string) []scriptcontract.MissingDep {
 	if len(rt.Python) == 0 && len(rt.Node) == 0 && len(rt.System) == 0 {
 		return nil
 	}

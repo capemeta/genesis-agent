@@ -23,7 +23,7 @@ func TestBuildTenantDependenciesAssemblesControlPlane(t *testing.T) {
 		t.Fatal(err)
 	}
 	if deps.RunManifests == nil || deps.ProducedResources == nil || deps.RemoteSessions == nil || deps.Reservations == nil || deps.Deliverables == nil ||
-		deps.ArtifactRuns == nil || deps.Finalizer == nil || deps.Completion == nil || deps.QAEvidence == nil {
+		deps.ArtifactRuns == nil || deps.Finalizer == nil || deps.Completion == nil || deps.QAEvidence == nil || deps.Adoptions == nil || deps.SkillBindings == nil || deps.SkillPackages == nil || deps.SubAgentStore == nil {
 		t.Fatalf("incomplete dependencies: %+v", deps)
 	}
 }

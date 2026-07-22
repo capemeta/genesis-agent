@@ -8,6 +8,7 @@ import (
 type completionPolicyContextKey struct{}
 type qaRecorderContextKey struct{}
 type evidenceQAHintsContextKey struct{}
+type adoptionStoreContextKey struct{}
 
 // EvidenceQAHints 是 Skill fork 等可信控制面注入的 QA 偏好，供「产物证据建约」使用。
 // 不单独构成交付承诺；仅在 FinalizeRequired 因产物证据创建 Spec 时覆盖默认 soft QA。
@@ -56,6 +57,21 @@ func QAEvidenceRecorderFromContext(ctx context.Context) (QAEvidenceRecorder, boo
 		return nil, false
 	}
 	value, ok := ctx.Value(qaRecorderContextKey{}).(QAEvidenceRecorder)
+	return value, ok && value != nil
+}
+
+func WithAdoptionStore(ctx context.Context, store AdoptionStore) context.Context {
+	if store == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, adoptionStoreContextKey{}, store)
+}
+
+func AdoptionStoreFromContext(ctx context.Context) (AdoptionStore, bool) {
+	if ctx == nil {
+		return nil, false
+	}
+	value, ok := ctx.Value(adoptionStoreContextKey{}).(AdoptionStore)
 	return value, ok && value != nil
 }
 

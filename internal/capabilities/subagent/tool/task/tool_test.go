@@ -366,4 +366,3 @@ func TestTaskResolvesInputFilesIntoSpawnRequest(t *testing.T) {
 }
 
 var _ contract.BackgroundRunner = (*recordingBackgroundRunner)(nil)
-

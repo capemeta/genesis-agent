@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 
 	skillcontract "genesis-agent/internal/capabilities/skill/contract"
+	skillmodel "genesis-agent/internal/capabilities/skill/model"
 	tool "genesis-agent/internal/capabilities/tool/contract"
 	"genesis-agent/internal/domain"
 	"genesis-agent/internal/platform/logger"
@@ -29,6 +31,12 @@ type SkillExplicitLoader interface {
 	LoadExplicitSkill(ctx context.Context, req skillcontract.ExplicitLoadRequest) (string, error)
 }
 
+// SkillInvocationBindingResolver 将 Skill 网关返回的 opaque binding_id 解析为
+// 当前 Run 已持久化的不可变 InvocationBinding。模型不参与 binding 传递。
+type SkillInvocationBindingResolver interface {
+	GetInvocationBinding(ctx context.Context, bindingID string) (skillmodel.InvocationBinding, error)
+}
+
 // WithSkillMentionSelector 注入 mention 自动选择。
 func WithSkillMentionSelector(selector SkillMentionSelector) EngineOption {
 	return func(e *ReactLoopEngine) {
@@ -40,6 +48,13 @@ func WithSkillMentionSelector(selector SkillMentionSelector) EngineOption {
 func WithSkillExplicitLoader(loader SkillExplicitLoader) EngineOption {
 	return func(e *ReactLoopEngine) {
 		e.skillExplicitLoader = loader
+	}
+}
+
+// WithSkillInvocationBindingResolver 注入 inline Invocation 激活所需的 Binding 解析器。
+func WithSkillInvocationBindingResolver(resolver SkillInvocationBindingResolver) EngineOption {
+	return func(e *ReactLoopEngine) {
+		e.skillBindingResolver = resolver
 	}
 }
 
@@ -79,29 +94,60 @@ func renderAlreadyLoadedAck(injection skillInjectionOutput) string {
 }
 
 // applySkillToolResult 处理 Skill 网关结果：去重、短确认、单份 injection、工具收窄。
-func (e *ReactLoopEngine) applySkillToolResult(rc *runtime.RunContext, toolResult toolExecutionResult, activeToolNames *[]string, toolInfos *[]*tool.Info, iterLog logger.Logger) bool {
+func (e *ReactLoopEngine) applySkillToolResult(ctx context.Context, rc *runtime.RunContext, toolResult toolExecutionResult, activeToolNames *[]string, toolInfos *[]*tool.Info, iterLog logger.Logger) (bool, error) {
 	injection, ok := parseSkillInjection(toolResult)
 	if !ok {
-		return false
+		return false, nil
+	}
+	binding, err := e.resolveSkillInvocation(ctx, injection)
+	if err != nil {
+		return true, err
 	}
 	key := skillInjectionKey(injection)
 	if rc.HasInjectedSkill(key) {
+		if err := rc.ActivateInvocation(binding); err != nil {
+			return true, err
+		}
 		rc.Messages = append(rc.Messages, domain.NewToolResultMessage(toolResult.ID, renderAlreadyLoadedAck(injection)))
-		return true
+		return true, nil
 	}
-	narrowed, narrowOK := narrowToolNames(*activeToolNames, injection.AllowedTools)
-	rc.Messages = append(rc.Messages, domain.NewToolResultMessage(toolResult.ID, renderSkillToolAck(injection, narrowOK)))
+	narrowed, narrowOK := narrowToolNames(*activeToolNames, binding.ToolPolicy.Allowed)
+	if !narrowOK {
+		rc.Messages = append(rc.Messages, domain.NewToolResultMessage(toolResult.ID, renderSkillToolAck(injection, false)))
+		iterLog.Error("Skill Invocation工具策略不可满足，拒绝注入", "skill", injection.QualifiedName, "allowed_tools", injection.AllowedTools)
+		return true, nil
+	}
+	if err := rc.ActivateInvocation(binding); err != nil {
+		return true, err
+	}
+	rc.Messages = append(rc.Messages, domain.NewToolResultMessage(toolResult.ID, renderSkillToolAck(injection, true)))
 	// 对齐 Kode newMessages / Codex <skill>：SKILL 全文以 user + Kind=skill_injection 注入。
 	rc.Messages = append(rc.Messages, domain.NewSkillInjectionMessage(renderSkillInjection(injection)).WithSource(domain.MessageSourceSkillGateway))
 	rc.MarkInjectedSkill(key)
 	registerSkillInjectionFollow(rc, injection.Content)
-	if narrowOK {
-		*activeToolNames = narrowed
-		*toolInfos = e.filterToolInfos(context.Background(), *activeToolNames)
-	} else {
-		iterLog.Warn("Skill allowed_tools 与当前可见工具求交为空，保持原工具集", "skill", injection.QualifiedName, "allowed_tools", injection.AllowedTools)
+	*activeToolNames = narrowed
+	*toolInfos = e.filterToolInfos(ctx, *activeToolNames)
+	return true, nil
+}
+
+func (e *ReactLoopEngine) resolveSkillInvocation(ctx context.Context, injection skillInjectionOutput) (skillmodel.InvocationBinding, error) {
+	if strings.TrimSpace(injection.BindingID) == "" {
+		return skillmodel.InvocationBinding{}, fmt.Errorf("SKILL_INVOCATION_ACTIVATION_FAILED: Skill网关未返回binding_id")
 	}
-	return true
+	if e.skillBindingResolver == nil {
+		return skillmodel.InvocationBinding{}, fmt.Errorf("SKILL_INVOCATION_ACTIVATION_FAILED: runtime未配置binding resolver")
+	}
+	binding, err := e.skillBindingResolver.GetInvocationBinding(ctx, injection.BindingID)
+	if err != nil {
+		return skillmodel.InvocationBinding{}, fmt.Errorf("SKILL_INVOCATION_ACTIVATION_FAILED: 读取binding %q: %w", injection.BindingID, err)
+	}
+	if binding.ID != injection.BindingID || binding.Handle != injection.QualifiedName || binding.PhysicalSkill != injection.PhysicalSkill || binding.InvocationID != injection.InvocationID {
+		return skillmodel.InvocationBinding{}, fmt.Errorf("SKILL_INVOCATION_ACTIVATION_FAILED: Skill结果与持久化binding身份不一致")
+	}
+	if !slices.Equal(binding.ToolPolicy.Allowed, injection.AllowedTools) {
+		return skillmodel.InvocationBinding{}, fmt.Errorf("SKILL_INVOCATION_ACTIVATION_FAILED: Skill结果与binding工具策略不一致")
+	}
+	return binding, nil
 }
 
 // injectMentionedSkills 在首轮 LLM 前按 mention 自动加载 skill。
@@ -138,20 +184,33 @@ func (e *ReactLoopEngine) injectMentionedSkills(ctx context.Context, rc *runtime
 			log.Warn("mention Skill 返回无法解析", "skill", mention.Skill)
 			continue
 		}
-		key := skillInjectionKey(injection)
-		if rc.HasInjectedSkill(key) {
+		binding, err := e.resolveSkillInvocation(ctx, injection)
+		if err != nil {
+			log.Error("mention Skill Invocation激活失败", "skill", injection.QualifiedName, "error", err)
+			rc.Messages = append(rc.Messages, domain.NewSystemMessage(fmt.Sprintf("<skill_mention_error>\nInvocation激活失败: %s\n</skill_mention_error>", err.Error())).WithSource(domain.MessageSourceSkillMention))
 			continue
 		}
-		narrowed, narrowOK := narrowToolNames(*activeToolNames, injection.AllowedTools)
+		key := skillInjectionKey(injection)
+		if rc.HasInjectedSkill(key) {
+			if err := rc.ActivateInvocation(binding); err != nil {
+				log.Error("mention Skill Invocation恢复失败", "skill", injection.QualifiedName, "error", err)
+			}
+			continue
+		}
+		narrowed, narrowOK := narrowToolNames(*activeToolNames, binding.ToolPolicy.Allowed)
+		if !narrowOK {
+			log.Error("mention Skill Invocation工具策略不可满足，拒绝注入", "skill", injection.QualifiedName)
+			continue
+		}
+		if err := rc.ActivateInvocation(binding); err != nil {
+			log.Error("mention Skill Invocation激活失败", "skill", injection.QualifiedName, "error", err)
+			continue
+		}
 		rc.Messages = append(rc.Messages, domain.NewSkillInjectionMessage(renderSkillInjection(injection)).WithSource(domain.MessageSourceSkillMention))
 		rc.MarkInjectedSkill(key)
 		registerSkillInjectionFollow(rc, injection.Content)
-		if narrowOK {
-			*activeToolNames = narrowed
-			*toolInfos = e.filterToolInfos(ctx, *activeToolNames)
-		} else {
-			log.Warn("mention Skill allowed_tools 求交为空，保持原工具集", "skill", injection.QualifiedName)
-		}
+		*activeToolNames = narrowed
+		*toolInfos = e.filterToolInfos(ctx, *activeToolNames)
 		log.Info("已按 mention 自动注入 Skill", "skill", injection.QualifiedName)
 	}
 }

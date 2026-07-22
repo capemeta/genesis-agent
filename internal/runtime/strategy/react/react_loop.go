@@ -18,20 +18,22 @@ import (
 
 	approvalcontract "genesis-agent/internal/capabilities/approval/contract"
 	artifactcontract "genesis-agent/internal/capabilities/artifact/contract"
+	artifactmodel "genesis-agent/internal/capabilities/artifact/model"
 	artifactservice "genesis-agent/internal/capabilities/artifact/service"
 	hookcontract "genesis-agent/internal/capabilities/hook/contract"
 	hookmodel "genesis-agent/internal/capabilities/hook/model"
+	"genesis-agent/internal/capabilities/llm/contract"
 	imagesanitize "genesis-agent/internal/capabilities/llm/sanitize"
 	"genesis-agent/internal/capabilities/llm/vision"
 	viewimage "genesis-agent/internal/capabilities/media/tool/view_image"
-	"genesis-agent/internal/capabilities/turninput"
-	runtimevision "genesis-agent/internal/runtime/vision"
-	"genesis-agent/internal/capabilities/llm/contract"
 	"genesis-agent/internal/capabilities/memory/contract"
 	skillcollision "genesis-agent/internal/capabilities/skill/collision"
+	skillcontract "genesis-agent/internal/capabilities/skill/contract"
+	skillmodel "genesis-agent/internal/capabilities/skill/model"
 	"genesis-agent/internal/capabilities/tool/contract"
 	"genesis-agent/internal/capabilities/tool/scheduler"
 	"genesis-agent/internal/capabilities/trace/contract"
+	"genesis-agent/internal/capabilities/turninput"
 	workcontract "genesis-agent/internal/capabilities/workspace/contract"
 	"genesis-agent/internal/domain"
 	"genesis-agent/internal/platform/contextutil"
@@ -45,6 +47,7 @@ import (
 	"genesis-agent/internal/runtime/progress"
 	"genesis-agent/internal/runtime/prompt"
 	"genesis-agent/internal/runtime/repeatguard"
+	runtimevision "genesis-agent/internal/runtime/vision"
 )
 
 // SkillNameMatcher 识别「把 Skill 名当成 Tool 名」的误调用（由产品注入，Gateway 不依赖 skill）。
@@ -68,6 +71,7 @@ type ReactLoopEngine struct {
 	skillNameMatcher          SkillNameMatcher
 	skillMentionSelector      SkillMentionSelector
 	skillExplicitLoader       SkillExplicitLoader
+	skillBindingResolver      SkillInvocationBindingResolver
 	subAgentTypeLookup        SubAgentTypeLookup
 	autoRewriteSkillCollision *bool // nil 表示默认开启
 	taskListReminder          TaskListReminderSource
@@ -246,6 +250,16 @@ func (e *ReactLoopEngine) Start(ctx context.Context, req domain.StartRunRequest)
 	runSpan := e.tracer.StartSpan(ctx, "run", run.ID)
 
 	rc := runtime.NewRunContext(run, req.Agent)
+	// fork Invocation 由子 Run Controller 在启动前注入 Binding；inline Invocation
+	// 则在 Skill 工具结果被接受后激活。两条路径最终统一进入 RunContext。
+	if binding, ok := skillcontract.InvocationBindingFromContext(ctx); ok {
+		if err := validateInitialInvocationBinding(ctx, req, binding); err != nil {
+			return run, err
+		}
+		if err := rc.ActivateInvocation(binding); err != nil {
+			return run, err
+		}
+	}
 	ctx = contextutil.WithApprovalGrantedHook(ctx, func(context.Context) {
 		if rc.RepeatGuard == nil {
 			return
@@ -280,6 +294,26 @@ func (e *ReactLoopEngine) Start(ctx context.Context, req domain.StartRunRequest)
 	}
 	progress.Emit(ctx, progress.Event{Kind: progress.KindRun, Phase: progress.PhaseComplete, RunID: run.ID, Summary: summary})
 	return run, nil
+}
+
+func validateInitialInvocationBinding(ctx context.Context, req domain.StartRunRequest, binding skillmodel.InvocationBinding) error {
+	if binding.TenantID != "" && binding.TenantID != req.TenantID {
+		return fmt.Errorf("SKILL_INVOCATION_ACTIVATION_FAILED: binding tenant与Run不一致")
+	}
+	switch binding.AgentMode.Mode {
+	case skillmodel.AgentModeMain:
+		if binding.RunID != req.RunID {
+			return fmt.Errorf("SKILL_INVOCATION_ACTIVATION_FAILED: main binding不属于当前Run")
+		}
+	case skillmodel.AgentModeFork:
+		prepared, ok := workcontract.PreparedRunFromContext(ctx)
+		if !ok || prepared.Manifest.RunID != req.RunID || prepared.Manifest.ParentRunID != binding.RunID {
+			return fmt.Errorf("SKILL_INVOCATION_ACTIVATION_FAILED: fork binding与父子Run关系不一致")
+		}
+	default:
+		return fmt.Errorf("SKILL_INVOCATION_ACTIVATION_FAILED: 未知agent_mode %q", binding.AgentMode.Mode)
+	}
+	return nil
 }
 
 // loop 核心执行循环
@@ -322,6 +356,14 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 	// ── 步骤1: 获取工具定义（tool.Info，与外部框架无关）─────────
 	toolInfos := e.applyCollabToolFilter(ctx, e.getToolInfos(agent))
 	activeToolNames := namesOfToolInfos(toolInfos)
+	if binding, ok := rc.ActiveInvocation(); ok {
+		var narrowOK bool
+		activeToolNames, narrowOK = narrowToolNames(activeToolNames, binding.ToolPolicy.Allowed)
+		if !narrowOK {
+			return fmt.Errorf("SKILL_TOOL_POLICY_UNSATISFIABLE: Invocation %q在当前Run无可执行工具", binding.Handle)
+		}
+		toolInfos = e.filterToolInfos(ctx, activeToolNames)
+	}
 
 	// ── 步骤2: 构建初始消息列表与弹性预算装配 ──────────────────
 	// System消息（Persona System Prompt）；子 Run 跳过主侧委派纪律
@@ -741,7 +783,11 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 				return toolErr
 			}
 			for _, toolResult := range toolResults {
-				if e.applySkillToolResult(rc, toolResult, &activeToolNames, &toolInfos, iterLog) {
+				handled, applyErr := e.applySkillToolResult(ctx, rc, toolResult, &activeToolNames, &toolInfos, iterLog)
+				if applyErr != nil {
+					return applyErr
+				}
+				if handled {
 					continue
 				}
 				if len(toolResult.Parts) > 0 {
@@ -1088,10 +1134,11 @@ func recordSkillQAEvidence(ctx context.Context, rc *runtime.RunContext, toolName
 		return fmt.Errorf("QA evidence recorder 已配置但缺少 prepared run")
 	}
 	validator := artifactservice.ClassifySkillQACommand(command)
-	return recorder.RecordPassed(ctx, artifactcontract.QAPassRequest{
+	return recorder.RecordOutcome(ctx, artifactcontract.QAOutcomeRequest{
 		TenantID:  prepared.Manifest.Scope.TenantID,
 		RunID:     prepared.Manifest.RunID,
 		Validator: validator,
+		Status:    artifactmodel.QAEvidencePassed,
 	})
 }
 
@@ -1108,6 +1155,14 @@ func (e *ReactLoopEngine) runToolCall(ctx context.Context, rc *runtime.RunContex
 	stepIdx := rc.Iteration
 	displayTrue := true
 	toolName := strings.TrimSpace(tc.Function.Name)
+	if rc != nil {
+		if binding, ok := rc.ActiveInvocation(); ok {
+			if !rc.InvocationAllowsTool(toolName) {
+				return "", fmt.Errorf("TOOL_NOT_ALLOWED_BY_INVOCATION: tool %q不在Invocation %q的EffectiveToolPolicy中", toolName, binding.Handle)
+			}
+			ctx = skillcontract.WithInvocationBinding(ctx, binding)
+		}
+	}
 	if toolName == "run_skill_command" && rc != nil && rc.SkillFollow != nil {
 		command := extractCommandArg(tc.Function.Arguments)
 		if rc.SkillFollow.ShouldBlockQA(command) {
@@ -1704,6 +1759,9 @@ func truncate(s string, maxLen int) string {
 type skillInjectionOutput struct {
 	Type          string   `json:"type"`
 	QualifiedName string   `json:"qualified_name"`
+	PhysicalSkill string   `json:"physical_skill"`
+	InvocationID  string   `json:"invocation_id"`
+	BindingID     string   `json:"binding_id"`
 	Resource      string   `json:"resource"`
 	Content       string   `json:"content"`
 	AllowedTools  []string `json:"allowed_tools"`
@@ -1725,7 +1783,7 @@ func parseSkillInjection(result toolExecutionResult) (skillInjectionOutput, bool
 func renderSkillToolAck(injection skillInjectionOutput, narrowOK bool) string {
 	msg := "Skill loaded. Follow <skill_injection> instructions and use primitive tools."
 	if !narrowOK {
-		msg = "Skill loaded, but allowed_tools intersected with the current visible tool set is empty; tool visibility was not narrowed. Fix the skill allowed-tools declaration."
+		msg = "Skill Invocation rejected because its effective tool policy cannot be satisfied."
 	}
 	payload := map[string]any{
 		"type":           "skill_loaded",
@@ -1804,14 +1862,6 @@ func narrowToolNames(current []string, allowed []string) (names []string, ok boo
 		name = strings.TrimSpace(name)
 		if name != "" {
 			allowedSet[name] = struct{}{}
-		}
-	}
-	// 网关与资源元工具：收窄后仍应可用（仅当当前 turn 本来就可见）。
-	// 网关 / 资源 / 脚本 / 依赖安装：收窄后仍应可用（仅当当前 turn 本来就可见）。
-	// install_skill_dependencies 是缺包闭环必需；对齐设计 §7。
-	for _, meta := range []string{"Skill", "list_skill_resources", "read_skill_resource", "search_skill_resources", "run_skill_command", "install_skill_dependencies"} {
-		if _, inCurrent := currentSet[meta]; inCurrent {
-			allowedSet[meta] = struct{}{}
 		}
 	}
 	out := make([]string, 0, len(current))

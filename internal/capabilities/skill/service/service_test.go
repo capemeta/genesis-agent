@@ -2,325 +2,192 @@ package service
 
 import (
 	"context"
-	capmodel "genesis-agent/internal/capabilities/capability/model"
 	"strings"
 	"testing"
-	"time"
 
-	capcontract "genesis-agent/internal/capabilities/capability/contract"
-	profilemodel "genesis-agent/internal/capabilities/profile/model"
+	skillmemory "genesis-agent/internal/capabilities/skill/adapter/memory"
 	"genesis-agent/internal/capabilities/skill/contract"
 	"genesis-agent/internal/capabilities/skill/model"
+	workmodel "genesis-agent/internal/capabilities/workspace/model"
 )
 
-func TestServiceResolveLoadAndRender(t *testing.T) {
-	source := fakeSource{meta: model.Metadata{Name: "review", QualifiedName: "review", Description: "Review things", Enabled: true, PromptVisible: true, Authority: model.Authority{Kind: model.SourceKindHost, ID: "fake"}, PackageID: "review", MainResource: "review/SKILL.md"}.Normalize(), body: "Use careful review with a deliberately long body that should be truncated by the prompt budget."}
-	svc := New([]contract.Source{source}, Options{MaxPromptBytes: 60, MaxListBytes: 200})
-	req := contract.CatalogRequest{Product: profilemodel.ChannelCLI, Environment: profilemodel.EnvironmentLocal}
-	catalog, err := svc.Catalog(context.Background(), req)
+func TestCatalogExpandsPhysicalSkillIntoInvocationHandles(t *testing.T) {
+	svc := testService(t)
+	catalog, err := svc.Catalog(context.Background(), contract.CatalogRequest{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(catalog.Entries) != 1 {
-		t.Fatalf("entries=%d", len(catalog.Entries))
+	if len(catalog.Errors) != 0 || len(catalog.Entries) != 2 {
+		t.Fatalf("catalog=%+v", catalog)
 	}
-	injection, err := svc.Load(context.Background(), contract.LoadRequest{ResolveRequest: contract.ResolveRequest{CatalogRequest: req, Name: "review", ModelCall: true}, Args: "abc"})
-	if err != nil {
-		t.Fatal(err)
+	if catalog.Entries[0].Name != "demo" || catalog.Entries[1].Name != "demo-read" {
+		t.Fatalf("entries=%+v", catalog.Entries)
 	}
-	if !injection.Truncated || !strings.Contains(injection.Contents, "[skill内容已按预算截断]") {
-		t.Fatalf("expected truncated injection: %+v", injection)
-	}
-	rendered, err := svc.RenderAvailableSkills(context.Background(), req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(rendered, "review") {
-		t.Fatalf("rendered = %q", rendered)
+	for _, entry := range catalog.Entries {
+		if entry.PhysicalSkill != "demo" || entry.PackageDigest == "" {
+			t.Fatalf("entry=%+v", entry)
+		}
 	}
 }
 
-func TestServiceLoadKeepsFullBodyUnderDefaultBudget(t *testing.T) {
-	longBody := strings.Repeat("A", 12*1024) // > 旧 8KiB，应低于默认 256KiB 安全上限
-	source := fakeSource{meta: model.Metadata{Name: "review", QualifiedName: "review", Description: "Review things", Enabled: true, PromptVisible: true, Authority: model.Authority{Kind: model.SourceKindHost, ID: "fake"}, PackageID: "review", MainResource: "review/SKILL.md"}.Normalize(), body: longBody}
-	svc := New([]contract.Source{source}, Options{})
-	req := contract.CatalogRequest{Product: profilemodel.ChannelCLI, Environment: profilemodel.EnvironmentLocal}
-	injection, err := svc.Load(context.Background(), contract.LoadRequest{ResolveRequest: contract.ResolveRequest{CatalogRequest: req, Name: "review", ModelCall: true}})
+func TestResolveLoadsInvocationSpecificInstructionsAndSkillBody(t *testing.T) {
+	svc := testService(t)
+	read, err := svc.Resolve(context.Background(), contract.ResolveRequest{Name: "demo-read"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if injection.Truncated {
-		t.Fatal("default budget should not truncate 12KiB skill body")
+	if read.SkillBody != "" || !strings.Contains(read.Instructions, "只读") {
+		t.Fatalf("read=%+v", read)
 	}
-	if !strings.Contains(injection.Contents, longBody) {
-		t.Fatal("expected full body retained")
-	}
-}
-
-type fakeCapabilityRegistry struct {
-	records []capmodel.CapabilityIndexRecord
-}
-
-func (r fakeCapabilityRegistry) ListCapabilities(context.Context, capmodel.CapabilityQuery) ([]capmodel.CapabilityIndexRecord, error) {
-	return append([]capmodel.CapabilityIndexRecord(nil), r.records...), nil
-}
-
-func (r fakeCapabilityRegistry) SetCapabilityEnabled(context.Context, string, bool) (capmodel.CapabilityIndexRecord, error) {
-	return capmodel.CapabilityIndexRecord{}, nil
-}
-
-var _ capcontract.Registry = fakeCapabilityRegistry{}
-
-func TestServiceFiltersDisabledSkillCapabilities(t *testing.T) {
-	meta := model.Metadata{Name: "review", QualifiedName: "review", Description: "Review things", Enabled: true, PromptVisible: true, Authority: model.Authority{Kind: model.SourceKindHost, ID: "fake"}, PackageID: "review", MainResource: "review/SKILL.md"}.Normalize()
-	source := fakeSource{meta: meta, body: "Body"}
-	visibility := fakeCapabilityRegistry{records: []capmodel.CapabilityIndexRecord{{ID: "review-id", Type: capmodel.CapabilityTypeSkill, Name: "review", Package: "review", ResourcePath: "./skills/review", Enabled: false}}}
-	svc := New([]contract.Source{source}, Options{Visibility: visibility})
-	req := contract.CatalogRequest{Product: profilemodel.ChannelCLI, Environment: profilemodel.EnvironmentLocal}
-	catalog, err := svc.Catalog(context.Background(), req)
+	work, err := svc.Resolve(context.Background(), contract.ResolveRequest{Name: "demo"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(catalog.Entries) != 0 {
-		t.Fatalf("expected disabled skill hidden: %+v", catalog.Entries)
-	}
-	if _, err := svc.Load(context.Background(), contract.LoadRequest{ResolveRequest: contract.ResolveRequest{CatalogRequest: req, Name: "review", ModelCall: true}}); err == nil {
-		t.Fatal("expected Skill load to fail for disabled capability")
-	}
-	rendered, err := svc.RenderAvailableSkills(context.Background(), req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rendered != "" {
-		t.Fatalf("expected disabled skill omitted from prompt, got %q", rendered)
+	if work.SkillBody != "portable body" || !strings.Contains(work.Instructions, "制作") {
+		t.Fatalf("work=%+v", work)
 	}
 }
 
-func TestServiceDoesNotHideNonPluginSkillWithSameName(t *testing.T) {
-	meta := model.Metadata{Name: "review", QualifiedName: "review", Description: "Local review", Enabled: true, PromptVisible: true, Authority: model.Authority{Kind: model.SourceKindHost, ID: "local"}, Scope: model.ScopeUser, PackageID: "local-review", MainResource: "local-review/SKILL.md"}.Normalize()
-	visibility := fakeCapabilityRegistry{records: []capmodel.CapabilityIndexRecord{{ID: "plugin-review", Type: capmodel.CapabilityTypeSkill, Name: "review", Package: "plugin-review", ResourcePath: "./skills/review", Enabled: false}}}
-	svc := New([]contract.Source{fakeSource{meta: meta, body: "Body"}}, Options{Visibility: visibility})
-	catalog, err := svc.Catalog(context.Background(), contract.CatalogRequest{Product: profilemodel.ChannelCLI, Environment: profilemodel.EnvironmentLocal})
+func TestCreateBindingValidatesRequestPersistsAndIsIdempotent(t *testing.T) {
+	store := skillmemory.NewBindingStore()
+	svc := testServiceWithStore(t, store)
+	resolved, err := svc.Resolve(context.Background(), contract.ResolveRequest{Name: "demo-read"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(catalog.Entries) != 1 || catalog.Entries[0].PackageID != "local-review" {
-		t.Fatalf("local skill should remain visible: %+v", catalog.Entries)
+	input := workmodel.ResourceRef{Authority: "host", Scheme: "run-input", ID: "requirements", Version: "sha256:abc", Path: "requirements.pptx"}
+	req := contract.BindingRequest{
+		Resolved: resolved, TenantID: "tenant", RunID: "run", Inputs: []workmodel.ResourceRef{input},
+		ToolPolicy:      model.EffectiveToolPolicy{Base: []string{"run_skill_command"}, Allowed: []string{"run_skill_command"}, Required: []string{"run_skill_command"}},
+		ExecutionPolicy: model.EffectiveExecutionPolicy{SandboxRequired: true, ExecutionMode: model.ExecutionModePerCall},
+		Capabilities:    model.EffectiveCapabilitySnapshot{VisionMode: "degraded_text"},
 	}
-}
-func TestServiceKeepsSkillsWithoutCapabilityIndex(t *testing.T) {
-	meta := model.Metadata{Name: "local", QualifiedName: "local", Description: "Local", Enabled: true, PromptVisible: true, Authority: model.Authority{Kind: model.SourceKindHost, ID: "fake"}, PackageID: "local", MainResource: "local/SKILL.md"}.Normalize()
-	svc := New([]contract.Source{fakeSource{meta: meta, body: "Body"}}, Options{Visibility: fakeCapabilityRegistry{}})
-	catalog, err := svc.Catalog(context.Background(), contract.CatalogRequest{Product: profilemodel.ChannelCLI, Environment: profilemodel.EnvironmentLocal})
+	first, err := svc.CreateBinding(context.Background(), req)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(catalog.Entries) != 1 || catalog.Entries[0].Name != "local" {
-		t.Fatalf("expected non-indexed local skill visible: %+v", catalog.Entries)
+	second, err := svc.CreateBinding(context.Background(), req)
+	if err != nil || first.ID != second.ID || first.IdempotencyKey != second.IdempotencyKey {
+		t.Fatalf("first=%+v second=%+v err=%v", first, second, err)
+	}
+	loaded, err := svc.GetBinding(context.Background(), contract.BindingLookup{TenantID: "tenant", RunID: "run", Handle: "demo-read"})
+	if err != nil || loaded.Package.Digest != resolved.Physical.Snapshot.Digest {
+		t.Fatalf("loaded=%+v err=%v", loaded, err)
+	}
+	bad := req
+	bad.Inputs = nil
+	if _, err := svc.CreateBinding(context.Background(), bad); err == nil || !strings.Contains(err.Error(), "SKILL_REQUEST_INVALID") {
+		t.Fatalf("expected request validation, got %v", err)
 	}
 }
 
-type fakeSource struct {
-	meta      model.Metadata
-	body      string
-	resources map[model.ResourceID]string
-}
-
-func (f fakeSource) Authority() model.Authority { return f.meta.Authority }
-func (f fakeSource) List(context.Context, contract.ListQuery) (contract.ListResult, error) {
-	return contract.ListResult{Entries: []model.Metadata{f.meta}}, nil
-}
-func (f fakeSource) Read(_ context.Context, req contract.ReadRequest) (contract.ReadResult, error) {
-	if req.Resource != "" && req.Resource != f.meta.MainResource {
-		return contract.ReadResult{Metadata: f.meta, Resource: req.Resource, Content: f.resources[req.Resource]}, nil
-	}
-	return contract.ReadResult{Metadata: f.meta, Resource: f.meta.MainResource, Content: f.body}, nil
-}
-func (f fakeSource) ListResources(context.Context, contract.SourceListResourcesRequest) (contract.ListResourcesResult, error) {
-	resources := make([]model.ResourceInfo, 0, len(f.resources))
-	for resource, content := range f.resources {
-		resources = append(resources, model.ResourceInfo{Resource: resource, Kind: model.ResourceKindReference, Name: string(resource), Size: int64(len(content)), Text: true})
-	}
-	return contract.ListResourcesResult{Metadata: f.meta, Resources: resources}, nil
-}
-func (f fakeSource) Search(context.Context, contract.SearchRequest) (contract.SearchResult, error) {
-	matches := make([]model.SearchMatch, 0, len(f.resources))
-	for resource := range f.resources {
-		matches = append(matches, model.SearchMatch{Resource: resource, Title: string(resource), Snippet: f.resources[resource]})
-	}
-	return contract.SearchResult{Matches: matches}, nil
-}
-
-func TestRenderAvailableSkillsOmitsDisableModelInvocationButExplicitLoadWorks(t *testing.T) {
-	meta := model.Metadata{Name: "manual", QualifiedName: "manual", Description: "Manual only", Enabled: true, PromptVisible: true, Authority: model.Authority{Kind: model.SourceKindHost, ID: "fake"}, PackageID: "manual", MainResource: "manual/SKILL.md", Policy: model.Policy{DisableModelInvocation: true}}.Normalize()
-	svc := New([]contract.Source{fakeSource{meta: meta, body: "Manual body"}}, Options{})
-	req := contract.CatalogRequest{Product: profilemodel.ChannelCLI, Environment: profilemodel.EnvironmentLocal}
-
-	rendered, err := svc.RenderAvailableSkills(context.Background(), req)
+func TestLoadRejectsBindingSnapshotMismatch(t *testing.T) {
+	svc := testService(t)
+	resolved, _ := svc.Resolve(context.Background(), contract.ResolveRequest{Name: "demo"})
+	binding, err := svc.CreateBinding(context.Background(), contract.BindingRequest{
+		Resolved: resolved, RunID: "run", Task: "制作", ToolPolicy: model.EffectiveToolPolicy{Allowed: []string{"run_skill_command"}},
+		ExecutionPolicy: model.EffectiveExecutionPolicy{SandboxRequired: true, ExecutionMode: model.ExecutionModeSandboxedSession},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(rendered, "manual") {
-		t.Fatalf("manual-only skill should not be rendered to model catalog: %q", rendered)
+	injection, err := svc.Load(context.Background(), contract.LoadRequest{Resolved: resolved, Binding: binding})
+	if err != nil || !strings.Contains(injection.Contents, "portable body") || !strings.Contains(injection.Contents, "制作") {
+		t.Fatalf("injection=%+v err=%v", injection, err)
 	}
-	if _, err := svc.Resolve(context.Background(), contract.ResolveRequest{CatalogRequest: req, Name: "manual", ModelCall: true}); err == nil {
-		t.Fatal("model call should reject disable-model-invocation skill")
-	}
-	injection, err := svc.Load(context.Background(), contract.LoadRequest{ResolveRequest: contract.ResolveRequest{CatalogRequest: req, Name: "manual", ModelCall: false, Invocation: "explicit"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(injection.Contents, "Manual body") {
-		t.Fatalf("injection = %+v", injection)
-	}
-}
-func TestServiceReadAndSearchResources(t *testing.T) {
-	meta := model.Metadata{Name: "review", QualifiedName: "review", Description: "Review things", Enabled: true, PromptVisible: true, Authority: model.Authority{Kind: model.SourceKindHost, ID: "fake"}, PackageID: "review", MainResource: "review/SKILL.md"}.Normalize()
-	source := fakeSource{meta: meta, body: "Body", resources: map[model.ResourceID]string{
-		"review/references/guide.md": "alpha beta",
-		"review/design.md":           "palette here",
-	}}
-	svc := New([]contract.Source{source}, Options{})
-	req := contract.CatalogRequest{Product: profilemodel.ChannelCLI, Environment: profilemodel.EnvironmentLocal}
-	resource, err := svc.ReadResource(context.Background(), contract.ResourceRequest{ResolveRequest: contract.ResolveRequest{CatalogRequest: req, Name: "review"}, Resource: "review/references/guide.md"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resource.Content != "alpha beta" {
-		t.Fatalf("resource = %+v", resource)
-	}
-	short, err := svc.ReadResource(context.Background(), contract.ResourceRequest{ResolveRequest: contract.ResolveRequest{CatalogRequest: req, Name: "review"}, Resource: "references/guide.md"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if short.Content != "alpha beta" || short.Resource != "review/references/guide.md" {
-		t.Fatalf("short resource = %+v", short)
-	}
-	bare, err := svc.ReadResource(context.Background(), contract.ResourceRequest{ResolveRequest: contract.ResolveRequest{CatalogRequest: req, Name: "review"}, Resource: "design.md"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if bare.Content != "palette here" || bare.Resource != "review/design.md" {
-		t.Fatalf("bare resource = %+v", bare)
-	}
-	matches, err := svc.SearchResources(context.Background(), contract.SearchResourcesRequest{ResolveRequest: contract.ResolveRequest{CatalogRequest: req, Name: "review"}, Query: "alpha"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(matches.Matches) < 1 {
-		t.Fatalf("matches = %+v", matches)
+	binding.Package.Digest = "sha256:tampered"
+	if _, err := svc.Load(context.Background(), contract.LoadRequest{Resolved: resolved, Binding: binding}); err == nil {
+		t.Fatal("tampered binding must fail")
 	}
 }
 
-func TestServiceListResources(t *testing.T) {
-	meta := model.Metadata{Name: "review", QualifiedName: "review", Description: "Review things", Enabled: true, PromptVisible: true, Authority: model.Authority{Kind: model.SourceKindHost, ID: "fake"}, PackageID: "review", MainResource: "review/SKILL.md"}.Normalize()
-	source := fakeSource{meta: meta, body: "Body", resources: map[model.ResourceID]string{"review/references/guide.md": "alpha beta"}}
-	svc := New([]contract.Source{source}, Options{})
-	listed, err := svc.ListResources(context.Background(), contract.ListResourcesRequest{ResolveRequest: contract.ResolveRequest{CatalogRequest: contract.CatalogRequest{Product: profilemodel.ChannelCLI, Environment: profilemodel.EnvironmentLocal}, Name: "review"}})
+func TestBindingPackageSnapshotSurvivesSourceUpgrade(t *testing.T) {
+	authority := model.Authority{Kind: model.SourceKindEmbedded, ID: "upgrade-test"}
+	manifest := testManifest()
+	source := skillmemory.NewSource(authority, []skillmemory.Skill{{
+		Metadata: model.Metadata{Name: "demo", Description: "Demo documents", Authority: authority, Scope: model.ScopeSystem, PackageID: "demo", MainResource: "demo/SKILL.md"},
+		Body:     "old body", Manifest: &manifest,
+		Resources: map[model.ResourceID]string{"demo/references/read.md": "只读提取", "demo/references/work.md": "完整制作"},
+	}})
+	packages := skillmemory.NewPackageStore()
+	svc := New([]contract.Source{source}, Options{KnownTools: []string{"run_skill_command", "view_image"}, DefaultInvocationTools: []string{"run_skill_command"}, BindingStore: skillmemory.NewBindingStore(), PackageStore: packages})
+	resolved, err := svc.Resolve(context.Background(), contract.ResolveRequest{Name: "demo"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(listed.Resources) != 1 || listed.Resources[0].Resource != "review/references/guide.md" {
-		t.Fatalf("listed = %+v", listed)
-	}
-}
-func TestServiceSelectForTurnExplicitMentionIgnoresImplicitPolicy(t *testing.T) {
-	allowImplicit := false
-	meta := model.Metadata{Name: "manual", QualifiedName: "manual", Description: "Manual", Enabled: true, PromptVisible: true, Authority: model.Authority{Kind: model.SourceKindHost, ID: "fake"}, PackageID: "manual", MainResource: "manual/SKILL.md", Policy: model.Policy{AllowImplicitInvocation: &allowImplicit, DisableModelInvocation: true}}.Normalize()
-	svc := New([]contract.Source{fakeSource{meta: meta, body: "Body"}}, Options{})
-	selected, err := svc.SelectForTurn(context.Background(), contract.SelectionRequest{CatalogRequest: contract.CatalogRequest{Product: profilemodel.ChannelCLI, Environment: profilemodel.EnvironmentLocal}, Text: "use $manual"})
+	binding, err := svc.CreateBinding(context.Background(), contract.BindingRequest{
+		Resolved: resolved, RunID: "run-old", Task: "制作", ToolPolicy: model.EffectiveToolPolicy{Allowed: []string{"run_skill_command"}},
+		ExecutionPolicy: model.EffectiveExecutionPolicy{SandboxRequired: true, ExecutionMode: model.ExecutionModeSandboxedSession},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(selected) != 1 || selected[0].Name != "manual" {
-		t.Fatalf("selected = %+v", selected)
-	}
-}
-func TestServiceSelectForTurnSkillURIAndAmbiguousName(t *testing.T) {
-	metaA := model.Metadata{Name: "review", QualifiedName: "a:review", Description: "Review A", Enabled: true, PromptVisible: true, Authority: model.Authority{Kind: model.SourceKindHost, ID: "a"}, PackageID: "review-a", MainResource: "review-a/SKILL.md"}.Normalize()
-	metaB := model.Metadata{Name: "review", QualifiedName: "b:review", Description: "Review B", Enabled: true, PromptVisible: true, Authority: model.Authority{Kind: model.SourceKindHost, ID: "b"}, PackageID: "review-b", MainResource: "review-b/SKILL.md"}.Normalize()
-	svc := New([]contract.Source{fakeSource{meta: metaA, body: "A"}, fakeSource{meta: metaB, body: "B"}}, Options{})
-	req := contract.SelectionRequest{CatalogRequest: contract.CatalogRequest{Product: profilemodel.ChannelCLI, Environment: profilemodel.EnvironmentLocal}, Text: "use $review and [$review](skill://review-b/SKILL.md)"}
-	selected, err := svc.SelectForTurn(context.Background(), req)
+	source.Put(skillmemory.Skill{
+		Metadata: resolved.Physical.Metadata, Body: "new body", Manifest: &manifest,
+		Resources: map[model.ResourceID]string{"demo/references/read.md": "只读提取", "demo/references/work.md": "完整制作"},
+	})
+	svc.ClearCache()
+	newResolved, err := svc.Resolve(context.Background(), contract.ResolveRequest{Name: "demo"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(selected) != 1 || selected[0].PackageID != "review-b" {
-		t.Fatalf("selected = %+v", selected)
+	if newResolved.Physical.Snapshot.Digest == binding.Package.Digest {
+		t.Fatal("source upgrade must create a new package digest")
+	}
+	stored, files, err := svc.GetPackageSnapshot(context.Background(), binding.Package.Digest)
+	if err != nil || stored.Digest != binding.Package.Digest {
+		t.Fatalf("stored=%+v err=%v", stored, err)
+	}
+	foundOld := false
+	for _, file := range files {
+		if file.Resource == "demo/SKILL.md" && strings.Contains(string(file.Content), "old body") && !strings.Contains(string(file.Content), "new body") {
+			foundOld = true
+		}
+	}
+	if !foundOld {
+		t.Fatalf("old immutable package not retained: %+v", files)
+	}
+	boundRead, err := svc.ReadBoundResource(context.Background(), contract.BoundResourceRequest{Binding: binding, Resource: "SKILL.md"})
+	if err != nil || !strings.Contains(boundRead.Content, "old body") || strings.Contains(boundRead.Content, "new body") {
+		t.Fatalf("bound read drifted from immutable snapshot: content=%q err=%v", boundRead.Content, err)
+	}
+	boundList, err := svc.ListBoundResources(context.Background(), binding)
+	if err != nil || len(boundList.Resources) == 0 {
+		t.Fatalf("bound list=%+v err=%v", boundList, err)
+	}
+	boundSearch, err := svc.SearchBoundResources(context.Background(), contract.BoundResourceSearchRequest{Binding: binding, Query: "old body"})
+	if err != nil || len(boundSearch.Matches) != 1 || boundSearch.Matches[0].Resource != "demo/SKILL.md" {
+		t.Fatalf("bound search=%+v err=%v", boundSearch, err)
 	}
 }
 
-func TestServiceSourceTimeoutKeepsOtherSources(t *testing.T) {
-	fast := fakeSource{meta: model.Metadata{Name: "fast", QualifiedName: "fast", Description: "Fast", Enabled: true, PromptVisible: true, Authority: model.Authority{Kind: model.SourceKindHost, ID: "fast"}, PackageID: "fast", MainResource: "fast/SKILL.md"}.Normalize(), body: "fast"}
-	svc := New([]contract.Source{slowSource{authority: model.Authority{Kind: model.SourceKindHost, ID: "slow"}}, fast}, Options{SourceTimeout: 50 * time.Millisecond})
-	catalog, err := svc.Catalog(context.Background(), contract.CatalogRequest{Product: profilemodel.ChannelCLI, Environment: profilemodel.EnvironmentLocal})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(catalog.Entries) != 1 || catalog.Entries[0].Name != "fast" {
-		t.Fatalf("catalog = %+v", catalog)
-	}
-	if len(catalog.Errors) == 0 {
-		t.Fatal("expected slow source error")
-	}
+func testService(t *testing.T) *Service {
+	t.Helper()
+	return testServiceWithStore(t, skillmemory.NewBindingStore())
 }
 
-type slowSource struct{ authority model.Authority }
-
-func (s slowSource) Authority() model.Authority { return s.authority }
-func (s slowSource) List(ctx context.Context, query contract.ListQuery) (contract.ListResult, error) {
-	<-ctx.Done()
-	return contract.ListResult{}, ctx.Err()
-}
-func (s slowSource) Read(context.Context, contract.ReadRequest) (contract.ReadResult, error) {
-	return contract.ReadResult{}, nil
-}
-func (s slowSource) ListResources(context.Context, contract.SourceListResourcesRequest) (contract.ListResourcesResult, error) {
-	return contract.ListResourcesResult{}, nil
-}
-func (s slowSource) Search(context.Context, contract.SearchRequest) (contract.SearchResult, error) {
-	return contract.SearchResult{}, nil
+func testServiceWithStore(t *testing.T, store contract.InvocationBindingStore) *Service {
+	t.Helper()
+	authority := model.Authority{Kind: model.SourceKindEmbedded, ID: "test"}
+	manifest := testManifest()
+	source := skillmemory.NewSource(authority, []skillmemory.Skill{{
+		Metadata: model.Metadata{Name: "demo", Description: "Demo documents", Authority: authority, Scope: model.ScopeSystem, PackageID: "demo", MainResource: "demo/SKILL.md"},
+		Body:     "portable body", Manifest: &manifest,
+		Resources: map[model.ResourceID]string{"demo/references/read.md": "只读提取", "demo/references/work.md": "完整制作"},
+	}})
+	return New([]contract.Source{source}, Options{KnownTools: []string{"run_skill_command", "view_image"}, DefaultInvocationTools: []string{"run_skill_command"}, BindingStore: store})
 }
 
-func TestServiceDoesNotCachePartialCatalogWithErrors(t *testing.T) {
-	flaky := &flakySource{meta: model.Metadata{Name: "flaky", QualifiedName: "flaky", Description: "Flaky", Enabled: true, PromptVisible: true, Authority: model.Authority{Kind: model.SourceKindHost, ID: "flaky"}, PackageID: "flaky", MainResource: "flaky/SKILL.md"}.Normalize()}
-	svc := New([]contract.Source{flaky}, Options{})
-	req := contract.CatalogRequest{Product: profilemodel.ChannelCLI, Environment: profilemodel.EnvironmentLocal}
-	first, err := svc.Catalog(context.Background(), req)
-	if err != nil {
-		t.Fatal(err)
+func testManifest() model.RuntimeManifest {
+	return model.RuntimeManifest{
+		Schema: model.RuntimeManifestSchemaV1, Skill: "demo",
+		RuntimeProfiles: map[string]model.RuntimeProfile{
+			"read": {Sandbox: model.SandboxRequirement{Required: true, ExecutionMode: model.ExecutionModePerCall}},
+			"work": {Sandbox: model.SandboxRequirement{Required: true, ExecutionMode: model.ExecutionModeSandboxedSession}},
+		},
+		Invocations: []model.InvocationDefinition{
+			{ID: "read", Handle: "demo-read", Description: "Read demo documents", AgentMode: model.AgentModeSpec{Mode: model.AgentModeMain}, RuntimeProfile: "read", Request: model.RequestContract{Inputs: model.InputContract{MinItems: 1, MaxItems: 1, Access: model.InputAccessReadOnly, AcceptedSuffixes: []string{".pptx"}}}, Prompt: model.InvocationPrompt{Instructions: "references/read.md", SkillBody: model.SkillBodyOmit}, ToolPolicy: model.ToolPolicy{Allow: []string{"run_skill_command"}, Required: []string{"run_skill_command"}}, Result: model.ResultContract{Kind: model.ResultKindMessage}},
+			{ID: "work", Handle: "demo", Description: "Create demo documents", AgentMode: model.AgentModeSpec{Mode: model.AgentModeFork}, RuntimeProfile: "work", Request: model.RequestContract{Task: model.TaskContract{Required: true}, Inputs: model.InputContract{MaxItems: 1, Access: model.InputAccessReadOnly}}, Prompt: model.InvocationPrompt{Instructions: "references/work.md", SkillBody: model.SkillBodyInclude}, ToolPolicy: model.ToolPolicy{Allow: []string{"run_skill_command", "view_image"}, Required: []string{"run_skill_command"}}, Result: model.ResultContract{Kind: model.ResultKindMessage}},
+		},
 	}
-	if len(first.Errors) == 0 {
-		t.Fatal("expected first catalog error")
-	}
-	second, err := svc.Catalog(context.Background(), req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(second.Errors) != 0 || len(second.Entries) != 1 {
-		t.Fatalf("second catalog = %+v", second)
-	}
-}
-
-type flakySource struct {
-	meta  model.Metadata
-	calls int
-}
-
-func (f *flakySource) Authority() model.Authority { return f.meta.Authority }
-func (f *flakySource) List(context.Context, contract.ListQuery) (contract.ListResult, error) {
-	f.calls++
-	if f.calls == 1 {
-		return contract.ListResult{}, context.DeadlineExceeded
-	}
-	return contract.ListResult{Entries: []model.Metadata{f.meta}}, nil
-}
-func (f *flakySource) Read(context.Context, contract.ReadRequest) (contract.ReadResult, error) {
-	return contract.ReadResult{Metadata: f.meta, Resource: f.meta.MainResource, Content: "body"}, nil
-}
-func (f *flakySource) ListResources(context.Context, contract.SourceListResourcesRequest) (contract.ListResourcesResult, error) {
-	return contract.ListResourcesResult{}, nil
-}
-func (f *flakySource) Search(context.Context, contract.SearchRequest) (contract.SearchResult, error) {
-	return contract.SearchResult{}, nil
 }

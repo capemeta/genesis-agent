@@ -11,39 +11,27 @@ import (
 )
 
 type capturingSkillService struct {
-	request skillcontract.ResourceRequest
+	request      skillcontract.ResourceRequest
+	boundRequest skillcontract.BoundResourceRequest
 }
 
-func (s *capturingSkillService) Catalog(context.Context, skillcontract.CatalogRequest) (model.Catalog, error) {
-	return model.Catalog{}, nil
+func (s *capturingSkillService) Resolve(context.Context, skillcontract.ResolveRequest) (model.ResolvedInvocation, error) {
+	return model.ResolvedInvocation{Definition: model.InvocationDefinition{AgentMode: model.AgentModeSpec{Mode: model.AgentModeMain}}}, nil
 }
-func (s *capturingSkillService) Resolve(context.Context, skillcontract.ResolveRequest) (model.Metadata, error) {
-	return model.Metadata{}, nil
-}
-func (s *capturingSkillService) Load(context.Context, skillcontract.LoadRequest) (model.Injection, error) {
-	return model.Injection{}, nil
-}
+
 func (s *capturingSkillService) ReadResource(_ context.Context, req skillcontract.ResourceRequest) (model.ResourceContent, error) {
 	s.request = req
 	return model.ResourceContent{
-		Skill:    model.Metadata{Name: req.Name, QualifiedName: req.Name},
+		Skill:    model.Metadata{Name: req.Name},
 		Resource: req.Resource,
 		Content:  "guide",
 	}, nil
 }
-func (s *capturingSkillService) ListResources(context.Context, skillcontract.ListResourcesRequest) (model.ResourceList, error) {
-	return model.ResourceList{}, nil
+
+func (s *capturingSkillService) ReadBoundResource(_ context.Context, req skillcontract.BoundResourceRequest) (model.ResourceContent, error) {
+	s.boundRequest = req
+	return model.ResourceContent{Skill: model.Metadata{Name: req.Binding.PhysicalSkill}, Resource: req.Resource, Content: "guide"}, nil
 }
-func (s *capturingSkillService) SearchResources(context.Context, skillcontract.SearchResourcesRequest) (model.SearchResult, error) {
-	return model.SearchResult{}, nil
-}
-func (s *capturingSkillService) SelectForTurn(context.Context, skillcontract.SelectionRequest) ([]model.Metadata, error) {
-	return nil, nil
-}
-func (s *capturingSkillService) RenderAvailableSkills(context.Context, skillcontract.CatalogRequest) (string, error) {
-	return "", nil
-}
-func (s *capturingSkillService) ClearCache() {}
 
 type allowApproval struct{}
 
@@ -76,6 +64,22 @@ func TestExecuteDerivesOwnerFromQualifiedResource(t *testing.T) {
 	}
 	if service.request.Name != "demo" || service.request.Resource != "demo/references/guide.md" {
 		t.Fatalf("request = %+v", service.request)
+	}
+}
+
+func TestExecuteUsesBindingPhysicalPackageForInvocationHandle(t *testing.T) {
+	service := &capturingSkillService{}
+	created, err := New(Deps{Service: service, Approval: allowApproval{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding := model.InvocationBinding{ID: "binding-read", Handle: "office-ppt-read", PhysicalSkill: "office-ppt", Package: model.SkillPackageSnapshot{PackageID: "office-ppt"}}
+	ctx := skillcontract.WithInvocationBinding(context.Background(), binding)
+	if _, err := created.Execute(ctx, `{"skill":"office-ppt-read","resource":"references/invocations/read.md"}`); err != nil {
+		t.Fatal(err)
+	}
+	if service.boundRequest.Resource != "office-ppt/references/invocations/read.md" {
+		t.Fatalf("bound request = %+v", service.boundRequest)
 	}
 }
 
