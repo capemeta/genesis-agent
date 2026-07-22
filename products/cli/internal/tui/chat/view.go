@@ -198,6 +198,7 @@ func (m Model) helpView() string {
 		items = []string{
 			styles.HelpKey.Render("Ctrl+C") + " " + styles.HelpBar.Render("退出"),
 			styles.HelpKey.Render("Ctrl+Y") + " " + styles.HelpBar.Render("复制"),
+			styles.HelpKey.Render("拖选") + " " + styles.HelpBar.Render("选取复制"),
 			styles.HelpKey.Render("v") + " " + styles.HelpBar.Render("选择消息"),
 			styles.HelpKey.Render("/help") + " " + styles.HelpBar.Render("帮助"),
 			styles.HelpKey.Render("↑↓/滚轮/PgUp/PgDn") + " " + styles.HelpBar.Render("滚动"),
@@ -344,8 +345,20 @@ func renderMessages(messages []uiMessage, termWidth int, progressExpanded, selec
 				var content string
 				if progressExpanded {
 					lines := []string{"▾ " + activitySummary(msg) + " · [o] 折叠:"}
-					for _, item := range msg.progressLog {
-						lines = append(lines, "  - "+item)
+					total := len(msg.progressLog)
+					for idx, item := range msg.progressLog {
+						isLast := idx == total-1
+						branch := "|-- "
+						if isLast {
+							branch = "`-- "
+						}
+						if strings.HasPrefix(item, "[Sub-Agent") || strings.HasPrefix(item, "[Agent") {
+							lines = append(lines, "    "+branch+item)
+						} else if strings.Contains(item, "[Sub-Agent") {
+							lines = append(lines, "    "+branch+item)
+						} else {
+							lines = append(lines, "  "+branch+"[Agent] "+item)
+						}
 					}
 					content = strings.Join(lines, "\n")
 				} else {
@@ -416,3 +429,5 @@ func renderSelectionMarker(messageIndex int, selectable []int, selectMode bool, 
 	}
 	return "  "
 }
+
+

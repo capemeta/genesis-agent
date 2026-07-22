@@ -100,15 +100,39 @@ type MCPScopeConfig struct {
 
 // SandboxConfig 描述外部 sandbox API 和产品默认沙箱执行配置。
 type SandboxConfig struct {
-	Enabled               bool          `mapstructure:"enabled"`
-	Mode                  string        `mapstructure:"mode"`
-	DefaultExecution      string        `mapstructure:"default_execution"`
-	AllowSessionOverride  bool          `mapstructure:"allow_session_override"`
-	BaseURL               string        `mapstructure:"base_url"`
-	APIKey                string        `mapstructure:"api_key"`
-	APIKeyEnv             string        `mapstructure:"api_key_env"`
+	Enabled               bool                 `mapstructure:"enabled"`
+	Mode                  string               `mapstructure:"mode"`
+	DefaultExecution      string               `mapstructure:"default_execution"`
+	AllowSessionOverride  bool                 `mapstructure:"allow_session_override"`
+	BaseURL               string               `mapstructure:"base_url"`
+	APIKey                string               `mapstructure:"api_key"`
+	APIKeyEnv             string               `mapstructure:"api_key_env"`
+	WorkspaceID           string               `mapstructure:"workspace_id"`
+	DefaultRuntimeProfile string               `mapstructure:"default_runtime_profile"`
+	Local                 SandboxLocalConfig   `mapstructure:"local"`
+	Remote                SandboxRemoteConfig  `mapstructure:"remote"`
+	Routing               SandboxRoutingConfig `mapstructure:"routing"`
+}
+
+type SandboxLocalConfig struct {
+	Enabled      bool   `mapstructure:"enabled"`
+	Preference   string `mapstructure:"preference"`
+	DefaultLevel string `mapstructure:"default_level"`
+}
+
+type SandboxRemoteConfig struct {
+	Enabled               bool   `mapstructure:"enabled"`
+	BaseURL               string `mapstructure:"base_url"`
+	APIKey                string `mapstructure:"api_key"`
+	APIKeyEnv             string `mapstructure:"api_key_env"`
 	WorkspaceID           string `mapstructure:"workspace_id"`
 	DefaultRuntimeProfile string `mapstructure:"default_runtime_profile"`
+}
+
+type SandboxRoutingConfig struct {
+	DefaultExecution     string `mapstructure:"default_execution"`
+	AllowSessionOverride bool   `mapstructure:"allow_session_override"`
+	AutoRouteRisk        bool   `mapstructure:"auto_route_risk"`
 }
 
 // WebConfig 包含网络搜索和获取工具的常用密钥与端点配置
@@ -335,11 +359,13 @@ type SecretsConfig struct {
 // PolicyConfig 描述统一权限与审批治理配置。第一批仅 files/defaults 参与运行时策略，
 // commands/web/sandbox 先作为配置预留，等待对应 matcher 接入。
 type PolicyConfig struct {
-	Defaults PolicyDefaultsConfig `mapstructure:"defaults"`
-	Files    PolicyFilesConfig    `mapstructure:"files"`
-	Commands PolicyCommandsConfig `mapstructure:"commands"`
-	Web      PolicyWebConfig      `mapstructure:"web"`
-	Sandbox  PolicySandboxConfig  `mapstructure:"sandbox"`
+	// PermissionMode 权限许可模式：plan | read_only | protected_write | agent | workspace_auto | full_access
+	PermissionMode string               `mapstructure:"permission_mode"`
+	Defaults       PolicyDefaultsConfig `mapstructure:"defaults"`
+	Files          PolicyFilesConfig    `mapstructure:"files"`
+	Commands       PolicyCommandsConfig `mapstructure:"commands"`
+	Web            PolicyWebConfig      `mapstructure:"web"`
+	Sandbox        PolicySandboxConfig  `mapstructure:"sandbox"`
 }
 
 // PolicyDefaultsConfig 描述策略默认决策。
@@ -987,6 +1013,50 @@ func applySecretsDefaults(cfg *SecretsConfig) {
 }
 
 func applySandboxDefaults(cfg *SandboxConfig) {
+	if cfg.Remote.Enabled {
+		cfg.Enabled = true
+		if strings.TrimSpace(cfg.Mode) == "" {
+			cfg.Mode = "remote_sandbox"
+		}
+		if strings.TrimSpace(cfg.BaseURL) == "" {
+			cfg.BaseURL = cfg.Remote.BaseURL
+		}
+		if strings.TrimSpace(cfg.APIKey) == "" {
+			cfg.APIKey = cfg.Remote.APIKey
+		}
+		if strings.TrimSpace(cfg.APIKeyEnv) == "" {
+			cfg.APIKeyEnv = cfg.Remote.APIKeyEnv
+		}
+		if strings.TrimSpace(cfg.WorkspaceID) == "" {
+			cfg.WorkspaceID = cfg.Remote.WorkspaceID
+		}
+		if strings.TrimSpace(cfg.DefaultRuntimeProfile) == "" {
+			cfg.DefaultRuntimeProfile = cfg.Remote.DefaultRuntimeProfile
+		}
+	} else {
+		mode := strings.ToLower(strings.TrimSpace(cfg.Mode))
+		if mode == "remote_sandbox" || mode == "docker_sandbox" {
+			if cfg.Local.Enabled {
+				cfg.Mode = "local_platform_sandbox"
+			} else {
+				cfg.Mode = "local_host"
+			}
+		}
+		if cfg.Local.Enabled {
+			cfg.Enabled = true
+			if strings.TrimSpace(cfg.Mode) == "" {
+				cfg.Mode = "local_platform_sandbox"
+			}
+		}
+	}
+
+	if strings.TrimSpace(cfg.Routing.DefaultExecution) != "" {
+		cfg.DefaultExecution = cfg.Routing.DefaultExecution
+	}
+	if cfg.Routing.AllowSessionOverride {
+		cfg.AllowSessionOverride = true
+	}
+
 	if strings.TrimSpace(cfg.Mode) == "" {
 		cfg.Mode = "local_host"
 	}
@@ -1002,6 +1072,9 @@ func applySandboxDefaults(cfg *SandboxConfig) {
 }
 
 func applyPolicyDefaults(cfg *PolicyConfig) {
+	if strings.TrimSpace(cfg.PermissionMode) == "" {
+		cfg.PermissionMode = "agent"
+	}
 	if strings.TrimSpace(cfg.Defaults.Unknown) == "" {
 		cfg.Defaults.Unknown = "ask"
 	}
@@ -1256,6 +1329,9 @@ func validateSandboxConfig(cfg SandboxConfig) error {
 	if cfg.Enabled {
 		switch strings.ToLower(strings.TrimSpace(cfg.Mode)) {
 		case "docker_sandbox", "remote_sandbox":
+			if !cfg.Remote.Enabled {
+				return fmt.Errorf("sandbox.remote.enabled=false 时禁止使用 mode=%s", cfg.Mode)
+			}
 			if strings.TrimSpace(cfg.BaseURL) == "" {
 				return fmt.Errorf("sandbox.enabled=true 且 mode=%s 时 sandbox.base_url 不能为空", cfg.Mode)
 			}
@@ -1265,6 +1341,12 @@ func validateSandboxConfig(cfg SandboxConfig) error {
 }
 
 func validatePolicyConfig(cfg PolicyConfig) error {
+	switch strings.ToLower(strings.TrimSpace(cfg.PermissionMode)) {
+	case "", "plan", "read_only", "protected_write", "agent", "workspace_auto", "full_access",
+		"default", "workspace_write", "workspace-auto", "unattended", "yolo", "bypass", "full-access":
+	default:
+		return fmt.Errorf("policy.permission_mode 无效: %q（允许: plan|read_only|protected_write|agent|workspace_auto|full_access）", cfg.PermissionMode)
+	}
 	decisions := map[string]bool{"allow": true, "ask": true, "deny": true}
 	checks := map[string]string{
 		"policy.defaults.unknown":               cfg.Defaults.Unknown,

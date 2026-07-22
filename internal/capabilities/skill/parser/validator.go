@@ -139,6 +139,7 @@ func validateFrontmatterShape(data []byte, skillPath string, result *ValidationR
 		"allowed-tools": {}, "context": {}, "agent": {}, "model": {},
 		"disable-model-invocation": {}, "allow-implicit-invocation": {},
 		"products": {}, "max-thinking-tokens": {}, "dependencies": {},
+		"requires": {}, "qa": {}, "sandbox": {},
 		"metadata": {}, "license": {}, "compatibility": {},
 	}
 	mapping := node.Content[0]
@@ -158,11 +159,11 @@ func validateFrontmatterShape(data []byte, skillPath string, result *ValidationR
 			if value.Kind != yaml.ScalarNode || value.Tag != "!!str" {
 				result.add(SeverityError, "description_not_string", skillPath, "description必须是字符串")
 			}
-		case "allowed-tools", "products":
+		case "allowed-tools", "products", "requires":
 			if value.Kind != yaml.SequenceNode {
-				result.add(SeverityError, key+"_not_sequence", skillPath, key+"必须是字符串数组")
+				result.add(SeverityError, key+"_not_sequence", skillPath, key+"必须是字符串数组或对象数组")
 			}
-		case "dependencies", "metadata":
+		case "dependencies", "metadata", "qa", "sandbox":
 			if value.Kind != yaml.MappingNode && value.Kind != yaml.SequenceNode {
 				result.add(SeverityWarning, key+"_shape", skillPath, key+"建议使用YAML对象或数组")
 			}

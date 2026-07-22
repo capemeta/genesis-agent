@@ -68,6 +68,7 @@ func (r *ProducedResourceRegistrar) RegisterProducedResource(ctx context.Context
 	if source.Scope != manifest.Scope {
 		return workmodel.ProducedResourceDescriptor{}, workcontract.NewError(workcontract.ErrCodeCrossExecutionResourceDenied, fmt.Errorf("source scope 与 Run manifest 不一致"))
 	}
+	// 不再「创建即全局登记」：跨 Run 可读性只来自父子边界的一次显式 Adopt（见 artifactservice.AdoptionStore）。
 	if existing != nil && producedContentEqual(*existing, req, source) {
 		return *existing, nil
 	}

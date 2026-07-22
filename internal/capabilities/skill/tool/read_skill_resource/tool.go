@@ -16,6 +16,7 @@ import (
 	"genesis-agent/internal/capabilities/skill/model"
 	tool "genesis-agent/internal/capabilities/tool/contract"
 	toolparam "genesis-agent/internal/capabilities/tool/param"
+	workcontract "genesis-agent/internal/capabilities/workspace/contract"
 )
 
 type Deps struct {
@@ -28,7 +29,6 @@ type Deps struct {
 type Tool struct{ deps Deps }
 
 type input struct {
-	Name     string `json:"name,omitempty"`
 	Skill    string `json:"skill,omitempty"`
 	Package  string `json:"package,omitempty"`
 	Resource string `json:"resource"`
@@ -56,13 +56,12 @@ func (t *Tool) GetInfo() *tool.Info {
 	return &tool.Info{
 		Name: "read_skill_resource",
 		Description: "读取已加载或已发现 Skill 包内 references、scripts、assets 的 UTF-8 文本资源。" +
-			"resource 可为完整 ResourceID（如 office-ppt/design.md），也可在提供 name/package 时使用短名（如 design.md、references/guide.md），运行时会按包自动限定。" +
+			"resource 可为完整 ResourceID（如 office-ppt/design.md），也可在提供 skill/package 时使用短名（如 design.md、references/guide.md），运行时会按包自动限定。" +
 			"二进制 assets 只能先通过 list_skill_resources 发现，不能用本工具直接读取。",
 		Parameters: &tool.ParameterSchema{
 			Type: "object",
 			Properties: map[string]*tool.ParameterSchema{
-				"name":      {Type: "string", Description: "Skill 名称或 qualified_name"},
-				"skill":     {Type: "string", Description: "name 的兼容别名；二者同时提供时必须一致"},
+				"skill":     {Type: "string", Description: "Skill 名称或 qualified_name，例如 office-ppt"},
 				"package":   {Type: "string", Description: "可选 package id，用于直接定位 skill"},
 				"resource":  {Type: "string", Description: "ResourceID 或短名：office-ppt/design.md 或 design.md"},
 				"max_bytes": {Type: "integer", Description: "最大读取字节数"},
@@ -78,10 +77,7 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 	if err := toolparam.Decode(params, &in); err != nil {
 		return "", fmt.Errorf("解析read_skill_resource参数失败: %w", err)
 	}
-	name, err := normalizeSkillName(in.Name, in.Skill)
-	if err != nil {
-		return "", err
-	}
+	name := strings.TrimSpace(in.Skill)
 	pkg := model.PackageID(strings.TrimSpace(in.Package))
 	rawResource := strings.TrimSpace(in.Resource)
 	if name == "" && pkg == "" {
@@ -90,6 +86,13 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 	resource := model.QualifySkillResource(string(pkg), name, rawResource)
 	if resource == "" {
 		return "", fmt.Errorf("resource不能为空")
+	}
+	if name != "" {
+		if meta, resolveErr := t.deps.Service.Resolve(ctx, skillcontract.ResolveRequest{CatalogRequest: t.deps.CatalogRequest, Name: name}); resolveErr == nil && meta.Context == model.ContextModeFork {
+			if prepared, ok := workcontract.PreparedRunFromContext(ctx); ok && prepared.Manifest.ParentRunID == "" {
+				return "", fmt.Errorf("FORBIDDEN_FORK_SKILL_EXECUTION: Skill %q 声明为 context: fork 物理沙箱隔离，父 Agent 禁止读取包内资源。请调用 Skill(skill=%q, args=...) 委派子 Agent 处理。", meta.QualifiedName, meta.QualifiedName)
+			}
+		}
 	}
 	if err := t.authorize(ctx, pkg, resource); err != nil {
 		return "", err
@@ -113,20 +116,8 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 	return string(data), nil
 }
 
-func normalizeSkillName(name, alias string) (string, error) {
-	name = strings.TrimSpace(name)
-	alias = strings.TrimSpace(alias)
-	if name != "" && alias != "" && !strings.EqualFold(name, alias) {
-		return "", fmt.Errorf("name与skill不能指向不同Skill")
-	}
-	if name != "" {
-		return name, nil
-	}
-	return alias, nil
-}
-
 // skillNameFromQualifiedResource 从完整 ResourceID 推导资源所有者。
-// 仅接受至少两段的包内路径，短名仍必须显式提供 name/skill/package。
+// 仅接受至少两段的包内路径，短名仍必须显式提供 skill/package。
 func skillNameFromQualifiedResource(resource string) string {
 	normalized := strings.Trim(strings.TrimSpace(strings.ReplaceAll(resource, `\`, "/")), "/")
 	if normalized == "" || !strings.Contains(normalized, "/") {

@@ -47,6 +47,13 @@ func FromRuntimeConfig(cfg platformconfig.SandboxConfig) (Config, error) {
 	if mode == "" {
 		mode = ModeLocalHost
 	}
+	if !cfg.Remote.Enabled && (mode == ModeDockerSandbox || mode == ModeRemoteSandbox) {
+		if cfg.Local.Enabled {
+			mode = ModePlatform
+		} else {
+			mode = ModeLocalHost
+		}
+	}
 	execution := execmodel.SandboxMode(strings.ToLower(strings.TrimSpace(cfg.DefaultExecution)))
 	if execution == "" {
 		execution = execmodel.SandboxDisabled

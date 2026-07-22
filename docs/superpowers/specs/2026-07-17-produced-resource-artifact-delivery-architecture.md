@@ -249,12 +249,15 @@ type ProducedResourceDescriptor struct {
   1. API / App Template 显式 `DeclaredDeliverable.DesiredName`（产品硬契约）；
   2. 否则 Spec.`DesiredName` 留空，Publish 时使用所选 produced 的 **`ObservedName`**——即模型在 skill 命令/脚本中写出的文件名。
 - Agent 负责产出内容正确、后缀/MIME 匹配契约的候选，并用产物文件名声明用户可见名；**不**承担「从沙箱拷到宿主」或自行宣布交付成功。
-- Prompt 出现交付类后缀/类型词时，TaskIntent 可置 `artifact_required=true`（只建类型契约）；纯查阅不建门禁。
+- Prompt 出现交付类后缀/类型词时，**不再**仅凭 NLP 置 `artifact_required=true` 预建门禁（双模态 Skill / 只读任务会被误伤）。
+- **证据驱动（默认）**：Run 启动可不建 Spec；当 Harness 登记到可交付 office 产物（`.pptx/.docx/.xlsx/.pdf`，排除 qa_asset）且尚无 required primary 时，`FinalizeRequired` 再建 Spec 并交付。只读无产物 → 无门禁，可正常完成。
+- **显式声明仍优先**：API / App Template `DeclaredDeliverable` 在启动时持久化，证据建约不会覆盖已有 primary required。
 
 Run 初始化优先级：
 
 1. **显式声明**（推荐）：API / CLI / App Template 经 `RunInitializationRequest.Deliverables`（`DeclaredDeliverable`）提交，控制面持久化为 `DeliverableSpec`；
-2. **TaskIntent 启发式**：仅当未提供显式声明且 `artifact_required=true` 时，由 `TaskDeliverableInitializer` 从可信 prompt 推断**交付类型**（MIME/后缀）；**不推断文件名**；猜不出类型则 fail-closed。
+2. **产物证据建约**：无 primary required 时，由 `FinalizeRequired` → `ensurePrimaryFromProduced` 按已登记产物后缀建约；
+3. **遗留 ArtifactRequired 启发式**：仅当调用方显式置 `artifact_required=true`（API/Supplied Intent）且无 Deliverables 时，仍可由 `TaskDeliverableInitializer` 从 Prompt 推断类型；NLP IntentResolver **不再**自动置该标志。
 
 命名策略（与交付覆盖策略配套）：
 

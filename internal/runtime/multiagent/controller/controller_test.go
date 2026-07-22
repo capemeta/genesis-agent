@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	artifactcontract "genesis-agent/internal/capabilities/artifact/contract"
 	execmodel "genesis-agent/internal/capabilities/execution/model"
 	hookcontract "genesis-agent/internal/capabilities/hook/contract"
 	hookmodel "genesis-agent/internal/capabilities/hook/model"
@@ -233,6 +234,49 @@ func TestControllerEmitsOnlyParentSubAgentProgress(t *testing.T) {
 		if event.Kind != progress.KindSubAgent || event.RunID != "parent-run" {
 			t.Fatalf("child event leaked into parent timeline: %+v", event)
 		}
+	}
+}
+
+func TestControllerForwardsChildProgressViaChildBridge(t *testing.T) {
+	limiter, err := NewMemorySlotLimiter(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := New(fakeEngine{}, limiter, nil, testWorkspaceOption())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var events []progress.Event
+	parentCtx := progress.WithSink(testParentContext(), func(event progress.Event) {
+		mu.Lock()
+		events = append(events, event)
+		mu.Unlock()
+	})
+	bridge := func(event progress.Event) {
+		event.Depth = 1
+		event.SubAgentID = "skill-fork:office-ppt"
+		event.Summary = "[Sub-Agent: skill-fork:office-ppt] " + event.Summary
+		progress.FromContext(parentCtx)(event)
+	}
+	spawnCtx := progress.WithChildBridge(parentCtx, bridge)
+	instance, err := c.Spawn(spawnCtx, contract.SpawnRequest{SessionID: "session", ParentRunID: "parent-run", Prompt: "inspect", Agent: &domain.Agent{Name: "explore"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Wait(parentCtx, instance.AgentID); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	var sawChildToolish bool
+	for _, event := range events {
+		if event.Kind == progress.KindRun && event.Depth == 1 && event.SubAgentID == "skill-fork:office-ppt" {
+			sawChildToolish = true
+		}
+	}
+	if !sawChildToolish {
+		t.Fatalf("expected bridged child KindRun event with SubAgent tag, got %+v", events)
 	}
 }
 
@@ -532,6 +576,64 @@ func TestControllerPersistsTerminalStateAfterParentCancel(t *testing.T) {
 	events := sink.Events()
 	if len(events) != 2 || events[1].Type != model.ProjectionEventStopped {
 		t.Fatalf("terminal projection should survive parent cancellation: %+v", events)
+	}
+}
+
+type recordingRunInitializer struct {
+	mu   sync.Mutex
+	reqs []artifactcontract.RunInitializationRequest
+}
+
+func (r *recordingRunInitializer) InitializeRun(_ context.Context, req artifactcontract.RunInitializationRequest) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.reqs = append(r.reqs, req)
+	return nil
+}
+
+func (r *recordingRunInitializer) calls() []artifactcontract.RunInitializationRequest {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]artifactcontract.RunInitializationRequest(nil), r.reqs...)
+}
+
+type stubIntentResolver struct{ artifactRequired bool }
+
+func (s stubIntentResolver) ResolveIntent(_ context.Context, _ workcontract.ResolveIntentRequest) (workcontract.ExecutionIntent, error) {
+	return workcontract.ExecutionIntent{ArtifactRequired: s.artifactRequired}, nil
+}
+
+// TestControllerDoesNotPreinitializeDeliverableFromIntent 验证证据驱动：
+// 子 Run 不再因 Intent.ArtifactRequired 预建 DeliverableSpec；交付改由产物证据触发。
+func TestControllerDoesNotPreinitializeDeliverableFromIntent(t *testing.T) {
+	limiter, err := NewMemorySlotLimiter(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	init := &recordingRunInitializer{}
+	option := WithWorkspaceRuntime(WorkspaceRuntime{
+		Preparer:       fakeRunPreparer{},
+		MaximumAccess:  execmodel.WorkspaceAccessReadWrite,
+		IntentResolver: stubIntentResolver{artifactRequired: true},
+		ArtifactRuns:   init,
+	})
+	c, err := New(fakeEngine{}, limiter, nil, option)
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance, err := c.Spawn(testParentContext(), contract.SpawnRequest{
+		SessionID: "session", ParentRunID: "parent-run", Prompt: "生成PPT",
+		SkillQAPolicy: "visual-qa/v1", SkillQAEnforcement: "optional",
+		Agent: &domain.Agent{Name: "worker"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Wait(context.Background(), instance.AgentID); err != nil {
+		t.Fatal(err)
+	}
+	if calls := init.calls(); len(calls) != 0 {
+		t.Fatalf("expected no InitializeRun from intent, got %+v", calls)
 	}
 }
 

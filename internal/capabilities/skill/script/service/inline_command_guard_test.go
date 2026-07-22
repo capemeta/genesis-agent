@@ -55,3 +55,30 @@ func stringsRepeat(s string, n int) string {
 	}
 	return string(out)
 }
+
+func TestAutoRewriteRiskyInlineCommand(t *testing.T) {
+	// 1. 常规单行探测 (<= 1024 字符，无换行/转义)：不触发重写，直接原样内联执行
+	shortCmd := `python -c "import openpyxl; print('ok')"`
+	if _, _, _, ok := autoRewriteRiskyInlineCommand(shortCmd); ok {
+		t.Fatalf("short command %q should NOT be auto-rewritten", shortCmd)
+	}
+
+	// 2. 长内联指令 (> 1024 字符)：自动重写落盘为脚本文件
+	longPayload := stringsRepeat("x", 1100)
+	cmd := `python -m markitdown "test.pptx" | python -c "` + longPayload + `"`
+	rewritten, scriptName, payload, ok := autoRewriteRiskyInlineCommand(cmd)
+	if !ok {
+		t.Fatalf("expected autoRewriteRiskyInlineCommand ok=true for long command")
+	}
+	if scriptName != "_auto_inline_check.py" {
+		t.Errorf("unexpected scriptName: %s", scriptName)
+	}
+	if payload != longPayload {
+		t.Errorf("unexpected payload: %s", payload)
+	}
+	wantCmd := `python -m markitdown "test.pptx" | python _auto_inline_check.py`
+	if rewritten != wantCmd {
+		t.Errorf("expected rewritten cmd %q, got %q", wantCmd, rewritten)
+	}
+}
+

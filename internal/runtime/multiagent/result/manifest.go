@@ -2,6 +2,7 @@ package result
 
 import (
 	"context"
+	"strings"
 	"sync"
 
 	"genesis-agent/internal/runtime/multiagent/model"
@@ -48,14 +49,34 @@ func RegisterFinding(ctx context.Context, finding model.Finding) bool {
 	return true
 }
 
-// RegisterArtifact 向当前 Run 的候选清单追加一个产物副本。
+// RegisterArtifact 向当前 Run 的候选清单登记产物。
+// 同名交付候选（及同 Path）以后写覆盖先写，避免改稿/重生后旧版与新版一并回传父侧。
 func (r *ManifestRegistry) RegisterArtifact(artifact model.Artifact) {
 	if r == nil {
 		return
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	key := artifactDedupeKey(artifact)
+	if key != "" {
+		for i := range r.artifacts {
+			if artifactDedupeKey(r.artifacts[i]) == key {
+				r.artifacts[i] = artifact
+				return
+			}
+		}
+	}
 	r.artifacts = append(r.artifacts, artifact)
+}
+
+func artifactDedupeKey(art model.Artifact) string {
+	if name := strings.TrimSpace(art.Name); name != "" {
+		return "name:" + strings.ToLower(name)
+	}
+	if path := strings.TrimSpace(art.Path); path != "" {
+		return "path:" + strings.ToLower(strings.ReplaceAll(path, `\`, "/"))
+	}
+	return ""
 }
 
 // RegisterFinding 向当前 Run 的候选清单追加一个结论副本。

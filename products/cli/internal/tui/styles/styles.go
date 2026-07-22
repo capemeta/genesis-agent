@@ -142,6 +142,11 @@ var SelectionCursor = lipgloss.NewStyle().
 var SelectionRange = lipgloss.NewStyle().
 	Foreground(ColorAccent)
 
+// MouseSelection 鼠标拖选时高亮选中的文本片段（反显，模拟终端原生选区）。
+var MouseSelection = lipgloss.NewStyle().
+	Foreground(lipgloss.Color("#111827")).
+	Background(ColorAccent)
+
 // ── 输入框 ───────────────────────────────────────────────────
 
 // InputBorder 输入框圆角边框（未聚焦，灰色）

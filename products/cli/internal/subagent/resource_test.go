@@ -91,3 +91,32 @@ func TestWorkspaceResourcesRewritesUnsafeResourceID(t *testing.T) {
 		t.Fatalf("unsafe evidence id should be filtered: %+v", validated.Findings)
 	}
 }
+
+// TestWorkspaceResourcesPreservesQAAssetRole 回归：证据校验重建 Artifact 时必须保留 Role，
+// 否则父侧归约无法剔除 qa_asset，会把缩略图泄漏给父 Agent。
+func TestWorkspaceResourcesPreservesQAAssetRole(t *testing.T) {
+	resources, err := NewWorkspaceResources(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	validated, err := resources.Validate(context.Background(), model.ArtifactManifest{Artifacts: []model.Artifact{
+		{CandidateID: "produced-qa", ResourceID: "produced-qa", Name: "slide-1.jpg", Kind: "file", Role: model.ArtifactRoleQAAsset},
+		{CandidateID: "produced-deck", ResourceID: "produced-deck", Name: "deck.pptx", Kind: "file"},
+	}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(validated.Artifacts) != 2 {
+		t.Fatalf("expected 2 artifacts, got %+v", validated.Artifacts)
+	}
+	byID := map[string]model.Artifact{}
+	for _, art := range validated.Artifacts {
+		byID[art.CandidateID] = art
+	}
+	if byID["produced-qa"].Role != model.ArtifactRoleQAAsset {
+		t.Fatalf("qa_asset Role was dropped: %+v", byID["produced-qa"])
+	}
+	if byID["produced-deck"].Role != "" {
+		t.Fatalf("deliverable Role should stay empty: %+v", byID["produced-deck"])
+	}
+}

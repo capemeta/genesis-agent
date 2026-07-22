@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	artifactservice "genesis-agent/internal/capabilities/artifact/service"
 	fscontract "genesis-agent/internal/capabilities/filesystem/contract"
 	"genesis-agent/internal/capabilities/filesystem/permission"
 	"genesis-agent/internal/capabilities/filesystem/tool/toolkit"
@@ -51,9 +52,10 @@ func VisionModeFromContext(ctx context.Context) (vision.Mode, bool) {
 
 // Tool 看图原语。
 type Tool struct {
-	deps     toolkit.Deps
-	produced workcontract.ProducedResourceStore // 可选：校验 leased candidate
-	readers  workcontract.ResourceReaderRouter  // 可选：candidate 物化读字节
+	deps      toolkit.Deps
+	produced  workcontract.ProducedResourceStore // 可选：校验 leased candidate
+	readers   workcontract.ResourceReaderRouter  // 可选：candidate 物化读字节
+	manifests workcontract.RunManifestStore      // 可选：跨 Run 读子产物所属 binding 的 backend
 }
 
 type input struct {
@@ -101,11 +103,21 @@ func WithReaders(t tool.Tool, readers workcontract.ResourceReaderRouter) tool.To
 	return vt
 }
 
+// WithManifests 注入 RunManifestStore，供跨 Run 读子产物时按其所属 binding 恢复 backend。
+func WithManifests(t tool.Tool, manifests workcontract.RunManifestStore) tool.Tool {
+	vt, ok := t.(*Tool)
+	if !ok || vt == nil {
+		return t
+	}
+	vt.manifests = manifests
+	return vt
+}
+
 func (t *Tool) GetInfo() *tool.Info {
 	return tool.WithTraits(&tool.Info{
 		Name: "view_image",
-		Description: "将 workspace 相对路径或 produced candidate_id 指向的图片加载为可视觉消费的 ImageRef。" +
-			"不要对 docx/pdf 等非图片使用。宿主绝对路径与远程物理路径禁止。" +
+		Description: "将 workspace 相对路径、宿主机可读绝对路径或 produced candidate_id 指向的图片加载为可视觉消费的 ImageRef。" +
+			"不要对 docx/pdf 等非图片使用。" +
 			"若返回 vision_unavailable：禁止改用 Pillow/像素分析伪看图，须如实告知用户无视觉能力。",
 		Parameters: &tool.ParameterSchema{
 			Type: "object",
@@ -230,19 +242,23 @@ func (t *Tool) hydrateCandidate(ctx context.Context, ref *domain.ImageRef) error
 	if !ok {
 		return fmt.Errorf("candidate_id requires prepared run context")
 	}
-	desc, err := t.produced.Get(ctx, prepared.Manifest.Scope.TenantID, prepared.Manifest.RunID, ref.CandidateID)
+	// 先在当前 Run scope 解析；未命中则按父在 finish 时写下的 AdoptionRecord 定位所属子 Run（跨 Run 读，spec §4.1 Case B）。
+	ownerTenant := prepared.Manifest.Scope.TenantID
+	ownerRun := prepared.Manifest.RunID
+	desc, err := t.produced.Get(ctx, ownerTenant, ownerRun, ref.CandidateID)
+	if err != nil {
+		if rec, ok := artifactservice.GlobalAdoptionStore.Resolve(ownerTenant, ownerRun, ref.CandidateID, prepared.Manifest.StateRoot.Path); ok && rec.OwnerRunID != "" {
+			ownerTenant, ownerRun = rec.OwnerTenantID, rec.OwnerRunID
+			desc, err = t.produced.Get(ctx, ownerTenant, ownerRun, ref.CandidateID)
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("produced resource not found: %w", err)
 	}
-	var execution workmodel.PreparedExecutionSnapshot
-	for _, candidate := range prepared.Manifest.Executions {
-		if candidate.Binding.ID == desc.BindingID {
-			execution = candidate
-			break
-		}
-	}
-	if execution.Binding.ID == "" {
-		return fmt.Errorf("produced resource binding not in run manifest")
+	// 按资源所属 binding 的 backend 读取，而非父 manifest 硬匹配（spec §7.2）。
+	execution, err := t.resolveOwnerExecution(ctx, prepared.Manifest, ownerTenant, ownerRun, desc.BindingID)
+	if err != nil {
+		return err
 	}
 	handle, err := t.readers.Open(ctx, execution.Backend, desc.Source)
 	if err != nil {
@@ -276,16 +292,45 @@ func (t *Tool) hydrateCandidate(ctx context.Context, ref *domain.ImageRef) error
 	return nil
 }
 
+// resolveOwnerExecution 按资源所属 binding 恢复其执行快照（含 backend），禁止父 manifest 硬匹配。
+// 同 Run（含 sandbox_exec 经 AddExecution 追加的 remote binding）直接用当前 manifest；
+// 跨 Run（子产物）读所属 Run 的 manifest 定位 binding backend。
+func (t *Tool) resolveOwnerExecution(ctx context.Context, parentManifest workmodel.RunManifest, ownerTenant, ownerRun, bindingID string) (workmodel.PreparedExecutionSnapshot, error) {
+	if ownerRun == "" || ownerRun == parentManifest.RunID {
+		if exec, ok := findExecution(parentManifest.Executions, bindingID); ok {
+			return exec, nil
+		}
+	}
+	if t.manifests != nil && ownerRun != "" {
+		if manifest, err := t.manifests.Get(ctx, ownerTenant, ownerRun); err == nil {
+			if exec, ok := findExecution(manifest.Executions, bindingID); ok {
+				return exec, nil
+			}
+		}
+	}
+	// 兜底：再查当前 manifest（覆盖 owner 解析回退到本 Run 的情况）。
+	if exec, ok := findExecution(parentManifest.Executions, bindingID); ok {
+		return exec, nil
+	}
+	return workmodel.PreparedExecutionSnapshot{}, fmt.Errorf("produced resource binding not resolvable (owner_run=%s)", ownerRun)
+}
+
+func findExecution(executions []workmodel.PreparedExecutionSnapshot, bindingID string) (workmodel.PreparedExecutionSnapshot, bool) {
+	for _, candidate := range executions {
+		if candidate.Binding.ID == bindingID {
+			return candidate, true
+		}
+	}
+	return workmodel.PreparedExecutionSnapshot{}, false
+}
+
 func rejectAbsoluteOrRemotePhysical(p string) error {
 	if p == "" {
 		return nil
 	}
 	cleaned := filepath.Clean(p)
-	if filepath.IsAbs(cleaned) || strings.HasPrefix(cleaned, "/") || (len(cleaned) > 1 && cleaned[1] == ':') {
-		return fmt.Errorf("absolute or drive path forbidden")
-	}
-	if strings.HasPrefix(cleaned, "/workspace/") || strings.Contains(p, `:\`) || strings.Contains(p, ":/") {
-		return fmt.Errorf("host or remote physical path forbidden")
+	if strings.HasPrefix(cleaned, "/workspace/") {
+		return fmt.Errorf("remote physical path forbidden")
 	}
 	return nil
 }

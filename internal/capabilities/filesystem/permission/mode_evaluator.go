@@ -27,6 +27,8 @@ func NormalizeMode(raw string) PermissionMode {
 		return PermissionModeProtectedWrite
 	case PermissionModeAgent, "default", "workspace_write":
 		return PermissionModeAgent
+	case PermissionModeWorkspaceAuto, "workspace-auto", "unattended":
+		return PermissionModeWorkspaceAuto
 	case PermissionModeFullAccess, "yolo", "bypass", "full-access":
 		return PermissionModeFullAccess
 	default:
@@ -51,6 +53,8 @@ func (e *ModeEvaluator) Evaluate(ctx context.Context, mode PermissionMode, req a
 		return evaluateProtectedWriteMode(req), nil
 	case PermissionModeAgent:
 		return evaluateAgentMode(req), nil
+	case PermissionModeWorkspaceAuto:
+		return evaluateWorkspaceAutoMode(req), nil
 	case PermissionModeFullAccess:
 		return evaluateFullAccessMode(req), nil
 	default:
@@ -255,6 +259,57 @@ func firstNonEmpty(vals ...string) string {
 	return ""
 }
 
+// evaluateWorkspaceAutoMode 工作区值守：工作区内与联网免确认；越界/装外部 Skill/敏感路径硬拒绝（不 Ask，避免无人值守挂死）。
+func evaluateWorkspaceAutoMode(req approvalmodel.Request) approvalmodel.PolicyResult {
+	meta := mergeMetadata(req)
+	if meta["critical"] == "true" {
+		return approvalmodel.PolicyResult{
+			Type:   approvalmodel.PolicyDeny,
+			Reason: fmt.Sprintf("workspace_auto 硬拒绝系统致命核心操作 (%s)", firstNonEmpty(meta["deny_reason"], "critical")),
+			Risk:   approvalmodel.RiskCritical,
+		}
+	}
+	if meta["protected"] == "true" || meta["scope"] == "protected" || meta["workspace_metadata_write"] == "true" {
+		return approvalmodel.PolicyResult{
+			Type:   approvalmodel.PolicyDeny,
+			Reason: fmt.Sprintf("workspace_auto 硬拒绝受保护/元数据路径操作 (%s)", firstNonEmpty(meta["deny_reason"], "protected")),
+			Risk:   approvalmodel.RiskCritical,
+		}
+	}
+	if req.Action == approvalmodel.ActionSkillInstall {
+		return approvalmodel.PolicyResult{
+			Type:   approvalmodel.PolicyDeny,
+			Reason: "workspace_auto 禁止安装外部 Skill",
+			Risk:   approvalmodel.RiskHigh,
+		}
+	}
+	if isExternalMutation(req) {
+		return approvalmodel.PolicyResult{
+			Type:   approvalmodel.PolicyDeny,
+			Reason: fmt.Sprintf("workspace_auto 硬拒绝工作区外修改 (%s)", req.Action),
+			Risk:   approvalmodel.RiskHigh,
+		}
+	}
+	return approvalmodel.PolicyResult{
+		Type:   approvalmodel.PolicyAllow,
+		Reason: "workspace_auto 放行工作区内操作与联网",
+		Risk:   approvalmodel.RiskLow,
+	}
+}
+
+func isExternalMutation(req approvalmodel.Request) bool {
+	scope := getScopeMetadata(req)
+	if scope != "external" {
+		return false
+	}
+	switch req.Action {
+	case approvalmodel.ActionFileWrite, approvalmodel.ActionFileEdit, approvalmodel.Action("file.delete"):
+		return true
+	default:
+		return false
+	}
+}
+
 func evaluateFullAccessMode(req approvalmodel.Request) approvalmodel.PolicyResult {
 	if isReadRequest(req) {
 		return approvalmodel.PolicyResult{
@@ -319,4 +374,3 @@ func mergeMetadata(req approvalmodel.Request) map[string]string {
 	}
 	return out
 }
-

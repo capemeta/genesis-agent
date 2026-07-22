@@ -19,6 +19,7 @@ const (
 	PermissionModeReadOnly       PermissionMode = "read_only"
 	PermissionModeProtectedWrite PermissionMode = "protected_write"
 	PermissionModeAgent          PermissionMode = "agent"
+	PermissionModeWorkspaceAuto  PermissionMode = "workspace_auto"
 	PermissionModeFullAccess     PermissionMode = "full_access"
 )
 
@@ -40,7 +41,8 @@ func FromContext(ctx context.Context) (PermissionMode, bool) {
 	return "", false
 }
 
-// ModeRank 返回 PermissionMode 的权限等级 (1-4)。数值越大，权限越高。
+// ModeRank 返回 PermissionMode 的权限等级。数值越大，权限越高（越宽）。
+// 光谱（宽→严）：full_access > workspace_auto > agent > protected_write > read_only/plan
 func ModeRank(mode PermissionMode) int {
 	switch NormalizeMode(string(mode)) {
 	case PermissionModePlan:
@@ -51,8 +53,10 @@ func ModeRank(mode PermissionMode) int {
 		return 2
 	case PermissionModeAgent:
 		return 3
-	case PermissionModeFullAccess:
+	case PermissionModeWorkspaceAuto:
 		return 4
+	case PermissionModeFullAccess:
+		return 5
 	default:
 		return 3
 	}

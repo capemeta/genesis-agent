@@ -18,7 +18,17 @@ type EvidenceValidator interface {
 	Validate(ctx context.Context, manifest model.ArtifactManifest, findings []model.Finding) (ValidatedEvidence, error)
 }
 
-// RejectingEvidenceValidator 用于尚未接入资源后端的产品。它安全地省略全部可选证据。
+// PassthroughEvidenceValidator 允许候选产物元数据（candidate_id / name）透传到结果中。
+type PassthroughEvidenceValidator struct{}
+
+func (PassthroughEvidenceValidator) Validate(_ context.Context, manifest model.ArtifactManifest, findings []model.Finding) (ValidatedEvidence, error) {
+	return ValidatedEvidence{
+		Artifacts: append([]model.Artifact(nil), manifest.Artifacts...),
+		Findings:  append([]model.Finding(nil), findings...),
+	}, nil
+}
+
+// RejectingEvidenceValidator 用于强安全审查模式。它安全地省略全部可选证据。
 type RejectingEvidenceValidator struct{}
 
 func (RejectingEvidenceValidator) Validate(context.Context, model.ArtifactManifest, []model.Finding) (ValidatedEvidence, error) {

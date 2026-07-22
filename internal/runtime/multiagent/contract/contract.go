@@ -5,6 +5,7 @@ import (
 	"context"
 	"time"
 
+	workmodel "genesis-agent/internal/capabilities/workspace/model"
 	"genesis-agent/internal/domain"
 	"genesis-agent/internal/runtime/multiagent/model"
 )
@@ -22,6 +23,11 @@ type SpawnRequest struct {
 	Agent        *domain.Agent
 	Timeout      time.Duration
 	Budget       *TreeBudget
+	Inputs       []workmodel.ResourceRef
+	// SkillQA* 来自 Skill frontmatter qa:；经 EvidenceQAHints 注入子 Run，
+	// 仅在产物证据建约时写入 Spec（不再按 Intent 预建交付契约）。
+	SkillQAPolicy      string
+	SkillQAEnforcement string
 }
 
 // SlotToken 是限流器创建的不可透明预留凭据。

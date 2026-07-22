@@ -11,6 +11,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	artifactcontract "genesis-agent/internal/capabilities/artifact/contract"
+	artifactservice "genesis-agent/internal/capabilities/artifact/service"
 	execmodel "genesis-agent/internal/capabilities/execution/model"
 	hookcontract "genesis-agent/internal/capabilities/hook/contract"
 	hookmodel "genesis-agent/internal/capabilities/hook/model"
@@ -64,6 +66,10 @@ type WorkspaceRuntime struct {
 	PolicyModes   []execmodel.WorkspaceMode
 	BackendModes  []execmodel.WorkspaceMode
 	MaximumAccess execmodel.WorkspaceAccess
+	// IntentResolver 仍可用于其它工作区推断；ArtifactRuns 保留给显式 DeclaredDeliverable 注入。
+	// 交付门禁改为证据驱动：子写出可交付产物后由 FinalizeRequired 建约并交付，不再按 Prompt 预建 Spec。
+	IntentResolver workcontract.IntentResolver
+	ArtifactRuns   artifactcontract.RunInitializer
 }
 
 // New 创建控制器。
@@ -169,7 +175,13 @@ func (c *Controller) Spawn(ctx context.Context, req contract.SpawnRequest) (mode
 	} else {
 		childCtx, cancel = context.WithCancel(childBase)
 	}
-	childCtx = progress.WithSink(childCtx, func(progress.Event) {})
+	// 默认 no-op：子 Run 内部 KindRun/KindTool 不得串入父时间线。
+	// Task 可通过 progress.WithChildBridge 显式桥接（带 Depth/SubAgentID 标签）供 CLI 展示。
+	if bridge := progress.ChildBridgeFromContext(ctx); bridge != nil {
+		childCtx = progress.WithSink(childCtx, bridge)
+	} else {
+		childCtx = progress.WithSink(childCtx, func(progress.Event) {})
+	}
 	manifest := result.NewManifestRegistry()
 	childCtx = result.WithManifestRegistry(childCtx, manifest)
 	childCtx = contract.WithDelegationDepth(childCtx, req.Depth)
@@ -310,6 +322,7 @@ func (c *Controller) run(ctx context.Context, req contract.SpawnRequest, e *entr
 		Scope: parent.Manifest.Scope, SessionID: req.SessionID, ParentRunID: req.ParentRunID, AgentID: req.Agent.ID,
 		App: parent.Manifest.AgentApp, Intent: workcontract.ExecutionIntent{RequiredMode: execmodel.WorkspaceModeTask, BoundedInputs: true, BoundedOutputs: true, HasProject: parent.Manifest.ProjectRoot != nil},
 		ProjectRoot: parent.Manifest.ProjectRoot, ProjectDir: parent.Manifest.ProjectDir, ProductModes: c.workspace.ProductModes, PolicyModes: c.workspace.PolicyModes, BackendModes: c.workspace.BackendModes, MaximumAccess: c.workspace.MaximumAccess, RequestedAccess: access,
+		Inputs: req.Inputs,
 	})
 	if prepareErr != nil {
 		err = fmt.Errorf("准备 subagent Run 工作空间: %w", prepareErr)
@@ -317,7 +330,21 @@ func (c *Controller) run(ctx context.Context, req contract.SpawnRequest, e *entr
 	}
 	ctx = workcontract.WithPreparedRun(ctx, prepared)
 	ctx = workcontract.WithControlPlane(ctx, c.workspace.Preparer)
+	ctx = c.prepareChildArtifactContext(ctx, req, prepared)
 	run, err = c.engine.Start(ctx, domain.StartRunRequest{RunID: prepared.Manifest.RunID, SessionID: req.SessionID, TenantID: req.TenantID, UserInput: req.Prompt, Agent: req.Agent})
+}
+
+// prepareChildArtifactContext 为子 Run 注入产物证据建约所需的可信 QA 偏好。
+// 交付 Spec 不再按 Prompt/Intent 预建：只读无产物可直接完成；写出 office 交付文件后由 FinalizeRequired 建约并交付。
+func (c *Controller) prepareChildArtifactContext(ctx context.Context, req contract.SpawnRequest, prepared workmodel.PreparedRun) context.Context {
+	ctx = artifactcontract.WithEvidenceQAHints(ctx, artifactcontract.EvidenceQAHints{
+		Policy:      req.SkillQAPolicy,
+		Enforcement: req.SkillQAEnforcement,
+	})
+	if _, ok := artifactcontract.CompletionPolicyFromContext(ctx); !ok && !req.ReadOnly {
+		c.logger.Warn("子 Run 上下文缺少完成门禁，产物证据交付可能静默不触发", "agent_id", req.Agent.ID, "run_id", prepared.Manifest.RunID)
+	}
+	return ctx
 }
 
 func (c *Controller) finish(ctx context.Context, e *entry, run *domain.Run, err error) {
@@ -355,6 +382,29 @@ func (c *Controller) finish(ctx context.Context, e *entry, run *domain.Run, err 
 	projected := c.projector.Project(resultCtx, record)
 	instance.Result = &projected
 	instance.Summary = projected.Summary
+	for _, art := range projected.Artifacts {
+		candidateID := art.CandidateID
+		if candidateID == "" {
+			candidateID = art.ResourceID
+		}
+		if candidateID == "" || run == nil {
+			continue
+		}
+		// 父子边界唯一的跨 Run 接纳点：把子交付候选显式、版本锁定地接纳进父作用域，
+		// 供父随后按资源所属 backend 只读引用（view_image 等）。QA/中间物已在归约层剔除，不会到这里。
+		if _, adoptErr := artifactservice.GlobalAdoptionStore.Adopt(artifactservice.AdoptionRecord{
+			ConsumerTenantID: instance.TenantID,
+			ConsumerRunID:    instance.ParentRunID,
+			ProducedID:       candidateID,
+			OwnerTenantID:    run.TenantID,
+			OwnerRunID:       run.ID,
+			AgentID:          instance.AgentID,
+			ContentHash:      art.ContentHash,
+			Role:             art.Role,
+		}); adoptErr != nil {
+			c.logger.Warn("接纳子交付候选失败", "agent_id", instance.AgentID, "candidate_id", candidateID, "error", adoptErr)
+		}
+	}
 	if projected.Error != nil {
 		instance.Error = projected.Error.Message
 	}

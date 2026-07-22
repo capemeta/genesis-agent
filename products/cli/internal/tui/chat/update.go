@@ -46,6 +46,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		return m.handleWindowSize(msg)
 
+	// ── 鼠标事件（滚轮滚动 + 应用内拖选复制）──────────────────
+	case tea.MouseMsg:
+		return m.handleMouse(msg)
+
 	// ── 键盘输入 ───────────────────────────────────────────────
 	case tea.KeyMsg:
 		if m.approvalFocus && m.activeApproval != nil {
@@ -569,6 +573,36 @@ func (m *Model) applyProgress(event progress.Event) {
 	}
 
 	if isLiveAssistantBlock(event.BlockType) {
+		if event.Depth > 0 || event.SubAgentID != "" {
+			// 子 Agent 的 Live Assistant Block (thinking/draft)：
+			// 不污染主对话气泡，而是转化为进度摘要原位呈现在 progressLog 的思考行中！
+			if (event.BlockType == "thinking" || event.BlockType == "assistant_draft") && strings.TrimSpace(event.Detail) != "" {
+				subName := event.SubAgentID
+				if subName == "" {
+					subName = "Worker"
+				}
+				prefix := fmt.Sprintf("[Sub-Agent: %s] 思考: ", subName)
+				cleanDetail := strings.ReplaceAll(event.Detail, "\n", " ")
+				thinkingIdx := -1
+				nLogs := len(m.progressLog)
+				if nLogs > 0 {
+					lastLog := m.progressLog[nLogs-1]
+					if strings.HasPrefix(lastLog, prefix) || (strings.HasPrefix(lastLog, "[Sub-Agent:") && strings.Contains(lastLog, "] 思考:")) {
+						thinkingIdx = nLogs - 1
+					}
+				}
+				if thinkingIdx != -1 {
+					currText := strings.TrimPrefix(m.progressLog[thinkingIdx], prefix)
+					fullText := currText + cleanDetail
+					m.progressLog[thinkingIdx] = prefix + fullText
+				} else {
+					newThinking := prefix + cleanDetail
+					m.progressLog = append(m.progressLog, newThinking)
+					m.progressCallIDs = append(m.progressCallIDs, "")
+				}
+			}
+			return
+		}
 		m.applyLiveAssistantBlock(event)
 		return
 	}
@@ -587,13 +621,29 @@ func (m *Model) applyProgress(event progress.Event) {
 		if n := len(m.progressLog); n > 0 && m.progressLog[n-1] == summary {
 			return
 		}
+
 		// 如果有 CallID，则尝试原位替换该工具调用的最新执行进度
 		replaced := false
 		if event.CallID != "" {
+			nLogs := len(m.progressLog)
 			for i, cid := range m.progressCallIDs {
 				if cid == event.CallID {
-					m.progressLog[i] = summary
-					replaced = true
+					// 仅当该 CallID 处于 progressLog 的最末尾（中途无思考或其他工具插队）时原位更新
+					if i == nLogs-1 {
+						oldLog := m.progressLog[i]
+						// 🟢 保留子智能体 Tag 前缀
+						if strings.HasPrefix(oldLog, "[Sub-Agent:") && !strings.HasPrefix(summary, "[Sub-Agent:") {
+							idx := strings.Index(oldLog, "] ")
+							if idx != -1 {
+								summary = oldLog[:idx+2] + summary
+							}
+						}
+						m.progressLog[i] = summary
+						replaced = true
+					} else {
+						// 若中途已有思考/其他工具日志插队，清空旧 CallID 避免错乱，改为在最底部按时间线追加
+						m.progressCallIDs[i] = ""
+					}
 					break
 				}
 			}
@@ -711,14 +761,15 @@ func progressSummary(event progress.Event) string {
 			case progress.KindSandbox:
 				summary = "sandbox: " + event.Name
 			case progress.KindLLM:
-				summary = "调用 LLM: " + event.Name
+				summary = "Thinking / 正在思考推理中..."
 			}
+		} else if event.Kind == progress.KindLLM {
+			summary = "Thinking / 正在思考推理中..."
 		}
 	}
 
-	// 针对具体工具参数进行解析并人性化输出
-	if event.Kind == progress.KindTool && event.Name != "" {
-		detail := event.Detail
+	detail := strings.TrimSpace(event.Detail)
+	if event.Kind == progress.KindTool {
 		if event.Name == "run_skill_command" && (event.Phase == progress.PhaseComplete || event.Phase == progress.PhaseError) {
 			label := "工具执行完成: run_skill_command"
 			if event.Phase == progress.PhaseError {
@@ -732,25 +783,24 @@ func progressSummary(event progress.Event) string {
 				parts = append(parts, timing)
 			}
 			if len(parts) > 0 {
-				return label + " (" + strings.Join(parts, "；") + ")"
+				summary = label + " (" + strings.Join(parts, "；") + ")"
+			} else {
+				summary = label
 			}
-			return label
-		}
-		if detail != "" && strings.HasPrefix(detail, "{") {
+		} else if detail != "" && strings.HasPrefix(detail, "{") {
 			if event.Name == "web_search" {
 				if event.Phase == progress.PhaseStart && strings.Contains(detail, `"query"`) {
 					query := extractJSONField(detail, "query")
 					if query != "" {
-						return fmt.Sprintf("调用工具: web_search (查询: %s)", truncateString(query, 40))
+						summary = fmt.Sprintf("调用工具: web_search (查询: %s)", truncateString(query, 40))
 					}
 				} else if event.Phase == progress.PhaseComplete && strings.Contains(detail, `"provider"`) {
 					provider := extractJSONField(detail, "provider")
 					if provider != "" {
-						return fmt.Sprintf("工具执行完成: web_search (搜索引擎: %s)", provider)
+						summary = fmt.Sprintf("工具执行完成: web_search (搜索引擎: %s)", provider)
 					}
 				}
-			}
-			if event.Name == "Skill" && (strings.Contains(detail, `"skill"`) || strings.Contains(detail, `"qualified_name"`) || strings.Contains(detail, `"name"`)) {
+			} else if event.Name == "Skill" && (strings.Contains(detail, `"skill"`) || strings.Contains(detail, `"qualified_name"`) || strings.Contains(detail, `"name"`)) {
 				name := extractJSONField(detail, "skill")
 				if name == "" {
 					name = extractJSONField(detail, "qualified_name")
@@ -760,29 +810,40 @@ func progressSummary(event progress.Event) string {
 				}
 				if name != "" {
 					if event.Phase == progress.PhaseStart {
-						return fmt.Sprintf("加载技能: %s", name)
+						summary = fmt.Sprintf("加载技能: %s", name)
+					} else {
+						summary = fmt.Sprintf("技能加载完成: %s", name)
 					}
-					return fmt.Sprintf("技能加载完成: %s", name)
 				}
-			}
-			if strings.Contains(detail, `"command"`) {
+			} else if strings.Contains(detail, `"command"`) {
 				cmd := extractJSONField(detail, "command")
 				if cmd != "" {
 					if event.Phase == progress.PhaseStart {
-						return fmt.Sprintf("调用工具: %s (命令: %s)", event.Name, truncateString(cmd, 40))
+						summary = fmt.Sprintf("调用工具: %s (命令: %s)", event.Name, truncateString(cmd, 40))
+					} else {
+						summary = fmt.Sprintf("工具执行完成: %s (命令: %s)", event.Name, truncateString(cmd, 40))
 					}
-					return fmt.Sprintf("工具执行完成: %s (命令: %s)", event.Name, truncateString(cmd, 40))
 				}
-			}
-			if strings.Contains(detail, `"path"`) {
+			} else if strings.Contains(detail, `"path"`) {
 				path := extractJSONField(detail, "path")
 				if path != "" {
 					if event.Phase == progress.PhaseStart {
-						return fmt.Sprintf("调用工具: %s (路径: %s)", event.Name, path)
+						summary = fmt.Sprintf("调用工具: %s (路径: %s)", event.Name, path)
+					} else {
+						summary = fmt.Sprintf("工具执行完成: %s (路径: %s)", event.Name, path)
 					}
-					return fmt.Sprintf("工具执行完成: %s (路径: %s)", event.Name, path)
 				}
 			}
+		}
+	}
+
+	if event.Depth > 0 || event.SubAgentID != "" {
+		subName := event.SubAgentID
+		if subName == "" {
+			subName = "Worker"
+		}
+		if !strings.HasPrefix(summary, "[Sub-Agent") {
+			summary = fmt.Sprintf("[Sub-Agent: %s] %s", subName, summary)
 		}
 	}
 
@@ -927,7 +988,7 @@ func (m Model) handleSlashCmd(input string) (tea.Model, tea.Cmd) {
 		m.err = nil
 		m.progressLog = nil
 		m.progressCallIDs = nil
-		m.progressExpanded = false
+		m.progressExpanded = true
 		m.hydrateFromSession()
 		m.refreshViewportContent()
 		m.viewport.GotoBottom()

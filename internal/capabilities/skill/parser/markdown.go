@@ -21,20 +21,33 @@ type Parser struct{}
 
 func New() *Parser { return &Parser{} }
 
+type sandboxSpec struct {
+	ExecutionMode    string `yaml:"execution_mode"`
+	PreferredBackend string `yaml:"preferred_backend"`
+}
+
 type frontmatter struct {
-	Name                    string    `yaml:"name"`
-	Description             string    `yaml:"description"`
-	ShortDescription        string    `yaml:"short-description"`
-	Version                 string    `yaml:"version"`
-	AllowedTools            []string  `yaml:"allowed-tools"`
-	Context                 string    `yaml:"context"`
-	Agent                   string    `yaml:"agent"`
-	Model                   string    `yaml:"model"`
-	DisableModelInvocation  bool      `yaml:"disable-model-invocation"`
-	AllowImplicitInvocation *bool     `yaml:"allow-implicit-invocation"`
-	Products                []string  `yaml:"products"`
-	MaxThinkingTokens       int       `yaml:"max-thinking-tokens"`
-	Dependencies            yaml.Node `yaml:"dependencies"`
+	Name                    string      `yaml:"name"`
+	Description             string      `yaml:"description"`
+	ShortDescription        string      `yaml:"short-description"`
+	Version                 string      `yaml:"version"`
+	AllowedTools            []string    `yaml:"allowed-tools"`
+	Context                 string      `yaml:"context"`
+	Sandbox                 sandboxSpec `yaml:"sandbox"`
+	Agent                   string      `yaml:"agent"`
+	Model                   string      `yaml:"model"`
+	DisableModelInvocation  bool        `yaml:"disable-model-invocation"`
+	AllowImplicitInvocation *bool       `yaml:"allow-implicit-invocation"`
+	Products                []string    `yaml:"products"`
+	MaxThinkingTokens       int         `yaml:"max-thinking-tokens"`
+	Dependencies            yaml.Node   `yaml:"dependencies"`
+	Requires                yaml.Node   `yaml:"requires"`
+	QA                      qaFrontmatter `yaml:"qa"`
+}
+
+type qaFrontmatter struct {
+	Policy      string `yaml:"policy"`
+	Enforcement string `yaml:"enforcement"`
 }
 
 func (p *Parser) ParseFrontmatter(data []byte, source contract.ParseSource) (model.Metadata, error) {
@@ -140,12 +153,61 @@ func metadataFromFrontmatter(fm frontmatter, source contract.ParseSource) (model
 		Model:             strings.TrimSpace(fm.Model),
 		MaxThinkingTokens: fm.MaxThinkingTokens,
 		Dependencies:      cleanDependencies(fm.Dependencies),
+		Requires:          cleanRequires(fm.Requires),
+		QA: model.QADeclaration{
+			Policy:      strings.TrimSpace(fm.QA.Policy),
+			Enforcement: strings.TrimSpace(fm.QA.Enforcement),
+		},
 		SourceRef: map[string]string{
 			"base_directory": source.BaseDirectory,
 			"display_path":   source.DisplayPath,
 		},
 	}.Normalize()
 	return meta, nil
+}
+
+func cleanRequires(node yaml.Node) []model.CapabilityRequirement {
+	if node.Kind == 0 || node.Kind != yaml.SequenceNode {
+		return nil
+	}
+	out := make([]model.CapabilityRequirement, 0, len(node.Content))
+	for _, item := range node.Content {
+		req := requirementFromNode(item)
+		if strings.TrimSpace(req.Kind) == "" {
+			continue
+		}
+		out = append(out, req)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func requirementFromNode(node *yaml.Node) model.CapabilityRequirement {
+	if node == nil {
+		return model.CapabilityRequirement{}
+	}
+	if node.Kind == yaml.ScalarNode {
+		return model.CapabilityRequirement{Kind: strings.TrimSpace(node.Value)}
+	}
+	if node.Kind != yaml.MappingNode {
+		return model.CapabilityRequirement{}
+	}
+	var req model.CapabilityRequirement
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		key := strings.TrimSpace(node.Content[i].Value)
+		val := strings.TrimSpace(node.Content[i+1].Value)
+		switch key {
+		case "kind":
+			req.Kind = val
+		case "enforcement":
+			req.Enforcement = val
+		case "description":
+			req.Description = val
+		}
+	}
+	return req
 }
 
 func cleanDependencies(node yaml.Node) model.Dependencies {

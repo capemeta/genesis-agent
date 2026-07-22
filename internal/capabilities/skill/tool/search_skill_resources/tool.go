@@ -24,7 +24,7 @@ type Deps struct {
 type Tool struct{ deps Deps }
 
 type input struct {
-	Name    string `json:"name,omitempty"`
+	Skill   string `json:"skill,omitempty"`
 	Package string `json:"package,omitempty"`
 	Query   string `json:"query"`
 	Limit   int    `json:"limit,omitempty"`
@@ -46,7 +46,7 @@ func New(deps Deps) (tool.Tool, error) {
 }
 
 func (t *Tool) GetInfo() *tool.Info {
-	return &tool.Info{Name: "search_skill_resources", Description: "搜索 Skill 包内 references/assets/scripts 文本资源，返回 resource id 和片段。", Parameters: &tool.ParameterSchema{Type: "object", Properties: map[string]*tool.ParameterSchema{"name": {Type: "string", Description: "Skill 名称或 qualified_name"}, "package": {Type: "string", Description: "可选 package id"}, "query": {Type: "string", Description: "搜索关键词"}, "limit": {Type: "integer", Description: "最大返回数量"}}, Required: []string{"query"}}, Traits: tool.ToolTraits{Exposure: tool.ToolExposureDirect, ReadOnly: true, ConcurrencySafe: true, NeedsPermission: true}}
+	return &tool.Info{Name: "search_skill_resources", Description: "搜索 Skill 包内 references/assets/scripts 文本资源，返回 resource id 和片段。", Parameters: &tool.ParameterSchema{Type: "object", Properties: map[string]*tool.ParameterSchema{"skill": {Type: "string", Description: "Skill 名称或 qualified_name，例如 office-ppt"}, "package": {Type: "string", Description: "可选 package id"}, "query": {Type: "string", Description: "搜索关键词"}, "limit": {Type: "integer", Description: "最大返回数量"}}, Required: []string{"query"}}, Traits: tool.ToolTraits{Exposure: tool.ToolExposureDirect, ReadOnly: true, ConcurrencySafe: true, NeedsPermission: true}}
 }
 
 func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
@@ -57,11 +57,12 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 	if strings.TrimSpace(in.Query) == "" {
 		return "", fmt.Errorf("query不能为空")
 	}
+	name := strings.TrimSpace(in.Skill)
 	pkg := model.PackageID(strings.TrimSpace(in.Package))
 	if err := t.authorize(ctx, pkg, in.Query); err != nil {
 		return "", err
 	}
-	result, err := t.deps.Service.SearchResources(ctx, skillcontract.SearchResourcesRequest{ResolveRequest: skillcontract.ResolveRequest{CatalogRequest: t.deps.CatalogRequest, Name: strings.TrimSpace(in.Name)}, PackageID: pkg, Query: in.Query, Limit: in.Limit})
+	result, err := t.deps.Service.SearchResources(ctx, skillcontract.SearchResourcesRequest{ResolveRequest: skillcontract.ResolveRequest{CatalogRequest: t.deps.CatalogRequest, Name: name}, PackageID: pkg, Query: in.Query, Limit: in.Limit})
 	if err != nil {
 		return "", err
 	}

@@ -35,6 +35,16 @@ func (failingEvidence) Validate(context.Context, model.ArtifactManifest, []model
 	return ValidatedEvidence{}, errors.New("backend unavailable")
 }
 
+// mixedEvidence 返回一个交付候选 + 一个 QA 预览，用于验证父交付面剔除 QA。
+type mixedEvidence struct{}
+
+func (mixedEvidence) Validate(context.Context, model.ArtifactManifest, []model.Finding) (ValidatedEvidence, error) {
+	return ValidatedEvidence{Artifacts: []model.Artifact{
+		{CandidateID: "produced-deck", ResourceID: "produced-deck", Path: "output/deck.pptx", Kind: "file"},
+		{CandidateID: "produced-qa", ResourceID: "produced-qa", Path: "output/slide-1.png", Kind: "file", Role: model.ArtifactRoleQAAsset},
+	}}, nil
+}
+
 type rewritingProjector struct{}
 
 func (rewritingProjector) ProjectArtifact(_ context.Context, artifact model.Artifact) (model.Artifact, bool, error) {
@@ -83,6 +93,20 @@ func TestReducerClassifiesBudgetFailure(t *testing.T) {
 	}
 }
 
+func TestReducerClassifiesCompletionGateFailure(t *testing.T) {
+	reduced := NewReducer().Reduce(context.Background(), TerminalCandidate{AgentID: "agent-1", Err: errors.New("RUN_COMPLETION_REQUIRED: Run 尚未满足持久化完成门禁；【交付门禁未满足】待办 QA: visual-qa/v1")})
+	if reduced.Error == nil || reduced.Error.Code != "completion_gate_unmet" {
+		t.Fatalf("expected completion_gate_unmet, got %+v", reduced.Error)
+	}
+	// 门禁类失败必须劝阻「原样重新委派」，避免无效循环。
+	if strings.Contains(reduced.NextAction, "可重新委派、调整任务或稍后 resume") {
+		t.Fatalf("completion gate failure should not encourage blind re-delegation: %q", reduced.NextAction)
+	}
+	if !strings.Contains(reduced.NextAction, "不要重复委派相同任务") {
+		t.Fatalf("expected anti-loop guidance, got %q", reduced.NextAction)
+	}
+}
+
 func TestReducerFailsClosedWhenSanitizerFails(t *testing.T) {
 	reduced := (Reducer{Sanitizer: failingSanitizer{}}).Reduce(context.Background(), TerminalCandidate{AgentID: "agent-1", Run: &domain.Run{ID: "run-1", Status: domain.RunStatusCompleted, FinalAnswer: "sensitive final"}})
 	if reduced.Status != model.ResultStatusFailed || reduced.Summary != "" || reduced.Error == nil {
@@ -105,6 +129,43 @@ func TestReducerOnlyDeliversValidatedManifest(t *testing.T) {
 	}
 	if len(reduced.Findings) != 1 || reduced.Findings[0].Evidence[0] != "res-verified" {
 		t.Fatalf("validated findings were not used: %+v", reduced.Findings)
+	}
+}
+
+func TestReducerDropsQAAssetsAndDoesNotPromptSelect(t *testing.T) {
+	reduced := (Reducer{Evidence: mixedEvidence{}}).Reduce(context.Background(), TerminalCandidate{
+		AgentID: "agent-1",
+		Run:     &domain.Run{ID: "run-child", Status: domain.RunStatusCompleted, FinalAnswer: "已生成 PPT"},
+		Manifest: model.ArtifactManifest{Artifacts: []model.Artifact{
+			{CandidateID: "produced-deck", Kind: "file"},
+			{CandidateID: "produced-qa", Kind: "file", Role: model.ArtifactRoleQAAsset},
+		}},
+	})
+	if reduced.Status != model.ResultStatusCompleted {
+		t.Fatalf("unexpected status: %+v", reduced)
+	}
+	// QA 预览不得进入父交付面。
+	if len(reduced.Artifacts) != 1 || reduced.Artifacts[0].CandidateID != "produced-deck" {
+		t.Fatalf("QA asset leaked to parent: %+v", reduced.Artifacts)
+	}
+	// R1=A：即便曾有多个产物，父也不被催 select（跨 Run select 会 ADOPTION_REQUIRED）。
+	if reduced.NextAction != "" {
+		t.Fatalf("parent should not be prompted to select: %q", reduced.NextAction)
+	}
+}
+
+func TestReducerKeepsLatestSameNameDeliverable(t *testing.T) {
+	reduced := NewReducer().Reduce(context.Background(), TerminalCandidate{
+		AgentID: "agent-1",
+		Run:     &domain.Run{ID: "run-child", Status: domain.RunStatusCompleted, FinalAnswer: "已生成 PPT"},
+		Manifest: model.ArtifactManifest{Artifacts: []model.Artifact{
+			{CandidateID: "produced-old", Name: "2026笔记本选型比较.pptx", Kind: "file"},
+			{CandidateID: "produced-new", Name: "2026笔记本选型比较.pptx", Kind: "file"},
+			{CandidateID: "produced-qa", Name: "slide-1.jpg", Kind: "file", Role: model.ArtifactRoleQAAsset},
+		}},
+	})
+	if len(reduced.Artifacts) != 1 || reduced.Artifacts[0].CandidateID != "produced-new" {
+		t.Fatalf("parent must only see latest same-name deliverable: %+v", reduced.Artifacts)
 	}
 }
 

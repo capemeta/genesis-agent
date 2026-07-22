@@ -10,6 +10,8 @@ import (
 	approvalmemory "genesis-agent/internal/capabilities/approval/adapter/memory"
 	approvalstatic "genesis-agent/internal/capabilities/approval/adapter/static"
 	approvalservice "genesis-agent/internal/capabilities/approval/service"
+	"genesis-agent/internal/capabilities/llm/vision"
+	viewimage "genesis-agent/internal/capabilities/media/tool/view_image"
 	skillmemory "genesis-agent/internal/capabilities/skill/adapter/memory"
 	skillcontract "genesis-agent/internal/capabilities/skill/contract"
 	skillmodel "genesis-agent/internal/capabilities/skill/model"
@@ -218,6 +220,38 @@ func TestSkillForkNamedAgentKeepsSkillIsolated(t *testing.T) {
 	}
 }
 
+func TestSkillRejectsRequiredVisionWithoutCapability(t *testing.T) {
+	meta := skillmodel.Metadata{
+		Name: "vision-review", QualifiedName: "vision-review", Description: "Need vision",
+		Enabled: true, PromptVisible: true,
+		Authority: skillmodel.Authority{Kind: skillmodel.SourceKindEmbedded, ID: "test"},
+		PackageID: "vision-review", MainResource: "vision-review/SKILL.md",
+		Requires: []skillmodel.CapabilityRequirement{{Kind: "vision", Enforcement: "required"}},
+	}.Normalize()
+	source := skillmemory.NewSource(meta.Authority, []skillmemory.Skill{{Metadata: meta, Body: "Body"}})
+	svc := skillservice.New([]skillcontract.Source{source}, skillservice.Options{})
+	approval, err := approvalservice.New(approvalstatic.NewPolicyEngine(), approvaldeny.NewRequester(), approvalmemory.NewStore(), logger.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := New(Deps{Service: svc, Approval: approval, EnabledTools: []string{"view_image"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 无 VisionMode 注入 → 视为 degraded_text
+	if _, err := created.Execute(context.Background(), `{"skill":"vision-review"}`); err == nil || !strings.Contains(err.Error(), "SKILL_CAPABILITY_REQUIRED") {
+		t.Fatalf("expected vision required failure, got %v", err)
+	}
+	ctx := viewimage.WithVisionMode(context.Background(), vision.ModeDirectInject)
+	out, err := created.Execute(ctx, `{"skill":"vision-review"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, `"type":"skill_injection"`) {
+		t.Fatalf("with vision capability should load: %s", out)
+	}
+}
+
 func newTestTool(t *testing.T, deps skillmodel.Dependencies, enabledTools []string) *Tool {
 	t.Helper()
 	meta := skillmodel.Metadata{Name: "review", QualifiedName: "review", Description: "Review", Enabled: true, PromptVisible: true, Authority: skillmodel.Authority{Kind: skillmodel.SourceKindEmbedded, ID: "test"}, PackageID: "review", MainResource: "review/SKILL.md", Dependencies: deps}.Normalize()
@@ -232,4 +266,41 @@ func newTestTool(t *testing.T, deps skillmodel.Dependencies, enabledTools []stri
 		t.Fatal(err)
 	}
 	return created.(*Tool)
+}
+
+func TestSkillForkAcceptsExplicitInputs(t *testing.T) {
+	meta := skillmodel.Metadata{
+		Name: "forked", QualifiedName: "forked", Description: "Forked", Enabled: true, PromptVisible: true,
+		Authority: skillmodel.Authority{Kind: skillmodel.SourceKindEmbedded, ID: "test"}, PackageID: "forked",
+		MainResource: "forked/SKILL.md", Context: skillmodel.ContextModeFork, AllowedTools: []string{"read_file"},
+	}.Normalize()
+	source := skillmemory.NewSource(meta.Authority, []skillmemory.Skill{{Metadata: meta, Body: "Skill body"}})
+	svc := skillservice.New([]skillcontract.Source{source}, skillservice.Options{})
+	approval, err := approvalservice.New(approvalstatic.NewPolicyEngine(), approvaldeny.NewRequester(), approvalmemory.NewStore(), logger.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := New(Deps{Service: svc, Approval: approval, EnabledTools: []string{"read_file"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway := &recordingForkTask{}
+	created.(*Tool).SetForkTask(gateway)
+
+	// Explicit inputs parameter passed by LLM
+	_, err = created.Execute(context.Background(), `{"skill":"forked","args":"create ppt","inputs":["explicit_doc.md"]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gateway.last.InputFiles) != 1 || gateway.last.InputFiles[0] != "explicit_doc.md" {
+		t.Fatalf("expected explicit input file [explicit_doc.md], got %#v", gateway.last.InputFiles)
+	}
+}
+
+func TestExtractWorkspaceInputFilesIntersection(t *testing.T) {
+	text := "根据ultra5-comparison-summary.md创建PPT，主题色红色，文件名2026笔记本选型比较.pptx"
+	inputs := extractFallbackInputFiles(text)
+	if len(inputs) == 0 {
+		t.Fatalf("expected fallback input extraction, got empty")
+	}
 }

@@ -15,5 +15,5 @@ func BuildEvaluator(cfg platformconfig.PolicyConfig) policycontract.Evaluator {
 		cfg.Defaults,
 		policyfs.New(cfg.Defaults, cfg.Files),
 		policymcp.New(cfg.Defaults),
-	)
+	).WithPermissionMode(cfg.PermissionMode)
 }

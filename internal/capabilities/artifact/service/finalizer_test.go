@@ -113,6 +113,56 @@ func TestDeterministicFinalizerSoftensDeliveryTargetConflict(t *testing.T) {
 	}
 }
 
+func TestDeterministicFinalizerBindsSpecFromProducedEvidence(t *testing.T) {
+	ctx := context.Background()
+	ledger := artifactmemory.NewStore()
+	produced := workmemory.NewProducedResourceStore()
+	now := time.Now().UTC()
+	createProduced(t, produced, "p1", "run:/work/b1/deck.pptx", "deck.pptx", "application/pptx", now)
+	createProduced(t, produced, "qa1", "run:/work/b1/slide-1.jpg", "slide-1.jpg", "image/jpeg", now)
+	pub, delivery := &recordingPublisher{}, &recordingDelivery{}
+	finalizer, _ := NewDeterministicFinalizer(ledger, ledger, produced, pub, delivery)
+	ctx = artifactcontract.WithEvidenceQAHints(ctx, artifactcontract.EvidenceQAHints{Policy: "visual-qa/v1", Enforcement: "optional"})
+	result, err := finalizer.FinalizeRequired(ctx, "tenant", "run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Resolutions) != 1 || result.Resolutions[0].Status != "delivered" || result.Resolutions[0].SelectedID != "p1" {
+		t.Fatalf("result=%+v", result)
+	}
+	specs, err := ledger.ListDeliverables(ctx, "tenant", "run")
+	if err != nil || len(specs) != 1 {
+		t.Fatalf("specs=%+v err=%v", specs, err)
+	}
+	if specs[0].QAPolicy != "visual-qa/v1" || specs[0].QAEnforcement != "optional" {
+		t.Fatalf("qa hints not applied: %+v", specs[0])
+	}
+	if len(pub.calls) != 1 || len(delivery.calls) != 1 {
+		t.Fatalf("publish=%d delivery=%d", len(pub.calls), len(delivery.calls))
+	}
+}
+
+func TestDeterministicFinalizerSkipsEvidenceWhenNoDeliverableProduced(t *testing.T) {
+	ctx := context.Background()
+	ledger := artifactmemory.NewStore()
+	produced := workmemory.NewProducedResourceStore()
+	now := time.Now().UTC()
+	createProduced(t, produced, "qa1", "run:/work/b1/slide-1.jpg", "slide-1.jpg", "image/jpeg", now)
+	pub, delivery := &recordingPublisher{}, &recordingDelivery{}
+	finalizer, _ := NewDeterministicFinalizer(ledger, ledger, produced, pub, delivery)
+	result, err := finalizer.FinalizeRequired(ctx, "tenant", "run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Resolutions) != 0 || len(pub.calls) != 0 {
+		t.Fatalf("read-only/qa-only must not create or deliver, result=%+v publish=%d", result, len(pub.calls))
+	}
+	specs, err := ledger.ListDeliverables(ctx, "tenant", "run")
+	if err != nil || len(specs) != 0 {
+		t.Fatalf("expected no specs, got %+v err=%v", specs, err)
+	}
+}
+
 func createProduced(t *testing.T, store *workmemory.ProducedResourceStore, id, logical, name, media string, now time.Time) {
 	t.Helper(); descriptor:=workmodel.ProducedResourceDescriptor{ID:id,TenantID:"tenant",RunID:"run",BindingID:"b1",LogicalRef:logical,Source:workmodel.ResourceRef{Authority:"host",Scheme:"run-file",ID:"loc-"+id,Version:"sha256:abc",MediaType:media,Scope:workmodel.ResourceScope{TenantID:"tenant"}},ObservedName:name,MediaType:media,Size:3,Availability:workmodel.ResourceAvailabilityDurable,CreatedAt:now}
 	if err:=store.Create(context.Background(),descriptor); err!=nil { t.Fatal(err) }

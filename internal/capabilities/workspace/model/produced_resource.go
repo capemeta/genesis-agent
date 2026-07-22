@@ -28,6 +28,7 @@ type ProducedResourceDescriptor struct {
 
 	ObservedName string `json:"observed_name"`
 	MediaType    string `json:"media_type,omitempty"`
+	Role         string `json:"role,omitempty"`
 	Size         int64  `json:"size"`
 
 	Availability ResourceAvailability `json:"availability"`

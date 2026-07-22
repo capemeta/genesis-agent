@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	artifactcontract "genesis-agent/internal/capabilities/artifact/contract"
@@ -41,11 +42,15 @@ func NewDeterministicFinalizer(deliverables artifactcontract.DeliverableSpecStor
 }
 
 func (s *DeterministicFinalizer) FinalizeRequired(ctx context.Context, tenantID, runID string) (artifactmodel.FinalizationResult, error) {
-	specs, err := s.deliverables.ListDeliverables(ctx, tenantID, runID)
+	resources, err := s.produced.ListByRun(ctx, tenantID, runID)
 	if err != nil {
 		return artifactmodel.FinalizationResult{}, err
 	}
-	resources, err := s.produced.ListByRun(ctx, tenantID, runID)
+	// 证据驱动：无显式/预置 primary 时，按已登记可交付产物再建 Spec，再进入原 Finalize 路径。
+	if err := s.ensurePrimaryFromProduced(ctx, tenantID, runID, resources); err != nil {
+		return artifactmodel.FinalizationResult{}, err
+	}
+	specs, err := s.deliverables.ListDeliverables(ctx, tenantID, runID)
 	if err != nil {
 		return artifactmodel.FinalizationResult{}, err
 	}
@@ -68,13 +73,14 @@ func (s *DeterministicFinalizer) SelectAndFinalize(ctx context.Context, tenantID
 	if err != nil {
 		return artifactmodel.DeliveryResult{}, err
 	}
+	realDeliverableID := spec.ID
 	if !matchesDeliverable(spec, resource, effectiveName(spec, resource)) {
 		return artifactmodel.DeliveryResult{}, artifactcontract.NewError(artifactcontract.ErrCodeArtifactInvalid, fmt.Errorf("candidate 不满足 deliverable contract"))
 	}
-	if err := s.bindSelection(ctx, tenantID, runID, deliverableID, candidateID, "model-candidate-id"); err != nil {
+	if err := s.bindSelection(ctx, tenantID, runID, realDeliverableID, candidateID, "model-candidate-id"); err != nil {
 		return artifactmodel.DeliveryResult{}, err
 	}
-	return s.publishAndDeliver(ctx, tenantID, runID, deliverableID, candidateID)
+	return s.publishAndDeliver(ctx, tenantID, runID, realDeliverableID, candidateID)
 }
 
 func (s *DeterministicFinalizer) resolve(ctx context.Context, tenantID, runID string, spec artifactmodel.DeliverableSpec, resources []workmodel.ProducedResourceDescriptor) (artifactmodel.DeliverableResolution, error) {
@@ -193,6 +199,34 @@ func (s *DeterministicFinalizer) loadCandidate(ctx context.Context, tenantID, ru
 	if err != nil {
 		return artifactmodel.DeliverableSpec{}, workmodel.ProducedResourceDescriptor{}, err
 	}
+	resource, err := s.produced.Get(ctx, tenantID, runID, candidateID)
+	if err != nil {
+		var stateRoot string
+		if prepared, ok := workcontract.PreparedRunFromContext(ctx); ok {
+			stateRoot = prepared.Manifest.StateRoot.Path
+		}
+		// 跨 Run 只对已显式接纳的产物可读，由 AdoptionRecord 解析所属 Run，不再扫目录/扫 manifest 做启发式。
+		if rec, ok := GlobalAdoptionStore.Resolve(tenantID, runID, candidateID, stateRoot); ok && rec.OwnerRunID != "" && rec.OwnerRunID != runID {
+			resource, err = s.produced.Get(ctx, rec.OwnerTenantID, rec.OwnerRunID, candidateID)
+		}
+		// 同 Run 内按名回退：candidate_id 可能是 ObservedName 而非 produced-id。
+		if err != nil {
+			if resources, listErr := s.produced.ListByRun(ctx, tenantID, runID); listErr == nil {
+				cleanCandidate := strings.TrimPrefix(candidateID, "produced-")
+				for _, r := range resources {
+					if r.ID == candidateID || r.ObservedName == candidateID || r.ObservedName == cleanCandidate {
+						resource = r
+						err = nil
+						break
+					}
+				}
+			}
+		}
+	}
+	if err != nil {
+		return artifactmodel.DeliverableSpec{}, workmodel.ProducedResourceDescriptor{}, err
+	}
+
 	var spec artifactmodel.DeliverableSpec
 	for _, item := range specs {
 		if item.ID == deliverableID {
@@ -201,10 +235,20 @@ func (s *DeterministicFinalizer) loadCandidate(ctx context.Context, tenantID, ru
 		}
 	}
 	if spec.ID == "" {
+		for _, item := range specs {
+			if matchesDeliverable(item, resource, effectiveName(item, resource)) {
+				spec = item
+				break
+			}
+		}
+		if spec.ID == "" && len(specs) > 0 {
+			spec = specs[0]
+		}
+	}
+	if spec.ID == "" {
 		return spec, workmodel.ProducedResourceDescriptor{}, artifactcontract.ErrNotFound
 	}
-	resource, err := s.produced.Get(ctx, tenantID, runID, candidateID)
-	return spec, resource, err
+	return spec, resource, nil
 }
 
 func matchingCandidateIDs(spec artifactmodel.DeliverableSpec, resources []workmodel.ProducedResourceDescriptor) []string {

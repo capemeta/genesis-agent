@@ -51,7 +51,7 @@ func (allowApproval) Authorize(context.Context, approvalmodel.Request) (approval
 	return approvalmodel.Decision{Type: approvalmodel.DecisionApproved}, nil
 }
 
-func TestExecuteAcceptsSkillAlias(t *testing.T) {
+func TestExecuteAcceptsSkill(t *testing.T) {
 	service := &capturingSkillService{}
 	created, err := New(Deps{Service: service, Approval: allowApproval{}, CatalogRequest: skillcontract.CatalogRequest{Product: profilemodel.ChannelCLI}})
 	if err != nil {
@@ -79,12 +79,14 @@ func TestExecuteDerivesOwnerFromQualifiedResource(t *testing.T) {
 	}
 }
 
-func TestExecuteRejectsConflictingNameAndSkill(t *testing.T) {
+// TestExecuteRejectsLegacyNameParam 固化单一权威参数设计：技能标识只认 skill，
+// 旧的 name 参数已移除，传入会作为未知字段被拒，避免 schema 里出现两个易混淆的名字。
+func TestExecuteRejectsLegacyNameParam(t *testing.T) {
 	created, err := New(Deps{Service: &capturingSkillService{}, Approval: allowApproval{}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := created.Execute(context.Background(), `{"name":"one","skill":"two","resource":"guide.md"}`); err == nil {
-		t.Fatal("expected conflict error")
+	if _, err := created.Execute(context.Background(), `{"name":"demo","resource":"design.md"}`); err == nil {
+		t.Fatal("expected legacy name param to be rejected")
 	}
 }

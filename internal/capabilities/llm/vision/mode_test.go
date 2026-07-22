@@ -28,3 +28,13 @@ func TestResolveEffectiveVisionMode(t *testing.T) {
 		})
 	}
 }
+
+func TestHasImageCapability(t *testing.T) {
+	t.Parallel()
+	if !HasImageCapability(ModeDirectInject) || !HasImageCapability(ModeExpertRoute) {
+		t.Fatal("direct/expert must have image capability")
+	}
+	if HasImageCapability(ModeDegradedText) || HasImageCapability("") {
+		t.Fatal("degraded/empty must not have image capability")
+	}
+}

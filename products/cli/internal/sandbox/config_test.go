@@ -92,6 +92,7 @@ func TestFromRuntimeConfigDockerSandbox(t *testing.T) {
 		WorkspaceID:           "workspace-1",
 		DefaultRuntimeProfile: string(execmodel.RuntimeProfileCodePythonIsolated),
 		AllowSessionOverride:  true,
+		Remote:                platformconfig.SandboxRemoteConfig{Enabled: true},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -106,3 +107,20 @@ func TestFromRuntimeConfigDockerSandbox(t *testing.T) {
 		t.Fatalf("profile = %+v", profile)
 	}
 }
+
+func TestFromRuntimeConfigDowngradesWhenRemoteDisabled(t *testing.T) {
+	cfg, err := FromRuntimeConfig(platformconfig.SandboxConfig{
+		Enabled:          true,
+		Mode:             string(ModeRemoteSandbox),
+		DefaultExecution: string(execmodel.SandboxOptional),
+		Local:            platformconfig.SandboxLocalConfig{Enabled: true},
+		Remote:           platformconfig.SandboxRemoteConfig{Enabled: false},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Mode != ModePlatform {
+		t.Fatalf("cfg.Mode = %s, want %s (local platform sandbox)", cfg.Mode, ModePlatform)
+	}
+}
+

@@ -36,7 +36,7 @@ func (p Projector) Project(ctx context.Context, record model.TaskResult) model.T
 }
 
 func isSafeProjectedArtifact(artifact model.Artifact) bool {
-	if strings.TrimSpace(artifact.ResourceID) == "" && strings.TrimSpace(artifact.Path) == "" {
+	if strings.TrimSpace(artifact.ResourceID) == "" && strings.TrimSpace(artifact.CandidateID) == "" && strings.TrimSpace(artifact.Path) == "" {
 		return false
 	}
 	path := strings.TrimSpace(artifact.Path)

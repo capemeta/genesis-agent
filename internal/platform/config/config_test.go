@@ -189,6 +189,9 @@ func TestLoadPolicyDefaults(t *testing.T) {
 		t.Fatalf("Load() error = %v", err)
 	}
 
+	if cfg.Policy.PermissionMode != "agent" {
+		t.Fatalf("permission_mode default = %q, want agent", cfg.Policy.PermissionMode)
+	}
 	if cfg.Policy.Defaults.Unknown != "ask" || cfg.Policy.Defaults.Critical != "deny" {
 		t.Fatalf("policy defaults = %+v", cfg.Policy.Defaults)
 	}
@@ -204,6 +207,7 @@ func TestLoadPolicyFromYAML(t *testing.T) {
 	dir := t.TempDir()
 	policy := `
 policy:
+  permission_mode: workspace_auto
   defaults:
     unknown: deny
     allowed_grant_scopes: [once, session]
@@ -224,6 +228,9 @@ policy:
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
+	if cfg.Policy.PermissionMode != "workspace_auto" {
+		t.Fatalf("PermissionMode = %q, want workspace_auto", cfg.Policy.PermissionMode)
+	}
 	if cfg.Policy.Defaults.Unknown != "deny" {
 		t.Fatalf("Unknown = %q, want deny", cfg.Policy.Defaults.Unknown)
 	}
@@ -235,6 +242,18 @@ policy:
 	}
 	if cfg.Policy.Sandbox.DefaultMode != "optional" {
 		t.Fatalf("sandbox default mode = %q", cfg.Policy.Sandbox.DefaultMode)
+	}
+}
+
+func TestLoadPolicyRejectsInvalidPermissionMode(t *testing.T) {
+	dir := t.TempDir()
+	policy := `
+policy:
+  permission_mode: mega_yolo
+`
+	writeTestConfig(t, dir, minimalConfig(policy, ""), minimalLLMConfig())
+	if _, err := Load(dir); err == nil {
+		t.Fatal("Load() expected invalid permission_mode error")
 	}
 }
 
@@ -309,6 +328,8 @@ sandbox:
   api_key_env: GENESIS_TEST_SANDBOX_KEY
   workspace_id: dev-workspace
   default_runtime_profile: code-polyglot-basic
+  remote:
+    enabled: true
 `
 	writeTestConfig(t, dir, content, minimalLLMConfig())
 
@@ -330,11 +351,34 @@ func TestLoadSandboxExternalRequiresBaseURL(t *testing.T) {
 sandbox:
   enabled: true
   mode: remote_sandbox
+  remote:
+    enabled: true
 `
 	writeTestConfig(t, dir, content, minimalLLMConfig())
 
 	if _, err := Load(dir); err == nil {
 		t.Fatal("Load() expected sandbox base_url validation error")
+	}
+}
+
+func TestLoadSandboxDowngradesWhenRemoteDisabled(t *testing.T) {
+	dir := t.TempDir()
+	content := minimalConfig("", "") + `
+sandbox:
+  mode: remote_sandbox
+  local:
+    enabled: true
+  remote:
+    enabled: false
+`
+	writeTestConfig(t, dir, content, minimalLLMConfig())
+
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Sandbox.Mode != "local_platform_sandbox" {
+		t.Fatalf("cfg.Sandbox.Mode = %q, want local_platform_sandbox", cfg.Sandbox.Mode)
 	}
 }
 

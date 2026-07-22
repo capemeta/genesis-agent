@@ -370,6 +370,11 @@ func BuildAgentService(ctx context.Context, opts BuildOptions) (*RuntimeBundle, 
 	worker := memoryservice.NewMemoryExtractWorker(memExtractor, ltm)
 	worker.Start(ctx)
 
+	toolResultMaxTokens := 32000
+	if resolvedLLM.ContextWindow/4 > toolResultMaxTokens {
+		toolResultMaxTokens = resolvedLLM.ContextWindow / 4
+	}
+
 	compactor := runtimecontext.NewDefaultCompactor(
 		estimator,
 		fileMem,
@@ -377,11 +382,11 @@ func BuildAgentService(ctx context.Context, opts BuildOptions) (*RuntimeBundle, 
 		sessionDir,
 		worker,
 		resolvedLLM.ContextWindow,
-		6,    // keepRecentTurns 默认保留 6 轮
-		0,    // keepRecentTokenBudget
-		0.85, // compactRatio 默认 85% 水位触发
-		0.75, // warnRatio 75%
-		8000, // toolResultMaxTokens
+		6,                   // keepRecentTurns 默认保留 6 轮
+		0,                   // keepRecentTokenBudget
+		0.85,                // compactRatio 默认 85% 水位触发
+		0.75,                // warnRatio 75%
+		toolResultMaxTokens, // toolResultMaxTokens 升级至 32000+，防止过早做 L1 Micro Compact
 	)
 
 	effectiveContextRatio := 0.92
@@ -521,6 +526,8 @@ func BuildAgentService(ctx context.Context, opts BuildOptions) (*RuntimeBundle, 
 			ProjectRoot: opts.RunWorkspace.ProjectRoot, ProjectDir: opts.RunWorkspace.ProjectDir,
 			ProductModes: opts.RunWorkspace.ProductModes, PolicyModes: opts.RunWorkspace.PolicyModes,
 			BackendModes: opts.RunWorkspace.BackendModes, MaximumAccess: opts.RunWorkspace.MaximumAccess,
+			// 子 Run 与主 Run 对称初始化交付契约（spec §7.1 阶段 A 前提）。
+			IntentResolver: opts.RunWorkspace.IntentResolver, ArtifactRuns: opts.RunWorkspace.ArtifactRuns,
 		}),
 	}
 	if opts.SubAgentStore != nil {
@@ -558,6 +565,10 @@ func BuildAgentService(ctx context.Context, opts BuildOptions) (*RuntimeBundle, 
 	if err != nil {
 		return nil, fmt.Errorf("初始化 subagent 后台管理器失败: %w", err)
 	}
+	var taskInputResolver subagenttask.InputResolver
+	if resolver, ok := opts.RunWorkspace.RequestInputs.(subagenttask.InputResolver); ok {
+		taskInputResolver = resolver
+	}
 	taskTool, err := subagenttask.New(subagenttask.Deps{
 		Catalog:           subAgentCatalog,
 		Controller:        subagentController,
@@ -566,6 +577,7 @@ func BuildAgentService(ctx context.Context, opts BuildOptions) (*RuntimeBundle, 
 		Approval:          opts.SubAgentApproval,
 		SnapshotSource:    contextsnapshot.NewPersistentSource(memStore),
 		Background:        subagentBackground,
+		InputResolver:     taskInputResolver,
 		DelegationPosture: opts.SubAgentDelegationPosture,
 		MaxConcurrent:     maxConcurrent,
 	})

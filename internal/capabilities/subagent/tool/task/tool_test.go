@@ -8,8 +8,10 @@ import (
 	"time"
 
 	approvalmodel "genesis-agent/internal/capabilities/approval/model"
+	subagentcontract "genesis-agent/internal/capabilities/subagent/contract"
 	submodel "genesis-agent/internal/capabilities/subagent/model"
 	"genesis-agent/internal/capabilities/subagent/service"
+	workmodel "genesis-agent/internal/capabilities/workspace/model"
 	"genesis-agent/internal/domain"
 	"genesis-agent/internal/platform/contextutil"
 	"genesis-agent/internal/runtime/multiagent/contextsnapshot"
@@ -323,4 +325,45 @@ func TestTaskRejectsNegativeRuntimeLimits(t *testing.T) {
 	}
 }
 
+type fakeInputResolver struct {
+	resolved []workmodel.ResourceRef
+}
+
+func (r *fakeInputResolver) ResolveAvailableInputs(_ context.Context, _ []string) ([]workmodel.ResourceRef, error) {
+	return r.resolved, nil
+}
+
+func TestTaskResolvesInputFilesIntoSpawnRequest(t *testing.T) {
+	controller := &fakeController{}
+	ref := workmodel.ResourceRef{Authority: "host", Scheme: "file", ID: "file-123", Path: "demo.md"}
+	resolver := &fakeInputResolver{resolved: []workmodel.ResourceRef{ref}}
+	created, err := New(Deps{
+		Catalog:       service.NewMemoryCatalog([]submodel.Definition{{Name: "worker", SystemPrompt: "work"}}),
+		Controller:    controller,
+		BaseAgent:     &domain.Agent{ID: "root", Name: "root"},
+		Approval:      approved{},
+		InputResolver: resolver,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := created.Execute(context.Background(), `{"subagent_type":"worker","prompt":"do work"}`); err != nil {
+		t.Fatal(err)
+	}
+	// Verify that fork/delegate with InputFiles resolves and populates SpawnRequest.Inputs
+	req := subagentcontract.DelegateRequest{
+		SubagentType: "worker",
+		Prompt:       "do work",
+		Description:  "work with input",
+		InputFiles:   []string{"demo.md"},
+	}
+	if _, err := created.Delegate(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if len(controller.request.Inputs) != 1 || controller.request.Inputs[0].ID != "file-123" {
+		t.Fatalf("expected resolved input in SpawnRequest, got: %+v", controller.request.Inputs)
+	}
+}
+
 var _ contract.BackgroundRunner = (*recordingBackgroundRunner)(nil)
+

@@ -1,6 +1,7 @@
 package approval
 
 import (
+	"fmt"
 	"path/filepath"
 	"strings"
 
@@ -16,7 +17,6 @@ type Choice struct {
 }
 
 // BuildChoices 按策略建议的时间作用域与资源类型组合生成审批选项。
-// 文件资源在 session/project 下额外提供「本文件 / 本文件夹」正交选择。
 func BuildChoices(req model.Request, result model.PolicyResult) []Choice {
 	choices := []Choice{{
 		Key:     "y",
@@ -37,7 +37,7 @@ func BuildChoices(req model.Request, result model.PolicyResult) []Choice {
 			choices = append(choices, Choice{
 				Key:     "s",
 				Aliases: []string{"session"},
-				Label:   "允许本会话·本文件",
+				Label:   "允许本会话·本文件 (本次对话有效)",
 				Decision: model.Decision{
 					Type:     model.DecisionApprovedForScope,
 					Scope:    model.GrantScopeSession,
@@ -49,7 +49,7 @@ func BuildChoices(req model.Request, result model.PolicyResult) []Choice {
 				choices = append(choices, Choice{
 					Key:     "d",
 					Aliases: []string{"session-dir", "session_dir"},
-					Label:   "允许本会话·本文件夹",
+					Label:   "允许本会话·本文件夹 (本次对话有效)",
 					Decision: model.Decision{
 						Type:     model.DecisionApprovedForScope,
 						Scope:    model.GrantScopeSession,
@@ -62,7 +62,7 @@ func BuildChoices(req model.Request, result model.PolicyResult) []Choice {
 			choices = append(choices, Choice{
 				Key:     "s",
 				Aliases: []string{"session"},
-				Label:   "允许本会话",
+				Label:   "允许本会话 (本次对话有效)",
 				Decision: model.Decision{
 					Type:   model.DecisionApprovedForScope,
 					Scope:  model.GrantScopeSession,
@@ -72,12 +72,12 @@ func BuildChoices(req model.Request, result model.PolicyResult) []Choice {
 		}
 	}
 
-	// project 仅对文件动作开放：当前仅文件域具备 .genesis/grants.yaml 持久化。
+	// project 仅对文件动作开放：项目级授权写入工作区持久化保存
 	if fileLike && supportsScope(result, req, model.GrantScopeProject) {
 		choices = append(choices, Choice{
 			Key:     "p",
 			Aliases: []string{"project"},
-			Label:   "允许本项目·本文件",
+			Label:   "允许本项目·本文件 (记住选择，总是允许)",
 			Decision: model.Decision{
 				Type:     model.DecisionApprovedForScope,
 				Scope:    model.GrantScopeProject,
@@ -89,7 +89,7 @@ func BuildChoices(req model.Request, result model.PolicyResult) []Choice {
 			choices = append(choices, Choice{
 				Key:     "f",
 				Aliases: []string{"project-dir", "project_dir"},
-				Label:   "允许本项目·本文件夹",
+				Label:   "允许本项目·本文件夹 (记住选择，总是允许)",
 				Decision: model.Decision{
 					Type:     model.DecisionApprovedForScope,
 					Scope:    model.GrantScopeProject,
@@ -100,57 +100,46 @@ func BuildChoices(req model.Request, result model.PolicyResult) []Choice {
 		}
 	}
 
-	choices = append(choices,
-		Choice{
-			Key:     "n",
-			Aliases: []string{"no", "deny"},
-			Label:   "拒绝",
-			Decision: model.Decision{
-				Type:   model.DecisionDenied,
-				Scope:  model.GrantScopeOnce,
-				Reason: "用户拒绝操作",
-			},
+	choices = append(choices, Choice{
+		Key:     "n",
+		Aliases: []string{"no", "deny"},
+		Label:   "拒绝",
+		Decision: model.Decision{
+			Type:   model.DecisionDenied,
+			Scope:  model.GrantScopeOnce,
+			Reason: "用户拒绝本次操作",
 		},
-		Choice{
-			Key:     "a",
-			Aliases: []string{"abort"},
-			Label:   "中断",
-			Decision: model.Decision{
-				Type:   model.DecisionAbort,
-				Scope:  model.GrantScopeOnce,
-				Reason: "用户中断任务",
-			},
-		},
-	)
+	})
+
 	return choices
 }
 
-// MatchChoice 按键或别名匹配选项。
+// FormatPrompt 格式化终端输入的快捷键提示文案。
+func FormatPrompt(choices []Choice) string {
+	parts := make([]string, 0, len(choices))
+	for _, c := range choices {
+		parts = append(parts, fmt.Sprintf("[%s]%s", strings.ToUpper(c.Key), c.Label))
+	}
+	return fmt.Sprintf("请选择 %s: ", strings.Join(parts, " / "))
+}
+
+// MatchChoice 匹配用户输入的快捷键。
 func MatchChoice(choices []Choice, input string) (Choice, bool) {
-	key := strings.ToLower(strings.TrimSpace(input))
-	if key == "" {
+	norm := strings.TrimSpace(strings.ToLower(input))
+	if norm == "" {
 		return Choice{}, false
 	}
-	for _, choice := range choices {
-		if key == choice.Key {
-			return choice, true
+	for _, c := range choices {
+		if norm == strings.ToLower(c.Key) {
+			return c, true
 		}
-		for _, alias := range choice.Aliases {
-			if key == alias {
-				return choice, true
+		for _, alias := range c.Aliases {
+			if norm == strings.ToLower(alias) {
+				return c, true
 			}
 		}
 	}
 	return Choice{}, false
-}
-
-// FormatPrompt 生成终端提示文案。
-func FormatPrompt(choices []Choice) string {
-	parts := make([]string, 0, len(choices))
-	for _, choice := range choices {
-		parts = append(parts, "["+strings.ToUpper(choice.Key)+"]"+choice.Label)
-	}
-	return "请选择 " + strings.Join(parts, " / ") + ": "
 }
 
 func isFileAction(req model.Request) bool {
@@ -161,32 +150,13 @@ func canOfferDirectoryMode(req model.Request) bool {
 	if req.Resource.Type == "directory" {
 		return false
 	}
-	switch req.Action {
-	case model.ActionFileList, model.ActionFileWalk:
+	res := strings.TrimSpace(req.Resource.Display)
+	if res == "" {
+		res = strings.TrimSpace(req.Resource.URI)
+	}
+	if res == "" || res == "." {
 		return false
 	}
-	path := requestBackendPath(req)
-	if path == "" {
-		return false
-	}
-	parent := filepath.Dir(filepath.Clean(path))
-	return parent != "" && parent != "." && parent != filepath.Clean(path)
-}
-
-func requestBackendPath(req model.Request) string {
-	if req.Metadata != nil {
-		if backend := strings.TrimSpace(req.Metadata["backend"]); backend != "" {
-			return backend
-		}
-	}
-	if req.Resource.Metadata != nil {
-		if backend := strings.TrimSpace(req.Resource.Metadata["backend"]); backend != "" {
-			return backend
-		}
-	}
-	uri := req.Resource.URI
-	if strings.HasPrefix(uri, "file://") {
-		return strings.TrimPrefix(uri, "file://")
-	}
-	return uri
+	dir := filepath.Dir(res)
+	return dir != "." && dir != "/" && dir != "\\"
 }

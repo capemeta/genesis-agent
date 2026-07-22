@@ -85,7 +85,7 @@ func (m *scriptedLLM) StreamGenerate(_ context.Context, messages []*domain.Messa
 		return domain.NewAssistantMessage("子任务结论 token=child-secret"), nil
 	case 3:
 		for _, message := range messages {
-			if message != nil && message.Role == domain.RoleTool && strings.Contains(message.Content, `"result_id"`) && !strings.Contains(message.Content, "child-secret") {
+			if message != nil && message.Role == domain.RoleTool && strings.Contains(message.Content, `"status"`) && !strings.Contains(message.Content, "child-secret") {
 				return domain.NewAssistantMessage("已收到子任务的安全摘要。"), nil
 			}
 		}

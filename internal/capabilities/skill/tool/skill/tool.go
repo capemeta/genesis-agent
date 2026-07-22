@@ -5,12 +5,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"regexp"
 	"strings"
+	"sync"
 
 	approvalcontract "genesis-agent/internal/capabilities/approval/contract"
 	approvalmodel "genesis-agent/internal/capabilities/approval/model"
 	hookcontract "genesis-agent/internal/capabilities/hook/contract"
 	hookmodel "genesis-agent/internal/capabilities/hook/model"
+	"genesis-agent/internal/capabilities/llm/vision"
+	viewimage "genesis-agent/internal/capabilities/media/tool/view_image"
 	skillcontract "genesis-agent/internal/capabilities/skill/contract"
 	"genesis-agent/internal/capabilities/skill/model"
 	subagentcontract "genesis-agent/internal/capabilities/subagent/contract"
@@ -18,6 +23,8 @@ import (
 	subagentprompt "genesis-agent/internal/capabilities/subagent/prompt"
 	tool "genesis-agent/internal/capabilities/tool/contract"
 	toolparam "genesis-agent/internal/capabilities/tool/param"
+	workcontract "genesis-agent/internal/capabilities/workspace/contract"
+	"genesis-agent/internal/runtime/progress"
 )
 
 const (
@@ -37,6 +44,7 @@ type Deps struct {
 type Tool struct {
 	deps     Deps
 	forkTask tool.Tool
+	inFlight sync.Map
 }
 
 // SetForkTask 由共享 bootstrap 在 Task 创建后注入唯一委派网关。
@@ -44,9 +52,10 @@ type Tool struct {
 func (t *Tool) SetForkTask(task tool.Tool) { t.forkTask = task }
 
 type input struct {
-	Skill    string `json:"skill,omitempty"`
-	Resource string `json:"resource,omitempty"`
-	Args     string `json:"args,omitempty"`
+	Skill      string   `json:"skill,omitempty"`
+	Resource   string   `json:"resource,omitempty"`
+	Args       string   `json:"args,omitempty"`
+	InputFiles []string `json:"inputs,omitempty"`
 }
 
 type dependencyOutput struct {
@@ -86,15 +95,16 @@ func New(deps Deps) (tool.Tool, error) {
 
 func (t *Tool) GetInfo() *tool.Info {
 	return &tool.Info{
-		Name:            toolNameSkill,
-		Description:     staticDescription,
+		Name:        toolNameSkill,
+		Description: staticDescription,
 		DescriptionFunc: t.renderDescription,
 		Parameters: &tool.ParameterSchema{
 			Type: "object",
 			Properties: map[string]*tool.ParameterSchema{
 				"skill":    {Type: "string", Description: "Skill 名称或 qualified_name，必须来自 <available_skills>，例如 office-ppt"},
 				"resource": {Type: "string", Description: "可选，不透明 resource id，用于消除同名冲突"},
-				"args":     {Type: "string", Description: "传给 Skill 的用户参数或任务上下文"},
+				"args":     {Type: "string", Description: "传给 Skill 的任务具体要求或上下文描述。对于 context: fork 技能（如 office-ppt），必须在此填入详细的任务目标与要求，禁止为空。"},
+				"inputs":   {Type: "array", Items: &tool.ParameterSchema{Type: "string"}, Description: "可选，显式指定引用的输入文件列表（如 [\"ultra5-comparison-summary.md\"]）。若未填则由系统按工作区真实文件自动匹配。"},
 			},
 			Required: []string{},
 		},
@@ -170,8 +180,11 @@ func (t *Tool) load(ctx context.Context, in input, modelCall bool, invocation st
 	if err := t.authorize(ctx, meta, depReport, invocation); err != nil {
 		return "", err
 	}
+	if err := t.checkRequiredCapabilities(ctx, meta); err != nil {
+		return "", err
+	}
 	if defaultContext(meta.Context) == model.ContextModeFork {
-		return t.fork(ctx, meta, resolveReq, in.Args)
+		return t.fork(ctx, meta, resolveReq, in.Args, in.InputFiles)
 	}
 	injection, err := t.deps.Service.Load(ctx, skillcontract.LoadRequest{ResolveRequest: resolveReq, Args: in.Args})
 	if err != nil {
@@ -204,7 +217,16 @@ func (t *Tool) load(ctx context.Context, in input, modelCall bool, invocation st
 	})
 }
 
-func (t *Tool) fork(ctx context.Context, meta model.Metadata, resolveReq skillcontract.ResolveRequest, args string) (string, error) {
+func (t *Tool) fork(ctx context.Context, meta model.Metadata, resolveReq skillcontract.ResolveRequest, args string, explicitInputs []string) (string, error) {
+	// 瞬间向 TUI 推送子 Agent 派生进度
+	progress.Emit(ctx, progress.Event{
+		Kind:      progress.KindSubAgent,
+		Phase:     progress.PhaseStart,
+		Component: "skill-gateway",
+		Name:      meta.QualifiedName,
+		Summary:   fmt.Sprintf("[Sub-Agent Worker] 派生沙箱 Worker 子智能体独立执行技能: %s", meta.QualifiedName),
+	})
+
 	if t.forkTask == nil {
 		return "", fmt.Errorf("skill %q 声明 context=fork，但 Task 委派网关未注入", meta.QualifiedName)
 	}
@@ -222,11 +244,31 @@ func (t *Tool) fork(ctx context.Context, meta model.Metadata, resolveReq skillco
 		return "", fmt.Errorf("skill %q 的 fork 内容为空", meta.QualifiedName)
 	}
 	args = strings.TrimSpace(args)
+	fingerprint := fmt.Sprintf("%s:%s", meta.QualifiedName, args)
+	if _, loaded := t.inFlight.LoadOrStore(fingerprint, true); loaded {
+		return fmt.Sprintf("【重复任务拦截】相同的技能任务 [%s] 正在后台运行中，请勿重复发起。请等待当前任务交卷。", meta.QualifiedName), nil
+	}
+	defer t.inFlight.Delete(fingerprint)
+
+	// 方案 B：若大模型显式传了 inputs，直接优先使用；未传则回退到方案 A (工作区真实存在性交集匹配)
+	inputFiles := normalizeInputs(explicitInputs)
+	if len(inputFiles) == 0 {
+		inputFiles = extractWorkspaceInputFiles(ctx, args)
+	}
+
+	// 规则校验：对于 context: fork 隔离技能，必须在 args 中有明确描述，或者在 inputs 中有显式文件。禁止同时为空！
+	if args == "" && len(inputFiles) == 0 {
+		return "", fmt.Errorf("MISSING_INPUT_REQUIRED: Skill %q 声明为 context: fork 物理沙箱隔离技能，委派子 Agent 必须在 args 中提供具体的任务描述，或在 inputs 中指定输入文件。请补充参数重新调用，例如 Skill(skill=%q, args=\"根据文件内容制作对比PPT\", inputs=[\"ultra5-comparison-summary.md\"])", meta.QualifiedName, meta.QualifiedName)
+	}
+
 	agentType := strings.TrimSpace(meta.Agent)
 	req := subagentcontract.DelegateRequest{
-		Description:  "执行 Skill " + meta.QualifiedName,
-		AllowedTools: cloneStrings(meta.AllowedTools),
-		PromptOrigin: "skill_fork",
+		Description:        "执行 Skill " + meta.QualifiedName,
+		AllowedTools:       cloneStrings(meta.AllowedTools),
+		InputFiles:         inputFiles,
+		PromptOrigin:       "skill_fork",
+		SkillQAPolicy:      strings.TrimSpace(meta.QA.Policy),
+		SkillQAEnforcement: strings.TrimSpace(meta.QA.Enforcement),
 	}
 	// Skill fork 一律 skill_isolated：不复制父聊天；正文进 definition/prompt，不注入主线程。
 	req.SnapshotMode = subagentcontract.SnapshotModeSkillIsolated
@@ -246,11 +288,7 @@ func (t *Tool) fork(ctx context.Context, meta model.Metadata, resolveReq skillco
 			SystemPrompt: body,
 			Tools:        cloneStrings(meta.AllowedTools),
 		}
-		if args != "" {
-			req.Prompt = args
-		} else {
-			req.Prompt = "按技能说明完成被委派的任务。"
-		}
+		req.Prompt = args
 	}
 	return delegator.Delegate(ctx, req)
 }
@@ -332,6 +370,31 @@ func (t *Tool) checkDependencies(ctx context.Context, meta model.Metadata, invoc
 		}
 	}
 	return report, nil
+}
+
+// checkRequiredCapabilities 仅处理 enforcement=required 的能力门槛。
+// vision：依据 Run 的 EffectiveVisionMode（由主模型 / router.vision 的真实 supports_image 求解），
+// degraded_text 时拒绝加载；optional 或不配置不做任何限制。
+func (t *Tool) checkRequiredCapabilities(ctx context.Context, meta model.Metadata) error {
+	for _, req := range meta.Requires {
+		if !model.IsRequiredEnforcement(req.Enforcement) {
+			continue
+		}
+		kind := strings.ToLower(strings.TrimSpace(req.Kind))
+		switch kind {
+		case "vision":
+			mode, ok := viewimage.VisionModeFromContext(ctx)
+			if !ok {
+				mode = vision.ModeDegradedText
+			}
+			if !vision.HasImageCapability(mode) {
+				return fmt.Errorf("SKILL_CAPABILITY_REQUIRED: Skill %q 声明 requires.vision=required，但当前 Run 无可用视觉模型（主模型与 router.vision 均未配置 supports_image=true）。请配置 models.*.supports_image 和/或 router.vision 后再调用", meta.QualifiedName)
+			}
+		default:
+			return fmt.Errorf("SKILL_CAPABILITY_REQUIRED: Skill %q 声明了未知能力门槛 kind=%q", meta.QualifiedName, req.Kind)
+		}
+	}
+	return nil
 }
 
 func (t *Tool) authorize(ctx context.Context, meta model.Metadata, deps dependencyReport, invocation string) error {
@@ -437,4 +500,101 @@ func defaultContext(value model.ContextMode) model.ContextMode {
 		return model.ContextModeInline
 	}
 	return value
+}
+
+func normalizeInputs(inputs []string) []string {
+	if len(inputs) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool)
+	var res []string
+	for _, item := range inputs {
+		clean := strings.TrimSpace(item)
+		if clean != "" && !seen[clean] {
+			seen[clean] = true
+			res = append(res, clean)
+		}
+	}
+	return res
+}
+
+func extractWorkspaceInputFiles(ctx context.Context, text string) []string {
+	if strings.TrimSpace(text) == "" {
+		return nil
+	}
+	seen := make(map[string]bool)
+	var res []string
+
+	addCandidate := func(candidate string) {
+		candidate = strings.TrimSpace(candidate)
+		if candidate != "" && !seen[candidate] {
+			seen[candidate] = true
+			res = append(res, candidate)
+		}
+	}
+
+	// 1. 方案 A 核心：工作区真实存在性交集匹配（Workspace File Intersection Matching）
+	// 不依赖正则猜中文词汇边界，而是拿真实工作区现存的文件名/别名与 Prompt 字符串比对（strings.Contains）
+	if prepared, ok := workcontract.PreparedRunFromContext(ctx); ok {
+		for _, inputRef := range prepared.Manifest.Inputs.Inputs {
+			name := strings.TrimSpace(inputRef.Name)
+			alias := strings.TrimSpace(string(inputRef.Alias))
+			if name != "" && strings.Contains(text, name) {
+				addCandidate(name)
+			} else if alias != "" && strings.Contains(text, alias) {
+				addCandidate(alias)
+			}
+		}
+		dirsToCheck := []string{
+			prepared.Execution.Workspace.WorkDir,
+			prepared.Execution.Workspace.InputDir,
+			prepared.Manifest.ProjectDir,
+		}
+		for _, dir := range dirsToCheck {
+			dir = strings.TrimSpace(dir)
+			if dir == "" {
+				continue
+			}
+			if entries, err := os.ReadDir(dir); err == nil {
+				for _, entry := range entries {
+					if entry.IsDir() {
+						continue
+					}
+					name := entry.Name()
+					if name != "" && strings.Contains(text, name) {
+						addCandidate(name)
+					}
+				}
+			}
+		}
+	}
+
+	// 2. 方案 A 备用：纯 ASCII/绝对路径/无 PreparedRun 时的标准模式提取
+	for _, m := range extractFallbackInputFiles(text) {
+		addCandidate(m)
+	}
+
+	return res
+}
+
+var fallbackPathPattern = regexp.MustCompile(`(?i)(?:[a-zA-Z]:[\\/][^\s"'，。；：、（）()]+|[a-zA-Z0-9_\-\.]+\.(?:md|markdown|txt|csv|tsv|json|ya?ml|pdf|docx?|xlsx?|pptx?|html?|xml|go|py|js|ts|java|sql|png|jpe?g))`)
+
+func extractFallbackInputFiles(text string) []string {
+	if strings.TrimSpace(text) == "" {
+		return nil
+	}
+	matches := fallbackPathPattern.FindAllString(text, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool)
+	var res []string
+	for _, m := range matches {
+		clean := strings.TrimSpace(m)
+		if clean != "" && !seen[clean] {
+			seen[clean] = true
+			res = append(res, clean)
+		}
+	}
+	return res
 }

@@ -612,8 +612,8 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 			microRes, microErr := e.compactor.MaybeMicroCompact(ctx, rc)
 			if microErr != nil {
 				iterLog.Warn("L1 Micro Compact 失败", "err", microErr)
-			} else if microRes.Triggered {
-				iterLog.Info("L1 Micro Compact 成功触发", "saved_tokens", microRes.TokensSaved)
+			} else if microRes.Triggered && microRes.TokensSaved > 1000 {
+				iterLog.Debug("L1 Micro Compact 成功触发", "saved_tokens", microRes.TokensSaved)
 			}
 
 			// 在压缩前，先记下本 Run 产生的增量消息数 N
@@ -909,7 +909,14 @@ func runCompletionPending(ctx context.Context) (bool, string, error) {
 		}
 		if !decision.Complete {
 			data, _ := json.Marshal(decision)
-			reminders = append(reminders, "Harness 根据持久化 Deliverable/Publication/Delivery/QA 事实判定尚未完成。若 run_skill_command 返回多个候选，只能调用 select_deliverable_candidate 选择 candidate_id；不得提交路径或自行复制文件。decision="+string(data))
+			var hints []string
+			if len(decision.PendingQAIDs) > 0 {
+				hints = append(hints, "仍有待完成 QA 检验的产物 (PendingQA)。请对生成的文件执行对应技能的 QA 检验脚本（如 office-ppt 的 thumbnail.py 或 soffice.py），或调用 select_deliverable_candidate 确认候选产物。")
+			}
+			if len(decision.MissingDeliverableIDs) > 0 {
+				hints = append(hints, "若 run_skill_command 返回了多个候选产物，请调用 select_deliverable_candidate 选择正确的 candidate_id 提交。")
+			}
+			reminders = append(reminders, fmt.Sprintf("【交付门禁未满足】%s\n(底层判定事实: %s)", strings.Join(hints, " "), string(data)))
 		}
 	}
 	if guard, ok := workcontract.CompletionGuardFromContext(ctx); ok {
@@ -1763,8 +1770,8 @@ func renderSkillScriptBridge(injection skillInjectionOutput) string {
 Skill Markdown 可移植，不必含 Genesis 工具名；适配由本 bridge 完成，不要改写第三方 SKILL.md / references。
 执行：文档中的 shell/脚本命令（python/python3/node/python -m 等）一律 run_skill_command(skill=%q, command=原文)。解释器跟文档（.js/require→node；python/-m→python），勿把 Node 包装成 python -m。运行时会 materialize 完整 Skill 包到工作目录后再执行。
 写与 stage：刚 write_file("$WORK_DIR/...") 的下一跳 run_skill_command **必须**带 inputs=["$WORK_DIR/..."]（漏传会 input_binding_missing）；command 只用 stage 后相对名。用户指定的宿主路径可直接进 inputs（勿 run_command 搬运）。禁止把 /workspace 等执行面路径写入 inputs/write_file.path；禁止把 $WORK_DIR/$INPUT_DIR/$OUTPUT_DIR/$TMPDIR/$SKILL_DIR 写进 command（不会展开）。仅跑包内 scripts/ 或文件已在技能 cwd 时可省略 inputs。大脚本可拆分多次 write_file，或 append=true + expected_hash；工具参数截断后勿原样重试。
-禁止多行/长串 python -c、node -e/--eval（本地与远程 shell 引号均易失败）；仅极短单行探测。依赖：勿用 run_skill_command 跑 npm/pip install（含 SKILL 里的安装示例行）；靠 dependencies.runtime / profile，缺包看 dependency_missing 再用 install_skill_dependencies，勿先写探测脚本、勿全局装包绕过声明。
-产物与交付：produced[] 只有 Harness 的 candidate_id/name（视觉预览图可带 role=qa_asset，不表示已交付到项目根）；唯一 required 候选自动发布，多候选只用 select_deliverable_candidate。禁止提交路径/locator，禁止 write_file 伪造办公二进制。最终以 Publication/Delivery 为准，勿把 runs 或 $OUTPUT_DIR 当作用户已交付。Skill 命令产出按 SKILL 写相对 cwd；元数据 execution_backend 标明执行面——remote_sandbox/remote_session 时宿主 glob/list_dir/walk_dir/read_file 看不到技能 cwd 文件；run_skill_command 刚列出的 slide-*.jpg/thumbnails 等须继续用 run_skill_command 查看/文本 QA，禁止改用宿主 read_file（二进制也会省略 content）。
+禁止多行或复杂转义 python -c、node -e/--eval（本地与远程 shell 引号均易失败）；需要执行 JS/Python 时默认先写入脚本再执行。依赖：勿用 run_skill_command 跑 npm/pip install（含 SKILL 里的安装示例行）；靠 dependencies.runtime / profile，缺包看 dependency_missing 再用 install_skill_dependencies，勿先写探测脚本、勿全局装包绕过声明。
+产物与交付：子 Agent / Task 交付的产物已由 Harness 自动继承并注册到当前 Session。父 Agent 在 Task/Skill 完成后禁止调用 dir/ls/glob 去探测子 Agent 内部路径；直接向用户总结结论，多候选产物按需 select_deliverable_candidate。produced[] 只有 Harness 的 candidate_id/name（视觉预览图可带 role=qa_asset，不表示已交付到项目根）；唯一 required 候选自动发布，多候选只用 select_deliverable_candidate。禁止提交路径/locator，禁止 write_file 伪造办公二进制。最终以 Publication/Delivery 为准，勿把 runs 或 $OUTPUT_DIR 当作用户已交付。Skill 命令产出按 SKILL 写相对 cwd；元数据 execution_backend 标明执行面——remote_sandbox/remote_session 时宿主 glob/list_dir/walk_dir/read_file 看不到技能 cwd 文件；run_skill_command 刚列出的 slide-*.jpg/thumbnails 等须继续用 run_skill_command 查看/文本 QA，禁止改用宿主 read_file（二进制也会省略 content）。
 SKILL 要求先 Read 的链接与 QA 命令须执行；用 grep/rg 检测「不应出现」的文本时，exit_code=1 且空 stderr 视为未命中/通过，勿当脚本崩溃反复重试。因 dependency_missing/sandbox_unavailable/unsupported_environment 失败时如实报告缺口，勿换绝对路径或搜用户目录硬扛。
 </skill_runtime_bridge>`, name)
 }

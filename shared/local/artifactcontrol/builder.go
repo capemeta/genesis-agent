@@ -44,6 +44,7 @@ type Control struct {
 	Produced       workcontract.ProducedResourceRegistrar
 	ProducedStore  workcontract.ProducedResourceStore
 	Readers        workcontract.ResourceReaderRouter
+	Manifests      workcontract.RunManifestStore
 	RemoteSessions scriptservice.RemoteSessionBinder
 	Reservations   artifactcontract.OutputReservationAllocator
 	Deliverables   artifactcontract.DeliverableSpecStore
@@ -64,6 +65,7 @@ func Build(opts Options) (Control, error) {
 		maxBytes = defaultBufferedObjectMaxBytes
 	}
 	ids := idgen.NewUUIDGenerator()
+	artifactservice.GlobalAdoptionStore.SetStateRoot(opts.StateRoot)
 	manifests, err := localworkspace.NewManifestStore(opts.StateRoot)
 	if err != nil {
 		return Control{}, err
@@ -213,7 +215,7 @@ func Build(opts Options) (Control, error) {
 	if err != nil {
 		return Control{}, err
 	}
-	completion, err := artifactservice.NewCompletionEvaluator(ledger, ledger, ledger, ledger, ledger)
+	completion, err := artifactservice.NewCompletionEvaluator(ledger, ledger, ledger, ledger, ledger, producedStore)
 	if err != nil {
 		return Control{}, err
 	}
@@ -233,6 +235,7 @@ func Build(opts Options) (Control, error) {
 		Produced:       registrar,
 		ProducedStore:  producedStore,
 		Readers:        readerRouter,
+		Manifests:      manifests,
 		RemoteSessions: remoteSessions,
 		Reservations:   reservations,
 		Deliverables:   ledger,

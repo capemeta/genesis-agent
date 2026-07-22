@@ -38,7 +38,7 @@ sandbox:
 
   # 远程容器沙箱配置 (genesis-sandbox API / Docker Service)
   remote:
-    enabled: false            # Layer 1 硬门控开关：未开启时禁止任何远程调度
+    enabled: true            # Layer 1 硬门控开关：未开启时禁止任何远程调度
     base_url: ${GENESIS_SANDBOX_BASE_URL}
     api_key: ${GENESIS_SANDBOX_API_KEY}
     api_key_env: GENESIS_SANDBOX_API_KEY
@@ -60,6 +60,12 @@ sandbox:
 
 
 policy:
+  # 权限许可模式 PermissionMode
+  # agent: 工作区写免审批，命令/联网/Skill脚本需确认
+  # workspace_auto: 工作区值守——工作区内+联网免确认；区外写/装外部Skill/敏感路径硬拒绝（不弹窗）
+  # full_access: 免审批全放行（仍硬拒 critical）；protected_write/read_only/plan 见文档
+  # 可选: plan | read_only | protected_write | agent | workspace_auto | full_access
+  permission_mode: workspace_auto
   defaults:
     unknown: ask
     dangerous: ask

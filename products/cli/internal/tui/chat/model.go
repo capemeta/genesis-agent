@@ -13,6 +13,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"genesis-agent/internal/app"
 	approvalmodel "genesis-agent/internal/capabilities/approval/model"
@@ -103,6 +104,17 @@ type Model struct {
 	selectAnchor int  // 选择起点；-1 表示尚未标记
 	selectCursor int  // 当前选择光标，对应 selectableMessageIndexes 的下标
 	helpOverlay  bool // 快捷键与命令帮助覆盖层
+
+	// ── 鼠标拖选复制 ───────────────────────────────────────────
+	// 开启 WithMouseCellMotion 后终端原生拖选被拦截，改由应用内实现字符级拖选。
+	// 坐标以「消息区渲染内容」的可见行列表达（行=内容行下标，列=可见列）。
+	renderedPlainLines []string // 当前消息区内容去 ANSI 后的可见行，用于坐标映射/取文本/高亮
+	mouseSelecting     bool     // 鼠标左键是否处于按下拖动过程中
+	mouseSelActive     bool     // 是否存在需高亮的有效选区（拖动产生位移后置真）
+	selStartLine       int      // 选区锚点：内容行下标
+	selStartCol        int      // 选区锚点：可见列
+	selEndLine         int      // 选区光标：内容行下标
+	selEndCol          int      // 选区光标：可见列
 
 	commandSuggestionIndex  int    // Tab 循环补全当前候选下标；-1 表示未激活
 	commandSuggestionPrefix string // 本轮补全的初始前缀，保证 Tab 能循环候选
@@ -211,6 +223,7 @@ func NewModel(
 		historyIdx:             -1, // 初始化为未浏览历史状态
 		selectAnchor:           -1,
 		commandSuggestionIndex: -1,
+		progressExpanded:       true, // 运行过程默认展开
 	}
 }
 
@@ -372,7 +385,14 @@ func (m *Model) refreshViewportContent() {
 		msgs = tempMsgs
 	}
 
-	m.viewport.SetContent(renderMessages(msgs, m.width, m.progressExpanded, m.selectMode, m.selectAnchor, m.selectCursor))
+	content := renderMessages(msgs, m.width, m.progressExpanded, m.selectMode, m.selectAnchor, m.selectCursor)
+	m.viewport.SetContent(content)
+	// 缓存去 ANSI 的可见行，供鼠标拖选做坐标映射、取文本与高亮。
+	m.renderedPlainLines = strings.Split(ansi.Strip(content), "\n")
+	// 若正处于鼠标选区中，重绘后需重新叠加高亮，避免被样式内容覆盖。
+	if m.mouseSelActive {
+		m.applyMouseSelectionHighlight()
+	}
 }
 
 func (m *Model) renderApprovalCard() string {
@@ -1074,7 +1094,7 @@ const helpText = `可用命令（以 / 开头）:
   PgDn     向下翻页
   鼠标滚轮 滚动消息历史
   Ctrl+P/N 上一条/下一条输入历史
-  Shift+拖选 终端原生选取文本（启用鼠标捕获后需按住 Shift）`
+  鼠标拖选 拖动选取消息区文本，松开即复制（无需按 Shift）`
 
 // welcomeMsg 首次进入对话时显示的欢迎消息
 func welcomeMsg(modelName, sessionID string) uiMessage {

@@ -23,6 +23,25 @@ func TestTaskDeliverableInitializerCreatesTypeOnlyPPTContract(t *testing.T) {
 	if len(specs) != 1 || specs[0].QAPolicy != "visual-qa/v1" || specs[0].AcceptedSuffix[0] != ".pptx" || specs[0].DesiredName != "" {
 		t.Fatalf("spec=%+v", specs)
 	}
+	if specs[0].QAEnforcement != "" {
+		t.Fatalf("default pptx QA must be soft (empty enforcement), got %q", specs[0].QAEnforcement)
+	}
+}
+
+func TestTaskDeliverableInitializerAppliesSkillQAOverride(t *testing.T) {
+	store := artifactmemory.NewStore()
+	initializer, _ := NewTaskDeliverableInitializer(store)
+	err := initializer.InitializeRun(context.Background(), artifactcontract.RunInitializationRequest{
+		TenantID: "tenant", RunID: "run-skill-qa", Prompt: "做个 PPT", ArtifactRequired: true,
+		QAPolicy: "visual-qa/v1", QAEnforcement: "required",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	specs, _ := store.ListDeliverables(context.Background(), "tenant", "run-skill-qa")
+	if len(specs) != 1 || specs[0].QAPolicy != "visual-qa/v1" || specs[0].QAEnforcement != "required" {
+		t.Fatalf("skill QA override not applied: %+v", specs)
+	}
 }
 
 func TestTaskDeliverableInitializerDoesNotExtractNameFromNaturalLanguage(t *testing.T) {

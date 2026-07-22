@@ -41,7 +41,7 @@ func newChatCmd(configDirRef *string, sandboxModeRef *string, factory ServiceFac
   ↑ / ↓      输入为空时滚动消息历史
   PgUp/PgDn  快速翻页
   鼠标滚轮   滚动消息历史
-  Shift+拖选 终端原生选取文本并复制（启用鼠标捕获后需按住 Shift）
+  鼠标拖选   拖动选取消息区文本，松开即复制（无需按 Shift）
 
 内置命令（以 / 开头）:
   /clear     清空当前会话历史，开始新对话
@@ -88,8 +88,9 @@ func newChatCmd(configDirRef *string, sandboxModeRef *string, factory ServiceFac
 
 			// 启动 TUI 程序
 			// WithAltScreen: 使用备用屏幕，退出后恢复原始终端内容。
-			// WithMouseCellMotion: 接收滚轮事件以滚动消息区。
-			// 原生拖选需按住 Shift（Windows Terminal / 多数现代终端均支持）。
+			// WithMouseCellMotion: 捕获鼠标（滚轮 + 拖动）。滚轮滚动消息区；
+			// 由于捕获鼠标会拦截终端原生拖选，改由应用内实现鼠标拖选并复制
+			// （见 chat.handleMouse），因此滚轮与选中复制可同时可用、无需按 Shift。
 			p := tea.NewProgram(
 				m,
 				tea.WithAltScreen(),

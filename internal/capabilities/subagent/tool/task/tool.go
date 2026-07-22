@@ -16,15 +16,22 @@ import (
 	"genesis-agent/internal/capabilities/subagent/service"
 	tool "genesis-agent/internal/capabilities/tool/contract"
 	toolparam "genesis-agent/internal/capabilities/tool/param"
+	workmodel "genesis-agent/internal/capabilities/workspace/model"
 	"genesis-agent/internal/domain"
 	"genesis-agent/internal/platform/contextutil"
 	"genesis-agent/internal/runtime/multiagent/contextsnapshot"
 	"genesis-agent/internal/runtime/multiagent/contract"
 	"genesis-agent/internal/runtime/multiagent/model"
+	"genesis-agent/internal/runtime/progress"
 )
 
 const toolName = "Task"
 const maxDelegationInputRunes = 32_000
+
+// InputResolver 是产品控制面的裸路径到已授权 ResourceRef 转换端口。
+type InputResolver interface {
+	ResolveAvailableInputs(ctx context.Context, inputs []string) ([]workmodel.ResourceRef, error)
+}
 
 // Deps 是 Task 的产品无关依赖。
 type Deps struct {
@@ -35,6 +42,7 @@ type Deps struct {
 	Approval       approvalcontract.Service
 	SnapshotSource contextsnapshot.TranscriptSnapshotSource
 	Background     contract.BackgroundRunner
+	InputResolver  InputResolver
 	// DelegationPosture 影响 Task Description 中的委派姿态文案。
 	DelegationPosture string
 	// MaxConcurrent 写入 Description 的并行提示（与 SlotLimiter 硬限一致）。
@@ -59,6 +67,7 @@ type input struct {
 	ForkContext  *bool    `json:"fork_context,omitempty"`
 	Resume       string   `json:"resume,omitempty"`
 	AllowedTools []string `json:"allowed_tools,omitempty"`
+	InputFiles   []string `json:"input_files,omitempty"`
 }
 
 // New 创建 Task。
@@ -76,7 +85,7 @@ func New(deps Deps) (*Tool, error) {
 func (t *Tool) GetInfo() *tool.Info {
 	// ConcurrencySafe=true：同轮多个 Task 由 scheduler 并行；并发槽位由 Controller SlotLimiter 硬限。
 	// ReadOnly=false：父会话会创建/更新子智能体实例，不等于「子代理只读」。
-	return &tool.Info{Name: toolName, Description: "委派独立子智能体执行任务；resume 可基于已完成 agent_id 发起后续任务。", DescriptionFunc: t.description, Parameters: &tool.ParameterSchema{Type: "object", Properties: map[string]*tool.ParameterSchema{"subagent_type": {Type: "string", Description: "新建时来自 available_agents 的子智能体类型"}, "prompt": {Type: "string", Description: "给子智能体的完整、独立任务说明；resume 时为后续任务"}, "resume": {Type: "string", Description: "可选，已完成 Task 返回的 agent_id；存在时忽略新建定义字段"}, "description": {Type: "string", Description: "委派摘要，用于审批和进度"}, "run_in_background": {Type: "boolean", Description: "为 true 时立即返回 agent_id"}, "fork_context": {Type: "boolean", Description: "为 true 时传入经过过滤的父线程背景（resume 不适用）"}, "max_turns": {Type: "integer", Description: "子 Run 最大轮次，仅可收紧"}, "max_tokens": {Type: "integer", Description: "子 Run token 硬预算，仅可收紧"}, "max_tool_calls": {Type: "integer", Description: "子 Run 工具调用硬上限，仅可收紧"}, "timeout_seconds": {Type: "integer", Description: "子 Run 墙钟超时秒数，仅可收紧"}}, Required: []string{"prompt"}}, Traits: tool.ToolTraits{Exposure: tool.ToolExposureDirect, ReadOnly: false, ConcurrencySafe: true, NeedsPermission: true}}
+	return &tool.Info{Name: toolName, Description: "委派独立子智能体执行任务；resume 可基于已完成 agent_id 发起后续任务。", DescriptionFunc: t.description, Parameters: &tool.ParameterSchema{Type: "object", Properties: map[string]*tool.ParameterSchema{"subagent_type": {Type: "string", Description: "新建时来自 available_agents 的子智能体类型"}, "prompt": {Type: "string", Description: "给子智能体的完整、独立任务说明；resume 时为后续任务"}, "resume": {Type: "string", Description: "可选，已完成 Task 返回的 agent_id；存在时忽略新建定义字段"}, "description": {Type: "string", Description: "委派摘要，用于审批和进度"}, "run_in_background": {Type: "boolean", Description: "为 true 时立即返回 agent_id"}, "fork_context": {Type: "boolean", Description: "为 true 时传入经过过滤的父线程背景（resume 不适用）"}, "input_files": {Type: "array", Items: &tool.ParameterSchema{Type: "string"}, Description: "可选，带入子智能体沙箱的输入文件列表，如 [\"a.md\"]"}, "max_turns": {Type: "integer", Description: "子 Run 最大轮次，仅可收紧"}, "max_tokens": {Type: "integer", Description: "子 Run token 硬预算，仅可收紧"}, "max_tool_calls": {Type: "integer", Description: "子 Run 工具调用硬上限，仅可收紧"}, "timeout_seconds": {Type: "integer", Description: "子 Run 墙钟超时秒数，仅可收紧"}}, Required: []string{"prompt"}}, Traits: tool.ToolTraits{Exposure: tool.ToolExposureDirect, ReadOnly: false, ConcurrencySafe: true, NeedsPermission: true}}
 }
 
 func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
@@ -101,6 +110,7 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 		TimeoutSec:   in.TimeoutSec,
 		ForkContext:  in.ForkContext,
 		AllowedTools: in.AllowedTools,
+		InputFiles:   in.InputFiles,
 		PromptOrigin: "model",
 	})
 }
@@ -164,6 +174,20 @@ func (t *Tool) Delegate(ctx context.Context, req subagentcontract.DelegateReques
 		PathFormat: "workspace-relative",
 	})
 
+	var inputSources []workmodel.ResourceRef
+	if len(req.InputFiles) > 0 {
+		var hints []string
+		for _, f := range req.InputFiles {
+			hints = append(hints, fmt.Sprintf("- %s", f))
+		}
+		req.Prompt += fmt.Sprintf("\n\n【关联输入文件通知】本任务关切的输入文件如下，请直接通过 read_file 工具读取对应文件名：\n%s", strings.Join(hints, "\n"))
+		if t.deps.InputResolver != nil {
+			if resolved, err := t.deps.InputResolver.ResolveAvailableInputs(ctx, req.InputFiles); err == nil {
+				inputSources = resolved
+			}
+		}
+	}
+
 	mode, parentMessages, toolCallID, err := t.resolveSnapshot(ctx, definition, req)
 	if err != nil {
 		return "", err
@@ -189,13 +213,37 @@ func (t *Tool) Delegate(ctx context.Context, req subagentcontract.DelegateReques
 		return "", fmt.Errorf("构造子智能体输入失败: %w", err)
 	}
 	spawnCtx := contextsnapshot.WithoutParentSnapshot(ctx)
+	if parentSink := progress.FromContext(ctx); parentSink != nil {
+		subName := definition.Name
+		subDepth := currentDepth + 1
+		childSink := func(ev progress.Event) {
+			if ev.Depth <= 0 {
+				ev.Depth = subDepth
+			}
+			if ev.SubAgentID == "" {
+				ev.SubAgentID = subName
+			}
+			if !strings.HasPrefix(ev.Summary, "[Sub-Agent") {
+				ev.Summary = fmt.Sprintf("[Sub-Agent: %s] %s", subName, ev.Summary)
+			}
+			parentSink(ev)
+		}
+		// 用 ChildBridge 而非 WithSink：Controller 会清掉父 Sink，只认显式桥接。
+		spawnCtx = progress.WithChildBridge(spawnCtx, childSink)
+	}
 	timeout := stricterDuration(time.Duration(definition.TimeoutSec)*time.Second, time.Duration(req.TimeoutSec)*time.Second)
 	budget := contract.TreeBudgetFromContext(ctx)
 	if budget == nil {
 		budget = contract.NewTreeBudget(agent.RuntimePolicy.MaxTokens, agent.RuntimePolicy.MaxToolCalls)
 	}
 	spawnCtx = contract.WithTreeBudget(spawnCtx, budget)
-	instance, err := t.deps.Controller.Spawn(spawnCtx, contract.SpawnRequest{SessionID: sessionID, TenantID: tenantID, ParentRunID: parentRunID, Depth: currentDepth + 1, MaxDepth: maxDepth, ReadOnly: readOnly, SubagentType: definition.Name, Prompt: delegation.UserInput, Agent: agent, Timeout: timeout, Budget: budget})
+	instance, err := t.deps.Controller.Spawn(spawnCtx, contract.SpawnRequest{
+		SessionID: sessionID, TenantID: tenantID, ParentRunID: parentRunID,
+		Depth: currentDepth + 1, MaxDepth: maxDepth, ReadOnly: readOnly,
+		SubagentType: definition.Name, Prompt: delegation.UserInput, Agent: agent,
+		Timeout: timeout, Budget: budget, Inputs: inputSources,
+		SkillQAPolicy: req.SkillQAPolicy, SkillQAEnforcement: req.SkillQAEnforcement,
+	})
 	if err != nil {
 		return "", err
 	}
@@ -294,6 +342,14 @@ func (t *Tool) resume(ctx context.Context, in input) (string, error) {
 }
 
 func encode(value any) (string, error) {
+	if tr, ok := value.(model.TaskResult); ok {
+		encoded, err := json.Marshal(tr.ToCompact())
+		if err != nil {
+			return "", fmt.Errorf("编码 Task 结果失败: %w", err)
+		}
+		return string(encoded), nil
+	}
+
 	encoded, err := json.Marshal(value)
 	if err != nil {
 		return "", fmt.Errorf("编码 Task 结果失败: %w", err)
@@ -410,8 +466,14 @@ func (t *Tool) childAgent(definition subagentmodel.Definition, readOnly bool, pa
 	if len(definition.Tools) > 0 {
 		allowed = intersect(allowed, definition.Tools)
 	}
+	// 只有处于沙箱环境（如 skill-fork 派生或声明了 run_skill_command）的子智能体才需要剔除宿主机高危 run_command
+	isSandboxed := strings.HasPrefix(definition.Name, "skill-fork:") || containsString(definition.Tools, "run_skill_command") || containsString(definition.Tools, "sandbox_exec")
+
 	for _, name := range allowed {
 		if name == "TaskOutput" || name == "TaskStop" || name == "Skill" {
+			continue
+		}
+		if name == "run_command" && isSandboxed {
 			continue
 		}
 		if name == toolName && !allowDelegation {
@@ -468,4 +530,13 @@ func isReadOnly(name string) bool {
 	default:
 		return false
 	}
+}
+
+func containsString(slice []string, target string) bool {
+	for _, item := range slice {
+		if item == target {
+			return true
+		}
+	}
+	return false
 }

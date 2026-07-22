@@ -242,7 +242,7 @@ func (c *Container) Init(ctx context.Context) error {
 			return
 		}
 		extraTools := append([]toolcontract.Tool{}, skillStack.Tools...)
-		if viewTool, viewErr := buildViewImageTool(".", approvalSvc, c.deps.ProducedStore, c.deps.ResourceReaders); viewErr != nil {
+		if viewTool, viewErr := buildViewImageTool(".", approvalSvc, c.deps.ProducedStore, c.deps.ResourceReaders, c.deps.RunManifests); viewErr != nil {
 			c.closeSkillStack()
 			_ = runtimeLogging.Close()
 			c.logging = nil
@@ -568,7 +568,7 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-func buildViewImageTool(workspaceRoot string, baseApproval approvalcontract.Service, produced workspacecontract.ProducedResourceStore, readers workspacecontract.ResourceReaderRouter) (toolcontract.Tool, error) {
+func buildViewImageTool(workspaceRoot string, baseApproval approvalcontract.Service, produced workspacecontract.ProducedResourceStore, readers workspacecontract.ResourceReaderRouter, manifests workspacecontract.RunManifestStore) (toolcontract.Tool, error) {
 	if strings.TrimSpace(workspaceRoot) == "" {
 		workspaceRoot = "."
 	}
@@ -594,6 +594,9 @@ func buildViewImageTool(workspaceRoot string, baseApproval approvalcontract.Serv
 	}
 	if readers != nil {
 		t = viewimage.WithReaders(t, readers)
+	}
+	if manifests != nil {
+		t = viewimage.WithManifests(t, manifests)
 	}
 	return t, nil
 }

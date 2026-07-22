@@ -231,7 +231,7 @@ type ExecutionIntent struct {
 	BoundedOutputs     bool
 	NeedsPersistentRun bool
 	HasProject         bool
-	ArtifactRequired   bool // 任务承诺生成用户可见文件，完成前必须正式发布 Artifact
+	ArtifactRequired   bool // 显式承诺生成用户可见文件（API/Supplied）；NLP 不再据此预建交付门禁
 }
 
 // StageRequest 描述一次 execution 的输入集合。

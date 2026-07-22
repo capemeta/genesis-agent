@@ -402,6 +402,9 @@ func buildDesktopViewImage(workspaceRoot string, baseApproval approvalcontract.S
 	if control.Readers != nil {
 		t = viewimage.WithReaders(t, control.Readers)
 	}
+	if control.Manifests != nil {
+		t = viewimage.WithManifests(t, control.Manifests)
+	}
 	return t, nil
 }
 

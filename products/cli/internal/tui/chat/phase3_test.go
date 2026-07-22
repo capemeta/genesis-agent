@@ -268,3 +268,52 @@ func TestHeaderViewStaysWithinNarrowTerminal(t *testing.T) {
 		}
 	}
 }
+
+func TestChronologicalRollingProgressLog(t *testing.T) {
+	m := NewModel(context.Background(), nil, nil)
+	model, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 40})
+	m = model.(Model)
+	m.progressExpanded = true
+
+	// 1. total <= 5: complete display
+	msgShort := uiMessage{
+		role:        "system",
+		isProgress:  true,
+		progressLog: []string{"[Sub-Agent: Worker] 思考: 尝试分析", "step 2", "step 3"},
+	}
+	m.messages = []uiMessage{msgShort}
+	m.refreshViewportContent()
+	viewShort := m.viewport.View()
+	for _, step := range []string{"思考: 尝试分析", "step 2", "step 3"} {
+		if !strings.Contains(viewShort, step) {
+			t.Fatalf("short log missing step %q: %s", step, viewShort)
+		}
+	}
+
+	// 2. All lines rendered without 5-line cap
+	msgLong := uiMessage{
+		role:       "system",
+		isProgress: true,
+		progressLog: []string{
+			"[Sub-Agent: Worker] 思考: 尝试分析系统日志并解决特定报错",
+			"工具执行 1",
+			"工具执行 2",
+			"[Sub-Agent: Worker] 失败: 命令未找到",
+			"工具执行 3",
+			"工具执行 4",
+			"工具执行 5",
+			"工具执行 6",
+		},
+	}
+	m.messages = []uiMessage{msgLong}
+	m.refreshViewportContent()
+	viewLong := m.viewport.View()
+
+	// Every single line must be rendered in natural order
+	for _, want := range msgLong.progressLog {
+		if !strings.Contains(viewLong, want) {
+			t.Fatalf("full log missing line %q: %s", want, viewLong)
+		}
+	}
+}
+

@@ -28,7 +28,7 @@ type Deps struct {
 type Tool struct{ deps Deps }
 
 type input struct {
-	Name    string `json:"name,omitempty"`
+	Skill   string `json:"skill,omitempty"`
 	Package string `json:"package,omitempty"`
 }
 
@@ -49,7 +49,7 @@ func New(deps Deps) (tool.Tool, error) {
 }
 
 func (t *Tool) GetInfo() *tool.Info {
-	return &tool.Info{Name: "list_skill_resources", Description: "列出 Skill 包内 references、scripts、assets 资源元数据。只返回 resource id、类型、文件名、大小和是否文本，不读取资源内容。", Parameters: &tool.ParameterSchema{Type: "object", Properties: map[string]*tool.ParameterSchema{"name": {Type: "string", Description: "Skill 名称或 qualified_name"}, "package": {Type: "string", Description: "可选 package id，用于直接定位 skill"}}}, Traits: tool.ToolTraits{Exposure: tool.ToolExposureDirect, ReadOnly: true, ConcurrencySafe: true, NeedsPermission: true}}
+	return &tool.Info{Name: "list_skill_resources", Description: "列出 Skill 包内 references、scripts、assets 资源元数据。只返回 resource id、类型、文件名、大小和是否文本，不读取资源内容。", Parameters: &tool.ParameterSchema{Type: "object", Properties: map[string]*tool.ParameterSchema{"skill": {Type: "string", Description: "Skill 名称或 qualified_name，例如 office-ppt"}, "package": {Type: "string", Description: "可选 package id，用于直接定位 skill"}}}, Traits: tool.ToolTraits{Exposure: tool.ToolExposureDirect, ReadOnly: true, ConcurrencySafe: true, NeedsPermission: true}}
 }
 
 func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
@@ -58,9 +58,9 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 		return "", fmt.Errorf("解析list_skill_resources参数失败: %w", err)
 	}
 	pkg := model.PackageID(strings.TrimSpace(in.Package))
-	name := strings.TrimSpace(in.Name)
+	name := strings.TrimSpace(in.Skill)
 	if pkg == "" && name == "" {
-		return "", fmt.Errorf("name或package必须提供一个")
+		return "", fmt.Errorf("skill或package必须提供一个")
 	}
 	if err := t.authorize(ctx, pkg, name); err != nil {
 		return "", err

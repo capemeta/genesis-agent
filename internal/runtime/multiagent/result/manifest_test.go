@@ -30,3 +30,18 @@ func TestManifestRegistryRejectsUnboundContext(t *testing.T) {
 		t.Fatal("unbound context must not register artifact")
 	}
 }
+
+func TestManifestRegistryReplacesSameNameArtifact(t *testing.T) {
+	registry := NewManifestRegistry()
+	ctx := WithManifestRegistry(context.Background(), registry)
+	if !RegisterArtifact(ctx, model.Artifact{CandidateID: "old", Name: "deck.pptx", Kind: "file"}) {
+		t.Fatal("expected first registration")
+	}
+	if !RegisterArtifact(ctx, model.Artifact{CandidateID: "new", Name: "deck.pptx", Kind: "file"}) {
+		t.Fatal("expected replacement registration")
+	}
+	manifest, _ := registry.Snapshot()
+	if len(manifest.Artifacts) != 1 || manifest.Artifacts[0].CandidateID != "new" {
+		t.Fatalf("same-name artifact must keep latest only: %+v", manifest.Artifacts)
+	}
+}

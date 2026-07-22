@@ -23,7 +23,6 @@ func TestTerminalRequesterDecisions(t *testing.T) {
 		{name: "allow project file", in: "p\n", want: model.DecisionApprovedForScope, scope: model.GrantScopeProject, pathMode: model.PathGrantExact},
 		{name: "allow project dir", in: "f\n", want: model.DecisionApprovedForScope, scope: model.GrantScopeProject, pathMode: model.PathGrantDirectory},
 		{name: "deny", in: "n\n", want: model.DecisionDenied, scope: model.GrantScopeOnce},
-		{name: "abort", in: "a\n", want: model.DecisionAbort, scope: model.GrantScopeOnce},
 	}
 
 	for _, tt := range tests {

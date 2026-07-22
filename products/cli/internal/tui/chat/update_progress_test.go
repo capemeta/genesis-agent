@@ -1,6 +1,7 @@
 package chat
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -46,8 +47,15 @@ func TestMouseWheelScrollsViewport(t *testing.T) {
 	}
 }
 
+func TestNewModelProgressExpandedByDefault(t *testing.T) {
+	m := NewModel(context.Background(), nil, nil)
+	if !m.progressExpanded {
+		t.Fatal("expected progressExpanded to be true by default in NewModel")
+	}
+}
+
 func TestExpandProgressScrollsToBottom(t *testing.T) {
-	m := Model{viewport: viewport.New(40, 4), historyIdx: -1, width: 40}
+	m := Model{viewport: viewport.New(40, 4), historyIdx: -1, width: 40, progressExpanded: false}
 	m.messages = []uiMessage{{
 		role:        "system",
 		isProgress:  true,
@@ -260,5 +268,100 @@ func TestProgressSummaryDisplaysRunSkillPhaseTimings(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Fatalf("TUI 耗时摘要缺少 %q: %s", want, got)
 		}
+	}
+}
+
+func TestApplyProgressSubagentTagPreservedOnReplace(t *testing.T) {
+	m := Model{}
+	display := true
+
+	// 1. Subagent Tool Input Start
+	m.applyProgress(progress.Event{
+		Kind:        progress.KindTool,
+		Phase:       progress.PhaseStart,
+		CallID:      "call-sub-1",
+		SubAgentID:  "skill-fork:office-ppt",
+		Depth:       1,
+		Name:        "run_skill_command",
+		Detail:      `{"command":"node build.js"}`,
+		BlockType:   "tool_input",
+		Display:     &display,
+	})
+
+	if len(m.progressLog) != 1 || !strings.HasPrefix(m.progressLog[0], "[Sub-Agent: skill-fork:office-ppt]") {
+		t.Fatalf("expected subagent tag prefix, got: %#v", m.progressLog)
+	}
+
+	// 2. Tool Result Complete -> Replaces CallID and retains subagent tag
+	m.applyProgress(progress.Event{
+		Kind:        progress.KindTool,
+		Phase:       progress.PhaseComplete,
+		CallID:      "call-sub-1",
+		SubAgentID:  "skill-fork:office-ppt",
+		Depth:       1,
+		Name:        "run_skill_command",
+		Detail:      `{"command":"node build.js"}`,
+		BlockType:   "tool_result",
+		Display:     &display,
+	})
+
+	if len(m.progressLog) != 1 || !strings.HasPrefix(m.progressLog[0], "[Sub-Agent: skill-fork:office-ppt]") {
+		t.Fatalf("expected subagent tag prefix preserved on replace, got: %#v", m.progressLog)
+	}
+}
+
+func TestApplyProgressSubagentThinkingInPlaceStreaming(t *testing.T) {
+	m := Model{}
+	subAgentID := "skill-fork:office-ppt"
+	
+	// Stream 3 thinking delta tokens
+	for _, chunk := range []string{"the input", " file to", " understand"} {
+		m.applyProgress(progress.Event{
+			Kind:       progress.KindLLM,
+			Phase:      progress.PhaseProgress,
+			SubAgentID: subAgentID,
+			Depth:      1,
+			BlockType:  "thinking",
+			Detail:     chunk,
+		})
+	}
+
+	// Verify that all 3 delta tokens were updated IN-PLACE into a single progressLog line
+	if len(m.progressLog) != 1 {
+		t.Fatalf("expected exactly 1 progressLog line for thinking stream, got %d: %#v", len(m.progressLog), m.progressLog)
+	}
+	wantPrefix := "[Sub-Agent: skill-fork:office-ppt] 思考: the input file to understand"
+	if m.progressLog[0] != wantPrefix {
+		t.Fatalf("expected in-place accumulated thinking line %q, got %q", wantPrefix, m.progressLog[0])
+	}
+}
+func TestApplyProgressPreservesChronologicalOrderWithInterleavedThinking(t *testing.T) {
+	m := &Model{loading: true}
+	display := true
+
+	// 1. Tool 1 Start
+	m.applyProgress(progress.Event{
+		Kind: progress.KindTool, Phase: progress.PhaseStart, CallID: "call-1", Name: "run_skill_command", Detail: `{"command":"python -m markitdown"}`, Display: &display,
+	})
+
+	// 2. Interleaved Thinking
+	m.applyProgress(progress.Event{
+		Kind: progress.KindLLM, Phase: progress.PhaseProgress, SubAgentID: "Worker", Depth: 1, BlockType: "thinking", Detail: "Content QA looks good",
+	})
+
+	// 3. Tool 1 Complete (arrives after thinking)
+	m.applyProgress(progress.Event{
+		Kind: progress.KindTool, Phase: progress.PhaseComplete, CallID: "call-1", Name: "run_skill_command", Detail: `{"command":"python -m markitdown"}`, Display: &display,
+	})
+
+	if len(m.progressLog) != 3 {
+		t.Fatalf("expected 3 chronological log lines, got %d: %#v", len(m.progressLog), m.progressLog)
+	}
+	// Verify that thinking remains at index 1 and completion appends at index 2 (timeline order preserved)
+	if !strings.Contains(m.progressLog[1], "思考") {
+		t.Fatalf("index 1 should be thinking line: %s", m.progressLog[1])
+	}
+	if !strings.Contains(m.progressLog[2], "工具执行完成") {
+		t.Fatalf("index 2 should be completion line appended at end: %s", m.progressLog[2])
 	}
 }

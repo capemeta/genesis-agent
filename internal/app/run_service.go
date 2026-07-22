@@ -8,6 +8,7 @@ import (
 
 	agentappcontract "genesis-agent/internal/capabilities/agentapp/contract"
 	artifactcontract "genesis-agent/internal/capabilities/artifact/contract"
+	fspermission "genesis-agent/internal/capabilities/filesystem/permission"
 	hookcontract "genesis-agent/internal/capabilities/hook/contract"
 	hookmodel "genesis-agent/internal/capabilities/hook/model"
 	memorycontract "genesis-agent/internal/capabilities/memory/contract"
@@ -103,6 +104,9 @@ func (s *agentServiceImpl) RunOnce(ctx context.Context, req RunRequest) (*RunRes
 	ctx = artifactcontract.WithCompletionPolicy(ctx, s.workspace.Completion)
 	ctx = workcontract.WithCompletionGuard(ctx, s.workspace.WorkspaceCompletion)
 	ctx = artifactcontract.WithQAEvidenceRecorder(ctx, s.workspace.QAEvidence)
+	if s.cfg != nil {
+		ctx = fspermission.WithPermissionMode(ctx, fspermission.NormalizeMode(s.cfg.Policy.PermissionMode))
+	}
 	if req.OnProgress != nil {
 		ctx = progress.WithSink(ctx, req.OnProgress)
 	}

@@ -128,12 +128,15 @@ func TestModeEvaluator_FullAccessMode(t *testing.T) {
 	eval := NewModeEvaluator()
 	ctx := context.Background()
 
-	// Read, Write, CommandExec should all be allowed
+	// Read, Write, CommandExec, Skill/SubAgent 路径均应放行
 	actions := []approvalmodel.Action{
 		approvalmodel.ActionFileRead,
 		approvalmodel.ActionFileWrite,
 		approvalmodel.ActionCommandExec,
 		approvalmodel.ActionHTTPRequest,
+		approvalmodel.ActionSkillLoad,
+		approvalmodel.ActionSkillResourceRead,
+		approvalmodel.ActionSubAgentDelegate,
 	}
 
 	for _, act := range actions {
@@ -143,6 +146,15 @@ func TestModeEvaluator_FullAccessMode(t *testing.T) {
 		if err != nil || res.Type != approvalmodel.PolicyAllow {
 			t.Fatalf("expected PolicyAllow for FullAccess action %s, got %v, err: %v", act, res.Type, err)
 		}
+	}
+
+	// run_skill_command 形态：command.exec + tool 名
+	res, err := eval.Evaluate(ctx, PermissionModeFullAccess, approvalmodel.Request{
+		ToolName: "run_skill_command",
+		Action:   approvalmodel.ActionCommandExec,
+	})
+	if err != nil || res.Type != approvalmodel.PolicyAllow {
+		t.Fatalf("full_access run_skill_command: got %+v err=%v, want Allow", res, err)
 	}
 }
 
@@ -217,6 +229,50 @@ func TestModeEvaluator_ProtectedReadBehavior(t *testing.T) {
 	}
 }
 
+func TestModeEvaluator_WorkspaceAutoMode(t *testing.T) {
+	eval := NewModeEvaluator()
+	ctx := context.Background()
+
+	allowActions := []approvalmodel.Action{
+		approvalmodel.ActionFileRead,
+		approvalmodel.ActionFileWrite,
+		approvalmodel.ActionCommandExec,
+		approvalmodel.ActionHTTPRequest,
+		approvalmodel.ActionMCPCall,
+		approvalmodel.ActionSkillLoad,
+		approvalmodel.ActionSubAgentDelegate,
+	}
+	for _, act := range allowActions {
+		res, err := eval.Evaluate(ctx, PermissionModeWorkspaceAuto, approvalmodel.Request{Action: act})
+		if err != nil || res.Type != approvalmodel.PolicyAllow {
+			t.Fatalf("workspace_auto action %s: got %+v err=%v, want Allow", act, res, err)
+		}
+	}
+
+	res, err := eval.Evaluate(ctx, PermissionModeWorkspaceAuto, approvalmodel.Request{
+		Action:   approvalmodel.ActionFileWrite,
+		Metadata: map[string]string{"scope": "external"},
+	})
+	if err != nil || res.Type != approvalmodel.PolicyDeny {
+		t.Fatalf("workspace_auto external write: got %+v err=%v, want Deny", res, err)
+	}
+
+	res, err = eval.Evaluate(ctx, PermissionModeWorkspaceAuto, approvalmodel.Request{
+		Action: approvalmodel.ActionSkillInstall,
+	})
+	if err != nil || res.Type != approvalmodel.PolicyDeny {
+		t.Fatalf("workspace_auto skill install: got %+v err=%v, want Deny", res, err)
+	}
+
+	res, err = eval.Evaluate(ctx, PermissionModeWorkspaceAuto, approvalmodel.Request{
+		Action:   approvalmodel.ActionFileWrite,
+		Metadata: map[string]string{"protected": "true"},
+	})
+	if err != nil || res.Type != approvalmodel.PolicyDeny {
+		t.Fatalf("workspace_auto protected write: got %+v err=%v, want Deny", res, err)
+	}
+}
+
 func TestNarrowPermissionMode(t *testing.T) {
 	// Subagent cannot escalate beyond parent mode
 	if got := NarrowPermissionMode(PermissionModeAgent, PermissionModeFullAccess); got != PermissionModeAgent {
@@ -225,6 +281,9 @@ func TestNarrowPermissionMode(t *testing.T) {
 	if got := NarrowPermissionMode(PermissionModePlan, PermissionModeAgent); got != PermissionModePlan {
 		t.Fatalf("NarrowPermissionMode(plan, agent) = %s, want plan", got)
 	}
+	if got := NarrowPermissionMode(PermissionModeWorkspaceAuto, PermissionModeFullAccess); got != PermissionModeWorkspaceAuto {
+		t.Fatalf("NarrowPermissionMode(workspace_auto, full_access) = %s, want workspace_auto", got)
+	}
 
 	// Subagent can narrow permission
 	if got := NarrowPermissionMode(PermissionModeAgent, PermissionModePlan); got != PermissionModePlan {
@@ -232,6 +291,9 @@ func TestNarrowPermissionMode(t *testing.T) {
 	}
 	if got := NarrowPermissionMode(PermissionModeFullAccess, PermissionModeProtectedWrite); got != PermissionModeProtectedWrite {
 		t.Fatalf("NarrowPermissionMode(full_access, protected_write) = %s, want protected_write", got)
+	}
+	if got := NarrowPermissionMode(PermissionModeFullAccess, PermissionModeWorkspaceAuto); got != PermissionModeWorkspaceAuto {
+		t.Fatalf("NarrowPermissionMode(full_access, workspace_auto) = %s, want workspace_auto", got)
 	}
 }
 

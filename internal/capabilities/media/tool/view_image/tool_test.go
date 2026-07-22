@@ -79,9 +79,10 @@ func testDeps(files map[string][]byte) toolkit.Deps {
 	}
 }
 
-func TestViewImageRejectsAbsoluteAndNonImage(t *testing.T) {
+func TestViewImageSupportsAbsoluteHostPathAndRejectsNonImage(t *testing.T) {
 	t.Parallel()
-	tool, err := New(testDeps(map[string][]byte{"a.docx": []byte("not-image")}))
+	png := []byte{0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 1, 2, 3}
+	tool, err := New(testDeps(map[string][]byte{"D:/abs/a.png": png, "a.docx": []byte("not-image")}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,8 +91,8 @@ func TestViewImageRejectsAbsoluteAndNonImage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out, errInvalidPath) {
-		t.Fatalf("want invalid path, got %s", out)
+	if !strings.Contains(out, `"ok": true`) || !strings.Contains(out, "D:/abs/a.png") {
+		t.Fatalf("want ok true for absolute path, got %s", out)
 	}
 	out, err = tool.Execute(ctx, `{"path":"a.docx"}`)
 	if err != nil {

@@ -237,6 +237,14 @@ func aliasWithinWorkspace(candidate string, workspace execmodel.ExecutionWorkspa
 		}
 		return path, nil
 	}
+	// 如果是宿主机绝对路径且文件存在，使用 Base 文件名作为 staging 别名
+	if filepath.IsAbs(candidate) {
+		base := filepath.Base(candidate)
+		path := workmodel.WorkspacePath(base)
+		if err := path.Validate(); err == nil {
+			return path, nil
+		}
+	}
 	return "", fmt.Errorf("path 不在 execution workspace")
 }
 

@@ -12,9 +12,12 @@ import (
 )
 
 // Evaluator 按 matcher 顺序执行策略评估，并保证 deny 优先。
+// 当配置或 Context 提供 PermissionMode 时：matcher Deny 仍最高优先；
+// Mode 的 Allow/Deny 覆盖 matcher Ask；Mode Ask 时再回落到 matcher / metadata。
 type Evaluator struct {
-	defaults config.PolicyDefaultsConfig
-	matchers []contract.Matcher
+	defaults       config.PolicyDefaultsConfig
+	permissionMode fspermission.PermissionMode
+	matchers       []contract.Matcher
 }
 
 // NewEvaluator 创建策略评估器。
@@ -22,12 +25,26 @@ func NewEvaluator(defaults config.PolicyDefaultsConfig, matchers ...contract.Mat
 	return &Evaluator{defaults: defaults, matchers: matchers}
 }
 
+// WithPermissionMode 设置默认 PermissionMode（可被 Context 覆盖）。
+func (e *Evaluator) WithPermissionMode(mode string) *Evaluator {
+	if e == nil {
+		return nil
+	}
+	raw := strings.TrimSpace(mode)
+	if raw == "" {
+		e.permissionMode = ""
+		return e
+	}
+	e.permissionMode = fspermission.NormalizeMode(raw)
+	return e
+}
+
 // Evaluate 评估一次请求。
 func (e *Evaluator) Evaluate(ctx context.Context, req approvalmodel.Request) (approvalmodel.PolicyResult, error) {
 	if err := ctx.Err(); err != nil {
 		return approvalmodel.PolicyResult{}, err
 	}
-	var first *approvalmodel.PolicyResult
+	var firstNonDeny *approvalmodel.PolicyResult
 	for _, matcher := range e.matchers {
 		if matcher == nil {
 			continue
@@ -43,37 +60,55 @@ func (e *Evaluator) Evaluate(ctx context.Context, req approvalmodel.Request) (ap
 		if result.Type == approvalmodel.PolicyDeny {
 			return result, nil
 		}
-		if first == nil {
+		if firstNonDeny == nil {
 			copy := result
-			first = &copy
+			firstNonDeny = &copy
 		}
 	}
-	if first != nil {
-		return *first, nil
+
+	if mode := e.resolveMode(ctx, req); mode != "" {
+		modeRes, err := fspermission.NewModeEvaluator().Evaluate(ctx, mode, req)
+		if err != nil {
+			return approvalmodel.PolicyResult{}, err
+		}
+		modeRes = e.normalize(modeRes, req)
+		switch modeRes.Type {
+		case approvalmodel.PolicyDeny, approvalmodel.PolicyAllow:
+			return modeRes, nil
+		case approvalmodel.PolicyAsk:
+			if firstNonDeny != nil {
+				return *firstNonDeny, nil
+			}
+			return modeRes, nil
+		}
 	}
-	if result, ok := e.metadataFallback(ctx, req); ok {
+
+	if firstNonDeny != nil {
+		return *firstNonDeny, nil
+	}
+	if result, ok := e.metadataFallback(req); ok {
 		return e.normalize(result, req), nil
 	}
 	return e.normalize(approvalmodel.PolicyResult{Type: decisionOf(e.defaults.Unknown), Reason: "policy default for unknown operation", Risk: riskOrDefault(req.Risk)}, req), nil
 }
 
-func (e *Evaluator) metadataFallback(ctx context.Context, req approvalmodel.Request) (approvalmodel.PolicyResult, bool) {
-	metadata := mergeMetadata(req)
-	var mode fspermission.PermissionMode
+func (e *Evaluator) resolveMode(ctx context.Context, req approvalmodel.Request) fspermission.PermissionMode {
 	if ctxMode, ok := fspermission.FromContext(ctx); ok && ctxMode != "" {
-		mode = ctxMode
-	} else if rawMode := firstNonEmptyString(metadata["permission_mode"], metadata["mode"]); rawMode != "" {
-		mode = fspermission.NormalizeMode(rawMode)
+		return fspermission.NormalizeMode(string(ctxMode))
 	}
-
-	if mode != "" {
-		eval := fspermission.NewModeEvaluator()
-		res, err := eval.Evaluate(ctx, mode, req)
-		if err == nil {
-			return res, true
-		}
+	metadata := mergeMetadata(req)
+	if rawMode := firstNonEmptyString(metadata["permission_mode"], metadata["mode"]); rawMode != "" {
+		return fspermission.NormalizeMode(rawMode)
 	}
+	if e.permissionMode != "" {
+		return e.permissionMode
+	}
+	return ""
+}
 
+func (e *Evaluator) metadataFallback(req approvalmodel.Request) (approvalmodel.PolicyResult, bool) {
+	metadata := mergeMetadata(req)
+	// PermissionMode 已在 Evaluate 中处理；此处仅保留无 mode 时的 metadata 启发式。
 
 	if metadata["critical"] == "true" || metadata["protected"] == "true" || metadata["scope"] == "protected" || metadata["workspace_metadata_write"] == "true" {
 		return approvalmodel.PolicyResult{Type: approvalmodel.PolicyDeny, Reason: denyReason(metadata), Risk: approvalmodel.RiskCritical}, true
@@ -94,7 +129,7 @@ func (e *Evaluator) metadataFallback(ctx context.Context, req approvalmodel.Requ
 	if metadata["scope"] == "workspace" {
 		return approvalmodel.PolicyResult{Type: approvalmodel.PolicyAllow, Reason: "policy allow", Risk: riskOrDefault(req.Risk)}, true
 	}
-	// Skill 脚本执行：默认 ask，并建议 session 授权，避免同脚本每轮弹一次。
+	// Skill 脚本执行：无 PermissionMode 时默认 ask，并建议 session 授权。
 	if metadata["skill_script"] == "true" || req.ToolName == "run_skill_command" {
 		return approvalmodel.PolicyResult{
 			Type:            approvalmodel.PolicyAsk,
@@ -197,5 +232,3 @@ func firstNonEmptyString(values ...string) string {
 	}
 	return ""
 }
-
-

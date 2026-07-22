@@ -162,6 +162,7 @@ type productRuntime struct {
 	completion           artifactcontract.CompletionPolicy
 	qaEvidence           artifactcontract.QAEvidenceRecorder
 	runResources         []workcontract.RunResourceReleaser
+	producedStore        workcontract.ProducedResourceStore
 	runtimeClosers       []runtimeCloser
 }
 
@@ -253,7 +254,7 @@ func (c *Container) Init(ctx context.Context) error {
 			c.initErr = err
 			return
 		}
-		subAgentResources, err := clisubagent.NewWorkspaceResources(runtime.workspaceRoot)
+		subAgentResources, err := clisubagent.NewWorkspaceResources(runtime.workspaceRoot, runtime.producedStore)
 		if err != nil {
 			_ = c.logging.Close()
 			c.logging = nil
@@ -523,6 +524,9 @@ func buildProductRuntime(ctx context.Context, configDir string, cfg *platformcon
 				if artifactControl.readers != nil {
 					productTools[i] = viewimage.WithReaders(productTools[i], artifactControl.readers)
 				}
+				if artifactControl.manifests != nil {
+					productTools[i] = viewimage.WithManifests(productTools[i], artifactControl.manifests)
+				}
 			}
 		}
 	}
@@ -730,6 +734,7 @@ func buildProductRuntime(ctx context.Context, configDir string, cfg *platformcon
 		completion:           artifactControl.completion,
 		qaEvidence:           artifactControl.qaEvidence,
 		runResources:         runResourceReleasers(skillScriptSvc, remoteSessionManager),
+		producedStore:        artifactControl.producedStore,
 		runtimeClosers:       runtimeResourceClosers(skillScriptSvc, remoteSessionManager),
 	}, log, nil
 }
@@ -1161,6 +1166,7 @@ type cliArtifactControl struct {
 	produced       workcontract.ProducedResourceRegistrar
 	producedStore  workcontract.ProducedResourceStore
 	readers        workcontract.ResourceReaderRouter
+	manifests      workcontract.RunManifestStore
 	remoteSessions scriptservice.RemoteSessionBinder
 	reservations   artifactcontract.OutputReservationAllocator
 	deliverables   artifactcontract.DeliverableSpecStore
@@ -1191,6 +1197,7 @@ func buildCLIArtifactControl(stateRoot, workspaceRoot string, execStack productE
 		produced:       built.Produced,
 		producedStore:  built.ProducedStore,
 		readers:        built.Readers,
+		manifests:      built.Manifests,
 		remoteSessions: built.RemoteSessions,
 		reservations:   built.Reservations,
 		deliverables:   built.Deliverables,

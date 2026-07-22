@@ -30,7 +30,7 @@ func TestBuildChoicesFileWithProjectAndDirectory(t *testing.T) {
 	for _, c := range choices {
 		keys[c.Key] = true
 	}
-	for _, want := range []string{"y", "s", "d", "p", "f", "n", "a"} {
+	for _, want := range []string{"y", "s", "d", "p", "f", "n"} {
 		if !keys[want] {
 			t.Fatalf("missing choice %q in %+v", want, keys)
 		}

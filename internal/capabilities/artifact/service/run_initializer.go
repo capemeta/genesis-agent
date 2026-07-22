@@ -21,7 +21,8 @@ import (
 var deliverableExtInPrompt = regexp.MustCompile(`(?i)\.(pptx|docx|xlsx|pdf|md|markdown)(?:\b|$)`)
 
 // TaskDeliverableInitializer 将可信任务事实解析为持久化交付契约。
-// 优先使用显式 DeclaredDeliverable；仅在无声明且 ArtifactRequired 时对 Prompt 做类型启发式（不抠文件名）。
+// 优先使用显式 DeclaredDeliverable；仅在无声明且调用方显式 ArtifactRequired 时对 Prompt 做类型启发式。
+// 默认路径改为产物证据建约（见 DeterministicFinalizer.ensurePrimaryFromProduced），NLP 不再预建门禁。
 type TaskDeliverableInitializer struct {
 	store artifactcontract.DeliverableSpecStore
 	now   func() time.Time
@@ -73,8 +74,16 @@ func (s *TaskDeliverableInitializer) persistHeuristic(ctx context.Context, req a
 		AcceptedMIMEs: []string{mimeForSuffix(suffix)}, AcceptedSuffix: []string{suffix},
 		DeliveryPolicy: "run-output", CreatedAt: s.now().UTC(),
 	}
+	// pptx 默认可挂 soft visual-qa（便于有视觉时记录证据）；不设 QAEnforcement=required，
+	// 与「不配置」等价：无视觉模型时不阻塞交付。
 	if suffix == ".pptx" {
 		spec.QAPolicy = "visual-qa/v1"
+	}
+	if p := strings.TrimSpace(req.QAPolicy); p != "" {
+		spec.QAPolicy = p
+	}
+	if e := strings.TrimSpace(req.QAEnforcement); e != "" {
+		spec.QAEnforcement = e
 	}
 	if err := s.store.CreateDeliverable(ctx, spec); err != nil && err != artifactcontract.ErrAlreadyExists {
 		return err
@@ -153,8 +162,10 @@ func declaredToSpec(tenantID, runID string, index int, declared artifactcontract
 	spec := artifactmodel.DeliverableSpec{
 		ID: id, TenantID: tenantID, RunID: runID, Required: required, Role: role,
 		DesiredName: desired, AcceptedMIMEs: mimes, AcceptedSuffix: suffixes,
-		QAPolicy: strings.TrimSpace(declared.QAPolicy), DeliveryPolicy: delivery, CreatedAt: now,
+		QAPolicy: strings.TrimSpace(declared.QAPolicy), QAEnforcement: strings.TrimSpace(declared.QAEnforcement),
+		DeliveryPolicy: delivery, CreatedAt: now,
 	}
+	// 未声明 QA 时，pptx 仅挂 soft policy（无 required enforcement）；硬视觉门槛须显式 QAEnforcement=required。
 	if spec.QAPolicy == "" && len(suffixes) == 1 && suffixes[0] == ".pptx" && required {
 		spec.QAPolicy = "visual-qa/v1"
 	}

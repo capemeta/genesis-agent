@@ -207,6 +207,10 @@ type Metadata struct {
 	Policy            Policy            `json:"policy,omitempty"`
 	Interface         Interface         `json:"interface,omitempty"`
 	Dependencies      Dependencies      `json:"dependencies,omitempty"`
+	// Requires 声明运行所需能力门槛；仅 enforcement=required 会在加载时硬拒绝。
+	Requires []CapabilityRequirement `json:"requires,omitempty"`
+	// QA 是交付结账侧的可选质量策略声明；仅 enforcement=required 会阻塞完成。
+	QA                QADeclaration     `json:"qa,omitempty"`
 	AllowedTools      []string          `json:"allowed_tools,omitempty"`
 	Context           ContextMode       `json:"context,omitempty"`
 	Agent             string            `json:"agent,omitempty"`
@@ -214,6 +218,33 @@ type Metadata struct {
 	MaxThinkingTokens int               `json:"max_thinking_tokens,omitempty"`
 	SourceRef         map[string]string `json:"source_ref,omitempty"`
 	UpdatedAt         time.Time         `json:"updated_at,omitempty"`
+}
+
+// Enforcement 描述能力/QA 门槛强度。
+// 空值与 optional 等价：不做限制；仅 required 会硬卡。
+type Enforcement string
+
+const (
+	EnforcementOptional Enforcement = "optional"
+	EnforcementRequired Enforcement = "required"
+)
+
+// IsRequiredEnforcement 仅当显式声明 required 时为真；空/optional/其它均不限制。
+func IsRequiredEnforcement(value string) bool {
+	return strings.EqualFold(strings.TrimSpace(value), string(EnforcementRequired))
+}
+
+// CapabilityRequirement 是技能启动前的能力门槛（如 vision）。
+type CapabilityRequirement struct {
+	Kind        string `json:"kind" yaml:"kind"`               // 如 vision
+	Enforcement string `json:"enforcement,omitempty" yaml:"enforcement"` // required | optional（默认）
+	Description string `json:"description,omitempty" yaml:"description"`
+}
+
+// QADeclaration 是技能声明的交付 QA 策略（写入 DeliverableSpec 时参考）。
+type QADeclaration struct {
+	Policy      string `json:"policy,omitempty" yaml:"policy"`           // 如 visual-qa/v1
+	Enforcement string `json:"enforcement,omitempty" yaml:"enforcement"` // required | optional（默认）
 }
 
 // Normalize 填充默认值。

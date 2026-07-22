@@ -52,12 +52,13 @@ func (r Reducer) Reduce(ctx context.Context, candidate TerminalCandidate) model.
 		result.NextAction = "可在调整任务后重新委派。"
 	} else if candidate.Err != nil || (candidate.Run != nil && candidate.Run.Status == domain.RunStatusFailed) {
 		result.Status = model.ResultStatusFailed
-		result.Error = &model.ResultError{Code: errorCodeFor(candidate.Err), Message: r.sanitizeError(candidate.Err), Retryable: retryable(candidate.Err)}
+		code := errorCodeFor(candidate.Err)
+		result.Error = &model.ResultError{Code: code, Message: r.sanitizeError(candidate.Err), Retryable: retryable(candidate.Err)}
 		result.Summary, result.Truncated = r.sanitizeAndTruncate(finalAnswer(candidate.Run), r.limit())
 		if result.Summary == "" {
 			result.Summary = result.Error.Message
 		}
-		result.NextAction = "可重新委派、调整任务或稍后 resume。"
+		result.NextAction = nextActionForFailure(code)
 	} else {
 		result.Status = model.ResultStatusCompleted
 		if candidate.Run != nil && candidate.Run.Incomplete {
@@ -81,8 +82,11 @@ func (r Reducer) Reduce(ctx context.Context, candidate TerminalCandidate) model.
 			result.NextAction = "可重新委派、调整任务或稍后 resume。"
 		} else {
 			result.Findings = cloneFindings(evidence.Findings)
-			result.Artifacts = append([]model.Artifact(nil), evidence.Artifacts...)
+			// 父交付面只暴露交付候选：QA 预览/中间物（role=qa_asset）留在子执行面，父根本收不到（spec §7.2 C1）。
+			result.Artifacts = deliverablesForParent(evidence.Artifacts)
 		}
+		// R1=A：子智能体的交付通常已在其子 Run 内 finalize+deliver；父 Agent 只总结，
+		// 禁止再 glob/探测子 cwd/手动 select（跨 Run select 会 ADOPTION_REQUIRED）。故此处不再产出 select 提示。
 	}
 	if result.Truncated {
 		result.OmittedSections = append(result.OmittedSections, "summary_tail")
@@ -159,7 +163,41 @@ func (r Reducer) evidenceValidator() EvidenceValidator {
 	if r.Evidence != nil {
 		return r.Evidence
 	}
-	return RejectingEvidenceValidator{}
+	return PassthroughEvidenceValidator{}
+}
+
+// deliverablesForParent 只保留交付候选，剔除 QA/中间物（role=qa_asset）；
+// 同名/同 Path 只保留最后一次登记（改稿后旧版不进父面）；并补齐 CandidateID/ResourceID 互填。
+func deliverablesForParent(artifacts []model.Artifact) []model.Artifact {
+	if len(artifacts) == 0 {
+		return nil
+	}
+	out := make([]model.Artifact, 0, len(artifacts))
+	indexByKey := map[string]int{}
+	for _, art := range artifacts {
+		if art.Role == model.ArtifactRoleQAAsset {
+			continue
+		}
+		if art.CandidateID == "" {
+			art.CandidateID = art.ResourceID
+		}
+		if art.ResourceID == "" {
+			art.ResourceID = art.CandidateID
+		}
+		key := artifactDedupeKey(art)
+		if key != "" {
+			if i, ok := indexByKey[key]; ok {
+				out[i] = art
+				continue
+			}
+			indexByKey[key] = len(out)
+		}
+		out = append(out, art)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func cloneFindings(findings []model.Finding) []model.Finding {
@@ -225,9 +263,24 @@ func errorCodeFor(err error) string {
 		return "budget_exceeded"
 	case strings.Contains(message, "deadline exceeded") || strings.Contains(message, "timeout"):
 		return "timeout"
+	case strings.Contains(err.Error(), "RUN_COMPLETION_REQUIRED"):
+		// 子已跑到终点但未自证完成门禁（如视觉 QA / 交付门禁）。这类失败原样重委派通常会复现，
+		// 单列一类以便父侧给出「补能力/调整任务」而非盲目重委派的指引，避免无效循环。
+		return "completion_gate_unmet"
 	default:
 		return "subagent_failed"
 	}
+}
+
+// nextActionForFailure 按失败类别给父 Agent 差异化下一步指引。
+// completion_gate_unmet 明确劝阻「原样重新委派」，因为门禁不满足通常源于子缺能力或任务本身，
+// 重复委派会复现同样失败（本类回归的无效循环根因）。
+func nextActionForFailure(code string) string {
+	if code == "completion_gate_unmet" {
+		return "子已产出但未通过完成门禁（如视觉 QA / 交付门禁），原样重新委派通常会复现同样失败。" +
+			"请先确认子 Agent 具备门禁所需能力（如 view_image 视觉 QA 工具），或调整任务/门禁后再委派；不要重复委派相同任务。"
+	}
+	return "可重新委派、调整任务或稍后 resume。"
 }
 
 func retryable(err error) bool {

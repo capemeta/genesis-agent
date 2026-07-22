@@ -92,6 +92,8 @@ type DeclaredDeliverable struct {
 	AcceptedMIMEs  []string `json:"accepted_mimes,omitempty"`
 	AcceptedSuffix []string `json:"accepted_suffixes,omitempty"`
 	QAPolicy       string   `json:"qa_policy,omitempty"`
+	// QAEnforcement 空/optional=不因 QA 阻塞完成；仅 required 硬卡。
+	QAEnforcement  string   `json:"qa_enforcement,omitempty"`
 	DeliveryPolicy string   `json:"delivery_policy,omitempty"`
 }
 
@@ -104,6 +106,10 @@ type RunInitializationRequest struct {
 	ArtifactRequired bool
 	// Deliverables 非空时优先持久化显式声明，不再用 Prompt 猜测交付契约。
 	Deliverables []DeclaredDeliverable
+	// QAPolicy / QAEnforcement 由 Skill frontmatter qa: 注入；仅在启发式建约时覆盖默认。
+	// Enforcement 空/optional=不阻塞完成；仅 required 硬卡。
+	QAPolicy      string
+	QAEnforcement string
 }
 
 // RunInitializer 在模型开始执行前持久化具体 DeliverableSpec。

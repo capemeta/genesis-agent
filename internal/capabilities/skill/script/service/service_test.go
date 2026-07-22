@@ -241,4 +241,21 @@ func TestShouldIgnoreProducedPath(t *testing.T) {
 	if shouldIgnoreProducedPath("ultra5-comparison-summary.pptx") {
 		t.Fatal("should keep pptx")
 	}
+	if !shouldIgnoreProducedPath("nul") || !shouldIgnoreProducedPath("office-ppt/nul") || !shouldIgnoreProducedPath("NUL.txt") {
+		t.Fatal("expected ignore reserved DOS device nul")
+	}
 }
+
+func TestIsReservedDOSDeviceName(t *testing.T) {
+	for _, name := range []string{"nul", "NUL", "nul.txt", "CON", "prn.dat", "aux", "com1", "lpt1"} {
+		if !isReservedDOSDeviceName(name) {
+			t.Fatalf("expected %q to be reserved DOS device name", name)
+		}
+	}
+	for _, name := range []string{"made.txt", "null.txt", "config.json", "ppt.pptx"} {
+		if isReservedDOSDeviceName(name) {
+			t.Fatalf("expected %q NOT to be reserved DOS device name", name)
+		}
+	}
+}
+

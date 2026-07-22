@@ -343,6 +343,9 @@ func missingPublicationInput(req PublicationRequest) bool {
 	return strings.TrimSpace(req.TenantID) == "" || strings.TrimSpace(req.RunID) == "" || strings.TrimSpace(req.DeliverableID) == "" || strings.TrimSpace(req.ProducedResourceID) == ""
 }
 func matchesDeliverable(spec artifactmodel.DeliverableSpec, d workmodel.ProducedResourceDescriptor, name string) bool {
+	if strings.EqualFold(strings.TrimSpace(d.Role), "qa_asset") || strings.EqualFold(strings.TrimSpace(d.Role), "intermediate_asset") {
+		return false
+	}
 	return spec.MatchesObserved(name, d.MediaType)
 }
 

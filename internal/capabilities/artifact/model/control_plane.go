@@ -58,7 +58,8 @@ type FinalizationResult struct {
 	Resolutions []DeliverableResolution `json:"resolutions,omitempty"`
 }
 
-// DeliverableSpec 是由任务契约声明的交付要求，而不是从执行输出反推的猜测。
+// DeliverableSpec 是交付控制面契约。
+// 来源优先级：显式 DeclaredDeliverable > 产物证据建约（FinalizeRequired）> 旧 ArtifactRequired 启发式。
 type DeliverableSpec struct {
 	ID             string          `json:"id"`
 	TenantID       string          `json:"tenant_id"`
@@ -69,8 +70,15 @@ type DeliverableSpec struct {
 	AcceptedMIMEs  []string        `json:"accepted_mimes,omitempty"`
 	AcceptedSuffix []string        `json:"accepted_suffixes,omitempty"`
 	QAPolicy       string          `json:"qa_policy,omitempty"`
+	// QAEnforcement 控制 QAPolicy 是否阻塞完成：空/optional=不限制；仅 required 必须 passed。
+	QAEnforcement  string          `json:"qa_enforcement,omitempty"`
 	DeliveryPolicy string          `json:"delivery_policy"`
 	CreatedAt      time.Time       `json:"created_at"`
+}
+
+// IsRequiredEnforcement 仅当显式声明 required 时为真；空/optional/其它均不限制。
+func IsRequiredEnforcement(value string) bool {
+	return strings.EqualFold(strings.TrimSpace(value), "required")
 }
 
 func (v DeliverableSpec) Validate() error {

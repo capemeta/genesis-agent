@@ -74,6 +74,8 @@ type Event struct {
 	StopReason  string            `json:"stop_reason,omitempty"`
 	DeltaType   string            `json:"delta_type,omitempty"`
 	Display     *bool             `json:"display,omitempty"`
+	Depth       int               `json:"depth,omitempty"`
+	SubAgentID  string            `json:"subagent_id,omitempty"`
 }
 
 // Sink 接收进度事件。实现必须快速返回，不能阻塞主执行流程。
@@ -114,4 +116,24 @@ func Emit(ctx context.Context, event Event) {
 		_ = recover()
 	}()
 	sink(event)
+}
+
+type childBridgeKey struct{}
+
+// WithChildBridge 注册子 Run 进度桥接器。
+// 与 WithSink 分离：父时间线默认仍隔离；仅 Task 等显式桥接时，Controller 才会把子内部事件转到该 Sink。
+func WithChildBridge(ctx context.Context, sink Sink) context.Context {
+	if sink == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, childBridgeKey{}, sink)
+}
+
+// ChildBridgeFromContext 取出子 Run 进度桥接器。
+func ChildBridgeFromContext(ctx context.Context) Sink {
+	if ctx == nil {
+		return nil
+	}
+	sink, _ := ctx.Value(childBridgeKey{}).(Sink)
+	return sink
 }

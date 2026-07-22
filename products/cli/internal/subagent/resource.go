@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strings"
 
+	workcontract "genesis-agent/internal/capabilities/workspace/contract"
 	"genesis-agent/internal/runtime/multiagent/model"
 	"genesis-agent/internal/runtime/multiagent/result"
 )
@@ -19,11 +20,12 @@ var safeResourceID = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
 // WorkspaceResources 验证并投影 CLI 工作区中的显式登记产物。
 type WorkspaceResources struct {
-	root string
+	root  string
+	store workcontract.ProducedResourceStore
 }
 
 // NewWorkspaceResources 创建受工作区边界约束的资源后端。
-func NewWorkspaceResources(workspaceRoot string) (*WorkspaceResources, error) {
+func NewWorkspaceResources(workspaceRoot string, store ...workcontract.ProducedResourceStore) (*WorkspaceResources, error) {
 	root := strings.TrimSpace(workspaceRoot)
 	if root == "" {
 		root = "."
@@ -32,7 +34,11 @@ func NewWorkspaceResources(workspaceRoot string) (*WorkspaceResources, error) {
 	if err != nil {
 		return nil, fmt.Errorf("解析工作区路径失败: %w", err)
 	}
-	return &WorkspaceResources{root: filepath.Clean(abs)}, nil
+	res := &WorkspaceResources{root: filepath.Clean(abs)}
+	if len(store) > 0 && store[0] != nil {
+		res.store = store[0]
+	}
+	return res, nil
 }
 
 func (r *WorkspaceResources) Validate(ctx context.Context, manifest model.ArtifactManifest, findings []model.Finding) (result.ValidatedEvidence, error) {
@@ -80,16 +86,63 @@ func (r *WorkspaceResources) ProjectArtifact(ctx context.Context, artifact model
 func (r *WorkspaceResources) validateArtifact(candidate model.Artifact) (model.Artifact, bool, error) {
 	rel := cleanRelative(candidate.Path)
 	if rel == "" {
+		rel = cleanRelative(candidate.Name)
+	}
+	if rel == "" {
+		resID := firstNonEmpty(candidate.CandidateID, candidate.ResourceID)
+		if strings.HasPrefix(resID, "produced-") {
+			rel = resID
+		}
+	}
+	if rel == "" {
 		return model.Artifact{}, false, nil
 	}
 	abs := filepath.Join(r.root, filepath.FromSlash(rel))
 	abs = filepath.Clean(abs)
 	if !inside(r.root, abs) {
+		resID := firstNonEmpty(candidate.CandidateID, candidate.ResourceID)
+		if strings.HasPrefix(resID, "produced-") {
+			observedName := candidate.Name
+			if r.store != nil {
+				if descriptor, storeErr := r.store.Get(context.Background(), "", "", resID); storeErr == nil && descriptor.ObservedName != "" {
+					observedName = descriptor.ObservedName
+				}
+			}
+			return model.Artifact{
+				CandidateID: resID,
+				ResourceID:  resID,
+				Path:        rel,
+				Name:        firstNonEmpty(observedName, candidate.Name, filepath.Base(rel)),
+				Kind:        firstNonEmpty(candidate.Kind, "file"),
+				Description: strings.TrimSpace(candidate.Description),
+				Role:        candidate.Role, // 必须保留：qa_asset 靠此在父侧归约时剔除
+			}, true, nil
+		}
 		return model.Artifact{}, false, nil
 	}
 	info, err := os.Stat(abs)
 	if err != nil {
 		if os.IsNotExist(err) {
+			resID := firstNonEmpty(candidate.CandidateID, candidate.ResourceID)
+			if resID != "" {
+				observedName := candidate.Name
+				if r.store != nil {
+					if descriptor, storeErr := r.store.Get(context.Background(), "", "", resID); storeErr == nil && descriptor.ObservedName != "" {
+						observedName = descriptor.ObservedName
+					}
+				}
+				if r.store != nil || strings.HasPrefix(resID, "produced-") {
+					return model.Artifact{
+						CandidateID: resID,
+						ResourceID:  resID,
+						Path:        rel,
+						Name:        firstNonEmpty(observedName, candidate.Name, filepath.Base(rel)),
+						Kind:        firstNonEmpty(candidate.Kind, "file"),
+						Description: strings.TrimSpace(candidate.Description),
+						Role:        candidate.Role, // 必须保留：qa_asset 靠此在父侧归约时剔除
+					}, true, nil
+				}
+			}
 			return model.Artifact{}, false, nil
 		}
 		return model.Artifact{}, false, fmt.Errorf("读取 subagent artifact 信息失败: %w", err)
@@ -106,11 +159,14 @@ func (r *WorkspaceResources) validateArtifact(candidate model.Artifact) (model.A
 		resourceID = "res-" + hash[:24]
 	}
 	return model.Artifact{
+		CandidateID: firstNonEmpty(candidate.CandidateID, resourceID),
 		ResourceID:  resourceID,
 		Path:        rel,
+		Name:        firstNonEmpty(candidate.Name, filepath.Base(rel)),
 		Kind:        firstNonEmpty(candidate.Kind, "file"),
 		Description: strings.TrimSpace(candidate.Description),
 		ContentHash: hash,
+		Role:        candidate.Role, // 必须保留：qa_asset 靠此在父侧归约时剔除
 	}, true, nil
 }
 

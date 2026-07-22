@@ -33,6 +33,8 @@ import (
 	workcontract "genesis-agent/internal/capabilities/workspace/contract"
 	workmodel "genesis-agent/internal/capabilities/workspace/model"
 	"genesis-agent/internal/platform/logger"
+	multiagentmodel "genesis-agent/internal/runtime/multiagent/model"
+	multiresult "genesis-agent/internal/runtime/multiagent/result"
 )
 
 // Service 编排 Skill 命令 materialize、工作空间与执行。
@@ -247,6 +249,18 @@ func (s *Service) Run(ctx context.Context, req scriptcontract.RunRequest) (*scri
 	meta, err := s.skills.Resolve(ctx, skillcontract.ResolveRequest{CatalogRequest: req.Catalog, Name: skillName})
 	if err != nil {
 		return nil, err
+	}
+	if meta.Context == skillmodel.ContextModeFork && req.Binding.Owner.ParentRunID == "" {
+		out := &scriptcontract.RunResult{
+			OK:          false,
+			Skill:       meta.Name,
+			Command:     command,
+			Error:       fmt.Sprintf("FORBIDDEN_FORK_SKILL_EXECUTION: Skill %q 声明为 context: fork 物理沙箱隔离，父 Agent 禁止直接执行 run_skill_command。请调用 Skill(skill=%q, args=...) 委派子 Agent 处理。", meta.QualifiedName, meta.QualifiedName),
+			FailureKind: "forbidden_fork_execution",
+			DurationMS:  time.Since(started).Milliseconds(),
+		}
+		classifyFailure(out)
+		return out, nil
 	}
 	if scriptHint != "" {
 		available, checkErr := s.commandEntryAvailable(ctx, req, meta, req.Binding.Owner.RunID, scriptHint)
@@ -946,8 +960,18 @@ func (s *Service) projectProducedCandidates(ctx context.Context, tenantID, runID
 		if id := uniqueMatchingDeliverableID(specs, descriptor); id != "" {
 			candidate.DeliverableID = id
 		} else if isQAPreviewAsset(descriptor.ObservedName) {
-			candidate.Role = "qa_asset"
+			candidate.Role = multiagentmodel.ArtifactRoleQAAsset
 		}
+		// 不再「创建即全局登记」：产物只在本 Run 内可读；跨 Run 可读由父子边界的一次显式 Adopt 授予（spec §7.2）。
+		// 带上 Role：qa_asset 会在子 Run 归约时被剔除，父根本收不到。
+		multiresult.RegisterArtifact(ctx, multiagentmodel.Artifact{
+			CandidateID: descriptor.ID,
+			ResourceID:  descriptor.ID,
+			Name:        descriptor.ObservedName,
+			Path:        descriptor.ObservedName,
+			Kind:        "file",
+			Role:        candidate.Role,
+		})
 		result = append(result, candidate)
 	}
 	return result
@@ -1231,6 +1255,14 @@ func shouldIgnoreProducedPath(rel string) bool {
 		return true
 	}
 	base := filepath.Base(slash)
+	if isReservedDOSDeviceName(base) {
+		return true
+	}
+	for _, part := range strings.Split(slash, "/") {
+		if isReservedDOSDeviceName(part) {
+			return true
+		}
+	}
 	if strings.Contains(slash, "/__pycache__/") || strings.HasPrefix(slash, "__pycache__/") {
 		return true
 	}
@@ -1437,4 +1469,19 @@ func isExecutableSkillEntry(value string) bool {
 	}
 	ext := strings.ToLower(filepath.Ext(base))
 	return ext == ".py" || ext == ".js" || ext == ".mjs" || ext == ".cjs" || ext == ".sh" || ext == ".ps1" || ext == ".bat" || ext == ".cmd"
+}
+
+func isReservedDOSDeviceName(name string) bool {
+	name = strings.ToUpper(strings.TrimSpace(name))
+	if idx := strings.IndexByte(name, '.'); idx != -1 {
+		name = name[:idx]
+	}
+	switch name {
+	case "CON", "PRN", "AUX", "NUL",
+		"COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+		"LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9":
+		return true
+	default:
+		return false
+	}
 }

@@ -12,6 +12,7 @@ const (
 
 // ResolveEffectiveVisionMode 根据主模型与 vision 路由模型的 supports_image 求值。
 // visionAlias 为空表示未配置 vision 路由。
+// 判定依据是真实已配置/将使用的模型（主模型或 router.vision），不是模型名猜测。
 func ResolveEffectiveVisionMode(mainSupportsImage bool, visionAlias string, visionSupportsImage bool) Mode {
 	if mainSupportsImage {
 		return ModeDirectInject
@@ -20,4 +21,10 @@ func ResolveEffectiveVisionMode(mainSupportsImage bool, visionAlias string, visi
 		return ModeExpertRoute
 	}
 	return ModeDegradedText
+}
+
+// HasImageCapability 表示当前 EffectiveVisionMode 下是否具备真实看图能力
+//（主模型 supports_image=true，或已配置且 supports_image=true 的 router.vision）。
+func HasImageCapability(mode Mode) bool {
+	return mode == ModeDirectInject || mode == ModeExpertRoute
 }

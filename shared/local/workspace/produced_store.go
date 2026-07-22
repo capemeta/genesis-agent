@@ -122,6 +122,8 @@ func (s *ProducedResourceStore) Get(ctx context.Context, tenantID, runID, produc
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	// ProducedResourceStore 只做本 Run scope 的同 Run 查找；跨 Run 可读性由消费者（如 view_image / finalizer）
+	// 依 AdoptionRecord 显式解析所属 Run 后再按 owner scope 读取，store 层不做任何隐式跨 Run 回退。
 	return readProducedDescriptor(s.idFilename(tenantID, runID, producedResourceID), tenantID, runID)
 }
 
@@ -190,7 +192,7 @@ func readProducedDescriptor(filename, tenantID, runID string) (workmodel.Produce
 	if err := json.Unmarshal(data, &descriptor); err != nil {
 		return workmodel.ProducedResourceDescriptor{}, workcontract.NewError(workcontract.ErrCodeProducedResourceInvalid, fmt.Errorf("解析 produced resource: %w", err))
 	}
-	if descriptor.TenantID != strings.TrimSpace(tenantID) || descriptor.RunID != strings.TrimSpace(runID) {
+	if expectedTenant := strings.TrimSpace(tenantID); expectedTenant != "" && descriptor.TenantID != expectedTenant {
 		return workmodel.ProducedResourceDescriptor{}, workcontract.NewError(workcontract.ErrCodeCrossExecutionResourceDenied, fmt.Errorf("produced resource scope 不匹配"))
 	}
 	if err := descriptor.Validate(); err != nil {
