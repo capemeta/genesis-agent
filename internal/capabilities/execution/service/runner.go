@@ -139,6 +139,17 @@ func (r *Runner) Run(ctx context.Context, cmd execmodel.Command, opts execcontra
 		}
 		return result, err
 	case execmodel.SandboxOptional:
+		if isLocalSandboxProvider(opts.Sandbox.Provider) {
+			l.Info("准备在[本地平台沙箱]执行命令 (可选沙箱)", "provider", opts.Sandbox.Provider, "sandbox_type", resolveSandboxType(opts.Sandbox.Provider), "runtime_profile", string(opts.Sandbox.RuntimeProfile))
+			result, err := r.direct.Run(ctx, cmd, opts)
+			ensureEnvironment(result, execmodel.EnvironmentLocal, opts.Sandbox.Provider)
+			if err != nil {
+				l.Error("本地平台沙箱命令执行失败", "error", err)
+			} else {
+				l.Info("本地平台沙箱命令执行完成", "exit_code", result.ExitCode)
+			}
+			return result, err
+		}
 		if r.sandbox == nil {
 			l.Warn("可选沙箱未配置；返回控制面，由 Harness 决定是否创建独立 Host attempt")
 			progress.Emit(ctx, progress.Event{
@@ -151,7 +162,7 @@ func (r *Runner) Run(ctx context.Context, cmd execmodel.Command, opts execcontra
 			})
 			return nil, execcontract.NewError(execcontract.ErrCodeSandboxUnavailable, fmt.Errorf("SandboxRunner未配置；Harness 必须创建独立 backend attempt 后重试"))
 		}
-		l.Info("准备在[沙箱环境]执行命令 (可选沙箱)", "provider", opts.Sandbox.Provider, "sandbox_type", resolveSandboxType(opts.Sandbox.Provider), "runtime_profile", string(opts.Sandbox.RuntimeProfile))
+		l.Info("准备在[远程沙箱环境]执行命令 (可选沙箱)", "provider", opts.Sandbox.Provider, "sandbox_type", resolveSandboxType(opts.Sandbox.Provider), "runtime_profile", string(opts.Sandbox.RuntimeProfile))
 		result, err := r.sandbox.RunInSandbox(ctx, cmd, opts.Sandbox, opts)
 		if err != nil && (execcontract.CodeOf(err) == execcontract.ErrCodeSandboxUnavailable || execcontract.CodeOf(err) == execcontract.ErrCodeSandboxPolicyUnsupported) {
 			l.Warn("沙箱服务不可用或策略不支持；返回控制面，由 Harness 决定独立 attempt", "error", err)
@@ -173,6 +184,17 @@ func (r *Runner) Run(ctx context.Context, cmd execmodel.Command, opts execcontra
 		}
 		return result, err
 	case execmodel.SandboxRequired:
+		if isLocalSandboxProvider(opts.Sandbox.Provider) {
+			l.Info("准备在[本地平台沙箱]执行命令 (强制沙箱)", "provider", opts.Sandbox.Provider, "sandbox_type", resolveSandboxType(opts.Sandbox.Provider), "runtime_profile", string(opts.Sandbox.RuntimeProfile))
+			result, err := r.direct.Run(ctx, cmd, opts)
+			ensureEnvironment(result, execmodel.EnvironmentLocal, opts.Sandbox.Provider)
+			if err != nil {
+				l.Error("本地平台沙箱命令执行失败", "error", err)
+			} else {
+				l.Info("本地平台沙箱命令执行完成", "exit_code", result.ExitCode)
+			}
+			return result, err
+		}
 		if r.sandbox == nil {
 			l.Error("沙箱必填但未配置SandboxRunner，执行中止")
 			progress.Emit(ctx, progress.Event{
@@ -185,7 +207,7 @@ func (r *Runner) Run(ctx context.Context, cmd execmodel.Command, opts execcontra
 			})
 			return nil, execcontract.NewError(execcontract.ErrCodeSandboxUnavailable, fmt.Errorf("SandboxRunner未配置"))
 		}
-		l.Info("准备在[沙箱环境]执行命令 (强制沙箱)", "provider", opts.Sandbox.Provider, "sandbox_type", resolveSandboxType(opts.Sandbox.Provider), "runtime_profile", string(opts.Sandbox.RuntimeProfile))
+		l.Info("准备在[远程沙箱环境]执行命令 (强制沙箱)", "provider", opts.Sandbox.Provider, "sandbox_type", resolveSandboxType(opts.Sandbox.Provider), "runtime_profile", string(opts.Sandbox.RuntimeProfile))
 		result, err := r.sandbox.RunInSandbox(ctx, cmd, opts.Sandbox, opts)
 		if err != nil {
 			l.Error("沙箱命令执行失败", "error", err)
@@ -196,6 +218,16 @@ func (r *Runner) Run(ctx context.Context, cmd execmodel.Command, opts execcontra
 	default:
 		l.Error("未知沙箱模式，执行中止")
 		return nil, execcontract.NewError(execcontract.ErrCodeInvalidInput, fmt.Errorf("未知sandbox模式: %s", mode))
+	}
+}
+
+func isLocalSandboxProvider(provider string) bool {
+	provider = strings.TrimSpace(strings.ToLower(provider))
+	switch provider {
+	case "local", "local-platform", "local_platform", "local_platform_sandbox", "bwrap", "landlock", "seatbelt", "windows", "host", "local_host", "local-host", "":
+		return true
+	default:
+		return false
 	}
 }
 

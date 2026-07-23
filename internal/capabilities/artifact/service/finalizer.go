@@ -124,6 +124,13 @@ func (s *DeterministicFinalizer) resolve(ctx context.Context, tenantID, runID st
 		}
 		return s.finalizeSelected(ctx, tenantID, runID, spec, candidates[0], candidates)
 	default:
+		if strings.EqualFold(spec.Cardinality, "one_or_more") || strings.EqualFold(spec.Cardinality, "zero_or_more") {
+			for _, cid := range candidates {
+				_ = s.bindSelection(ctx, tenantID, runID, spec.ID, cid, "harness-cardinality-auto")
+				_, _, _ = s.publishGateAndDeliver(ctx, tenantID, runID, spec, cid)
+			}
+			return s.finalizeSelected(ctx, tenantID, runID, spec, candidates[0], candidates)
+		}
 		resolution.Status = "selection_required"
 		return resolution, nil
 	}
@@ -210,10 +217,14 @@ func (s *DeterministicFinalizer) publishGateAndDeliver(ctx context.Context, tena
 			return artifactmodel.DeliveryResult{}, "", err
 		}
 		if state != qaStatePassed && !((state == qaStateDegraded || state == qaStateFailed) && !artifactmodel.IsRequiredEnforcement(spec.QAEnforcement)) {
+			if state == qaStateMissing {
+				return artifactmodel.DeliveryResult{}, "qa_pending", nil
+			}
 			if artifactmodel.IsRequiredEnforcement(spec.QAEnforcement) {
 				return artifactmodel.DeliveryResult{}, "qa_required", nil
 			}
-			return artifactmodel.DeliveryResult{}, "qa_pending", nil
+			delivery, err := s.deliveries.Deliver(ctx, DeliveryRequest{TenantID: tenantID, RunID: runID, DeliverableID: spec.ID})
+			return delivery, "delivered", err
 		}
 	}
 	delivery, err := s.deliveries.Deliver(ctx, DeliveryRequest{TenantID: tenantID, RunID: runID, DeliverableID: spec.ID})

@@ -13,10 +13,25 @@ import (
 	workmodel "genesis-agent/internal/capabilities/workspace/model"
 )
 
-type recordingPublisher struct{ calls []PublicationRequest }
+type recordingPublisher struct {
+	store *artifactmemory.Store
+	calls []PublicationRequest
+}
 
-func (p *recordingPublisher) Publish(_ context.Context, req PublicationRequest) (artifactmodel.ArtifactRef, error) {
+func (p *recordingPublisher) Publish(ctx context.Context, req PublicationRequest) (artifactmodel.ArtifactRef, error) {
 	p.calls = append(p.calls, req)
+	if p.store != nil {
+		now := time.Now().UTC()
+		rec := artifactmodel.ArtifactPublicationRecord{
+			ID: "pub-" + req.ProducedResourceID, TenantID: req.TenantID, RunID: req.RunID, DeliverableID: req.DeliverableID,
+			ProducedResourceID: req.ProducedResourceID, DesiredName: "deck.pptx", ArtifactID: "art-1", Status: artifactmodel.PublicationCommitted,
+			GateVersion: "v1", IdempotencyKey: "ik-" + req.ProducedResourceID, Revision: 1,
+			SubjectVersion: "v1", SubjectSHA256: "sha256:123", CreatedAt: now, UpdatedAt: now,
+		}
+		if _, _, err := p.store.CreatePublication(ctx, rec); err != nil {
+			panic(fmt.Sprintf("CreatePublication error: %v", err))
+		}
+	}
 	return artifactmodel.ArtifactRef{ID: "artifact", Name: "deck.pptx"}, nil
 }
 
@@ -157,7 +172,7 @@ func TestDeterministicFinalizerBindsSpecFromProducedEvidence(t *testing.T) {
 	now := time.Now().UTC()
 	createProduced(t, produced, "p1", "run:/work/b1/deck.pptx", "deck.pptx", "application/pptx", now)
 	createProduced(t, produced, "qa1", "run:/work/b1/slide-1.jpg", "slide-1.jpg", "image/jpeg", now)
-	pub, delivery := &recordingPublisher{}, &recordingDelivery{}
+	pub, delivery := &recordingPublisher{store: ledger}, &recordingDelivery{}
 	finalizer, _ := NewDeterministicFinalizer(ledger, ledger, produced, pub, ledger, ledger, delivery)
 	ctx = artifactcontract.WithEvidenceQAHints(ctx, artifactcontract.EvidenceQAHints{Policy: "visual-qa/v1", Enforcement: "optional"})
 	result, err := finalizer.FinalizeRequired(ctx, "tenant", "run")
@@ -165,7 +180,7 @@ func TestDeterministicFinalizerBindsSpecFromProducedEvidence(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(result.Resolutions) != 1 || result.Resolutions[0].Status != "qa_pending" || result.Resolutions[0].SelectedID != "p1" {
-		t.Fatalf("result=%+v", result)
+		t.Fatalf("expected qa_pending, got result=%+v", result)
 	}
 	specs, err := ledger.ListDeliverables(ctx, "tenant", "run")
 	if err != nil || len(specs) != 1 {
@@ -174,7 +189,25 @@ func TestDeterministicFinalizerBindsSpecFromProducedEvidence(t *testing.T) {
 	if specs[0].QAPolicy != "visual-qa/v1" || specs[0].QAEnforcement != "optional" {
 		t.Fatalf("qa hints not applied: %+v", specs[0])
 	}
-	if len(pub.calls) != 1 || len(delivery.calls) != 0 {
+	pubs, err := ledger.ListPublications(ctx, "tenant", "run", "")
+	if err != nil || len(pubs) != 1 {
+		t.Fatalf("pubs=%+v err=%v", pubs, err)
+	}
+	// 充入 QA 降级/证明后重试，契约应当解锁并进入 delivered
+	_ = ledger.CreateQAEvidence(ctx, artifactmodel.QAEvidenceRecord{
+		ID: "qa-rec-1", TenantID: "tenant", RunID: "run", DeliverableID: specs[0].ID,
+		ProducedResourceID: "p1", PublicationID: pubs[0].ID, SubjectVersion: pubs[0].SubjectVersion, SubjectSHA256: pubs[0].SubjectSHA256,
+		PolicyID: "visual-qa/v1", Validator: "visual-qa/v1", ValidatorVersion: "v1", Status: artifactmodel.QAEvidenceDegraded,
+		FailureCode: "vision_unavailable", CreatedAt: now,
+	})
+	result, err = finalizer.FinalizeRequired(ctx, "tenant", "run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Resolutions) != 1 || result.Resolutions[0].Status != "delivered" {
+		t.Fatalf("expected delivered after QA evidence, got result=%+v", result)
+	}
+	if len(pub.calls) != 2 || len(delivery.calls) != 1 {
 		t.Fatalf("publish=%d delivery=%d", len(pub.calls), len(delivery.calls))
 	}
 }

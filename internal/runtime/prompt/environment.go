@@ -90,7 +90,15 @@ func renderEnvironmentContext(ctx context.Context, environment EnvironmentContex
 			xmlEscape(environment.SandboxProvider),
 		))
 		if available && strings.TrimSpace(environment.HostCommandTool) != "" && strings.TrimSpace(environment.SandboxCommandTool) != "" {
-			lines = append(lines, "<environment_rule>run_command 始终操作宿主项目工作区；sandbox_exec 始终操作远程 /workspace。两个环境的文件不自动共享，sandbox_exec 仅通过 inputs 接收宿主文件，并自动发布 OUTPUT_DIR 中的交付物。</environment_rule>")
+			hostRule := hostOSRuleText(environment.HostCommandTool, hostOS)
+			ruleText := fmt.Sprintf(`[环境差异与命令执行规则]:
+%s
+2. %s / run_skill_command 工具 (Linux 沙箱): 专门在隔离容器环境 (/workspace) 中运行第三方工具、数据提取与风险代码。必须使用 POSIX/Linux Shell 语法与正斜线 / 路径。
+3. [隔离与文件传递]: 宿主与沙箱文件系统隔离，沙箱仅接收 inputs 显式传入的输入文件，并自动将 OUTPUT_DIR 中的结果发布为交付物。
+4. [最佳实践]: 进行文件读写、发现与查找时，请优先使用通用工具 (read_file, write_file, list_dir, glob, grep)，避免因跨 OS 命令行语法差异导致错误。`,
+				hostRule, environment.SandboxCommandTool,
+			)
+			lines = append(lines, fmt.Sprintf("<environment_rule>\n%s\n</environment_rule>", xmlEscape(ruleText)))
 		}
 	}
 	if environment.ExternalApproval {
@@ -143,4 +151,20 @@ func xmlEscape(value string) string {
 	var b strings.Builder
 	_ = xml.EscapeText(&b, []byte(value))
 	return b.String()
+}
+
+func hostOSRuleText(toolName, osName string) string {
+	switch strings.ToLower(strings.TrimSpace(osName)) {
+	case "windows":
+		return fmt.Sprintf("1. %s 工具 (宿主系统: Windows): 专门在宿主 Windows 上运行本地构建、测试和系统命令。请使用 PowerShell / cmd 语法（支持 .exe 扩展名与 PowerShell 常用命令），路径可使用 \\ 或 /。", toolName)
+	case "darwin", "macos":
+		return fmt.Sprintf("1. %s 工具 (宿主系统: macOS): 专门在宿主 macOS 上运行本地构建、测试和系统命令。请使用 Zsh / Bash POSIX 标准命令，路径必须使用正斜线 /。", toolName)
+	case "linux":
+		return fmt.Sprintf("1. %s 工具 (宿主系统: Linux): 专门在宿主 Linux 上运行本地构建、测试和系统命令。请使用 Bash POSIX 标准命令，路径必须使用正斜线 /。", toolName)
+	default:
+		if osName == "" {
+			osName = "未指定"
+		}
+		return fmt.Sprintf("1. %s 工具 (宿主系统: %s): 专门在宿主机上运行本地构建、测试和系统命令。请使用符合该宿主 Shell 语法的命令。", toolName, osName)
+	}
 }

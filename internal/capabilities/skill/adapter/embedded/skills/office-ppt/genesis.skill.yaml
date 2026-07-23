@@ -6,7 +6,6 @@ runtime_profiles:
     sandbox:
       execution_mode: per_call
       backends:
-        - remote_sandbox
         - local_platform_sandbox
     dependencies:
       runtime:
@@ -40,7 +39,7 @@ runtime_profiles:
 invocations:
   - id: read
     handle: office-ppt-read
-    description: 提取并总结已有 PPT 的文字、备注和表格，不渲染、不编辑
+    description: 仅用于 PPTX 内容、表格与结构的只读提取与摘要。严禁在此模式下尝试解包、修改 XML 或重新打包 PPTX 文件！如需修改、重色或重新生成 PPTX，必须调用 Skill(skill="office-ppt", task="...") 触发子智能体执行。
     agent_mode:
       mode: main
     runtime_profile: read

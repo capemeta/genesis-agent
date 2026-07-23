@@ -89,7 +89,7 @@ func (v DeliverableSpec) Validate() error {
 	if v.Role != DeliverableRolePrimary && v.Role != DeliverableRoleSupporting {
 		return fmt.Errorf("deliverable role 无效: %q", v.Role)
 	}
-	if v.Cardinality != "" && v.Cardinality != "exactly_one" && v.Cardinality != "zero_or_one" {
+	if v.Cardinality != "" && v.Cardinality != "exactly_one" && v.Cardinality != "zero_or_one" && v.Cardinality != "one_or_more" && v.Cardinality != "zero_or_more" {
 		return fmt.Errorf("deliverable cardinality无效: %q", v.Cardinality)
 	}
 	if strings.ContainsAny(v.DesiredName, "/\\\x00") {

@@ -16,12 +16,14 @@ import (
 	"genesis-agent/internal/capabilities/skill/script/scriptutil"
 	tool "genesis-agent/internal/capabilities/tool/contract"
 	toolparam "genesis-agent/internal/capabilities/tool/param"
+	workcontract "genesis-agent/internal/capabilities/workspace/contract"
 )
 
 type Deps struct {
 	Service interface {
 		ListResources(context.Context, skillcontract.ListResourcesRequest) (model.ResourceList, error)
 		ListBoundResources(context.Context, model.InvocationBinding) (model.ResourceList, error)
+		Resolve(context.Context, skillcontract.ResolveRequest) (model.ResolvedInvocation, error)
 	}
 	Approval       approvalcontract.Service
 	CatalogRequest skillcontract.CatalogRequest
@@ -38,6 +40,8 @@ type input struct {
 type output struct {
 	SkillQualifiedName string               `json:"skill_qualified_name"`
 	Package            string               `json:"package"`
+	AgentMode          string               `json:"agent_mode,omitempty"`
+	UsageNotice        string               `json:"usage_notice,omitempty"`
 	Resources          []model.ResourceInfo `json:"resources"`
 }
 
@@ -88,7 +92,23 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 	}
 	resources := t.filterIndexedResources(ctx, pkg, name, result.Resources)
 	resources = filterExecutableScriptEntries(resources)
-	data, err := json.Marshal(output{SkillQualifiedName: result.Skill.Name, Package: string(result.Skill.PackageID), Resources: resources})
+
+	outPayload := output{
+		SkillQualifiedName: result.Skill.Name,
+		Package:            string(result.Skill.PackageID),
+		Resources:          resources,
+	}
+
+	if !bound {
+		if resolved, resolveErr := t.deps.Service.Resolve(ctx, skillcontract.ResolveRequest{CatalogRequest: t.deps.CatalogRequest, Name: name}); resolveErr == nil && resolved.Definition.AgentMode.Mode == model.AgentModeFork {
+			if prepared, ok := workcontract.PreparedRunFromContext(ctx); ok && prepared.Manifest.ParentRunID == "" {
+				outPayload.AgentMode = string(model.AgentModeFork)
+				outPayload.UsageNotice = fmt.Sprintf("【重要提示】当前 Skill %q 声明为 fork 隔离模式，主 Agent 禁止读取其包内资源文件。请勿调用 read_skill_resource，请直接调用 Skill(skill=%q, task=...) 工具委派子 Agent 执行。", resolved.Definition.Handle, resolved.Definition.Handle)
+			}
+		}
+	}
+
+	data, err := json.Marshal(outPayload)
 	if err != nil {
 		return "", err
 	}

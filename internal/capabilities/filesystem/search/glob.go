@@ -40,13 +40,14 @@ func (m *GlobMatcher) Match(p string) bool {
 
 func globToRegexp(pattern string) string {
 	var b strings.Builder
-	for i := 0; i < len(pattern); i++ {
-		ch := pattern[i]
+	runes := []rune(pattern)
+	for i := 0; i < len(runes); i++ {
+		ch := runes[i]
 		switch ch {
 		case '*':
-			if i+1 < len(pattern) && pattern[i+1] == '*' {
+			if i+1 < len(runes) && runes[i+1] == '*' {
 				i++
-				if i+1 < len(pattern) && pattern[i+1] == '/' {
+				if i+1 < len(runes) && runes[i+1] == '/' {
 					i++
 					b.WriteString("(?:.*/)?")
 				} else {

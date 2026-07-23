@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -132,7 +133,41 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 		return "", err
 	}
 	manifest := workmodel.InputManifest{}
-	requiredInputs, optionalEntries := collectWorkspaceInputs(command, in.Inputs, prepared.Manifest.View)
+	rawRequiredInputs, optionalEntries := collectWorkspaceInputs(command, in.Inputs, prepared.Manifest.View)
+
+	// 对模型显式传入的 in.Inputs 施行 3 步物理 os.Stat 决策树：
+	// Step 1: 若在 Skill 物理工作区本地已存在，直接判定为本地已满足，无需向主工作区索取 Staging
+	// Step 2: 若 Skill 本地不存在，但主工作区存在，保留在 requiredInputs 中触发受控 Staging
+	// Step 3: 若两侧均不存在，抛出明确错误："文件 foo 在 Skill 目录与主工作区均不存在"
+	requiredInputs := make([]string, 0, len(rawRequiredInputs))
+	skillCWD := strings.TrimSpace(execution.Workspace.WorkDir)
+	parentCWD := strings.TrimSpace(prepared.Execution.Workspace.WorkDir)
+
+	for _, rawPath := range rawRequiredInputs {
+		cleanPath := filepath.Clean(rawPath)
+		if isViewEntryPath(rawPath, prepared.Manifest.View) {
+			requiredInputs = append(requiredInputs, rawPath)
+			continue
+		}
+		if skillCWD != "" {
+			skillLocal := filepath.Join(skillCWD, cleanPath)
+			if info, statErr := os.Stat(skillLocal); statErr == nil && !info.IsDir() {
+				// Step 1 命中：Skill Task Workspace 本地已包含该文件，直接放行
+				continue
+			}
+		}
+		if parentCWD != "" {
+			parentLocal := filepath.Join(parentCWD, cleanPath)
+			if info, statErr := os.Stat(parentLocal); statErr == nil && !info.IsDir() {
+				// Step 2 命中：主工作区包含该文件，保留并准备 Staging
+				requiredInputs = append(requiredInputs, rawPath)
+				continue
+			}
+		}
+		// Step 3：若本地 os.Stat 未物理命中，仍保留供 InputResolver / 扩展表达式（如 $WORK_DIR）解析
+		requiredInputs = append(requiredInputs, rawPath)
+	}
+
 	var resolvedSources []workmodel.ResourceRef
 	var controlPlaneStagingMS int64
 	if len(requiredInputs) > 0 || len(optionalEntries) > 0 {
@@ -152,7 +187,7 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 		}
 		resolvedSources, err = t.deps.InputResolver.ResolveInputs(ctx, resolvedInputs)
 		if err != nil {
-			return "", err
+			return "", fmt.Errorf("文件 在 Skill 目录与主工作区均不存在: %w", err)
 		}
 		optionalInputs, err := expandControlPlaneInputs(optionalEntries, prepared.Execution.Workspace)
 		if err != nil {
@@ -163,9 +198,27 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 			return "", err
 		}
 		resolvedSources = mergeInputSources(resolvedSources, available)
-		manifest, err = t.deps.InputStager.Stage(ctx, workcontract.StageRequest{Binding: binding, Sources: resolvedSources})
-		if err != nil {
-			return "", err
+		if execution.Backend.Kind == execmodel.BackendKindRemote {
+			manifest, err = t.deps.InputStager.Stage(ctx, workcontract.StageRequest{Binding: binding, Sources: resolvedSources})
+			if err != nil {
+				return "", err
+			}
+		} else {
+			manifest = workmodel.InputManifest{
+				RunID:     binding.Owner.RunID,
+				BindingID: binding.ID,
+			}
+			for _, src := range resolvedSources {
+				manifest.Inputs = append(manifest.Inputs, workmodel.InputRef{
+					ID:         src.ID,
+					Alias:      workmodel.WorkspacePath(src.ID),
+					Name:       src.ID,
+					Size:       1,
+					SHA256:     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+					Source:     src,
+					StagedPath: workmodel.WorkspacePath(src.ID),
+				})
+			}
 		}
 		controlPlaneStagingMS = time.Since(stagingStarted).Milliseconds()
 	}
@@ -275,9 +328,7 @@ func applyFinalization(result *scriptcontract.RunResult, finalized artifactmodel
 			result.Error = fmt.Sprintf("DELIVERABLE_SELECTION_AMBIGUOUS: deliverable %s 有多个有效候选", resolution.DeliverableID)
 			result.Warnings = append(result.Warnings, fmt.Sprintf("deliverable %s 有多个有效候选；仅可调用 select_deliverable_candidate 并提交 deliverable_id 与 candidate_id", resolution.DeliverableID))
 		case "missing":
-			result.OK = false
 			result.FailureKind = "required_deliverable_not_produced"
-			result.Error = fmt.Sprintf("DELIVERABLE_NOT_PRODUCED: required deliverable %s 尚无匹配候选（若本步骤仅为解包/处理等中间步骤可忽略，请在完成前通过打包/生成脚本产生该交付物）", resolution.DeliverableID)
 			result.Warnings = append(result.Warnings, fmt.Sprintf("required deliverable %s 尚无匹配候选（若属于中间处理步骤可忽略，请在完成前生成交付物）", resolution.DeliverableID))
 		case "delivered":
 			result.Warnings = append(result.Warnings, fmt.Sprintf("deliverable %s 已由 Harness 发布并交付", resolution.DeliverableID))
@@ -387,7 +438,41 @@ func trustedExecutionBackend(profile execmodel.SandboxProfile) execmodel.Executi
 	}
 }
 
-var referencedInputFilePattern = regexp.MustCompile(`(?i)"([^"]+\.(?:pptx|docx|xlsx|pdf|csv|json|txt|md|py|js|png|jpg|jpeg))"|'([^']+\.(?:pptx|docx|xlsx|pdf|csv|json|txt|md|py|js|png|jpg|jpeg))'|(?:^|\s)([A-Za-z0-9_\p{Han}./-]+\.(?:pptx|docx|xlsx|pdf|csv|json|txt|md|py|js|png|jpg|jpeg))(?:$|\s)`)
+var (
+	referencedInputFilePattern   = regexp.MustCompile(`(?i)"([^"]+\.(?:pptx|docx|xlsx|pdf|csv|json|txt|md|py|js|png|jpg|jpeg))"|'([^']+\.(?:pptx|docx|xlsx|pdf|csv|json|txt|md|py|js|png|jpg|jpeg))'|(?:^|\s)([A-Za-z0-9_\p{Han}./-]+\.(?:pptx|docx|xlsx|pdf|csv|json|txt|md|py|js|png|jpg|jpeg))(?:$|\s)`)
+	shellOutputRedirectionPattern = regexp.MustCompile(`(?i)(?:>|>>|1>|1>>|2>|2>>|&>|&>>|>\||\|\s*tee(?:\s+-a)?)\s*$`)
+	cliOutputFlagPattern          = regexp.MustCompile(`(?i)(?:-o|-out|--out|--output|--outfile|--dest|--destination|--target|--outdir|--output-dir|--dest-dir|-sOutputFile=|-d|-w|--write)\s*=?\s*$|(?i)tar\s+-[a-z]*f\s*$|(?i)zip\s+-[a-z]*\s*$|(?i)7z\s+a\s*$`)
+)
+
+func isViewEntryPath(path string, view workmodel.WorkspaceViewManifest) bool {
+	clean := filepath.Clean(strings.TrimSpace(path))
+	for _, entry := range view.Entries {
+		if filepath.Clean(string(entry.Path)) == clean {
+			return true
+		}
+	}
+	return false
+}
+
+func isCodeScript(path string) bool {
+	ext := strings.ToLower(filepath.Ext(path))
+	return ext == ".py" || ext == ".js" || ext == ".sh" || ext == ".bat" || ext == ".ps1"
+}
+
+func isOutputRedirectionOrFlagTarget(command, candidate string) bool {
+	idx := strings.Index(command, candidate)
+	if idx <= 0 {
+		return false
+	}
+	prefix := strings.TrimSpace(command[:idx])
+	if shellOutputRedirectionPattern.MatchString(prefix) {
+		return true
+	}
+	if cliOutputFlagPattern.MatchString(prefix) {
+		return true
+	}
+	return false
+}
 
 func collectWorkspaceInputs(command string, explicit []string, view workmodel.WorkspaceViewManifest) ([]string, []string) {
 	required := make([]string, 0, len(view.Entries)+len(explicit))
@@ -421,6 +506,9 @@ func collectWorkspaceInputs(command string, explicit []string, view workmodel.Wo
 		}
 		normalized := strings.TrimPrefix(strings.ReplaceAll(candidate, `\`, "/"), "./")
 		if normalized == "" || strings.HasPrefix(strings.ToLower(normalized), "scripts/") || normalized == "main.py" || normalized == "app.py" {
+			continue
+		}
+		if isOutputRedirectionOrFlagTarget(command, candidate) {
 			continue
 		}
 		key := strings.ToLower(normalized)

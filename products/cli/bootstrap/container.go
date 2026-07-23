@@ -714,6 +714,7 @@ func buildProductRuntime(ctx context.Context, configDir string, cfg *platformcon
 		var b strings.Builder
 		b.WriteString("Skills 是任务流程包，不是可执行工具。加载技能必须调用 Skill(skill=...)；禁止把 office-ppt 等技能名当作独立工具调用。用户输入中的 $skill 或 skill:// 引用会在回合开始自动注入。请求里精确引用的已有文件由 Harness 自动绑定到当前 Run；run_skill_command 会自动 stage 已绑定输入和 command 入口脚本，禁止 run_command / Copy-Item 手动搬运。可用技能列表见 Skill 工具描述中的 <available_skills>。用户给出 Skill 的 GitHub/URL 地址要求安装时：调用 install_skill_from_source（须审批），禁止 run_command/curl/git clone 旁路。若 run_skill_command 返回 failure_kind=dependency_missing：调用 install_skill_dependencies（须审批，仅装 runtime 白名单包）后，用相同参数再跑命令（安装成功会清零重复失败计数）；sandbox_violation 勿当成缺包。收到 failure_kind=repeated_failure：禁止再次提交相同调用，必须改参或改策略。收到 failure_kind=no_progress：必须总结阻塞或询问用户，禁止继续空转。")
 		b.WriteString("\n\nRun 文件落点：中间脚本/临时文件直接使用当前根下相对路径，例如 write_file(\"create_ppt.js\")。run_skill_command 返回不透明 candidate_id；required 交付物唯一匹配时 Harness 自动 Gate、发布与交付，多个匹配时只能用 select_deliverable_candidate 选择返回的 candidate_id。禁止提交物理路径或 locator，也禁止复制到仓库根或内部 runs 目录。")
+		b.WriteString("\n\n沙箱指令规范：在 Linux 沙箱与受控环境下执行命令时，禁止发送 Get-ChildItem 等 PowerShell 专属 Cmdlet，请使用标准 ls / python / node 命令或脚本。")
 		return promptbuilder.Fragment{
 			Name:     "skills_instructions",
 			Contents: b.String(),

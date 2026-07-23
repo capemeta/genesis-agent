@@ -213,4 +213,4 @@ llm:
     # - 主模型 supports_image=false 且本字段可用 → 形态 B（VisionExpert 用该模型看图，只回写文本）
     # - 主模型 supports_image=false 且本字段空/不可用 → 形态 C
     # 示例：vision: qwen-vl   或   vision: gpt4o
-    vision: "qwen-vl"
+    vision: ""

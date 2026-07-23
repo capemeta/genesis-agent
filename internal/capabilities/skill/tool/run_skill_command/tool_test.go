@@ -3,6 +3,9 @@ package run_skill_command
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -91,6 +94,11 @@ type fakeInputResolver struct {
 
 func (r *fakeInputResolver) ResolveInputs(_ context.Context, inputs []string) ([]workmodel.ResourceRef, error) {
 	r.inputs = append([]string(nil), inputs...)
+	for _, in := range inputs {
+		if strings.Contains(in, "non_existent") {
+			return nil, fmt.Errorf("resource not found: %s", in)
+		}
+	}
 	return append([]workmodel.ResourceRef(nil), r.refs...), nil
 }
 
@@ -273,6 +281,79 @@ func TestCollectWorkspaceInputsIncludesBoundInputAndCommandEntry(t *testing.T) {
 	}
 	if len(optional) != 1 || optional[0] != "create.js" {
 		t.Fatalf("collectWorkspaceInputs() optional = %v", optional)
+	}
+}
+
+func TestCollectWorkspaceInputsFiltersShellRedirectionAndOutputFlags(t *testing.T) {
+	view := workmodel.WorkspaceViewManifest{}
+	_, optionalRedirection := collectWorkspaceInputs(`python process.py input.csv > aaa.txt`, nil, view)
+	for _, opt := range optionalRedirection {
+		if opt == "aaa.txt" {
+			t.Fatalf("shell output redirection 目标 aaa.txt 不可以加入 optional: %v", optionalRedirection)
+		}
+	}
+
+	_, optionalFlag := collectWorkspaceInputs(`pandoc in.md -o out.pdf`, nil, view)
+	if len(optionalFlag) != 1 || optionalFlag[0] != "in.md" {
+		t.Fatalf("CLI -o 输出标志目标不可以加入 optional, expected in.md, got: %v", optionalFlag)
+	}
+
+	_, optionalOutDir := collectWorkspaceInputs(`soffice --convert-to pdf --outdir ./out in.docx`, nil, view)
+	if len(optionalOutDir) != 1 || optionalOutDir[0] != "in.docx" {
+		t.Fatalf("CLI --outdir 输出标志目标不可以加入 optional, expected in.docx, got: %v", optionalOutDir)
+	}
+}
+
+func TestExecutePhysicalStat3StepInputResolution(t *testing.T) {
+	tempSkillDir := t.TempDir()
+	tempParentDir := t.TempDir()
+
+	// 准备 Skill Task Workspace 本地产物
+	localFile := filepath.Join(tempSkillDir, "local_created.pptx")
+	if err := os.WriteFile(localFile, []byte("ppt data"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 准备 Parent Run Workspace 外部数据
+	parentFile := filepath.Join(tempParentDir, "sales_data.xlsx")
+	if err := os.WriteFile(parentFile, []byte("excel data"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := &captureRunner{}
+	stager := &fakeInputStager{}
+	ref := workmodel.ResourceRef{Authority: "host", Scheme: "file", ID: "res-parent", Version: "v1", Path: parentFile}
+	resolver := &fakeInputResolver{refs: []workmodel.ResourceRef{ref}}
+
+	tool, err := New(Deps{Runner: runner, InputResolver: resolver, InputStager: stager})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	skillBinding := execmodel.ExecutionBinding{ID: "skill-binding", Mode: execmodel.WorkspaceModeTask, Access: execmodel.WorkspaceAccessReadWrite, Owner: execmodel.ExecutionOwnerRef{RunID: "run-1", TaskID: "skill:demo"}}
+	rootExecution := workmodel.PreparedExecutionSnapshot{Binding: execmodel.ExecutionBinding{ID: "root-binding"}, Workspace: execmodel.ExecutionWorkspace{WorkDir: tempParentDir}}
+	skillExecution := workmodel.PreparedExecutionSnapshot{Binding: skillBinding, Workspace: execmodel.ExecutionWorkspace{WorkDir: tempSkillDir}}
+	manifest := workmodel.RunManifest{RunID: "run-1", StateRoot: workmodel.StateRoot{ID: "state", Authority: "test"}, Executions: []workmodel.PreparedExecutionSnapshot{rootExecution, skillExecution}}
+
+	control := &skillTestControl{execution: skillExecution, manifest: manifest}
+	ctx := workcontract.WithPreparedRun(context.Background(), workmodel.PreparedRun{Manifest: manifest, Execution: rootExecution})
+	ctx = workcontract.WithControlPlane(ctx, control)
+	ctx = withInvocation(ctx)
+
+	// 测试 Step 1：Skill 本地已包含 local_created.pptx -> 放行且不请求 parent staging
+	if _, err := tool.Execute(ctx, `{"skill":"demo","command":"python process.py","inputs":["local_created.pptx"]}`); err != nil {
+		t.Fatalf("Step 1 物理 Stat 命中放行失败: %v", err)
+	}
+
+	// 测试 Step 2：Skill 本地没有，Parent 有 sales_data.xlsx -> 触发 parent staging
+	if _, err := tool.Execute(ctx, `{"skill":"demo","command":"python process.py","inputs":["sales_data.xlsx"]}`); err != nil {
+		t.Fatalf("Step 2 主工作区 Stat 命中 Staging 失败: %v", err)
+	}
+
+	// 测试 Step 3：两侧均不存在 non_existent.csv -> 报明确错误
+	_, err = tool.Execute(ctx, `{"skill":"demo","command":"python process.py","inputs":["non_existent.csv"]}`)
+	if err == nil || !strings.Contains(err.Error(), "均不存在") {
+		t.Fatalf("Step 3 两侧不存在必须抛出明确错误: %v", err)
 	}
 }
 

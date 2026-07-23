@@ -221,7 +221,7 @@ func TestRenderEnvironmentContextOnlyDescribesInstalledEnvironmentTools(t *testi
 		OS: "windows", HostCommandTool: "run_command", SandboxMode: "required",
 		SandboxProvider: "genesis-sandbox", SandboxCommandTool: "sandbox_exec",
 	})
-	for _, want := range []string{`tool="run_command"`, `tool="sandbox_exec"`, "两个环境的文件不自动共享"} {
+	for _, want := range []string{`tool="run_command"`, `tool="sandbox_exec"`, "环境差异与命令执行规则"} {
 		if !strings.Contains(mixed, want) {
 			t.Fatalf("mixed context=%q missing %q", mixed, want)
 		}

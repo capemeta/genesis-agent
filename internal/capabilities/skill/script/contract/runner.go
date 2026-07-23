@@ -14,19 +14,25 @@ type Runner interface {
 	Run(ctx context.Context, req RunRequest) (*RunResult, error)
 }
 
+type AutoScriptPayload struct {
+	Name    string
+	Content []byte
+}
+
 // RunRequest 描述一次 Skill 命令执行。
 type RunRequest struct {
-	Catalog    skillcontract.CatalogRequest
-	Skill      string
-	Invocation skillmodel.InvocationBinding
-	Command    string
-	Inputs     workmodel.InputManifest // 控制面完成权限、版本、hash 与 staging 后生成的不可变输入清单
-	Binding    execmodel.ExecutionBinding
-	Backend    execmodel.ExecutionBackendRef
-	StateRoot  workmodel.StateRoot
-	ProjectDir string
-	TimeoutMS  int64
-	Sandbox    execmodel.SandboxProfile
+	Catalog        skillcontract.CatalogRequest
+	Skill          string
+	Invocation     skillmodel.InvocationBinding
+	Command        string
+	AutoScriptFile *AutoScriptPayload
+	Inputs         workmodel.InputManifest // 控制面完成权限、版本、hash 与 staging 后生成的不可变输入清单
+	Binding        execmodel.ExecutionBinding
+	Backend        execmodel.ExecutionBackendRef
+	StateRoot      workmodel.StateRoot
+	ProjectDir     string
+	TimeoutMS      int64
+	Sandbox        execmodel.SandboxProfile
 }
 
 // RunResult 是 Skill 命令执行结果。

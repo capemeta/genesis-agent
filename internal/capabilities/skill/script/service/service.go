@@ -224,21 +224,31 @@ func (s *Service) Run(ctx context.Context, req scriptcontract.RunRequest) (*scri
 		return out, nil
 	}
 	if risk, risky := detectRiskyInlineCommand(command); risky {
-		out := &scriptcontract.RunResult{
-			OK:              false,
-			Skill:           skillName,
-			Command:         command,
-			Error:           errCommandInlineRisky(command, risk).Error(),
-			FailureKind:     "command_inline_risky",
-			Retryable:       true,
-			SuggestedAction: "write_workdir_script_then_run_relative",
-			DurationMS:      time.Since(started).Milliseconds(),
-			Warnings: []string{
-				"python -c / node -e 多行或长串内联在 Windows 与远程 shell 下极易因引号失败；请写入 $WORK_DIR 脚本后执行。",
-			},
+		if rewrittenCmd, scriptName, payload, ok := autoRewriteRiskyInlineCommand(command); ok {
+			req.Command = rewrittenCmd
+			req.AutoScriptFile = &scriptcontract.AutoScriptPayload{
+				Name:    scriptName,
+				Content: []byte(payload),
+			}
+			command = rewrittenCmd
+			s.log.Info("已自动将高风险内联脚本重写为隐式脚本文件执行", "script", scriptName, "rewritten", rewrittenCmd)
+		} else {
+			out := &scriptcontract.RunResult{
+				OK:              false,
+				Skill:           skillName,
+				Command:         command,
+				Error:           errCommandInlineRisky(command, risk).Error(),
+				FailureKind:     "command_inline_risky",
+				Retryable:       true,
+				SuggestedAction: "write_workdir_script_then_run_relative",
+				DurationMS:      time.Since(started).Milliseconds(),
+				Warnings: []string{
+					"python -c / node -e 多行或长串内联在 Windows 与远程 shell 下极易因引号失败；请写入 $WORK_DIR 脚本后执行。",
+				},
+			}
+			classifyFailure(out)
+			return out, nil
 		}
-		classifyFailure(out)
-		return out, nil
 	}
 	scriptHint := commandScriptHint(command)
 	if scriptHint != "" && !isExecutableSkillEntry(scriptHint) {
@@ -559,6 +569,12 @@ func (s *Service) runLocal(ctx context.Context, meta skillmodel.Metadata, runID 
 	if _, err := mat.MaterializePackageScripts(ctx, req.Catalog, meta, req.Invocation.Package, skillDir); err != nil {
 		return skillExecutionAttempt{Workspace: executionWorkspace, Err: err}
 	}
+	if req.AutoScriptFile != nil && strings.TrimSpace(req.AutoScriptFile.Name) != "" {
+		autoPath := filepath.Join(skillDir, req.AutoScriptFile.Name)
+		if err := os.WriteFile(autoPath, req.AutoScriptFile.Content, 0o644); err != nil {
+			return skillExecutionAttempt{WorkDir: skillDir, Workspace: executionWorkspace, Err: fmt.Errorf("自动写入内联脚本失败: %w", err)}
+		}
+	}
 	stagingStarted := time.Now()
 	staged, err := stageInputManifestLocal(ctx, s.inputSnapshots, req.Binding, req.Invocation.Package, req.Inputs, skillDir)
 	stagingDurationMS := time.Since(stagingStarted).Milliseconds()
@@ -642,6 +658,12 @@ func (s *Service) runRemote(ctx context.Context, meta skillmodel.Metadata, runID
 	if err != nil {
 		return skillExecutionAttempt{WorkDir: remoteWorkspace.SkillDir, Workspace: remoteWorkspace, StagingDurationMS: stagingDurationMS, Err: err}
 	}
+	if req.AutoScriptFile != nil && strings.TrimSpace(req.AutoScriptFile.Name) != "" {
+		remoteAutoPath := filepath.ToSlash(filepath.Join(remoteWorkspace.SkillDir, req.AutoScriptFile.Name))
+		if err := sess.WriteFile(ctx, remoteAutoPath, req.AutoScriptFile.Content, fscontract.WriteOptions{Overwrite: true}); err != nil {
+			return skillExecutionAttempt{WorkDir: remoteWorkspace.SkillDir, Workspace: remoteWorkspace, StagingDurationMS: stagingDurationMS, Err: fmt.Errorf("自动写入远程内联脚本失败: %w", err)}
+		}
+	}
 	before, err := snapshotRemoteFiles(ctx, sess, remoteWorkspace.SkillDir)
 	if err != nil {
 		return skillExecutionAttempt{WorkDir: remoteWorkspace.SkillDir, Staged: staged, Workspace: remoteWorkspace, StagingDurationMS: stagingDurationMS, Err: err}
@@ -690,6 +712,12 @@ func (s *Service) commandEntryAvailable(ctx context.Context, req scriptcontract.
 	entry = normalizeCommandEntry(entry)
 	if entry == "" {
 		return true, nil
+	}
+	if req.AutoScriptFile != nil && strings.TrimSpace(req.AutoScriptFile.Name) != "" {
+		autoName := normalizeCommandEntry(req.AutoScriptFile.Name)
+		if autoName == entry || path.Base(entry) == path.Base(autoName) {
+			return true, nil
+		}
 	}
 	for _, input := range req.Inputs.Inputs {
 		alias := inputAlias(input)
