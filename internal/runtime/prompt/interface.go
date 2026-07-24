@@ -13,8 +13,12 @@ type Audience string
 const (
 	// AudienceRoot 是根会话主 Agent（默认）。
 	AudienceRoot Audience = "root"
-	// AudienceSubAgent 是委派子 Run：跳过主侧委派纪律与冗长腔调。
+	// AudienceSubAgent 是普通 Task 委派子 Run：跳过主侧委派纪律与冗长腔调，但可保留
+	// memory/RAG 类 Injector；仍持有 Skill 工具（可在任务中调度技能）。
 	AudienceSubAgent Audience = "subagent"
+	// AudienceSkillFork 是由 Skill 网关派生的执行子 Run：跳过所有全局 Injectors；
+	// 不持有 Skill 工具；System 由 ComposeChildSystem 完全接管。
+	AudienceSkillFork Audience = "skill_fork"
 )
 
 // BuildRequest 描述一次系统提示词构建请求。
@@ -50,14 +54,42 @@ type ContextInjector interface {
 	Inject(ctx context.Context, req BuildRequest) (Fragment, error)
 }
 
-// ContextInjectorFunc 让普通函数可作为注入器。
+// AudienceAware 是可选接口：Injector 通过实现此接口声明自己适用于哪些受众。
+// 未实现此接口视为适用于所有受众（向后兼容）。
+// 返回 nil 或空切片同样视为适用于所有受众。
+type AudienceAware interface {
+	Audiences() []Audience
+}
+
+// ContextInjectorFunc 让普通函数可作为注入器（适用所有受众）。
 type ContextInjectorFunc func(ctx context.Context, req BuildRequest) (Fragment, error)
 
 func (f ContextInjectorFunc) Inject(ctx context.Context, req BuildRequest) (Fragment, error) {
 	return f(ctx, req)
 }
 
+// audienceFilteredInjector 包装任意 ContextInjector，限定其适用受众。
+type audienceFilteredInjector struct {
+	inner     ContextInjector
+	audiences []Audience
+}
+
+func (a *audienceFilteredInjector) Inject(ctx context.Context, req BuildRequest) (Fragment, error) {
+	return a.inner.Inject(ctx, req)
+}
+
+func (a *audienceFilteredInjector) Audiences() []Audience {
+	return a.audiences
+}
+
+// WithAudiences 为任意 ContextInjector 声明适用受众，返回实现了 AudienceAware 的注入器。
+// 用于 skillstack 等需要限定受众的匿名函数注入器。
+func WithAudiences(injector ContextInjector, audiences ...Audience) ContextInjector {
+	return &audienceFilteredInjector{inner: injector, audiences: audiences}
+}
+
 // Builder 构建运行时提示词。
 type Builder interface {
 	BuildSystem(ctx context.Context, req BuildRequest) (string, error)
 }
+

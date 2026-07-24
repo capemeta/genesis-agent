@@ -211,3 +211,26 @@ func TestResetClearsAll(t *testing.T) {
 		t.Fatal("reset should clear blocks")
 	}
 }
+
+func TestStateMutatingToolClearsCommandFailures(t *testing.T) {
+	g := New(Config{Enabled: true, MaxIdenticalToolFailures: 2, MaxStagnantIterations: 0})
+	args := `{"command":"python -m markitdown test.pptx","skill":"office-ppt-read"}`
+	fail := `{"ok":false,"failure_kind":"script_error","stderr":"No module named markitdown"}`
+
+	// 连续失败 2 次，触达阻断
+	g.Record("run_skill_command", args, fail, nil, nil)
+	g.Record("run_skill_command", args, fail, nil, nil)
+
+	if !g.Check("run_skill_command", args, nil).Blocked {
+		t.Fatal("expected run_skill_command blocked after 2 failures")
+	}
+
+	// 状态变更工具 (install_skill_dependencies) 成功
+	g.Record("install_skill_dependencies", `{"skill":"office-ppt-read","packages":[{"manager":"pip","name":"markitdown[pptx]"}]}`,
+		`{"ok":true,"installed":[{"name":"markitdown[pptx]"}]}`, nil, nil)
+
+	// 再次校验 run_skill_command：应当解封放行！
+	if g.Check("run_skill_command", args, nil).Blocked {
+		t.Fatal("expected run_skill_command to be unblocked after state mutating tool (install_skill_dependencies) success")
+	}
+}

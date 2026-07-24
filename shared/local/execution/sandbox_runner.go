@@ -83,20 +83,28 @@ func (r *SandboxRunner) RunInSandbox(ctx context.Context, cmd execmodel.Command,
 	}
 	argvCommand := ArgvCommand{Argv: plan.Command.Argv, Env: plan.Command.Env, Cwd: plan.Command.Cwd, Stdin: cmd.Stdin, DisplayCommand: cmd.Command, Shell: shell}
 
+	cmdDesc := strings.TrimSpace(cmd.Command)
 	isSandbox := plan.Type != localsandbox.TypeNone
 	if isSandbox {
+		startSummary := "启动本地平台沙箱"
+		if cmdDesc != "" {
+			startSummary = fmt.Sprintf("启动本地平台沙箱: %s", cmdDesc)
+		}
 		progress.Emit(ctx, progress.Event{
 			Kind:      progress.KindSandbox,
 			Phase:     progress.PhaseStart,
 			Component: "local-platform-sandbox",
 			Name:      string(plan.Type),
-			Summary:   "启动本地平台沙箱",
-			Detail:    fmt.Sprintf("沙箱类型: %s, 级别: %s, 隔离等级: %s", plan.Type, plan.WindowsLevel, plan.Enforcement),
+			Summary:   startSummary,
+			Detail:    fmt.Sprintf("命令: %s, 沙箱类型: %s, 级别: %s, 隔离等级: %s", cmdDesc, plan.Type, plan.WindowsLevel, plan.Enforcement),
 		})
 	} else if profile.Mode != execmodel.SandboxDisabled {
 		summary := "自动降级：本地宿主机直接执行 (沙箱未配置)"
 		if plan.Degraded {
 			summary = "自动降级：本地宿主机直接执行 (沙箱策略未就绪)"
+		}
+		if cmdDesc != "" {
+			summary += ": " + cmdDesc
 		}
 		progress.Emit(ctx, progress.Event{
 			Kind:      progress.KindSandbox,
@@ -113,42 +121,58 @@ func (r *SandboxRunner) RunInSandbox(ctx context.Context, cmd execmodel.Command,
 
 	if isSandbox {
 		if err != nil {
+			failSummary := "本地平台沙箱执行异常"
+			if cmdDesc != "" {
+				failSummary = fmt.Sprintf("本地平台沙箱执行异常: %s", cmdDesc)
+			}
 			progress.Emit(ctx, progress.Event{
 				Kind:      progress.KindSandbox,
 				Phase:     progress.PhaseError,
 				Level:     progress.LevelError,
 				Component: "local-platform-sandbox",
 				Name:      string(plan.Type),
-				Summary:   "本地平台沙箱执行异常",
+				Summary:   failSummary,
 				Detail:    err.Error(),
 			})
 		} else {
+			completeSummary := "本地平台沙箱执行结束"
+			if cmdDesc != "" {
+				completeSummary = fmt.Sprintf("本地平台沙箱执行完成: %s", cmdDesc)
+			}
 			progress.Emit(ctx, progress.Event{
 				Kind:      progress.KindSandbox,
 				Phase:     progress.PhaseComplete,
 				Component: "local-platform-sandbox",
 				Name:      string(plan.Type),
-				Summary:   "本地平台沙箱执行结束",
+				Summary:   completeSummary,
 			})
 		}
 	} else if profile.Mode != execmodel.SandboxDisabled {
 		if err != nil {
+			failSummary := "宿主环境直接执行异常"
+			if cmdDesc != "" {
+				failSummary = fmt.Sprintf("宿主环境直接执行异常: %s", cmdDesc)
+			}
 			progress.Emit(ctx, progress.Event{
 				Kind:      progress.KindSandbox,
 				Phase:     progress.PhaseError,
 				Level:     progress.LevelError,
 				Component: "local-platform-sandbox",
 				Name:      "local_host",
-				Summary:   "宿主环境直接执行异常",
+				Summary:   failSummary,
 				Detail:    err.Error(),
 			})
 		} else {
+			completeSummary := "宿主环境直接执行完成"
+			if cmdDesc != "" {
+				completeSummary = fmt.Sprintf("宿主环境直接执行完成: %s", cmdDesc)
+			}
 			progress.Emit(ctx, progress.Event{
 				Kind:      progress.KindSandbox,
 				Phase:     progress.PhaseComplete,
 				Component: "local-platform-sandbox",
 				Name:      "local_host",
-				Summary:   "宿主环境直接执行完成",
+				Summary:   completeSummary,
 			})
 		}
 	}

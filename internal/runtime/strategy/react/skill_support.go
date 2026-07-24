@@ -111,12 +111,7 @@ func (e *ReactLoopEngine) applySkillToolResult(ctx context.Context, rc *runtime.
 		rc.Messages = append(rc.Messages, domain.NewToolResultMessage(toolResult.ID, renderAlreadyLoadedAck(injection)))
 		return true, nil
 	}
-	narrowed, narrowOK := narrowToolNames(*activeToolNames, binding.ToolPolicy.Allowed)
-	if !narrowOK {
-		rc.Messages = append(rc.Messages, domain.NewToolResultMessage(toolResult.ID, renderSkillToolAck(injection, false)))
-		iterLog.Error("Skill Invocation工具策略不可满足，拒绝注入", "skill", injection.QualifiedName, "allowed_tools", injection.AllowedTools)
-		return true, nil
-	}
+	unionized := unionToolNames(*activeToolNames, binding.ToolPolicy.Allowed)
 	if err := rc.ActivateInvocation(binding); err != nil {
 		return true, err
 	}
@@ -125,7 +120,7 @@ func (e *ReactLoopEngine) applySkillToolResult(ctx context.Context, rc *runtime.
 	rc.Messages = append(rc.Messages, domain.NewSkillInjectionMessage(renderSkillInjection(injection)).WithSource(domain.MessageSourceSkillGateway))
 	rc.MarkInjectedSkill(key)
 	registerSkillInjectionFollow(rc, injection.Content)
-	*activeToolNames = narrowed
+	*activeToolNames = unionized
 	*toolInfos = e.filterToolInfos(ctx, *activeToolNames)
 	return true, nil
 }
@@ -197,11 +192,7 @@ func (e *ReactLoopEngine) injectMentionedSkills(ctx context.Context, rc *runtime
 			}
 			continue
 		}
-		narrowed, narrowOK := narrowToolNames(*activeToolNames, binding.ToolPolicy.Allowed)
-		if !narrowOK {
-			log.Error("mention Skill Invocation工具策略不可满足，拒绝注入", "skill", injection.QualifiedName)
-			continue
-		}
+		unionized := unionToolNames(*activeToolNames, binding.ToolPolicy.Allowed)
 		if err := rc.ActivateInvocation(binding); err != nil {
 			log.Error("mention Skill Invocation激活失败", "skill", injection.QualifiedName, "error", err)
 			continue
@@ -209,7 +200,7 @@ func (e *ReactLoopEngine) injectMentionedSkills(ctx context.Context, rc *runtime
 		rc.Messages = append(rc.Messages, domain.NewSkillInjectionMessage(renderSkillInjection(injection)).WithSource(domain.MessageSourceSkillMention))
 		rc.MarkInjectedSkill(key)
 		registerSkillInjectionFollow(rc, injection.Content)
-		*activeToolNames = narrowed
+		*activeToolNames = unionized
 		*toolInfos = e.filterToolInfos(ctx, *activeToolNames)
 		log.Info("已按 mention 自动注入 Skill", "skill", injection.QualifiedName)
 	}

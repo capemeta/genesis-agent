@@ -227,15 +227,18 @@ func BuildEmbedded(opts Options) (*Stack, error) {
 
 	matcher := &skillcollision.Matcher{Service: skillSvc, CatalogRequest: catalogReq}
 	mentions := &react.MentionSelector{Service: skillSvc, CatalogRequest: catalogReq}
-	injector := promptbuilder.ContextInjectorFunc(func(ctx context.Context, req promptbuilder.BuildRequest) (promptbuilder.Fragment, error) {
-		var b strings.Builder
-		b.WriteString("Skills 是任务流程包，不是可执行工具。加载技能必须调用 Skill(skill=...)；禁止把 office-ppt 等技能名当作独立工具调用。用户输入中的 $skill 或 skill:// 引用会在回合开始自动注入。用户指定的宿主机文件应直接作为 run_skill_command.inputs，由运行时在审批后 stage，禁止 run_command / Copy-Item 手动搬运。可用技能列表见 Skill 工具描述中的 <available_skills>。若 run_skill_command 返回 failure_kind=dependency_missing：调用 install_skill_dependencies（须审批，仅装 runtime 白名单包）后，用相同参数再跑命令（安装成功会清零重复失败计数）；sandbox_violation 勿当成缺包。收到 failure_kind=repeated_failure：禁止再次提交相同调用，必须改参或改策略。收到 failure_kind=no_progress：必须总结阻塞或询问用户，禁止继续空转。")
-		b.WriteString("\n\nRun 文件落点：中间脚本/临时文件写当前 execution work；run_skill_command 只返回不透明 candidate_id。required 交付物唯一匹配时由 Harness 自动 Gate、发布和交付；多个匹配时只能通过 select_deliverable_candidate 选择返回的 candidate_id，禁止提交路径或 locator。")
-		return promptbuilder.Fragment{
-			Name:     "skills_instructions",
-			Contents: b.String(),
-		}, nil
-	})
+	injector := promptbuilder.WithAudiences(
+		promptbuilder.ContextInjectorFunc(func(ctx context.Context, req promptbuilder.BuildRequest) (promptbuilder.Fragment, error) {
+			var b strings.Builder
+			b.WriteString("Skills 是任务流程包，不是可执行工具。加载技能必须调用 Skill(skill=...)；禁止把 office-ppt 等技能名当作独立工具调用。用户输入中的 $skill 或 skill:// 引用会在回合开始自动注入。当用户要求处理某个文件时（无论是宿主机绝对路径还是相对路径），直接将该路径填入 Skill(inputs=[...])；系统会自动校验并挂载至技能工作目录，严禁使用 run_command 或复制命令 (Copy-Item/cp) 手动搬运文件。在技能工作目录跑命令 (run_skill_command) 时，输入文件已被自动放置在当前目录下，命令中请直接使用相对文件名（如 python parse.py 1.pdf），禁止在 command 字符串中拼接宿主机绝对路径。可用技能列表见 Skill 工具描述中的 <available_skills>。若 run_skill_command 返回 failure_kind=dependency_missing：调用 install_skill_dependencies（须审批，仅装 runtime 白名单包）后，用相同参数再跑命令（安装成功会清零重复失败计数）；sandbox_violation 勿当成缺包。收到 failure_kind=repeated_failure：禁止再次提交相同调用，必须改参或改策略。收到 failure_kind=no_progress：必须总结阻塞或询问用户，禁止继续空转。")
+			b.WriteString("\n\nRun 文件落点：中间脚本/临时文件写当前 execution work；run_skill_command 只返回不透明 candidate_id。required 交付物唯一匹配时由 Harness 自动 Gate、发布和交付；多个匹配时只能通过 select_deliverable_candidate 选择返回的 candidate_id，禁止提交路径或 locator。")
+			return promptbuilder.Fragment{
+				Name:     "skills_instructions",
+				Contents: b.String(),
+			}, nil
+		}),
+		promptbuilder.AudienceRoot, // skills_instructions 仅注入主 Agent；子 Agent 无需技能调度说明
+	)
 
 	tools := []toolcontract.Tool{skillGateway, listResources, readResource, searchResources, runSkillCommand, installDeps}
 	if opts.Finalizer != nil {

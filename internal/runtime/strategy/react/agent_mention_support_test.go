@@ -6,8 +6,10 @@ import (
 	"testing"
 
 	"genesis-agent/internal/domain"
+	"genesis-agent/internal/platform/contextutil"
 	"genesis-agent/internal/runtime"
 	multicontract "genesis-agent/internal/runtime/multiagent/contract"
+	"genesis-agent/internal/runtime/prompt"
 )
 
 type mapSubAgentLookup map[string]struct{}
@@ -74,3 +76,21 @@ func TestInjectAgentMentionsSkippedOnSubRun(t *testing.T) {
 		t.Fatalf("sub run must not inject agent mention reminders: %d", len(rc.Messages))
 	}
 }
+
+func TestPromptAudience(t *testing.T) {
+	rootCtx := context.Background()
+	if aud := promptAudience(rootCtx); aud != prompt.AudienceRoot {
+		t.Fatalf("root context audience must be AudienceRoot, got %s", aud)
+	}
+
+	subCtx := multicontract.WithDelegationDepth(context.Background(), 1)
+	if aud := promptAudience(subCtx); aud != prompt.AudienceSubAgent {
+		t.Fatalf("subagent context audience must be AudienceSubAgent, got %s", aud)
+	}
+
+	forkCtx := contextutil.WithSubagentType(multicontract.WithDelegationDepth(context.Background(), 1), "skill-fork:office-ppt-read")
+	if aud := promptAudience(forkCtx); aud != prompt.AudienceSkillFork {
+		t.Fatalf("skill fork context audience must be AudienceSkillFork, got %s", aud)
+	}
+}
+

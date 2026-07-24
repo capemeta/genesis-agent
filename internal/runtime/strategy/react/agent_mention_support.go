@@ -6,6 +6,7 @@ import (
 
 	subagentprompt "genesis-agent/internal/capabilities/subagent/prompt"
 	"genesis-agent/internal/domain"
+	"genesis-agent/internal/platform/contextutil"
 	"genesis-agent/internal/runtime"
 	multicontract "genesis-agent/internal/runtime/multiagent/contract"
 	"genesis-agent/internal/runtime/prompt"
@@ -23,12 +24,18 @@ func WithSubAgentTypeLookup(lookup SubAgentTypeLookup) EngineOption {
 	}
 }
 
-// promptAudience 按委派深度选择 BuildSystem 受众。
+// promptAudience 按委派深度和子智能体类型选择 BuildSystem 受众。
+// - depth=0：主 Agent（AudienceRoot）
+// - depth>0 且 SubagentType 以 "skill-fork:" 开头：Skill 执行子 Run（AudienceSkillFork）
+// - depth>0 其他：普通 Task 子 Agent（AudienceSubAgent）
 func promptAudience(ctx context.Context) prompt.Audience {
-	if multicontract.DelegationDepth(ctx) > 0 {
-		return prompt.AudienceSubAgent
+	if multicontract.DelegationDepth(ctx) <= 0 {
+		return prompt.AudienceRoot
 	}
-	return prompt.AudienceRoot
+	if strings.HasPrefix(contextutil.GetSubagentType(ctx), subagentprompt.SkillForkSubagentTypePrefix) {
+		return prompt.AudienceSkillFork
+	}
+	return prompt.AudienceSubAgent
 }
 
 // injectAgentMentions 在根 Run 首轮 LLM 前注入 @agent / @run-agent 提醒（L4）。

@@ -107,7 +107,7 @@ func (t *Tool) GetInfo() *tool.Info {
 		Parameters: &tool.ParameterSchema{
 			Type: "object",
 			Properties: map[string]*tool.ParameterSchema{
-				"skill": {Type: "string", Description: "Skill 名称，例如 office-ppt"},
+				"skill": {Type: "string", Description: "必须与当前 Run 中已通过 Skill(...) 工具激活的技能 handle 完全一致。若需为其他技能安装依赖，必须先调用 Skill(skill=...) 加载并激活该目标技能。"},
 				"packages": {
 					Type:        "array",
 					Description: "要安装的包列表",
@@ -183,12 +183,13 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 		out.DurationMS = time.Since(started).Milliseconds()
 		return marshalFail(out, out.Error)
 	}
-	if remoteSandboxWorkspaceInstallUnsupported(t.deps.Sandbox) {
+	effectiveSandbox, _ := invocationSandboxProfile(t.deps.Sandbox, binding.ExecutionPolicy)
+	if remoteSandboxWorkspaceInstallUnsupported(effectiveSandbox) {
 		out.OK = false
 		out.Error = "scope=workspace 在 genesis-sandbox 远程模式下不会被后续 run_skill_command 的 office/skill session 可靠看见；当前请使用 profile/镜像预装，或等待 session scope 安装闭环"
 		out.Metadata["failure_kind"] = "install_scope_not_visible"
-		out.Metadata["provider"] = t.deps.Sandbox.Provider
-		out.Metadata["sandbox_mode"] = string(t.deps.Sandbox.Mode)
+		out.Metadata["provider"] = effectiveSandbox.Provider
+		out.Metadata["sandbox_mode"] = string(effectiveSandbox.Mode)
 		out.Suggested = "不要重复安装；请重跑脚本以使用镜像预装依赖，或重建对应 runtime profile"
 		out.DurationMS = time.Since(started).Milliseconds()
 		return marshalFail(out, out.Error)
@@ -198,7 +199,7 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 	pkgs, err := normalizeAndAuthorizePackages(in.Packages, binding.RuntimeProfile.Dependencies)
 	if err != nil {
 		out.OK = false
-		out.Error = err.Error()
+		out.Error = err.Error() + "\nSuggested Action: 仅能安装当前技能已声明的依赖包。若你需要办理其他领域的任务，请优先检查 <available_skills> 中是否存在匹配的专属技能，并调用 Skill(skill=\"<target-skill>\", task=...) 加载激活对应的专属技能。"
 		out.Metadata["failure_kind"] = "package_not_allowed"
 		out.DurationMS = time.Since(started).Milliseconds()
 		return marshalFail(out, out.Error)
@@ -276,7 +277,7 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 		return "", err
 	}
 
-	sandbox := cloneSandbox(t.deps.Sandbox)
+	sandbox := cloneSandbox(effectiveSandbox)
 	// Gate B 最小可用：安装走独立元数据标记 + build Operation；
 	// 远端/build profile 完整消费属 Gate C。本地 disabled 时仍需审批+命令白名单。
 	sandbox.Operation = execmodel.SandboxOperationBuildDependencies
@@ -632,6 +633,35 @@ func joinPkgNames(pkgs []packageInput) string {
 		parts = append(parts, p.Manager+":"+p.Name)
 	}
 	return strings.Join(parts, ",")
+}
+
+func invocationSandboxProfile(base execmodel.SandboxProfile, policy model.EffectiveExecutionPolicy) (execmodel.SandboxProfile, error) {
+	out := cloneSandbox(base)
+	selected := strings.ToLower(strings.TrimSpace(policy.SelectedBackend))
+	if selected == "" {
+		selected = strings.ToLower(strings.TrimSpace(policy.PreferredBackend))
+	}
+	switch selected {
+	case "", "inherit":
+	case "remote_sandbox":
+		out.Provider = "genesis-sandbox"
+		if policy.SandboxRequired {
+			out.Mode = execmodel.SandboxRequired
+		} else if out.Mode == "" || out.Mode == execmodel.SandboxDisabled {
+			out.Mode = execmodel.SandboxOptional
+		}
+	case "local_platform_sandbox":
+		out.Provider = "local-platform"
+		if policy.SandboxRequired {
+			out.Mode = execmodel.SandboxRequired
+		} else if out.Mode == "" || out.Mode == execmodel.SandboxDisabled {
+			out.Mode = execmodel.SandboxOptional
+		}
+	case "local_host":
+		out.Provider = "local-host"
+		out.Mode = execmodel.SandboxDisabled
+	}
+	return out, nil
 }
 
 func remoteSandboxWorkspaceInstallUnsupported(sandbox execmodel.SandboxProfile) bool {

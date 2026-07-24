@@ -53,44 +53,57 @@ func NewWithOptions(opts []Option, injectors ...ContextInjector) Builder {
 }
 
 // BuildSystem 构建 System 消息。
+// Audience 三档裁剪策略：
+//   - AudienceRoot：全量注入所有 Injectors。
+//   - AudienceSubAgent：跳过仅适用于 Root 的 Injectors（如 environment_context、skills_instructions）。
+//   - AudienceSkillFork：跳过全部 Injectors；System 由 ComposeChildSystem 完全接管。
 func (b *DefaultBuilder) BuildSystem(ctx context.Context, req BuildRequest) (string, error) {
 	var sb strings.Builder
 
 	sb.WriteString(fmt.Sprintf("当前时间: %s\n\n", time.Now().Format("2006年01月02日 15:04:05")))
 
+	aud := effectiveAudience(req)
 	if req.Agent != nil && req.Agent.SystemPrompt != "" {
 		sb.WriteString(req.Agent.SystemPrompt)
 		sb.WriteString("\n\n")
-	} else {
+	} else if aud == AudienceRoot {
+		// 子 Agent 的 SystemPrompt 由 ComposeChildSystem 填充，不注入默认文案
 		sb.WriteString("你是一个有帮助的AI助手。请根据用户的问题，合理使用提供的工具来回答。\n\n")
 	}
 
-	for _, injector := range b.injectors {
-		fragment, err := injector.Inject(ctx, req)
-		if err != nil {
-			return "", fmt.Errorf("注入提示词片段失败: %w", err)
+	// AudienceSkillFork：跳过全部 Injectors
+	if aud != AudienceSkillFork {
+		for _, injector := range b.injectors {
+			// AudienceSubAgent：跳过仅适用于 Root 的 Injectors
+			if !injectorAppliesToAudience(injector, aud) {
+				continue
+			}
+			fragment, err := injector.Inject(ctx, req)
+			if err != nil {
+				return "", fmt.Errorf("注入提示词片段失败: %w", err)
+			}
+			if strings.TrimSpace(fragment.Contents) == "" {
+				continue
+			}
+			if fragment.Name != "" {
+				sb.WriteString("<")
+				sb.WriteString(fragment.Name)
+				sb.WriteString(">\n")
+			}
+			sb.WriteString(strings.TrimRight(fragment.Contents, "\n"))
+			sb.WriteString("\n")
+			if fragment.Name != "" {
+				sb.WriteString("</")
+				sb.WriteString(fragment.Name)
+				sb.WriteString(">\n")
+			}
+			sb.WriteString("\n")
 		}
-		if strings.TrimSpace(fragment.Contents) == "" {
-			continue
-		}
-		if fragment.Name != "" {
-			sb.WriteString("<")
-			sb.WriteString(fragment.Name)
-			sb.WriteString(">\n")
-		}
-		sb.WriteString(strings.TrimRight(fragment.Contents, "\n"))
-		sb.WriteString("\n")
-		if fragment.Name != "" {
-			sb.WriteString("</")
-			sb.WriteString(fragment.Name)
-			sb.WriteString(">\n")
-		}
-		sb.WriteString("\n")
 	}
 
 	// L0 稳定块：规划模式与任务清单互斥；委派纪律仅主 Agent
 	writeCollaborationBlocks(&sb, req)
-	if effectiveAudience(req) != AudienceSubAgent {
+	if aud == AudienceRoot {
 		writeDelegationBlock(&sb, req.AvailableTools, b.effectiveDelegationPosture(req))
 	}
 	writeBehaviorRules(&sb, req)
@@ -99,16 +112,45 @@ func (b *DefaultBuilder) BuildSystem(ctx context.Context, req BuildRequest) (str
 }
 
 func effectiveAudience(req BuildRequest) Audience {
-	if req.Audience == AudienceSubAgent {
+	switch req.Audience {
+	case AudienceSkillFork:
+		return AudienceSkillFork
+	case AudienceSubAgent:
 		return AudienceSubAgent
+	default:
+		return AudienceRoot
 	}
-	return AudienceRoot
 }
 
-// writeBehaviorRules 按受众裁剪行为规则；子 Run 已含 ChildBase，避免重复腔调。
+// injectorAppliesToAudience 判断 Injector 是否适用于指定受众。
+// 若 Injector 未实现 AudienceAware 接口，视为适用所有受众（向后兼容）。
+func injectorAppliesToAudience(injector ContextInjector, aud Audience) bool {
+	if aud == AudienceRoot {
+		return true // Root 始终接受所有 Injector
+	}
+	aware, ok := injector.(AudienceAware)
+	if !ok {
+		return true // 未声明受众的 Injector 默认适用所有受众
+	}
+	audiences := aware.Audiences()
+	if len(audiences) == 0 {
+		return true // 声明了空列表视为适用所有受众
+	}
+	for _, a := range audiences {
+		if a == aud {
+			return true
+		}
+	}
+	return false
+}
+
+// writeBehaviorRules 按受众裁剪行为规则。
+// - AudienceRoot：完整规则（思考过程 + 路径约束 + 工具纪律 + 用户反馈）
+// - AudienceSubAgent / AudienceSkillFork：精简规则（工具纪律 + 熔断保护）
 func writeBehaviorRules(sb *strings.Builder, req BuildRequest) {
 	sb.WriteString("## 行为规则\n")
-	if effectiveAudience(req) == AudienceSubAgent {
+	aud := effectiveAudience(req)
+	if aud == AudienceSubAgent || aud == AudienceSkillFork {
 		sb.WriteString("- 使用工具前先判断是否必要\n")
 		writeToolBehaviorRules(sb, req)
 		sb.WriteString("- 收到 failure_kind=repeated_failure：禁止再次提交相同调用，必须改参、先完成 suggested_action，或向调用方说明阻塞\n")

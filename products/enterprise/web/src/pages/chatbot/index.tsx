@@ -213,7 +213,7 @@ const ChatbotPage: React.FC = () => {
         };
 
         if (isAI && thinkContent) {
-          item.header = <Think>{thinkContent}</Think>;
+          item.footer = <Think>{thinkContent}</Think>;
         }
 
         return item;

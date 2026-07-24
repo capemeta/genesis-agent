@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 
+	"genesis-agent/internal/capabilities/tool/validation"
 	"genesis-agent/internal/domain"
 )
 
@@ -212,7 +213,9 @@ func (g *Guard) Record(toolName, argsJSON, result string, toolErr error, extraIg
 		g.consecutiveAnyFail = 0
 		g.iter.AnyToolSuccess = true
 		g.noteArtifactsLocked(outcome.Artifacts)
-		if strings.EqualFold(strings.TrimSpace(toolName), "install_skill_dependencies") {
+		if IsStateMutatingTool(toolName, argsJSON) {
+			g.clearAllCommandFailuresLocked()
+		} else if strings.EqualFold(strings.TrimSpace(toolName), "install_skill_dependencies") {
 			g.clearDependencyMissingLocked(outcome.Skill)
 		}
 		return outcome
@@ -296,6 +299,48 @@ func (g *Guard) clearDependencyMissingLocked(skill string) {
 	if cleared {
 		g.iter.EventCleared = true
 	}
+}
+
+func (g *Guard) clearAllCommandFailuresLocked() {
+	cleared := false
+	for k := range g.calls {
+		delete(g.calls, k)
+		cleared = true
+	}
+	if cleared {
+		g.iter.EventCleared = true
+	}
+}
+
+// IsStateMutatingTool 判定指定工具及入参是否会改变底层物理/逻辑系统状态
+func IsStateMutatingTool(toolName, argsJSON string) bool {
+	toolName = strings.TrimSpace(toolName)
+	switch toolName {
+	case "install_skill_dependencies", "install_skill_from_source", "write_file", "edit_file", "apply_patch", "delete_file", "Skill", "select_deliverable_candidate":
+		return true
+	case "run_command", "run_skill_command", "sandbox_exec":
+		cmd := commandFromArgs(argsJSON)
+		if cmd != "" {
+			return validation.IsCommandMutatingState(cmd)
+		}
+		return true
+	default:
+		if strings.HasPrefix(toolName, "mcp__") {
+			return true
+		}
+		return false
+	}
+}
+
+func commandFromArgs(argsJSON string) string {
+	var m map[string]any
+	if err := json.Unmarshal([]byte(argsJSON), &m); err != nil {
+		return ""
+	}
+	if cmd, ok := m["command"].(string); ok {
+		return cmd
+	}
+	return ""
 }
 
 // EndIteration 在每轮工具执行结束后评估进展；iteration 为当前 rc.Iteration。

@@ -573,21 +573,22 @@ func (m *Model) applyProgress(event progress.Event) {
 	}
 
 	if isLiveAssistantBlock(event.BlockType) {
-		if event.Depth > 0 || event.SubAgentID != "" {
-			// 子 Agent 的 Live Assistant Block (thinking/draft)：
-			// 不污染主对话气泡，而是转化为进度摘要原位呈现在 progressLog 的思考行中！
-			if (event.BlockType == "thinking" || event.BlockType == "assistant_draft") && strings.TrimSpace(event.Detail) != "" {
+		if event.BlockType == "thinking" {
+			if strings.TrimSpace(event.Detail) != "" {
 				subName := event.SubAgentID
-				if subName == "" {
-					subName = "Worker"
+				prefix := "[Agent] 思考: "
+				if event.Depth > 0 || subName != "" {
+					if subName == "" {
+						subName = "Worker"
+					}
+					prefix = fmt.Sprintf("[Sub-Agent: %s] 思考: ", subName)
 				}
-				prefix := fmt.Sprintf("[Sub-Agent: %s] 思考: ", subName)
-				cleanDetail := strings.ReplaceAll(event.Detail, "\n", " ")
+				cleanDetail := strings.ReplaceAll(event.Detail, "\r\n", "\n")
 				thinkingIdx := -1
 				nLogs := len(m.progressLog)
 				if nLogs > 0 {
 					lastLog := m.progressLog[nLogs-1]
-					if strings.HasPrefix(lastLog, prefix) || (strings.HasPrefix(lastLog, "[Sub-Agent:") && strings.Contains(lastLog, "] 思考:")) {
+					if strings.HasPrefix(lastLog, prefix) {
 						thinkingIdx = nLogs - 1
 					}
 				}
@@ -600,6 +601,40 @@ func (m *Model) applyProgress(event progress.Event) {
 					m.progressLog = append(m.progressLog, newThinking)
 					m.progressCallIDs = append(m.progressCallIDs, "")
 				}
+			}
+			return
+		}
+		if event.BlockType == "assistant_draft" {
+			if strings.TrimSpace(event.Detail) != "" {
+				subName := event.SubAgentID
+				prefix := "[Agent] 输出: "
+				if event.Depth > 0 || subName != "" {
+					if subName == "" {
+						subName = "Worker"
+					}
+					prefix = fmt.Sprintf("[Sub-Agent: %s] 输出: ", subName)
+				}
+				cleanDetail := strings.ReplaceAll(event.Detail, "\r\n", "\n")
+				draftIdx := -1
+				nLogs := len(m.progressLog)
+				if nLogs > 0 {
+					lastLog := m.progressLog[nLogs-1]
+					if strings.HasPrefix(lastLog, prefix) {
+						draftIdx = nLogs - 1
+					}
+				}
+				if draftIdx != -1 {
+					currText := strings.TrimPrefix(m.progressLog[draftIdx], prefix)
+					fullText := currText + cleanDetail
+					m.progressLog[draftIdx] = prefix + fullText
+				} else {
+					newDraft := prefix + cleanDetail
+					m.progressLog = append(m.progressLog, newDraft)
+					m.progressCallIDs = append(m.progressCallIDs, "")
+				}
+			}
+			if event.Depth == 0 && event.SubAgentID == "" {
+				m.applyLiveAssistantBlock(event)
 			}
 			return
 		}
@@ -636,6 +671,13 @@ func (m *Model) applyProgress(event progress.Event) {
 							idx := strings.Index(oldLog, "] ")
 							if idx != -1 {
 								summary = oldLog[:idx+2] + summary
+							}
+						}
+						// 🟢 保留旧日志中的技能名称（当 complete/error 事件中缺少具体技能名时）
+						if strings.Contains(oldLog, "加载技能: ") && !strings.Contains(summary, ": ") {
+							if idx := strings.Index(oldLog, "加载技能: "); idx != -1 {
+								skillName := oldLog[idx+len("加载技能: "):]
+								summary += ": " + skillName
 							}
 						}
 						m.progressLog[i] = summary
@@ -776,13 +818,17 @@ func progressSummary(event progress.Event) string {
 				label = "工具执行失败: run_skill_command"
 			}
 			backendTag := ""
-			if backend, ok := event.Metadata["selected_backend"]; ok && backend != "" {
-				switch backend {
-				case "remote_sandbox":
+			backend := event.Metadata["selected_backend"]
+			if backend == "" {
+				backend = event.Metadata["execution_backend"]
+			}
+			if backend != "" {
+				switch strings.ToLower(backend) {
+				case "remote_sandbox", "genesis-sandbox":
 					backendTag = "[远程容器沙箱]"
-				case "local_platform_sandbox":
+				case "local_platform_sandbox", "local-platform", "local_platform", "local_sandbox":
 					backendTag = "[本地平台沙箱]"
-				case "local_host":
+				case "local_host", "local-host", "host", "local":
 					backendTag = "[宿主直跑]"
 				default:
 					backendTag = "[" + backend + "]"
@@ -793,7 +839,7 @@ func progressSummary(event progress.Event) string {
 			}
 			parts := make([]string, 0, 2)
 			if cmd := extractJSONField(detail, "command"); cmd != "" {
-				parts = append(parts, "命令: "+truncateString(cmd, 40))
+				parts = append(parts, "命令: "+cmd)
 			}
 			if timing := formatSkillTiming(event.Metadata); timing != "" {
 				parts = append(parts, timing)
@@ -803,12 +849,35 @@ func progressSummary(event progress.Event) string {
 			} else {
 				summary = label
 			}
+		} else if event.Name == "install_skill_dependencies" {
+			skillName, pkgList, cmdList := parseInstallDepsDetail(detail)
+			infoParts := make([]string, 0, 2)
+			if skillName != "" {
+				infoParts = append(infoParts, "技能: "+skillName)
+			}
+			if len(pkgList) > 0 {
+				infoParts = append(infoParts, "包: "+strings.Join(pkgList, ", "))
+			} else if len(cmdList) > 0 {
+				infoParts = append(infoParts, "命令: "+strings.Join(cmdList, " && "))
+			}
+			extra := ""
+			if len(infoParts) > 0 {
+				extra = " (" + strings.Join(infoParts, "；") + ")"
+			}
+
+			if event.Phase == progress.PhaseStart {
+				summary = "调用工具: install_skill_dependencies" + extra
+			} else if event.Phase == progress.PhaseComplete {
+				summary = "工具执行完成: install_skill_dependencies" + extra
+			} else if event.Phase == progress.PhaseError {
+				summary = "工具执行失败: install_skill_dependencies" + extra
+			}
 		} else if detail != "" && strings.HasPrefix(detail, "{") {
 			if event.Name == "web_search" {
 				if event.Phase == progress.PhaseStart && strings.Contains(detail, `"query"`) {
 					query := extractJSONField(detail, "query")
 					if query != "" {
-						summary = fmt.Sprintf("调用工具: web_search (查询: %s)", truncateString(query, 40))
+						summary = fmt.Sprintf("调用工具: web_search (查询: %s)", query)
 					}
 				} else if event.Phase == progress.PhaseComplete && strings.Contains(detail, `"provider"`) {
 					provider := extractJSONField(detail, "provider")
@@ -816,7 +885,7 @@ func progressSummary(event progress.Event) string {
 						summary = fmt.Sprintf("工具执行完成: web_search (搜索引擎: %s)", provider)
 					}
 				}
-			} else if event.Name == "Skill" && (strings.Contains(detail, `"skill"`) || strings.Contains(detail, `"qualified_name"`) || strings.Contains(detail, `"name"`)) {
+			} else if event.Name == "Skill" {
 				name := extractJSONField(detail, "skill")
 				if name == "" {
 					name = extractJSONField(detail, "qualified_name")
@@ -824,20 +893,38 @@ func progressSummary(event progress.Event) string {
 				if name == "" {
 					name = extractJSONField(detail, "name")
 				}
+				if name == "" {
+					name = extractJSONField(detail, "physical_skill")
+				}
+				if name == "" {
+					name = extractJSONField(detail, "handle")
+				}
 				if name != "" {
 					if event.Phase == progress.PhaseStart {
 						summary = fmt.Sprintf("加载技能: %s", name)
+					} else if event.Phase == progress.PhaseError {
+						summary = fmt.Sprintf("技能加载失败: %s", name)
 					} else {
 						summary = fmt.Sprintf("技能加载完成: %s", name)
+					}
+				} else {
+					if event.Phase == progress.PhaseStart {
+						summary = "加载技能"
+					} else if event.Phase == progress.PhaseError {
+						summary = "技能加载失败"
+					} else {
+						summary = "技能加载完成"
 					}
 				}
 			} else if strings.Contains(detail, `"command"`) {
 				cmd := extractJSONField(detail, "command")
 				if cmd != "" {
 					if event.Phase == progress.PhaseStart {
-						summary = fmt.Sprintf("调用工具: %s (命令: %s)", event.Name, truncateString(cmd, 40))
+						summary = fmt.Sprintf("调用工具: %s (命令: %s)", event.Name, cmd)
+					} else if event.Phase == progress.PhaseError {
+						summary = fmt.Sprintf("工具执行失败: %s (命令: %s)", event.Name, cmd)
 					} else {
-						summary = fmt.Sprintf("工具执行完成: %s (命令: %s)", event.Name, truncateString(cmd, 40))
+						summary = fmt.Sprintf("工具执行完成: %s (命令: %s)", event.Name, cmd)
 					}
 				}
 			} else if strings.Contains(detail, `"path"`) {
@@ -845,11 +932,19 @@ func progressSummary(event progress.Event) string {
 				if path != "" {
 					if event.Phase == progress.PhaseStart {
 						summary = fmt.Sprintf("调用工具: %s (路径: %s)", event.Name, path)
+					} else if event.Phase == progress.PhaseError {
+						summary = fmt.Sprintf("工具执行失败: %s (路径: %s)", event.Name, path)
 					} else {
 						summary = fmt.Sprintf("工具执行完成: %s (路径: %s)", event.Name, path)
 					}
 				}
 			}
+		}
+	}
+
+	if event.Phase == progress.PhaseError || (event.Level == progress.LevelError && strings.Contains(summary, "失败")) {
+		if errPreview := extractFailureLines(detail, 5); errPreview != "" {
+			summary += errPreview
 		}
 	}
 
@@ -864,6 +959,67 @@ func progressSummary(event progress.Event) string {
 	}
 
 	return summary
+}
+
+func extractFailureLines(detail string, maxLines int) string {
+	detail = strings.TrimSpace(detail)
+	if detail == "" {
+		return ""
+	}
+	var rawErr string
+	if strings.HasPrefix(detail, "{") {
+		if stderr := extractJSONField(detail, "stderr"); stderr != "" {
+			rawErr = stderr
+		} else if errStr := extractJSONField(detail, "error"); errStr != "" {
+			rawErr = errStr
+		} else if stdout := extractJSONField(detail, "stdout"); stdout != "" {
+			rawErr = stdout
+		} else if kind := extractJSONField(detail, "failure_kind"); kind != "" {
+			rawErr = "failure_kind: " + kind
+		} else {
+			rawErr = detail
+		}
+	} else {
+		rawErr = detail
+	}
+
+	rawErr = strings.TrimSpace(rawErr)
+	if rawErr == "" {
+		return ""
+	}
+
+	rawErr = strings.ReplaceAll(rawErr, "\r\n", "\n")
+	rawErr = strings.ReplaceAll(rawErr, "\\n", "\n")
+	rawErr = strings.ReplaceAll(rawErr, "\\r", "")
+	rawErr = strings.ReplaceAll(rawErr, "\\\"", "\"")
+
+	lines := strings.Split(rawErr, "\n")
+	for len(lines) > 0 && strings.TrimSpace(lines[0]) == "" {
+		lines = lines[1:]
+	}
+	for len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "" {
+		lines = lines[:len(lines)-1]
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+
+	truncated := false
+	if len(lines) > maxLines {
+		lines = lines[:maxLines]
+		truncated = true
+	}
+
+	var sb strings.Builder
+	sb.WriteString("\n  └─ 失败日志:")
+	for _, line := range lines {
+		sb.WriteString("\n     ")
+		sb.WriteString(strings.TrimRight(line, "\r"))
+	}
+	if truncated {
+		fmt.Fprintf(&sb, "\n     ... (日志超限，仅展示前 %d 行)", maxLines)
+	}
+	return sb.String()
 }
 
 func formatSkillTiming(metadata map[string]string) string {
@@ -898,6 +1054,14 @@ func formatMilliseconds(value int64) string {
 }
 
 func extractJSONField(jsonStr, field string) string {
+	var m map[string]interface{}
+	if err := json.Unmarshal([]byte(jsonStr), &m); err == nil {
+		if val, ok := m[field]; ok {
+			if s, isStr := val.(string); isStr {
+				return s
+			}
+		}
+	}
 	idx := strings.Index(jsonStr, `"`+field+`"`)
 	if idx == -1 {
 		return ""
@@ -918,6 +1082,44 @@ func extractJSONField(jsonStr, field string) string {
 		return ""
 	}
 	return sub[:end]
+}
+
+func parseInstallDepsDetail(detail string) (skillName string, pkgList []string, cmdList []string) {
+	detail = strings.TrimSpace(detail)
+	if !strings.HasPrefix(detail, "{") {
+		return "", nil, nil
+	}
+	var data struct {
+		Skill    string `json:"skill"`
+		Packages []struct {
+			Manager string `json:"manager"`
+			Name    string `json:"name"`
+		} `json:"packages"`
+		Installed []struct {
+			Manager string `json:"manager"`
+			Name    string `json:"name"`
+		} `json:"installed"`
+		Commands []string `json:"commands"`
+	}
+	if err := json.Unmarshal([]byte(detail), &data); err != nil {
+		return extractJSONField(detail, "skill"), nil, nil
+	}
+	skillName = data.Skill
+	cmdList = data.Commands
+	pkgs := data.Packages
+	if len(pkgs) == 0 {
+		pkgs = data.Installed
+	}
+	for _, p := range pkgs {
+		if p.Name != "" {
+			if p.Manager != "" {
+				pkgList = append(pkgList, p.Manager+":"+p.Name)
+			} else {
+				pkgList = append(pkgList, p.Name)
+			}
+		}
+	}
+	return skillName, pkgList, cmdList
 }
 
 func truncateString(s string, max int) string {

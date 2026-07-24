@@ -116,6 +116,17 @@ func TestSkillRequiredVisionChecksTargetBeforeFork(t *testing.T) {
 	}
 }
 
+func TestSkillRecursionDeniesSamePackageInvocations(t *testing.T) {
+	created := newInvocationTool(t, false)
+	delegate := &captureDelegator{}
+	created.SetForkTask(delegate)
+	ctx := skillcontract.WithInvocationAncestors(testContext(vision.ModeDirectInject), []string{"test:demo:read"})
+	_, err := created.Execute(ctx, `{"skill":"demo","task":"执行"}`)
+	if err == nil || !strings.Contains(err.Error(), "SKILL_RECURSION_DENIED") {
+		t.Fatalf("expected SKILL_RECURSION_DENIED error for same package invocation, got %v", err)
+	}
+}
+
 func TestResolveToolPolicyFailsClosed(t *testing.T) {
 	if _, err := resolveToolPolicy([]string{"read_file"}, skillmodel.ToolPolicy{Allow: []string{"run_skill_command"}, Required: []string{"run_skill_command"}}); err == nil {
 		t.Fatal("empty intersection must fail")

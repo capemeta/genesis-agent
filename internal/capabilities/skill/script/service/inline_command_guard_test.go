@@ -80,4 +80,17 @@ func TestAutoRewriteRiskyInlineCommand(t *testing.T) {
 	if rewritten != wantCmd {
 		t.Errorf("expected rewritten cmd %q, got %q", wantCmd, rewritten)
 	}
+
+	// 3. 包含内联转义引号的复杂命令 (如 \" 及多行)
+	escapedCmd := `python -c "from pptx import Presentation; f'\"{.join(cells)}\"'; print('ok')"`
+	rewrittenEscaped, scriptNameEscaped, _, okEscaped := autoRewriteRiskyInlineCommand(escapedCmd)
+	if !okEscaped {
+		t.Fatalf("expected autoRewriteRiskyInlineCommand ok=true for escapedCmd")
+	}
+	if scriptNameEscaped != "_auto_inline_check.py" {
+		t.Errorf("unexpected scriptName: %s", scriptNameEscaped)
+	}
+	if rewrittenEscaped != "python _auto_inline_check.py" {
+		t.Errorf("expected clean rewritten cmd 'python _auto_inline_check.py', got %q", rewrittenEscaped)
+	}
 }

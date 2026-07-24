@@ -239,13 +239,14 @@ func aliasWithinWorkspace(candidate string, workspace execmodel.ExecutionWorkspa
 	}
 	// 如果是宿主机绝对路径且文件存在，使用 Base 文件名作为 staging 别名
 	if filepath.IsAbs(candidate) {
-		base := filepath.Base(candidate)
-		path := workmodel.WorkspacePath(base)
-		if err := path.Validate(); err == nil {
-			return path, nil
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			alias := workmodel.WorkspacePath(filepath.Base(candidate))
+			if err := alias.Validate(); err == nil {
+				return alias, nil
+			}
 		}
 	}
-	return "", fmt.Errorf("path 不在 execution workspace")
+	return "", fmt.Errorf("candidate %s 不在当前 execution workspace 内", candidate)
 }
 
 // Open 按 ResourceRef 打开并复核文件身份版本，审批后变化会稳定失败。

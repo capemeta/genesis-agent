@@ -457,8 +457,8 @@ export default function ToolCallPage() {
                     role: msg.role,
                     content: (
                       <div>
-                        {msg.role === 'assistant' && msg.toolExecutions && renderToolExecutions(msg.toolExecutions)}
                         {msg.content && <XMarkdown content={msg.content} />}
+                        {msg.role === 'assistant' && msg.toolExecutions && renderToolExecutions(msg.toolExecutions)}
                       </div>
                     ),
                     avatar:

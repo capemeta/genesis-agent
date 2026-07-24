@@ -344,7 +344,7 @@ func renderMessages(messages []uiMessage, termWidth int, progressExpanded, selec
 			if msg.isProgress {
 				var content string
 				if progressExpanded {
-					lines := []string{"▾ " + activitySummary(msg) + " · [o] 折叠:"}
+					lines := []string{styles.SystemMsg.Render("▾ " + activitySummary(msg) + " · [o] 折叠:")}
 					total := len(msg.progressLog)
 					for idx, item := range msg.progressLog {
 						isLast := idx == total-1
@@ -352,20 +352,56 @@ func renderMessages(messages []uiMessage, termWidth int, progressExpanded, selec
 						if isLast {
 							branch = "`-- "
 						}
-						if strings.HasPrefix(item, "[Sub-Agent") || strings.HasPrefix(item, "[Agent") {
-							lines = append(lines, "    "+branch+item)
-						} else if strings.Contains(item, "[Sub-Agent") {
-							lines = append(lines, "    "+branch+item)
-						} else {
-							lines = append(lines, "  "+branch+"[Agent] "+item)
+						isSub := strings.HasPrefix(item, "[Sub-Agent") || strings.Contains(item, "[Sub-Agent")
+						isThinking := strings.Contains(item, "思考:") || strings.Contains(item, "Thinking")
+						isContent := strings.Contains(item, "输出:") || strings.Contains(item, "内容:")
+
+						subLines := strings.Split(item, "\n")
+						for i, subLine := range subLines {
+							var linePrefix string
+							if isSub {
+								if i == 0 {
+									linePrefix = "    " + branch
+								} else if !isLast {
+									linePrefix = "    |   "
+								} else {
+									linePrefix = "        "
+								}
+								if isThinking {
+									lines = append(lines, linePrefix+styles.SubAgentThinkingMsg.Render(subLine))
+								} else if isContent {
+									lines = append(lines, linePrefix+styles.SubAgentContentMsg.Render(subLine))
+								} else {
+									lines = append(lines, linePrefix+styles.SubAgentMsg.Render(subLine))
+								}
+							} else {
+								lineText := subLine
+								if i == 0 && !strings.HasPrefix(subLine, "[Agent") {
+									lineText = "[Agent] " + subLine
+								}
+								if i == 0 {
+									linePrefix = "  " + branch
+								} else if !isLast {
+									linePrefix = "  |   "
+								} else {
+									linePrefix = "      "
+								}
+								if isThinking {
+									lines = append(lines, linePrefix+styles.MainAgentThinkingMsg.Render(lineText))
+								} else if isContent {
+									lines = append(lines, linePrefix+styles.MainAgentContentMsg.Render(lineText))
+								} else {
+									lines = append(lines, linePrefix+styles.MainAgentMsg.Render(lineText))
+								}
+							}
 						}
 					}
 					content = strings.Join(lines, "\n")
 				} else {
-					content = "▸ " + activitySummary(msg) + " · [o] 展开"
+					content = styles.SystemMsg.Render("▸ " + activitySummary(msg) + " · [o] 展开")
 				}
 				sb.WriteString("  ")
-				sb.WriteString(styles.SystemMsg.Width(contentWidth).Render(content))
+				sb.WriteString(content)
 				sb.WriteString("\n\n")
 			} else {
 				// 普通系统消息：斜体灰色，用于 /help、错误提示、欢迎语等

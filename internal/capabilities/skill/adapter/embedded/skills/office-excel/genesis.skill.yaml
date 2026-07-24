@@ -2,14 +2,14 @@ schema: genesis.skill/v1
 skill: office-excel
 runtime_profiles:
   read:
-    sandbox: {execution_mode: per_call, backends: [remote_sandbox, local_platform_sandbox]}
+    sandbox: {execution_mode: per_call, backends: [remote_sandbox, local_platform_sandbox, local_host]}
     dependencies:
       runtime:
         python:
           - {name: openpyxl, import: openpyxl}
           - {name: pandas, import: pandas}
   work:
-    sandbox: {execution_mode: sandboxed_session, backends: [remote_sandbox, local_platform_sandbox]}
+    sandbox: {execution_mode: sandboxed_session, backends: [remote_sandbox, local_platform_sandbox, local_host]}
     dependencies:
       runtime:
         python:
@@ -21,7 +21,7 @@ invocations:
   - id: read
     handle: office-excel-read
     description: 提取并总结已有工作簿或表格的数据、公式和工作表结构，不编辑
-    agent_mode: {mode: main}
+    agent_mode: {mode: fork}
     runtime_profile: read
     request:
       task: {required: false}
@@ -32,8 +32,9 @@ invocations:
         accepted_suffixes: [.xlsx, .xlsm, .csv, .tsv]
     prompt: {instructions: references/invocations/read.md, skill_body: omit}
     tool_policy:
-      allow: [list_skill_resources, read_skill_resource, search_skill_resources, run_skill_command, install_skill_dependencies]
+      allow: [run_skill_command, install_skill_dependencies]
       required: [run_skill_command]
+
     result: {kind: message}
   - id: work
     handle: office-excel

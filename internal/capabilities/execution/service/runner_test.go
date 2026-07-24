@@ -220,7 +220,7 @@ func TestRunnerOptionalSandboxPermissionDeniedDoesNotFallback(t *testing.T) {
 
 func TestRunnerPreservesSandboxRunnerMetadata(t *testing.T) {
 	sandbox := &fakeSandboxRunner{result: &execmodel.Result{Command: "echo hi", Environment: execmodel.EnvironmentLocal, Warnings: []string{"sandbox unavailable; running locally"}}}
-	runner, err := NewRunner(&fakeDirectRunner{}, sandbox)
+	runner, err := NewRunner(&fakeDirectRunner{}, nil, WithLocalSandbox(sandbox))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -235,6 +235,28 @@ func TestRunnerPreservesSandboxRunnerMetadata(t *testing.T) {
 	}
 	if len(result.Warnings) != 1 {
 		t.Fatalf("Warnings = %+v", result.Warnings)
+	}
+}
+
+func TestRunnerUsesDirectForLocalPlatformWhenNoLocalSandboxInjected(t *testing.T) {
+	direct := &fakeDirectRunner{}
+	remoteSandbox := &fakeSandboxRunner{}
+	// 装配了远程 genesis-sandbox，但没有装配 localSandbox
+	runner, err := NewRunner(direct, remoteSandbox)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := projectRunOptions()
+	opts.Sandbox = execmodel.SandboxProfile{Mode: execmodel.SandboxRequired, Provider: "local-platform"}
+	result, err := runner.Run(context.Background(), execmodel.Command{Command: "echo hi"}, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !direct.called || remoteSandbox.called {
+		t.Fatalf("local-platform 绝对不能去调用远程 genesis-sandbox: direct=%t remoteSandbox=%t", direct.called, remoteSandbox.called)
+	}
+	if result.Environment != execmodel.EnvironmentLocal || result.SandboxProvider != "local-platform" {
+		t.Fatalf("result = %+v", result)
 	}
 }
 

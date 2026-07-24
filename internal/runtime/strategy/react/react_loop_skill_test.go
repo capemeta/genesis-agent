@@ -13,6 +13,7 @@ import (
 	tool "genesis-agent/internal/capabilities/tool/contract"
 	traceadapter "genesis-agent/internal/capabilities/trace/adapter"
 	"genesis-agent/internal/domain"
+	"genesis-agent/internal/platform/contextutil"
 	"genesis-agent/internal/platform/logger"
 	"genesis-agent/internal/runtime"
 )
@@ -32,7 +33,7 @@ func TestNarrowToolNamesUsesExactIntersectionWithoutHiddenEscalation(t *testing.
 	if !ok {
 		t.Fatal("expected ok")
 	}
-	want := map[string]bool{"read_file": true, "run_command": true}
+	want := map[string]bool{"read_file": true, "run_command": true, "Skill": true}
 	if len(got) != len(want) {
 		t.Fatalf("got=%v", got)
 	}
@@ -190,13 +191,14 @@ func TestInvocationToolPolicyIsEnforcedBeforeRegistry(t *testing.T) {
 	if err := rc.ActivateInvocation(binding); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := e.runToolCall(context.Background(), rc, domain.ToolCall{ID: "denied", Function: domain.FunctionCall{Name: "sandbox_exec", Arguments: `{}`}}, logger.NewNop()); err == nil || !strings.Contains(err.Error(), "TOOL_NOT_ALLOWED_BY_INVOCATION") {
+	forkCtx := contextutil.WithSubagentType(context.Background(), "skill-fork:demo")
+	if _, err := e.runToolCall(forkCtx, rc, domain.ToolCall{ID: "denied", Function: domain.FunctionCall{Name: "sandbox_exec", Arguments: `{}`}}, logger.NewNop()); err == nil || !strings.Contains(err.Error(), "TOOL_NOT_ALLOWED_BY_INVOCATION") {
 		t.Fatalf("err=%v", err)
 	}
 	if registry.calls != 0 {
 		t.Fatalf("denied tool reached registry: calls=%d", registry.calls)
 	}
-	if _, err := e.runToolCall(context.Background(), rc, domain.ToolCall{ID: "allowed", Function: domain.FunctionCall{Name: "read_file", Arguments: `{}`}}, logger.NewNop()); err != nil {
+	if _, err := e.runToolCall(forkCtx, rc, domain.ToolCall{ID: "allowed", Function: domain.FunctionCall{Name: "read_file", Arguments: `{}`}}, logger.NewNop()); err != nil {
 		t.Fatal(err)
 	}
 	if registry.calls != 1 || registry.binding.ID != binding.ID {
@@ -290,4 +292,33 @@ type fakeExplicitLoader struct {
 func (f *fakeExplicitLoader) LoadExplicitSkill(context.Context, skillcontract.ExplicitLoadRequest) (string, error) {
 	f.calls++
 	return f.result, nil
+}
+
+type fakeContextAwareRegistry struct {
+	tool.Registry
+	receivedCtx context.Context
+}
+
+func (f *fakeContextAwareRegistry) FilterInfosContext(ctx context.Context, names []string) []*tool.Info {
+	f.receivedCtx = ctx
+	info := &tool.Info{Name: "Skill", DescriptionFunc: func(c context.Context) (string, error) {
+		ancestors := skillcontract.InvocationAncestors(c)
+		return strings.Join(ancestors, ","), nil
+	}}
+	return []*tool.Info{tool.SnapshotForLLM(ctx, info)}
+}
+
+func TestGetToolInfosPreservesContextForDynamicDescription(t *testing.T) {
+	reg := &fakeContextAwareRegistry{}
+	e := &ReactLoopEngine{registry: reg}
+	ctx := skillcontract.WithInvocationAncestors(context.Background(), []string{"office-word:work"})
+	agent := &domain.Agent{Tools: []domain.ToolRef{{Name: "Skill"}}}
+
+	infos := e.getToolInfos(ctx, agent)
+	if len(infos) != 1 {
+		t.Fatalf("expected 1 info, got %d", len(infos))
+	}
+	if infos[0].Description != "office-word:work" {
+		t.Fatalf("expected dynamic description to receive InvocationAncestors 'office-word:work', got %q", infos[0].Description)
+	}
 }

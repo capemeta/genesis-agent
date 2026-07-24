@@ -246,3 +246,56 @@ func TestRenderEnvironmentContextUsesLogicalRunWorkspace(t *testing.T) {
 		t.Fatalf("workspace context 泄漏物理路径: %s", got)
 	}
 }
+
+func TestBuildSystemSubAgentAudienceSkipsEnvironmentContext(t *testing.T) {
+	envInjector := NewEnvironmentContextInjector(EnvironmentContext{
+		OS: "windows", HostCommandTool: "run_command", SandboxMode: "required",
+		SandboxProvider: "genesis-sandbox", SandboxCommandTool: "sandbox_exec",
+	})
+	builder := New(envInjector)
+
+	subAgentPrompt, err := builder.BuildSystem(context.Background(), BuildRequest{
+		Agent:    &domain.Agent{SystemPrompt: "SubAgent Contract"},
+		Audience: AudienceSubAgent,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(subAgentPrompt, "<environment_context>") {
+		t.Fatalf("AudienceSubAgent must skip EnvironmentContextInjector:\n%s", subAgentPrompt)
+	}
+
+	rootPrompt, err := builder.BuildSystem(context.Background(), BuildRequest{
+		Agent:    &domain.Agent{SystemPrompt: "Root Contract"},
+		Audience: AudienceRoot,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(rootPrompt, "<environment_context>") {
+		t.Fatalf("AudienceRoot must include EnvironmentContextInjector:\n%s", rootPrompt)
+	}
+}
+
+func TestBuildSystemSkillForkAudienceSkipsAllInjectors(t *testing.T) {
+	dummyInjector := ContextInjectorFunc(func(ctx context.Context, req BuildRequest) (Fragment, error) {
+		return Fragment{Name: "dummy_fragment", Contents: "dummy content"}, nil
+	})
+	envInjector := NewEnvironmentContextInjector(EnvironmentContext{OS: "windows"})
+	builder := New(dummyInjector, envInjector)
+
+	got, err := builder.BuildSystem(context.Background(), BuildRequest{
+		Agent:    &domain.Agent{SystemPrompt: "Skill Fork Persona"},
+		Audience: AudienceSkillFork,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(got, "dummy_fragment") || strings.Contains(got, "<environment_context>") {
+		t.Fatalf("AudienceSkillFork must skip all injectors:\n%s", got)
+	}
+	if !strings.Contains(got, "Skill Fork Persona") {
+		t.Fatalf("AudienceSkillFork must keep agent persona:\n%s", got)
+	}
+}
+

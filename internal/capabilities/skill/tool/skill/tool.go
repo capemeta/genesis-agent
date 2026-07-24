@@ -98,11 +98,11 @@ func (t *Tool) GetInfo() *tool.Info {
 	return &tool.Info{
 		Name: toolNameSkill, Description: staticDescription, DescriptionFunc: t.renderDescription,
 		Parameters: &tool.ParameterSchema{Type: "object", Properties: map[string]*tool.ParameterSchema{
-			"skill":  {Type: "string", Description: "Invocation handle，必须来自<available_skills>，例如office-ppt-read或office-ppt"},
+			"skill":  {Type: "string", Description: "Invocation handle，必须来自<available_skills>中的<name>节点"},
 			"task":   {Type: "string", Description: "任务目标；是否必填由Invocation契约决定"},
-			"inputs": {Type: "array", Items: &tool.ParameterSchema{Type: "string"}, Description: "显式输入资源引用或当前Run内已授权别名；数量和类型由Invocation契约校验"},
+			"inputs": {Type: "array", Items: &tool.ParameterSchema{Type: "string"}, Description: "待处理的显式输入文件路径列表（完全支持宿主机绝对路径，如 Windows 'C:\\...\\demo.pdf' 或 macOS/Linux '/path/to/demo.pdf'，以及工作区相对路径）。系统会在后台自动校验并只读挂载至技能工作目录。严禁调用 run_command 或 Copy-Item/cp 手动搬运文件。"},
 		}, Required: []string{"skill"}},
-		Traits: tool.ToolTraits{Exposure: tool.ToolExposureDirect, ReadOnly: false, ConcurrencySafe: false, NeedsPermission: true, RequiresUserInteraction: true},
+		Traits: tool.ToolTraits{Exposure: tool.ToolExposureDirect, ReadOnly: false, ConcurrencySafe: true, NeedsPermission: true, RequiresUserInteraction: true},
 	}
 }
 
@@ -111,7 +111,18 @@ func (t *Tool) renderDescription(ctx context.Context) (string, error) {
 	if err != nil {
 		return staticDescription, err
 	}
-	return staticDescription + "\n\n<skills_instructions>\n只调用一次Skill(skill, task?, inputs?)完成Invocation选择；不要传entrypoint、sandbox、model、qa或deliverable参数。\n</skills_instructions>\n\n" + strings.TrimSpace(catalog), nil
+	instructions := `<skills_instructions>
+只调用一次Skill(skill, task?, inputs?)完成Invocation选择；不要传entrypoint、sandbox、model、qa或deliverable参数。
+
+【通用执行与调度纪律】：
+1. 能力优先原则 (Capability-First Rule):
+   在办理任何任务（如数据提取、文档处理、代码分析、格式转换等）时，必须优先检索并调用 <available_skills> 中匹配的专属技能或系统工具。仅当没有任何可用技能或工具满足需求时，才允许自行编写代码解决。
+2. 职责与上下文边界原则 (Context Boundary Rule):
+   一旦激活某个技能（Invocation）进入其专属上下文：
+   - 严禁在当前技能沙箱内越界编写或安装非本技能职责范畴的代码与依赖。
+   - 若任务包含后续其他阶段（如从提取到生成新格式），且 <available_skills> 中存在对应阶段的专属技能，必须通过 Skill(skill="<target-skill>", task="...") 显式切换或激活目标技能。
+</skills_instructions>`
+	return staticDescription + "\n\n" + instructions + "\n\n" + strings.TrimSpace(catalog), nil
 }
 
 func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
@@ -153,7 +164,7 @@ func (t *Tool) load(ctx context.Context, in input, modelCall bool, invocationSou
 	if err != nil {
 		return "", err
 	}
-	if err := t.checkRecursion(ctx, resolved.CatalogItem.ID); err != nil {
+	if err := t.checkRecursion(ctx, resolved.CatalogItem); err != nil {
 		return "", err
 	}
 	if err := t.dispatchPreHook(ctx, modelCall, invocationSource, resolved); err != nil {
@@ -254,6 +265,14 @@ func resolveToolPolicy(base []string, declared model.ToolPolicy) (model.Effectiv
 		return model.EffectiveToolPolicy{}, fmt.Errorf("SKILL_TOOL_POLICY_UNSATISFIABLE: Tool Policy求交为空")
 	}
 	allowedSet := stringSet(allowed)
+	// 网关工具常驻硬规则：Skill 是系统级元工具（Skill Gateway）。
+	// 无论技能声明的 allow 规则如何设定，只要基准工具集中启用了 Skill，Allowed 列表中必须包含 "Skill"，确保大模型在任何技能模式下随时可发起技能切换。
+	if _, hasSkill := baseSet["Skill"]; hasSkill {
+		if _, ok := allowedSet["Skill"]; !ok {
+			allowed = append(allowed, "Skill")
+			allowedSet["Skill"] = struct{}{}
+		}
+	}
 	for _, name := range required {
 		if _, ok := allowedSet[name]; !ok {
 			return model.EffectiveToolPolicy{}, fmt.Errorf("SKILL_TOOL_POLICY_UNSATISFIABLE: 缺少required Tool %q", name)
@@ -370,14 +389,18 @@ func (t *Tool) fork(ctx context.Context, resolved model.ResolvedInvocation, bind
 	defer t.inFlight.Delete(fingerprint)
 
 	allowedTools := appendSubAgentTasklistTools(binding.ToolPolicy.Allowed)
+	// skill-fork 子 Agent 是执行者而非调度者：物理移除 Skill 网关工具。
+	// 主 Agent 的「Skill 必须常驻」规则不适用于执行子 Run。
+	// 普通 Task 子 Agent（走 task/tool.go → Delegate()）保留 Skill 不变。
+	allowedTools = filterOut(allowedTools, "Skill")
 	definition := &subagentmodel.Definition{
-		Name: subagentprompt.SkillForkDefinitionName(binding.Handle), Description: "Skill Invocation fork: " + binding.Handle,
-		WhenToUse: "仅由Skill网关按Runtime Manifest创建", SystemPrompt: "", Tools: cloneStrings(allowedTools),
+		Name: subagentprompt.SkillForkDefinitionName(binding.Handle), Description: "独立执行已注入的 Skill Invocation 任务",
+		WhenToUse: "仅由Skill网关按Runtime Manifest创建", SystemPrompt: subagentprompt.SkillForkExecutorPrompt(), Tools: cloneStrings(allowedTools),
 		MaxTurns: binding.AgentMode.MaxTurns, MaxTokens: binding.AgentMode.MaxTokens, MaxToolCalls: binding.AgentMode.MaxToolCalls,
 		TimeoutSec: binding.AgentMode.TimeoutSec,
 	}
 	req := subagentcontract.DelegateRequest{
-		Prompt: injection.Contents, Description: "执行Skill Invocation " + binding.Handle,
+		Prompt: injection.Contents, Description: "按照已注入的 Skill 指令直接执行任务，不要再次调用 Skill 工具",
 		AllowedTools: cloneStrings(allowedTools), Definition: definition,
 		SnapshotMode: subagentcontract.SnapshotModeSkillIsolated, PromptOrigin: "skill_fork",
 		MaxTurns: binding.AgentMode.MaxTurns, MaxTokens: binding.AgentMode.MaxTokens,
@@ -480,15 +503,20 @@ func (t *Tool) authorize(ctx context.Context, resolved model.ResolvedInvocation,
 	return nil
 }
 
-func (t *Tool) checkRecursion(ctx context.Context, invocationID string) error {
+func (t *Tool) checkRecursion(ctx context.Context, catalogItem model.InvocationMetadata) error {
 	ancestors := skillcontract.InvocationAncestors(ctx)
 	if len(ancestors) >= 8 {
 		return fmt.Errorf("SKILL_RECURSION_DENIED: Invocation调用深度超过8")
 	}
+	ancestorSet := make(map[string]struct{}, len(ancestors))
 	for _, ancestor := range ancestors {
-		if ancestor == invocationID {
-			return fmt.Errorf("SKILL_RECURSION_DENIED: Invocation祖先链形成环: %s", invocationID)
+		ancestor = strings.TrimSpace(ancestor)
+		if ancestor != "" {
+			ancestorSet[strings.ToLower(ancestor)] = struct{}{}
 		}
+	}
+	if model.IsAncestorSkill(catalogItem, ancestorSet) {
+		return fmt.Errorf("SKILL_RECURSION_DENIED: Invocation祖先链形成环或禁止同技能包重复调用: %s", catalogItem.Name)
 	}
 	return nil
 }
@@ -581,6 +609,21 @@ func appendSubAgentTasklistTools(allowed []string) []string {
 		if _, ok := set[toolName]; !ok {
 			out = append(out, toolName)
 			set[toolName] = struct{}{}
+		}
+	}
+	return out
+}
+
+// filterOut 从 tools 中移除指定名称的工具（幂等，大小写精确匹配）。
+func filterOut(tools []string, names ...string) []string {
+	exclude := make(map[string]struct{}, len(names))
+	for _, n := range names {
+		exclude[n] = struct{}{}
+	}
+	out := make([]string, 0, len(tools))
+	for _, t := range tools {
+		if _, skip := exclude[t]; !skip {
+			out = append(out, t)
 		}
 	}
 	return out

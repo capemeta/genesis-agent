@@ -459,10 +459,22 @@ func (s *Service) RenderAvailableSkills(ctx context.Context, req contract.Catalo
 	if err != nil {
 		return "", err
 	}
+	ancestors := contract.InvocationAncestors(ctx)
+	ancestorSet := make(map[string]struct{}, len(ancestors))
+	for _, ancestor := range ancestors {
+		ancestor = strings.TrimSpace(ancestor)
+		if ancestor != "" {
+			ancestorSet[strings.ToLower(ancestor)] = struct{}{}
+		}
+	}
+
 	var b strings.Builder
 	b.WriteString("<available_skills>\n")
 	shown := 0
 	for _, entry := range catalog.Entries {
+		if isAncestorSkill(entry, ancestorSet) {
+			continue
+		}
 		item := fmt.Sprintf("  <skill>\n    <name>%s</name>\n    <description>%s</description>\n    <location>skill://%s</location>\n  </skill>\n", xmlEscape(entry.Name), xmlEscape(oneLine(entry.Description)), xmlEscape(entry.ID))
 		if b.Len()+len(item)+len("</available_skills>") > s.opts.MaxListBytes || estimateTokens(b.String()+item) > s.opts.MaxListTokens {
 			break
@@ -475,6 +487,10 @@ func (s *Service) RenderAvailableSkills(ctx context.Context, req contract.Catalo
 	}
 	b.WriteString("</available_skills>")
 	return b.String(), nil
+}
+
+func isAncestorSkill(entry model.InvocationMetadata, ancestorSet map[string]struct{}) bool {
+	return model.IsAncestorSkill(entry, ancestorSet)
 }
 
 func (s *Service) ClearCache() {
@@ -553,18 +569,35 @@ func expandInvocations(physical model.PhysicalSkillDefinition, defaultTools []st
 	return entries
 }
 
+func hasExecutableScripts(physical model.PhysicalSkillDefinition) bool {
+	for _, f := range physical.Snapshot.Files {
+		res := strings.ToLower(string(f.Resource))
+		if strings.Contains(res, "/scripts/") || strings.HasSuffix(res, ".py") || strings.HasSuffix(res, ".js") || strings.HasSuffix(res, ".sh") || strings.HasSuffix(res, ".ps1") {
+			return true
+		}
+	}
+	return false
+}
+
 func defaultDefinitions(physical model.PhysicalSkillDefinition, defaultTools []string) []model.InvocationDefinition {
 	if physical.Manifest != nil {
 		return append([]model.InvocationDefinition(nil), physical.Manifest.Invocations...)
 	}
+	mode := model.AgentModeMain
+	tools := append([]string(nil), defaultTools...)
+	if hasExecutableScripts(physical) {
+		mode = model.AgentModeFork
+		tools = []string{"run_skill_command", "install_skill_dependencies", "list_skill_resources", "read_skill_resource"}
+	}
 	return []model.InvocationDefinition{{
 		ID: "default", Handle: physical.Metadata.Name, Description: physical.Metadata.Description,
-		AgentMode: model.AgentModeSpec{Mode: model.AgentModeMain}, RuntimeProfile: "default",
+		AgentMode: model.AgentModeSpec{Mode: mode}, RuntimeProfile: "default",
 		Request:    model.RequestContract{Inputs: model.InputContract{Access: model.InputAccessReadOnly, MaxItems: model.MaxInputs}},
 		Prompt:     model.InvocationPrompt{SkillBody: model.SkillBodyInclude},
-		ToolPolicy: model.ToolPolicy{Allow: append([]string(nil), defaultTools...)}, Result: model.ResultContract{Kind: model.ResultKindMessage},
+		ToolPolicy: model.ToolPolicy{Allow: tools}, Result: model.ResultContract{Kind: model.ResultKindMessage},
 	}}
 }
+
 
 func invocationFromPhysical(physical model.PhysicalSkillDefinition, id string, defaultTools []string) (model.InvocationDefinition, model.RuntimeProfile, error) {
 	for _, definition := range defaultDefinitions(physical, defaultTools) {
@@ -639,20 +672,68 @@ func composePrompt(resolved model.ResolvedInvocation, binding model.InvocationBi
 	}
 	var request strings.Builder
 	request.WriteString("<invocation_request>\n")
-	request.WriteString("handle: " + binding.Handle + "\n")
 	if binding.Task != "" {
-		request.WriteString("task: " + binding.Task + "\n")
+		request.WriteString("task: ")
+		request.WriteString(cleanAbsolutePaths(binding.Task, binding.Inputs))
+		request.WriteString("\n")
 	}
 	if len(binding.Inputs) > 0 {
 		request.WriteString("inputs:\n")
 		for _, input := range binding.Inputs {
-			fmt.Fprintf(&request, "- alias=%s resource=%s:%s version=%s\n", input.Alias, input.Ref.Authority, input.Ref.ID, input.Ref.Version)
+			resID := cleanResourceID(input.Ref, input.Alias)
+			fmt.Fprintf(&request, "- alias=%s resource=%s:%s version=%s\n", input.Alias, input.Ref.Authority, resID, input.Ref.Version)
 		}
 	}
 	request.WriteString("</invocation_request>")
 	parts = append(parts, request.String())
 	return strings.Join(parts, "\n\n")
 }
+
+func cleanResourceID(ref workmodel.ResourceRef, alias string) string {
+	id := strings.TrimSpace(ref.ID)
+	if ref.Authority == "host" || isAbsolutePath(id) {
+		if strings.TrimSpace(alias) != "" {
+			return alias
+		}
+	}
+	return id
+}
+
+func isAbsolutePath(s string) bool {
+	if len(s) >= 2 && s[1] == ':' {
+		c := s[0]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
+			return true
+		}
+	}
+	return strings.HasPrefix(s, "/") || strings.HasPrefix(s, `\`)
+}
+
+func cleanAbsolutePaths(task string, inputs []model.BoundInput) string {
+	if strings.TrimSpace(task) == "" {
+		return ""
+	}
+	res := task
+	for _, input := range inputs {
+		alias := strings.TrimSpace(input.Alias)
+		if alias == "" {
+			continue
+		}
+		if id := strings.TrimSpace(input.Ref.ID); id != "" {
+			res = strings.ReplaceAll(res, id, alias)
+			res = strings.ReplaceAll(res, strings.ReplaceAll(id, `/`, `\`), alias)
+			res = strings.ReplaceAll(res, strings.ReplaceAll(id, `\`, `/`), alias)
+		}
+		if p := strings.TrimSpace(input.Ref.Path); p != "" {
+			res = strings.ReplaceAll(res, p, alias)
+			res = strings.ReplaceAll(res, strings.ReplaceAll(p, `/`, `\`), alias)
+			res = strings.ReplaceAll(res, strings.ReplaceAll(p, `\`, `/`), alias)
+		}
+	}
+	return res
+}
+
+
 
 func (s *Service) packageRecord(authority model.Authority, packageID model.PackageID) (packageRecord, error) {
 	s.mu.RLock()

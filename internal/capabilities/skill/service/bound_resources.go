@@ -23,24 +23,41 @@ func (s *Service) ReadBoundResource(ctx context.Context, req contract.BoundResou
 		return model.ResourceContent{}, fmt.Errorf("RESOURCE_NOT_IN_BOUND_PACKAGE: %s不属于binding package %s", resource, snapshot.PackageID)
 	}
 	for _, file := range files {
-		if file.Resource != resource {
-			continue
+		if file.Resource == resource {
+			return readBoundFileContent(s.opts.MaxPromptBytes, req, file, resource, snapshot)
 		}
-		if !utf8.Valid(file.Content) {
-			return model.ResourceContent{}, fmt.Errorf("skill resource不是UTF-8文本: %s", resource)
+	}
+	// 容错匹配：当精确匹配未命中时，支持短文件名（如 read.md）或相对后缀唯一匹配
+	reqRes := strings.TrimLeft(string(req.Resource), "/")
+	var matchFile *model.SkillPackageFile
+	matchCount := 0
+	for i := range files {
+		fRes := string(files[i].Resource)
+		if fRes == reqRes || strings.HasSuffix(fRes, "/"+reqRes) || path.Base(fRes) == reqRes {
+			matchFile = &files[i]
+			matchCount++
 		}
-		limit := req.MaxBytes
-		if limit <= 0 || limit > s.opts.MaxPromptBytes {
-			limit = s.opts.MaxPromptBytes
-		}
-		content := file.Content
-		truncated := len(content) > limit
-		if truncated {
-			content = content[:limit]
-		}
-		return model.ResourceContent{Skill: boundMetadata(req.Binding), Resource: resource, Content: string(content), Version: snapshot.Digest, Truncated: truncated}, nil
+	}
+	if matchCount == 1 && matchFile != nil {
+		return readBoundFileContent(s.opts.MaxPromptBytes, req, *matchFile, matchFile.Resource, snapshot)
 	}
 	return model.ResourceContent{}, fmt.Errorf("skill resource不存在于binding快照: %s", resource)
+}
+
+func readBoundFileContent(maxBytes int, req contract.BoundResourceRequest, file model.SkillPackageFile, resource model.ResourceID, snapshot model.SkillPackageSnapshot) (model.ResourceContent, error) {
+	if !utf8.Valid(file.Content) {
+		return model.ResourceContent{}, fmt.Errorf("skill resource不是UTF-8文本: %s", resource)
+	}
+	limit := req.MaxBytes
+	if limit <= 0 || limit > maxBytes {
+		limit = maxBytes
+	}
+	content := file.Content
+	truncated := len(content) > limit
+	if truncated {
+		content = content[:limit]
+	}
+	return model.ResourceContent{Skill: boundMetadata(req.Binding), Resource: resource, Content: string(content), Version: snapshot.Digest, Truncated: truncated}, nil
 }
 
 // ListBoundResources 只枚举 Binding 固定快照中的资源。

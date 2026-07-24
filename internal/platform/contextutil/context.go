@@ -12,6 +12,7 @@ type sessionKey struct{}
 type runKey struct{}
 type sandboxProfileKey struct{}
 type approvalGrantedHookKey struct{}
+type subagentTypeKeyType struct{}
 
 var (
 	tenantIDKey           = tenantKey{}
@@ -20,7 +21,20 @@ var (
 	runIDKey              = runKey{}
 	sandboxOverrideKey    = sandboxProfileKey{}
 	approvalGrantedHookID = approvalGrantedHookKey{}
+	subagentTypeKey       = subagentTypeKeyType{}
 )
+
+// WithSubagentType 将子智能体类型注入 context（供 promptAudience 等识别角色）。
+func WithSubagentType(ctx context.Context, subagentType string) context.Context {
+	return context.WithValue(ctx, subagentTypeKey, strings.TrimSpace(subagentType))
+}
+
+// GetSubagentType 从 context 提取子智能体类型；空值或未设置时返回 ""。
+func GetSubagentType(ctx context.Context) string {
+	val, _ := ctx.Value(subagentTypeKey).(string)
+	return strings.TrimSpace(val)
+}
+
 
 // ApprovalGrantedHook 在用户批准后回调（供 Repeat Guard 等 Run 级状态清零）。
 type ApprovalGrantedHook func(ctx context.Context)

@@ -365,3 +365,106 @@ func TestApplyProgressPreservesChronologicalOrderWithInterleavedThinking(t *test
 		t.Fatalf("index 2 should be completion line appended at end: %s", m.progressLog[2])
 	}
 }
+
+func TestProgressSummaryFullCommandAndFailureLogPreview(t *testing.T) {
+	fullCmd := "python -m markitdown 2026笔记本选型比较.pptx --output result.md"
+	summary := progressSummary(progress.Event{
+		Kind:     progress.KindTool,
+		Phase:    progress.PhaseError,
+		Name:     "run_skill_command",
+		Detail:   `{"command":"` + fullCmd + `", "stderr":"Traceback (most recent call last):\n  File \"test.py\", line 10\n    syntax error\nSyntaxError: invalid syntax\nline 5\nline 6"}`,
+		Metadata: map[string]string{"execution_backend": "local_platform_sandbox"},
+	})
+
+	if !strings.Contains(summary, fullCmd) {
+		t.Fatalf("expected full command %q in summary, got: %s", fullCmd, summary)
+	}
+	if !strings.Contains(summary, "└─ 失败日志:") {
+		t.Fatalf("expected failure log preview header, got: %s", summary)
+	}
+	if !strings.Contains(summary, "Traceback") || !strings.Contains(summary, "SyntaxError") {
+		t.Fatalf("expected error lines in summary, got: %s", summary)
+	}
+	if !strings.Contains(summary, "日志超限，仅展示前 5 行") {
+		t.Fatalf("expected truncation notice for >5 lines, got: %s", summary)
+	}
+}
+
+func TestProgressSummaryInstallSkillDependencies(t *testing.T) {
+	summaryStart := progressSummary(progress.Event{
+		Kind:   progress.KindTool,
+		Phase:  progress.PhaseStart,
+		Name:   "install_skill_dependencies",
+		Detail: `{"skill":"office-ppt","packages":[{"manager":"pip","name":"markitdown[pptx]"}]}`,
+	})
+	if !strings.Contains(summaryStart, "技能: office-ppt") || !strings.Contains(summaryStart, "包: pip:markitdown[pptx]") {
+		t.Fatalf("unexpected summaryStart: %s", summaryStart)
+	}
+
+	summaryComplete := progressSummary(progress.Event{
+		Kind:   progress.KindTool,
+		Phase:  progress.PhaseComplete,
+		Name:   "install_skill_dependencies",
+		Detail: `{"ok":true,"skill":"office-ppt","commands":["pip install markitdown[pptx]"],"installed":[{"manager":"pip","name":"markitdown[pptx]"}]}`,
+	})
+	if !strings.Contains(summaryComplete, "工具执行完成: install_skill_dependencies") || !strings.Contains(summaryComplete, "pip:markitdown[pptx]") {
+		t.Fatalf("unexpected summaryComplete: %s", summaryComplete)
+	}
+}
+
+func TestMultiLineThinkingPreservedAndRendered(t *testing.T) {
+	m := &Model{progressExpanded: true}
+
+	// Stream multi-line thinking for main Agent
+	m.applyProgress(progress.Event{
+		Kind:      progress.KindLLM,
+		Phase:     progress.PhaseProgress,
+		BlockType: "thinking",
+		Detail:    "第一行思考：分析文件存在\n第二行思考：读取文件内容",
+	})
+
+	// Stream multi-line thinking for Sub-Agent
+	m.applyProgress(progress.Event{
+		Kind:       progress.KindLLM,
+		Phase:      progress.PhaseProgress,
+		SubAgentID: "Worker",
+		Depth:      1,
+		BlockType:  "thinking",
+		Detail:     "子Agent第一行\n子Agent第二行",
+	})
+
+	if len(m.progressLog) != 2 {
+		t.Fatalf("expected 2 progressLog entries, got %d", len(m.progressLog))
+	}
+
+	if !strings.Contains(m.progressLog[0], "\n") {
+		t.Fatalf("expected main agent thinking to preserve newlines, got: %q", m.progressLog[0])
+	}
+	if !strings.Contains(m.progressLog[1], "\n") {
+		t.Fatalf("expected sub-agent thinking to preserve newlines, got: %q", m.progressLog[1])
+	}
+
+	// Test rendered messages view
+	msg := uiMessage{
+		role:        "system",
+		isProgress:  true,
+		progressLog: m.progressLog,
+	}
+	rendered := renderMessages([]uiMessage{msg}, 80, true, false, -1, -1)
+
+	// Check tree indentation
+	if !strings.Contains(rendered, "  |-- [Agent] 思考: 第一行思考：分析文件存在") {
+		t.Fatalf("rendered output missing main agent first line tree branch, got:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, "  |   第二行思考：读取文件内容") {
+		t.Fatalf("rendered output missing main agent continuation indent, got:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, "    `-- [Sub-Agent: Worker] 思考: 子Agent第一行") {
+		t.Fatalf("rendered output missing sub agent first line tree branch, got:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, "        子Agent第二行") {
+		t.Fatalf("rendered output missing sub agent continuation indent, got:\n%s", rendered)
+	}
+}
+
+

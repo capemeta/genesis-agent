@@ -471,15 +471,16 @@ func (t *Tool) childAgent(definition subagentmodel.Definition, readOnly bool, pa
 	isSandboxed := strings.HasPrefix(definition.Name, "skill-fork:") || containsString(definition.Tools, "run_skill_command") || containsString(definition.Tools, "sandbox_exec")
 
 	for _, name := range allowed {
-		if name == "TaskOutput" || name == "TaskStop" || name == "Skill" {
+		if name == "TaskOutput" || name == "TaskStop" {
+			continue
+		}
+		if (name == "Skill" || name == toolName) && (!allowDelegation || strings.HasPrefix(definition.Name, "skill-fork:")) {
 			continue
 		}
 		if name == "run_command" && isSandboxed {
 			continue
 		}
-		if name == toolName && !allowDelegation {
-			continue
-		}
+
 		if readOnly && !isReadOnly(name) {
 			continue
 		}

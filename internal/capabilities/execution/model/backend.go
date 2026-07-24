@@ -41,3 +41,18 @@ func (r ExecutionBackendRef) Validate() error {
 	}
 	return nil
 }
+
+// ResolveBackendKind classifies a provider string into a stable BackendKind.
+func ResolveBackendKind(provider string) BackendKind {
+	p := strings.TrimSpace(strings.ToLower(provider))
+	switch p {
+	case "host", "local-host", "local_host":
+		return BackendKindHost
+	case "local", "local-platform", "local_platform", "local_platform_sandbox", "bwrap", "landlock", "seatbelt", "windows":
+		return BackendKindLocalSandbox
+	case "genesis-sandbox", "docker", "remote", "remote_sandbox", "remote-sandbox":
+		return BackendKindRemote
+	default:
+		return BackendKindRemote
+	}
+}

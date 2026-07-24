@@ -152,42 +152,67 @@ func (c *DefaultCompactor) MaybeMicroCompact(ctx context.Context, rc *runtime.Ru
 	triggered := false
 	artifactsDir := filepath.Join(c.sessionDir, rc.Run.SessionID, "artifacts")
 
-	for _, msg := range rc.Messages {
-		if msg.NormalizedKind() != domain.MessageKindToolResult || msg.ToolCallID == "" {
+	lastSkillIdx := -1
+	for i := len(rc.Messages) - 1; i >= 0; i-- {
+		if rc.Messages[i] != nil && rc.Messages[i].NormalizedKind() == domain.MessageKindSkillInjection {
+			lastSkillIdx = i
+			break
+		}
+	}
+
+	for i, msg := range rc.Messages {
+		if msg == nil {
 			continue
 		}
-		// 若属于最近 3 次的 tool_result，保留不卸载
-		if _, ok := recentSet[msg.ToolCallID]; ok {
-			continue
+		if msg.NormalizedKind() == domain.MessageKindToolResult && msg.ToolCallID != "" {
+			// 若属于最近 3 次的 tool_result，保留不卸载
+			if _, ok := recentSet[msg.ToolCallID]; ok {
+				continue
+			}
+			// 校验长度超限，且非已经持久化的标签
+			if len(msg.Content) > c.toolResultMaxTokens && !isAlreadyMicrocompacted(msg.Content) {
+				if err := os.MkdirAll(artifactsDir, 0755); err != nil {
+					return Compaction{Triggered: false, Kind: CompactionKindNone}, fmt.Errorf("create artifacts dir failed: %w", err)
+				}
+
+				// 保存完整内容至本地 artifacts
+				fileName := fmt.Sprintf("tool-%s.log", msg.ToolCallID)
+				filePath := filepath.Join(artifactsDir, fileName)
+				if err := os.WriteFile(filePath, []byte(msg.Content), 0600); err != nil {
+					return Compaction{Triggered: false, Kind: CompactionKindNone}, fmt.Errorf("write tool output file failed: %w", err)
+				}
+
+				// 计算 Token 节省值
+				originalTokens := c.estimator.EstimateMessages(ctx, []*domain.Message{msg}, getModel(rc))
+
+				// 原位替换为占位文本 (相对路径引用 artifacts/...)
+				preview := ""
+				if len(msg.Content) > 400 {
+					preview = msg.Content[:400]
+				} else {
+					preview = msg.Content
+				}
+				msg.Content = fmt.Sprintf("<persisted-output ref=\"artifacts/%s\">[Oversized tool result (%d chars) persisted. First 400 chars:\n%s...]</persisted-output>", fileName, len(msg.Content), preview)
+
+				newTokens := c.estimator.EstimateMessages(ctx, []*domain.Message{msg}, getModel(rc))
+				tokensSaved += (originalTokens - newTokens)
+				triggered = true
+			}
 		}
-		// 校验长度超限，且非已经持久化的标签
-		if len(msg.Content) > c.toolResultMaxTokens && !isAlreadyMicrocompacted(msg.Content) {
-			if err := os.MkdirAll(artifactsDir, 0755); err != nil {
-				return Compaction{Triggered: false, Kind: CompactionKindNone}, fmt.Errorf("create artifacts dir failed: %w", err)
+
+		// 历史陈旧技能指引消息：若非末端最新一个且长度超限，在 L1 阶段就地原位折叠为标签
+		if i < lastSkillIdx && msg.NormalizedKind() == domain.MessageKindSkillInjection {
+			if len(msg.Content) > c.toolResultMaxTokens && !isAlreadyMicrocompacted(msg.Content) {
+				originalTokens := c.estimator.EstimateMessages(ctx, []*domain.Message{msg}, getModel(rc))
+
+				handle := extractSkillHandle(msg.Content)
+				kbSize := float64(len(msg.Content)) / 1024.0
+				msg.Content = fmt.Sprintf("<skill-injection-summary handle=\"%s\">[历史技能指引已执行完毕，已折叠 %.1fKB]</skill-injection-summary>", handle, kbSize)
+
+				newTokens := c.estimator.EstimateMessages(ctx, []*domain.Message{msg}, getModel(rc))
+				tokensSaved += (originalTokens - newTokens)
+				triggered = true
 			}
-
-			// 保存完整内容至本地 artifacts
-			fileName := fmt.Sprintf("tool-%s.log", msg.ToolCallID)
-			filePath := filepath.Join(artifactsDir, fileName)
-			if err := os.WriteFile(filePath, []byte(msg.Content), 0600); err != nil {
-				return Compaction{Triggered: false, Kind: CompactionKindNone}, fmt.Errorf("write tool output file failed: %w", err)
-			}
-
-			// 计算 Token 节省值
-			originalTokens := c.estimator.EstimateMessages(ctx, []*domain.Message{msg}, getModel(rc))
-
-			// 原位替换为占位文本 (相对路径引用 artifacts/...)
-			preview := ""
-			if len(msg.Content) > 400 {
-				preview = msg.Content[:400]
-			} else {
-				preview = msg.Content
-			}
-			msg.Content = fmt.Sprintf("<persisted-output ref=\"artifacts/%s\">[Oversized tool result (%d chars) persisted. First 400 chars:\n%s...]</persisted-output>", fileName, len(msg.Content), preview)
-
-			newTokens := c.estimator.EstimateMessages(ctx, []*domain.Message{msg}, getModel(rc))
-			tokensSaved += (originalTokens - newTokens)
-			triggered = true
 		}
 	}
 
@@ -203,15 +228,29 @@ func (c *DefaultCompactor) MaybeMicroCompact(ctx context.Context, rc *runtime.Ru
 }
 
 func (c *DefaultCompactor) hasMicroCompactionCandidate(rc *runtime.RunContext, recentSet map[string]struct{}) bool {
-	for _, msg := range rc.Messages {
-		if msg == nil || msg.NormalizedKind() != domain.MessageKindToolResult || msg.ToolCallID == "" {
+	lastSkillIdx := -1
+	for i := len(rc.Messages) - 1; i >= 0; i-- {
+		if rc.Messages[i] != nil && rc.Messages[i].NormalizedKind() == domain.MessageKindSkillInjection {
+			lastSkillIdx = i
+			break
+		}
+	}
+
+	for i, msg := range rc.Messages {
+		if msg == nil {
 			continue
 		}
-		if _, recent := recentSet[msg.ToolCallID]; recent {
-			continue
+		if msg.NormalizedKind() == domain.MessageKindToolResult && msg.ToolCallID != "" {
+			if _, recent := recentSet[msg.ToolCallID]; !recent {
+				if len(msg.Content) > c.toolResultMaxTokens && !isAlreadyMicrocompacted(msg.Content) {
+					return true
+				}
+			}
 		}
-		if len(msg.Content) > c.toolResultMaxTokens && !isAlreadyMicrocompacted(msg.Content) {
-			return true
+		if i < lastSkillIdx && msg.NormalizedKind() == domain.MessageKindSkillInjection {
+			if len(msg.Content) > c.toolResultMaxTokens && !isAlreadyMicrocompacted(msg.Content) {
+				return true
+			}
 		}
 	}
 	return false
@@ -456,9 +495,18 @@ func containsMessageID(msgs []*domain.Message, id string) bool {
 	return false
 }
 
-// isAlreadyMicrocompacted 校验该正文是否已经是持久化后的占位符
+// isAlreadyMicrocompacted 校验该正文是否已经是持久化或原位微折叠后的占位符
 func isAlreadyMicrocompacted(content string) bool {
-	return len(content) > 0 && (content[0] == '<' && (strings.HasPrefix(content, "<persisted-output") || strings.Contains(content, "ref=")))
+	return strings.Contains(content, "<persisted-output") || strings.Contains(content, "<skill-injection-summary")
+}
+
+func extractSkillHandle(content string) string {
+	re := regexp.MustCompile(`(?:name|handle|qualified_name)="([^"]+)"`)
+	matches := re.FindStringSubmatch(content)
+	if len(matches) > 1 && strings.TrimSpace(matches[1]) != "" {
+		return strings.TrimSpace(matches[1])
+	}
+	return "skill"
 }
 
 func getModel(rc *runtime.RunContext) string {

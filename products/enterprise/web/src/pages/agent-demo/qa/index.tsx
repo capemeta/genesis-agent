@@ -340,15 +340,7 @@ export default function QAPage() {
 
     return (
       <div style={{ width: '100%' }}>
-        {/* 思维链 */}
-        {msg.thinkingSteps && (
-          <ThinkingProcess steps={msg.thinkingSteps} running={hasThinkingInProgress} />
-        )}
-
-        {/* 工具调用状态 */}
-        {msg.toolCalls && <ToolCallBadge tools={msg.toolCalls} />}
-
-        {/* Markdown 内容 */}
+        {/* Markdown 内容 (最终内容放上面) */}
         {msg.content && <XMarkdown content={msg.content} />}
 
         {/* 流式光标 */}
@@ -363,6 +355,14 @@ export default function QAPage() {
               animation: 'cursor-blink 1s step-end infinite',
             }}
           />
+        )}
+
+        {/* 工具调用状态 */}
+        {msg.toolCalls && <ToolCallBadge tools={msg.toolCalls} />}
+
+        {/* 思维链 (思考过程放下面) */}
+        {msg.thinkingSteps && (
+          <ThinkingProcess steps={msg.thinkingSteps} running={hasThinkingInProgress} />
         )}
 
         {/* 结构化卡片 */}

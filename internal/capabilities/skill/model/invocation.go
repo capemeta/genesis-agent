@@ -352,3 +352,32 @@ func ValidateBindingIdentity(binding InvocationBinding) error {
 	}
 	return nil
 }
+
+// IsAncestorSkill 判断给定的 Invocation Metadata（或所属物理技能包）是否匹配祖先链中的任何记录。
+func IsAncestorSkill(entry InvocationMetadata, ancestorSet map[string]struct{}) bool {
+	if len(ancestorSet) == 0 {
+		return false
+	}
+	keys := []string{
+		strings.ToLower(strings.TrimSpace(entry.ID)),
+		strings.ToLower(strings.TrimSpace(entry.Name)),
+		strings.ToLower(strings.TrimSpace(entry.QualifiedName)),
+		strings.ToLower(strings.TrimSpace(entry.PhysicalSkill)),
+		strings.ToLower(strings.TrimSpace(string(entry.PackageID))),
+	}
+	for _, key := range keys {
+		if key == "" {
+			continue
+		}
+		if _, ok := ancestorSet[key]; ok {
+			return true
+		}
+		for ancestor := range ancestorSet {
+			if ancestor == key || strings.Contains(ancestor, ":"+key+":") || strings.HasSuffix(ancestor, ":"+key) || strings.HasPrefix(ancestor, key+":") || strings.Contains(ancestor, ":"+key) || strings.Contains(ancestor, key+":") {
+				return true
+			}
+		}
+	}
+	return false
+}
+

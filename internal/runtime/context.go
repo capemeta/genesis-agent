@@ -1,13 +1,16 @@
 package runtime
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
 
 	skillmodel "genesis-agent/internal/capabilities/skill/model"
+	subagentprompt "genesis-agent/internal/capabilities/subagent/prompt"
 	"genesis-agent/internal/domain"
+	"genesis-agent/internal/platform/contextutil"
 	"genesis-agent/internal/runtime/repeatguard"
 )
 
@@ -81,10 +84,19 @@ func (rc *RunContext) ActiveInvocation() (skillmodel.InvocationBinding, bool) {
 	return rc.activeSkill.Clone(), true
 }
 
-// InvocationAllowsTool 是执行期硬门禁；工具可见性过滤不能替代本检查。
-func (rc *RunContext) InvocationAllowsTool(name string) bool {
+// InvocationAllowsTool 是执行期硬门禁；工具可见性过滤与策略门控仅作用于 skill-fork 子智能体执行上下文。
+// 主 Agent (AudienceRoot / main 模式) 不受此限，始终保留完整的工具链能力。
+func (rc *RunContext) InvocationAllowsTool(ctx context.Context, name string) bool {
 	binding, ok := rc.ActiveInvocation()
 	if !ok {
+		return true
+	}
+	// tool_policy.allow 仅对 skill-fork 派生的子 Run 生效；主 Agent 不被锁定。
+	subagentType := ""
+	if ctx != nil {
+		subagentType = contextutil.GetSubagentType(ctx)
+	}
+	if !strings.HasPrefix(subagentType, subagentprompt.SkillForkSubagentTypePrefix) {
 		return true
 	}
 	name = strings.TrimSpace(name)
@@ -95,6 +107,9 @@ func (rc *RunContext) InvocationAllowsTool(name string) bool {
 	}
 	return false
 }
+
+
+
 
 // NewRunContext 初始化RunContext
 func NewRunContext(run *domain.Run, agent *domain.Agent) *RunContext {

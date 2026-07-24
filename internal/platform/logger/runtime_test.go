@@ -9,7 +9,7 @@ import (
 	"genesis-agent/internal/platform/config"
 )
 
-func TestNewRuntimeLogging_CreatesThreeChannels(t *testing.T) {
+func TestNewRuntimeLogging_CreatesFourChannels(t *testing.T) {
 	dir := t.TempDir()
 	enabled := true
 	cfg := config.LogConfig{
@@ -23,6 +23,7 @@ func TestNewRuntimeLogging_CreatesThreeChannels(t *testing.T) {
 			"agent": {Enabled: &enabled, File: "agent.log", Format: "text", RetainDays: 14},
 			"audit": {Enabled: &enabled, File: "audit.log", Format: "jsonl", RetainDays: 90},
 			"usage": {Enabled: &enabled, File: "usage.log", Format: "jsonl", RetainDays: 90},
+			"llm":   {Enabled: &enabled, File: "llm.log", Format: "jsonl", RetainDays: 14},
 		},
 	}
 
@@ -33,8 +34,8 @@ func TestNewRuntimeLogging_CreatesThreeChannels(t *testing.T) {
 	defer rt.Close()
 
 	rt.AgentLogger.Info("hello", "run_id", "r1")
-	if rt.AuditWriter == nil || rt.UsageWriter == nil {
-		t.Fatal("audit/usage writers should be enabled")
+	if rt.AuditWriter == nil || rt.UsageWriter == nil || rt.LLMWriter == nil {
+		t.Fatal("audit/usage/llm writers should be enabled")
 	}
 	if _, err := rt.AuditWriter.Write([]byte("{\"type\":\"test\"}\n")); err != nil {
 		t.Fatal(err)
@@ -42,9 +43,12 @@ func TestNewRuntimeLogging_CreatesThreeChannels(t *testing.T) {
 	if _, err := rt.UsageWriter.Write([]byte("{\"type\":\"tool.usage\"}\n")); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := rt.LLMWriter.Write([]byte("{\"model\":\"test\"}\n")); err != nil {
+		t.Fatal(err)
+	}
 	_ = rt.Close()
 
-	for _, name := range []string{"agent.log", "audit.log", "usage.log"} {
+	for _, name := range []string{"agent.log", "audit.log", "usage.log", "llm.log"} {
 		p := filepath.Join(dir, name)
 		if _, err := os.Stat(p); err != nil {
 			t.Fatalf("missing %s: %v", p, err)

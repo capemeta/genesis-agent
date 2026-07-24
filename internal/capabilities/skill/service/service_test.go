@@ -161,6 +161,57 @@ func TestBindingPackageSnapshotSurvivesSourceUpgrade(t *testing.T) {
 	}
 }
 
+func TestRenderAvailableSkillsFiltersAncestorSkills(t *testing.T) {
+	svc := testService(t)
+	// Normal render without ancestor context
+	renderedAll, err := svc.RenderAvailableSkills(context.Background(), contract.CatalogRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(renderedAll, "demo") || !strings.Contains(renderedAll, "demo-read") {
+		t.Fatalf("renderedAll=%s", renderedAll)
+	}
+
+	// Render with ancestor context containing 'demo'
+	ctx := contract.WithInvocationAncestors(context.Background(), []string{"test:demo:work"})
+	renderedFiltered, err := svc.RenderAvailableSkills(ctx, contract.CatalogRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(renderedFiltered, "<name>demo</name>") || strings.Contains(renderedFiltered, "<name>demo-read</name>") {
+		t.Fatalf("ancestor skills should be filtered out without comments, got=%s", renderedFiltered)
+	}
+}
+
+func TestComposePromptCleansAbsoluteHostPaths(t *testing.T) {
+	resolved := model.ResolvedInvocation{
+		SkillBody:    "Skill instructions",
+		Instructions: "Do work",
+	}
+	binding := model.InvocationBinding{
+		Task: `请解析文件 C:\Users\csl2021\Documents\test.pptx 并转换`,
+		Inputs: []model.BoundInput{
+			{
+				Alias: "input_1.pptx",
+				Ref: workmodel.ResourceRef{
+					Authority: "host",
+					Scheme:    "file",
+					ID:        `C:\Users\csl2021\Documents\test.pptx`,
+					Path:      `C:\Users\csl2021\Documents\test.pptx`,
+				},
+			},
+		},
+	}
+	got := composePrompt(resolved, binding)
+	if strings.Contains(got, `C:\Users\csl2021`) {
+		t.Fatalf("composePrompt leaked host absolute path:\n%s", got)
+	}
+	if !strings.Contains(got, "input_1.pptx") {
+		t.Fatalf("composePrompt missing replaced alias:\n%s", got)
+	}
+}
+
+
 func testService(t *testing.T) *Service {
 	t.Helper()
 	return testServiceWithStore(t, skillmemory.NewBindingStore())

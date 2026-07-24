@@ -25,19 +25,32 @@ type EnvironmentContext struct {
 	ExternalApproval   bool
 }
 
+// environmentContextInjector 实现了 AudienceAware，仅主 Agent 接受运行环境注入。
+// 子 Agent 已经通过工具描述赋予环境差异知识，无需重复注入宿主机 OS 规则。
+type environmentContextInjector struct {
+	environment EnvironmentContext
+}
+
+func (e *environmentContextInjector) Inject(ctx context.Context, req BuildRequest) (Fragment, error) {
+	if err := ctx.Err(); err != nil {
+		return Fragment{}, err
+	}
+	_ = req
+	contents := renderEnvironmentContext(ctx, e.environment)
+	if contents == "" {
+		return Fragment{}, nil
+	}
+	return Fragment{Name: "environment_context", Contents: contents}, nil
+}
+
+// Audiences 声明该注入器仅适用于主 Agent。
+func (e *environmentContextInjector) Audiences() []Audience {
+	return []Audience{AudienceRoot}
+}
+
 // NewEnvironmentContextInjector 创建运行环境上下文注入器。
 func NewEnvironmentContextInjector(environment EnvironmentContext) ContextInjector {
-	return ContextInjectorFunc(func(ctx context.Context, req BuildRequest) (Fragment, error) {
-		if err := ctx.Err(); err != nil {
-			return Fragment{}, err
-		}
-		_ = req
-		contents := renderEnvironmentContext(ctx, environment)
-		if contents == "" {
-			return Fragment{}, nil
-		}
-		return Fragment{Name: "environment_context", Contents: contents}, nil
-	})
+	return &environmentContextInjector{environment: environment}
 }
 
 func renderEnvironmentContext(ctx context.Context, environment EnvironmentContext) string {

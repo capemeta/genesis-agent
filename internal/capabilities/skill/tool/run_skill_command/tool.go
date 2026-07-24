@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"time"
 
@@ -66,23 +67,43 @@ func (t *Tool) GetInfo() *tool.Info {
 在当前 Skill 的持久工作目录中按原文执行命令。
 当第三方 SKILL.md 写 python scripts/foo.py、python -m bar、node scripts/foo.js、pdftoppm ... 时，应直接把整条命令放进 command，由运行时负责 materialize skill、准备工作目录、注入环境并选择合适的 sandbox/profile。
 需要执行 JS/Python 时，默认先写入脚本再执行 python foo.py / node foo.js；避免多行或复杂转义内联。
-Harness 会自动把当前 Run 已绑定输入和 command 引用的入口脚本 stage 到 Skill 工作目录。inputs 仅用于补充当前工作区内、command 未直接引用的相对路径；禁止宿主机绝对路径、/workspace 路径和跨根猜测。禁止用 run_command / Copy-Item 手动搬运输入文件。
+Harness 会自动把已绑定的输入文件与入口脚本准备到 Skill 工作目录。inputs 仅用于补充工作区内相对路径；command 内请直接使用相对文件名（如 '3-人资部.pdf'），禁止在 command 字符串中拼接宿主机绝对路径。禁止用 run_command / Copy-Item / cp 手动搬运文件。
 command 写相对文件名或包内 scripts/...；禁止把物理路径写进 command。正确：inputs=["foo.py"] + command="python foo.py"。
 返回 metadata.execution_backend / degraded（勿把物理路径写入 inputs/command）。
 produced 只返回 Harness 生成的不透明 candidate_id/name 投影，不含路径或 locator。用户可见交付文件名以你在 skill 工作目录中写出的产物文件名为准（produced.name）；Harness 按该名 Publish/Delivery，不会从用户自然语言抠文件名。required 交付物唯一匹配时 Harness 自动发布交付；多候选时只允许调用 select_deliverable_candidate。不要用 write_file 伪造 .pptx/.docx/.xlsx/.pdf。
 `),
+		DescriptionFunc: t.renderDescription,
 		Parameters: &tool.ParameterSchema{
 			Type: "object",
 			Properties: map[string]*tool.ParameterSchema{
-				"skill":      {Type: "string", Description: "Skill 名称，例如 office-ppt"},
-				"command":    {Type: "string", Description: "在 Skill 工作目录执行的命令，如 python create_pdfs.py。注意：若逻辑较长或包含换行，请使用 write_file 先创建 .py/.js 脚本文件后再运行，避免包含换行的多行 python -c 内联代码。"},
-				"inputs":     {Type: "array", Description: "可选补充输入，只接受当前 Run 根内相对路径；已绑定输入和 command 入口脚本会自动 stage", Items: &tool.ParameterSchema{Type: "string"}},
+				"skill":      {Type: "string", Description: "可选 Skill 名称（例如 office-ppt）。在技能子智能体上下文中可省略不填，系统会自动使用当前已绑定的技能。"},
+				"command":    {Type: "string", Description: "在 Skill 工作目录执行的命令（如 python parse.py 3-人资部.pdf）。输入文件已被自动放置在当前目录下，命令中请直接使用相对文件名（如 '3-人资部.pdf'），禁止在 command 字符串中拼接宿主机绝对路径。复杂/多行代码请先通过 write_file 写入脚本文件后再执行。"},
+				"inputs":     {Type: "array", Description: "可选补充输入文件列表（只填工作区相对路径或已准备好的文件名，如 ['3-人资部.pdf']）", Items: &tool.ParameterSchema{Type: "string"}},
 				"timeout_ms": {Type: "integer", Description: "超时毫秒，默认 120000"},
 			},
-			Required: []string{"skill", "command"},
+			Required: []string{"command"},
 		},
 		Traits: tool.ToolTraits{Exposure: tool.ToolExposureDirect, ReadOnly: false, ConcurrencySafe: false, NeedsPermission: true},
 	}
+}
+
+func (t *Tool) renderDescription(ctx context.Context) (string, error) {
+	base := strings.TrimSpace(`
+在当前 Skill 的持久工作目录中按原文执行命令。
+当第三方 SKILL.md 写 python scripts/foo.py、python -m bar、node scripts/foo.js、pdftoppm ... 时，应直接把整条命令放进 command，由运行时负责 materialize skill、准备工作目录、注入环境并选择合适的 sandbox/profile。
+需要执行 JS/Python 时，默认先写入脚本再执行 python foo.py / node foo.js；避免多行或复杂转义内联。
+Harness 会自动把已绑定的输入文件与入口脚本准备到 Skill 工作目录。inputs 仅用于补充工作区内相对路径；command 内请直接使用相对文件名（如 '3-人资部.pdf'），禁止在 command 字符串中拼接宿主机绝对路径。禁止用 run_command / Copy-Item / cp 手动搬运文件。
+command 写相对文件名或包内 scripts/...；禁止把物理路径写进 command。正确：inputs=["foo.py"] + command="python foo.py"。
+返回 metadata.execution_backend / degraded（勿把物理路径写入 inputs/command）。
+produced 只返回 Harness 生成的不透明 candidate_id/name 投影，不含路径或 locator。用户可见交付文件名以你在 skill 工作目录中写出的产物文件名为准（produced.name）；Harness 按该名 Publish/Delivery，不会从用户自然语言抠文件名。required 交付物唯一匹配时 Harness 自动发布交付；多候选时只允许调用 select_deliverable_candidate。不要用 write_file 伪造 .pptx/.docx/.xlsx/.pdf。
+`)
+	var osInfo string
+	if runtime.GOOS == "windows" {
+		osInfo = "\n\n【系统平台与 Shell 运行环境指南】：\n- 当前操作系统平台：Windows (PowerShell)。\n- 严禁使用 Cmd 独有语法（如 dir /b、findstr）；优先使用标准 Python 脚本或 PowerShell Cmdlet（如 Get-ChildItem）。\n- 检索或遍历目录优先使用平台原生工具 walk_dir / list_dir / glob。\n- 注意：容器内路径 /workspace/... 仅为远程容器内部路径，在 inputs 参数中请统一使用工作区相对路径（如 3-人资部.pdf）。"
+	} else {
+		osInfo = "\n\n【系统平台与 Shell 运行环境指南】：\n- 当前操作系统平台：Linux / Unix (POSIX bash shell)。\n- 支持标准 bash 指令（如 ls -la、find、cat、grep）。\n- 检索或遍历目录优先使用平台原生工具 walk_dir / list_dir / glob。\n- 注意：容器内路径 /workspace/... 仅为容器内部路径，在 inputs 参数中请统一使用工作区相对路径。"
+	}
+	return base + osInfo, nil
 }
 
 func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
@@ -93,8 +114,8 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 	}
 	skill := strings.TrimSpace(in.Skill)
 	command := strings.TrimSpace(in.Command)
-	if skill == "" || command == "" {
-		return "", fmt.Errorf("skill与command不能为空")
+	if command == "" {
+		return "", fmt.Errorf("command不能为空")
 	}
 	control, ok := workcontract.ControlPlaneFromContext(ctx)
 	if !ok {
@@ -108,7 +129,9 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("SKILL_INVOCATION_BINDING_REQUIRED: run_skill_command 只能在已解析的 Skill Invocation 内执行")
 	}
-	if skill != invocation.PhysicalSkill && skill != invocation.Handle {
+	if skill == "" {
+		skill = invocation.Handle
+	} else if skill != invocation.PhysicalSkill && skill != invocation.Handle {
 		return "", fmt.Errorf("SKILL_INVOCATION_MISMATCH: 参数 skill=%q 与当前 binding %q/%q 不一致", skill, invocation.PhysicalSkill, invocation.Handle)
 	}
 	sandbox, err := invocationSandboxProfile(t.deps.Sandbox, invocation.ExecutionPolicy)
@@ -198,27 +221,9 @@ func (t *Tool) Execute(ctx context.Context, params string) (string, error) {
 			return "", err
 		}
 		resolvedSources = mergeInputSources(resolvedSources, available)
-		if execution.Backend.Kind == execmodel.BackendKindRemote {
-			manifest, err = t.deps.InputStager.Stage(ctx, workcontract.StageRequest{Binding: binding, Sources: resolvedSources})
-			if err != nil {
-				return "", err
-			}
-		} else {
-			manifest = workmodel.InputManifest{
-				RunID:     binding.Owner.RunID,
-				BindingID: binding.ID,
-			}
-			for _, src := range resolvedSources {
-				manifest.Inputs = append(manifest.Inputs, workmodel.InputRef{
-					ID:         src.ID,
-					Alias:      workmodel.WorkspacePath(src.ID),
-					Name:       src.ID,
-					Size:       1,
-					SHA256:     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-					Source:     src,
-					StagedPath: workmodel.WorkspacePath(src.ID),
-				})
-			}
+		manifest, err = t.deps.InputStager.Stage(ctx, workcontract.StageRequest{Binding: binding, Sources: resolvedSources})
+		if err != nil {
+			return "", err
 		}
 		controlPlaneStagingMS = time.Since(stagingStarted).Milliseconds()
 	}

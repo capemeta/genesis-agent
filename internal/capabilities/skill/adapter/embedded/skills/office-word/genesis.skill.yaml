@@ -2,12 +2,12 @@ schema: genesis.skill/v1
 skill: office-word
 runtime_profiles:
   read:
-    sandbox: {execution_mode: per_call, backends: [remote_sandbox, local_platform_sandbox]}
+    sandbox: {execution_mode: per_call, backends: [remote_sandbox, local_platform_sandbox, local_host]}
     dependencies:
       runtime:
         python: [{name: markitdown, import: markitdown}]
   work:
-    sandbox: {execution_mode: sandboxed_session, backends: [remote_sandbox, local_platform_sandbox]}
+    sandbox: {execution_mode: sandboxed_session, backends: [remote_sandbox, local_platform_sandbox, local_host]}
     dependencies:
       runtime:
         python:
@@ -22,7 +22,7 @@ invocations:
   - id: read
     handle: office-word-read
     description: 提取并总结已有 Word 文档的文字和表格，不渲染、不编辑
-    agent_mode: {mode: main}
+    agent_mode: {mode: fork}
     runtime_profile: read
     request:
       task: {required: false}
@@ -33,8 +33,9 @@ invocations:
         accepted_suffixes: [.docx, .doc]
     prompt: {instructions: references/invocations/read.md, skill_body: omit}
     tool_policy:
-      allow: [list_skill_resources, read_skill_resource, search_skill_resources, run_skill_command, install_skill_dependencies]
+      allow: [run_skill_command, install_skill_dependencies]
       required: [run_skill_command]
+
     result: {kind: message}
   - id: work
     handle: office-word

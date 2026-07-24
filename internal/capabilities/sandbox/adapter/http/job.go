@@ -35,28 +35,28 @@ func (c *Client) RunCommand(ctx context.Context, req sandboxcontract.CommandRequ
 	}
 	defer cancelCall()
 
-	progress.Emit(callCtx, progress.Event{Kind: progress.KindSandbox, Phase: progress.PhaseStart, Component: "genesis-sandbox", Name: string(req.Sandbox.RuntimeProfile), Summary: "申请 sandbox 租约"})
+	progress.Emit(callCtx, progress.Event{Kind: progress.KindSandbox, Phase: progress.PhaseStart, Component: "genesis-sandbox", Name: string(req.Sandbox.RuntimeProfile), Summary: "申请 [远程容器沙箱] 租约"})
 	lease, err := c.leaseSandbox(callCtx, req)
 	if err != nil {
-		progress.Emit(callCtx, progress.Event{Kind: progress.KindSandbox, Phase: progress.PhaseError, Level: progress.LevelError, Component: "genesis-sandbox", Summary: "sandbox 租约申请失败", Detail: err.Error()})
+		progress.Emit(callCtx, progress.Event{Kind: progress.KindSandbox, Phase: progress.PhaseError, Level: progress.LevelError, Component: "genesis-sandbox", Summary: "[远程容器沙箱] 租约申请失败", Detail: err.Error()})
 		return nil, err
 	}
-	progress.Emit(callCtx, progress.Event{Kind: progress.KindSandbox, Phase: progress.PhaseComplete, Component: "genesis-sandbox", Name: lease.SandboxID, Summary: "sandbox 租约已就绪"})
+	progress.Emit(callCtx, progress.Event{Kind: progress.KindSandbox, Phase: progress.PhaseComplete, Component: "genesis-sandbox", Name: lease.SandboxID, Summary: "[远程容器沙箱] 租约已就绪"})
 	renewCtx, cancelRenew := context.WithCancel(context.Background())
 	go c.renewLoop(renewCtx, lease.SandboxID, nil)
 	defer func() {
 		cancelRenew()
-		progress.Emit(ctx, progress.Event{Kind: progress.KindSandbox, Phase: progress.PhaseStart, Component: "genesis-sandbox", Name: lease.SandboxID, Summary: "释放 sandbox 租约"})
+		progress.Emit(ctx, progress.Event{Kind: progress.KindSandbox, Phase: progress.PhaseStart, Component: "genesis-sandbox", Name: lease.SandboxID, Summary: "释放 [远程容器沙箱] 租约"})
 		if closeErr := c.closeSandbox(lease.SandboxID); closeErr != nil {
 			if result != nil {
 				result.Warnings = append(result.Warnings, fmt.Sprintf("sandbox释放异常: %v", closeErr))
 			} else if err == nil {
 				err = closeErr
 			}
-			progress.Emit(ctx, progress.Event{Kind: progress.KindSandbox, Phase: progress.PhaseError, Level: progress.LevelWarn, Component: "genesis-sandbox", Name: lease.SandboxID, Summary: "sandbox 租约释放异常", Detail: closeErr.Error()})
+			progress.Emit(ctx, progress.Event{Kind: progress.KindSandbox, Phase: progress.PhaseError, Level: progress.LevelWarn, Component: "genesis-sandbox", Name: lease.SandboxID, Summary: "[远程容器沙箱] 租约释放异常", Detail: closeErr.Error()})
 			return
 		}
-		progress.Emit(ctx, progress.Event{Kind: progress.KindSandbox, Phase: progress.PhaseComplete, Component: "genesis-sandbox", Name: lease.SandboxID, Summary: "sandbox 租约已释放"})
+		progress.Emit(ctx, progress.Event{Kind: progress.KindSandbox, Phase: progress.PhaseComplete, Component: "genesis-sandbox", Name: lease.SandboxID, Summary: "[远程容器沙箱] 租约已释放"})
 	}()
 
 	payload := execJobRequestFromCommand(req)
@@ -66,18 +66,18 @@ func (c *Client) RunCommand(ctx context.Context, req sandboxcontract.CommandRequ
 		return nil, execcontract.NewError(execcontract.ErrCodeInvalidInput, fmt.Errorf("编码sandbox job请求失败: %w", err))
 	}
 	var job jobResult
-	progress.Emit(callCtx, progress.Event{Kind: progress.KindSandbox, Phase: progress.PhaseStart, Component: "genesis-sandbox", Name: lease.SandboxID, Summary: "提交 sandbox job"})
+	progress.Emit(callCtx, progress.Event{Kind: progress.KindSandbox, Phase: progress.PhaseStart, Component: "genesis-sandbox", Name: lease.SandboxID, Summary: "提交 [远程容器沙箱] job"})
 	if err := c.doJSON(callCtx, http.MethodPost, "/v1/jobs", &body, &job); err != nil {
-		progress.Emit(callCtx, progress.Event{Kind: progress.KindSandbox, Phase: progress.PhaseError, Level: progress.LevelError, Component: "genesis-sandbox", Name: lease.SandboxID, Summary: "sandbox job 提交失败", Detail: err.Error()})
+		progress.Emit(callCtx, progress.Event{Kind: progress.KindSandbox, Phase: progress.PhaseError, Level: progress.LevelError, Component: "genesis-sandbox", Name: lease.SandboxID, Summary: "[远程容器沙箱] job 提交失败", Detail: err.Error()})
 		return nil, err
 	}
-	progress.Emit(callCtx, progress.Event{Kind: progress.KindSandbox, Phase: progress.PhaseProgress, Component: "genesis-sandbox", Name: job.JobID, Summary: "等待 sandbox job 完成"})
+	progress.Emit(callCtx, progress.Event{Kind: progress.KindSandbox, Phase: progress.PhaseProgress, Component: "genesis-sandbox", Name: job.JobID, Summary: "等待 [远程容器沙箱] job 完成"})
 	finalJob, err := c.finalJob(callCtx, job, timeout)
 	if err != nil {
-		progress.Emit(callCtx, progress.Event{Kind: progress.KindSandbox, Phase: progress.PhaseError, Level: progress.LevelError, Component: "genesis-sandbox", Name: job.JobID, Summary: "sandbox job 执行失败", Detail: err.Error()})
+		progress.Emit(callCtx, progress.Event{Kind: progress.KindSandbox, Phase: progress.PhaseError, Level: progress.LevelError, Component: "genesis-sandbox", Name: job.JobID, Summary: "[远程容器沙箱] job 执行失败", Detail: err.Error()})
 		return nil, err
 	}
-	progress.Emit(callCtx, progress.Event{Kind: progress.KindSandbox, Phase: progress.PhaseComplete, Component: "genesis-sandbox", Name: finalJob.JobID, Summary: "sandbox job 已完成"})
+	progress.Emit(callCtx, progress.Event{Kind: progress.KindSandbox, Phase: progress.PhaseComplete, Component: "genesis-sandbox", Name: finalJob.JobID, Summary: "[远程容器沙箱] job 已完成"})
 	return c.resultFromJob(callCtx, req, *finalJob), nil
 }
 

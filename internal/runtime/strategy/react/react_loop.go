@@ -354,16 +354,20 @@ func (e *ReactLoopEngine) loop(ctx context.Context, rc *runtime.RunContext, req 
 	}
 
 	// ── 步骤1: 获取工具定义（tool.Info，与外部框架无关）─────────
-	toolInfos := e.applyCollabToolFilter(ctx, e.getToolInfos(agent))
+	toolInfos := e.applyCollabToolFilter(ctx, e.getToolInfos(ctx, agent))
 	activeToolNames := namesOfToolInfos(toolInfos)
 	if binding, ok := rc.ActiveInvocation(); ok {
-		var narrowOK bool
-		activeToolNames, narrowOK = narrowToolNames(activeToolNames, binding.ToolPolicy.Allowed)
-		if !narrowOK {
-			return fmt.Errorf("SKILL_TOOL_POLICY_UNSATISFIABLE: Invocation %q在当前Run无可执行工具", binding.Handle)
+		if promptAudience(ctx) == prompt.AudienceSkillFork {
+			allowed := filterOutToolNames(binding.ToolPolicy.Allowed, "Skill")
+			toolInfos = e.filterToolInfos(ctx, allowed)
+			activeToolNames = namesOfToolInfos(toolInfos)
 		}
+	}
+	if promptAudience(ctx) == prompt.AudienceSkillFork {
+		activeToolNames = filterOutToolNames(activeToolNames, "Skill")
 		toolInfos = e.filterToolInfos(ctx, activeToolNames)
 	}
+
 
 	// ── 步骤2: 构建初始消息列表与弹性预算装配 ──────────────────
 	// System消息（Persona System Prompt）；子 Run 跳过主侧委派纪律
@@ -1157,7 +1161,7 @@ func (e *ReactLoopEngine) runToolCall(ctx context.Context, rc *runtime.RunContex
 	toolName := strings.TrimSpace(tc.Function.Name)
 	if rc != nil {
 		if binding, ok := rc.ActiveInvocation(); ok {
-			if !rc.InvocationAllowsTool(toolName) {
+			if !rc.InvocationAllowsTool(ctx, toolName) {
 				return "", fmt.Errorf("TOOL_NOT_ALLOWED_BY_INVOCATION: tool %q不在Invocation %q的EffectiveToolPolicy中", toolName, binding.Handle)
 			}
 			ctx = skillcontract.WithInvocationBinding(ctx, binding)
@@ -1378,13 +1382,22 @@ func toolTimingMetadata(toolName, result string) map[string]string {
 		return nil
 	}
 	keys := []string{"duration_ms", "approval_duration_ms", "staging_duration_ms", "execution_duration_ms"}
-	metadata := make(map[string]string, len(keys))
+	metadata := make(map[string]string, len(keys)+2)
 	for _, key := range keys {
 		value, ok := payload[key].(float64)
 		if !ok || value < 0 {
 			continue
 		}
 		metadata[key] = strconv.FormatInt(int64(value), 10)
+	}
+	if metaObj, ok := payload["metadata"].(map[string]any); ok {
+		if backend, ok := metaObj["execution_backend"].(string); ok && backend != "" {
+			metadata["execution_backend"] = backend
+			metadata["selected_backend"] = backend
+		} else if backend, ok := metaObj["selected_backend"].(string); ok && backend != "" {
+			metadata["execution_backend"] = backend
+			metadata["selected_backend"] = backend
+		}
 	}
 	if len(metadata) == 0 {
 		return nil
@@ -1586,8 +1599,10 @@ func isToolRegistered(registry tool.Registry, name string) bool {
 // ==================== 辅助函数 ====================
 
 // getToolInfos 根据Agent配置获取可用工具列表
-func (e *ReactLoopEngine) getToolInfos(agent *domain.Agent) []*tool.Info {
-	ctx := context.Background()
+func (e *ReactLoopEngine) getToolInfos(ctx context.Context, agent *domain.Agent) []*tool.Info {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if len(agent.Tools) == 0 {
 		if withCtx, ok := e.registry.(interface {
 			ListInfosContext(context.Context) []*tool.Info
@@ -1843,6 +1858,39 @@ func namesOfToolInfos(infos []*tool.Info) []string {
 	return out
 }
 
+// unionToolNames 按主 Agent 单 Run Inline 模式公式追加工具集并集：
+// ActiveTools_new = ActiveTools_current ∪ Skill.AllowedTools ∪ {Skill}
+func unionToolNames(current []string, allowed []string) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(current)+len(allowed)+1)
+
+	// 网关工具常驻硬规则：无论何时始终包含 Skill
+	seen["Skill"] = struct{}{}
+	out = append(out, "Skill")
+
+	for _, name := range current {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if _, dup := seen[name]; !dup {
+			seen[name] = struct{}{}
+			out = append(out, name)
+		}
+	}
+	for _, name := range allowed {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if _, dup := seen[name]; !dup {
+			seen[name] = struct{}{}
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
 // narrowToolNames 按 skill.allowed_tools 收窄当前可见工具集。
 // allowed 为空：不收窄。非空：与 current 求交，并始终并入 Skill；若 current 已含资源元工具则一并保留。
 // 求交结果为空时 ok=false，调用方不得静默回退为全量工具集。
@@ -1863,6 +1911,10 @@ func narrowToolNames(current []string, allowed []string) (names []string, ok boo
 		if name != "" {
 			allowedSet[name] = struct{}{}
 		}
+	}
+	// 规范契约：若 current 中包含 Skill 网关工具，收窄时始终保留 Skill，使智能体可在单 Run 中跨 Skill 协作或发起多 Task
+	if _, hasSkill := currentSet["Skill"]; hasSkill {
+		allowedSet["Skill"] = struct{}{}
 	}
 	out := make([]string, 0, len(current))
 	seen := map[string]struct{}{}
@@ -1902,3 +1954,14 @@ func filterToolInfosByName(infos []*tool.Info, names []string) []*tool.Info {
 	}
 	return out
 }
+
+func filterOutToolNames(names []string, target string) []string {
+	out := make([]string, 0, len(names))
+	for _, n := range names {
+		if strings.TrimSpace(n) != target {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+

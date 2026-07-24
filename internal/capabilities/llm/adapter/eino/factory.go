@@ -19,6 +19,7 @@ import (
 	einoModel "github.com/cloudwego/eino/components/model"
 
 	"genesis-agent/internal/capabilities/llm/contract"
+	llmlogger "genesis-agent/internal/capabilities/llm/logger"
 )
 
 // Provider 是当前 Eino 适配器支持的 LLM 服务商类型。
@@ -115,7 +116,18 @@ func New(ctx context.Context, cfg *Config) (llm.ChatModel, error) {
 		return nil, err
 	}
 
-	return newAdapter(einoM, cfg.Model, cfg.SupportsImage), nil
+	params := map[string]any{
+		"provider":       string(cfg.Provider),
+		"model":          cfg.Model,
+		"base_url":       cfg.BaseURL,
+		"max_tokens":     cfg.MaxTokens,
+		"temperature":    cfg.Temperature,
+		"top_p":          cfg.TopP,
+		"supports_image": cfg.SupportsImage,
+	}
+
+	adapter := newAdapter(einoM, cfg.Model, cfg.SupportsImage)
+	return llmlogger.Wrap(adapter, nil, params), nil
 }
 
 // ==================== 各 Provider eino 实例创建 ====================

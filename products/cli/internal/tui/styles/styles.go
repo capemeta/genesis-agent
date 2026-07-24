@@ -31,6 +31,16 @@ var (
 	ColorBlue = lipgloss.Color("#3B82F6")
 	// ColorWhite 主文本白
 	ColorWhite = lipgloss.Color("#F9FAFB")
+	// ColorSubAgent 子 Agent 专属色（柔和青蓝 #2DD4BF，黑色 CLI 背景下清晰易读，不刺眼）
+	ColorSubAgent = lipgloss.Color("#2DD4BF")
+	// ColorThinking 主 Agent 思考专属色（亮紫 #C084FC）
+	ColorThinking = lipgloss.Color("#C084FC")
+	// ColorMainContent 主 Agent 中间输出专属色（亮粉紫 #E879F9）
+	ColorMainContent = lipgloss.Color("#E879F9")
+	// ColorSubAgentThinking 子 Agent 思考专属色（金黄高亮 #FBBF24，在黑底 CLI 下极醒目）
+	ColorSubAgentThinking = lipgloss.Color("#FBBF24")
+	// ColorSubAgentContent 子 Agent 中间输出专属色（天蓝 #38BDF8）
+	ColorSubAgentContent = lipgloss.Color("#38BDF8")
 )
 
 // ── 标题栏 ──────────────────────────────────────────────────
@@ -81,6 +91,40 @@ var SystemMsg = lipgloss.NewStyle().
 	Foreground(ColorGray).
 	Italic(true).
 	Padding(0, 1)
+
+// MainAgentThinkingMsg 主 Agent 思考过程文字样式（薰衣草亮紫斜体加粗）
+var MainAgentThinkingMsg = lipgloss.NewStyle().
+	Foreground(ColorThinking).
+	Bold(true).
+	Italic(true)
+
+// MainAgentContentMsg 主 Agent 中间输出过程文字样式（亮粉紫斜体加粗）
+var MainAgentContentMsg = lipgloss.NewStyle().
+	Foreground(ColorMainContent).
+	Bold(true).
+	Italic(true)
+
+// SubAgentThinkingMsg 子 Agent 思考过程文字样式（金黄高亮加粗斜体，黑底极醒目）
+var SubAgentThinkingMsg = lipgloss.NewStyle().
+	Foreground(ColorSubAgentThinking).
+	Bold(true).
+	Italic(true)
+
+// SubAgentContentMsg 子 Agent 中间输出过程文字样式（天蓝斜体加粗）
+var SubAgentContentMsg = lipgloss.NewStyle().
+	Foreground(ColorSubAgentContent).
+	Bold(true).
+	Italic(true)
+
+// SubAgentMsg 子 Agent 工具调用过程文字样式（柔和青蓝斜体）
+var SubAgentMsg = lipgloss.NewStyle().
+	Foreground(ColorSubAgent).
+	Italic(true)
+
+// MainAgentMsg 主 Agent 工具调用过程文字样式（灰色斜体）
+var MainAgentMsg = lipgloss.NewStyle().
+	Foreground(ColorGray).
+	Italic(true)
 
 // HelpOverlay 让帮助在固定 transcript 区内展示，不改变整体布局高度。
 var HelpOverlay = lipgloss.NewStyle().

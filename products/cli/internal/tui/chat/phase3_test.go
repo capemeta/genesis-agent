@@ -316,3 +316,36 @@ func TestChronologicalRollingProgressLog(t *testing.T) {
 		}
 	}
 }
+
+func TestThinkingVsToolStyles(t *testing.T) {
+	m := NewModel(context.Background(), nil, nil)
+	m.progressExpanded = true
+	m.messages = []uiMessage{{
+		role:       "system",
+		isProgress: true,
+		progressLog: []string{
+			"[Agent] 思考: 分析任务需求",
+			"[Agent] 输出: 中间解释内容",
+			"[Agent] 调用工具: read_file",
+			"[Sub-Agent: Worker] 思考: 处理子任务",
+			"[Sub-Agent: Worker] 输出: 子任务分析阶段性结论",
+			"[Sub-Agent: Worker] 调用工具: run_command",
+		},
+	}}
+	m.viewport.Height = 50
+	m.refreshViewportContent()
+	rendered := m.viewport.View()
+	for _, expected := range []string{
+		"[Agent] 思考: 分析任务需求",
+		"[Agent] 输出: 中间解释内容",
+		"调用工具: read_file",
+		"[Sub-Agent: Worker] 思考: 处理子任务",
+		"[Sub-Agent: Worker] 输出: 子任务分析阶段性结论",
+		"调用工具: run_command",
+	} {
+		if !strings.Contains(rendered, expected) {
+			t.Fatalf("rendered output missing %q: %s", expected, rendered)
+		}
+	}
+}
+

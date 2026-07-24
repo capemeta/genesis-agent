@@ -134,7 +134,7 @@ func (e *ReactLoopEngine) syncCollabAfterTools(
 	if mode == prevMode {
 		return ctx, mode, handoff, nil
 	}
-	base := e.getToolInfos(agent)
+	base := e.getToolInfos(ctx, agent)
 	filtered := e.applyCollabToolFilter(ctx, base)
 	*toolInfos = filtered
 	*activeToolNames = namesOfToolInfos(filtered)

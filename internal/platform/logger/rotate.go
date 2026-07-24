@@ -13,11 +13,13 @@ import (
 
 // RotateOptions 控制按日/大小滚动与保留。
 type RotateOptions struct {
-	Daily      bool
-	MaxSizeMB  int
-	RetainDays int
-	Compress   bool             // 预留；当前实现不压缩
-	Now        func() time.Time // 可选；测试注入时钟
+	Daily         bool
+	MaxSizeMB     int
+	RetainDays    int
+	Compress      bool             // 预留；当前实现不压缩
+	RotateOnStart bool             // 启动时（首次写入时）若存在旧日志，自动归档并开启全新文件
+	LazyOpen      bool             // 首次 Write 前不创建/打开文件，避免未发生交互时产生空日志
+	Now           func() time.Time // 可选；测试注入时钟
 }
 
 // Normalize 填充滚动默认值。
@@ -38,11 +40,12 @@ type RotatingWriter struct {
 	name string
 	opts RotateOptions
 
-	mu      sync.Mutex
-	file    *os.File
-	curDay  string
-	curSize int64
-	nowFn   func() time.Time // 测试可注入
+	mu             sync.Mutex
+	file           *os.File
+	curDay         string
+	curSize        int64
+	startupPending bool
+	nowFn          func() time.Time // 测试可注入
 }
 
 // NewRotatingWriter 创建滚动 Writer；name 为通道名（agent/audit/usage），不含 .log。
@@ -63,13 +66,16 @@ func NewRotatingWriter(dir, name string, opts RotateOptions) (*RotatingWriter, e
 		nowFn = opts.Now
 	}
 	w := &RotatingWriter{
-		dir:   dir,
-		name:  name,
-		opts:  opts,
-		nowFn: nowFn,
+		dir:            dir,
+		name:           name,
+		opts:           opts,
+		startupPending: opts.RotateOnStart,
+		nowFn:          nowFn,
 	}
-	if err := w.openLocked(w.nowFn()); err != nil {
-		return nil, err
+	if !opts.LazyOpen {
+		if err := w.openLocked(w.nowFn()); err != nil {
+			return nil, err
+		}
 	}
 	return w, nil
 }
@@ -130,8 +136,17 @@ func (w *RotatingWriter) openLocked(now time.Time) error {
 	day := now.Format("2006-01-02")
 	active := w.activePath()
 
-	// 若活跃文件来自旧日，先按日归档再新建。
-	if info, err := os.Stat(active); err == nil {
+	// 启动时（首次 Write 时）：若已存在有内容的旧活跃文件，先归档旧文件，确保本 session 写入全新的 llm.log
+	if w.startupPending {
+		w.startupPending = false
+		if info, err := os.Stat(active); err == nil && info.Size() > 0 {
+			modDay := info.ModTime().In(time.Local).Format("2006-01-02")
+			if err := w.archiveActive(modDay, true); err != nil {
+				return err
+			}
+		}
+	} else if info, err := os.Stat(active); err == nil {
+		// 若活跃文件来自旧日，先按日归档再新建。
 		modDay := info.ModTime().In(time.Local).Format("2006-01-02")
 		if w.opts.Daily && modDay != day {
 			if err := w.archiveActive(modDay, false); err != nil {

@@ -138,7 +138,7 @@ func autoRewriteRiskyInlineCommand(command string) (rewrittenCmd, scriptName, pa
 	rest = strings.TrimSpace(rest)
 	if len(rest) > 0 && (rest[0] == '"' || rest[0] == '\'') {
 		quote := rest[0]
-		end := strings.IndexByte(rest[1:], quote)
+		end := findMatchingCloseQuote(rest[1:], quote)
 		if end >= 0 {
 			rest = rest[1+end+1:]
 		} else {
@@ -156,4 +156,25 @@ func autoRewriteRiskyInlineCommand(command string) (rewrittenCmd, scriptName, pa
 
 	rewrittenCmd = strings.TrimSpace(prefix + " " + scriptName + " " + strings.TrimSpace(rest))
 	return rewrittenCmd, scriptName, risk.Payload, true
+}
+
+// findMatchingCloseQuote 寻找真正的未转义闭合引号位置。
+// 忽略 \" 和 \' 等转义字符，兼容 Windows (PowerShell/Cmd), Linux (Bash/Sh), macOS 下复杂的内联代码格式。
+func findMatchingCloseQuote(s string, quote byte) int {
+	escaped := false
+	for i := 0; i < len(s); i++ {
+		b := s[i]
+		if escaped {
+			escaped = false
+			continue
+		}
+		if b == '\\' {
+			escaped = true
+			continue
+		}
+		if b == quote {
+			return i
+		}
+	}
+	return -1
 }

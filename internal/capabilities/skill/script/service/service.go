@@ -329,7 +329,8 @@ func (s *Service) Run(ctx context.Context, req scriptcontract.RunRequest) (*scri
 			Retryable:       true,
 			SuggestedAction: "run_declared_business_command_directly",
 			DurationMS:      time.Since(started).Milliseconds(),
-			Warnings:        []string{"Skill Harness 会在正式命令执行前校验声明的 runtime/profile；不要用独立版本或 import/require 探测消耗迭代与审批。"},
+			Warnings:        []string{"Skill Harness 已通过 preflight 校验声明依赖可 100% 正常导入；请直接提交业务代码。若收到报错，请检查代码语法（如引号与转义），禁止再次发送单行 import/require 探针。"},
+
 		}
 		classifyFailure(out)
 		return out, nil
@@ -555,6 +556,12 @@ type skillExecutionAttempt struct {
 }
 
 func (s *Service) runLocal(ctx context.Context, meta skillmodel.Metadata, runID string, req scriptcontract.RunRequest, timeout time.Duration, sandbox execmodel.SandboxProfile) skillExecutionAttempt {
+	// 当沙箱禁用时（直接在宿主运行），provider 为空，ResolveBackendKind 会默认返回 Remote。
+	// 必须显式处理：SandboxDisabled 语义上等价于 BackendKindHost。
+	backendKind := execmodel.ResolveBackendKind(sandbox.Provider)
+	if sandbox.Mode == execmodel.SandboxDisabled || strings.TrimSpace(sandbox.Provider) == "" {
+		backendKind = execmodel.BackendKindHost
+	}
 	prepared, err := s.provisioner.Prepare(ctx, workcontract.PrepareRequest{StateRoot: req.StateRoot, Binding: req.Binding, Backend: req.Backend})
 	if err != nil {
 		return skillExecutionAttempt{Err: err}
@@ -576,7 +583,7 @@ func (s *Service) runLocal(ctx context.Context, meta skillmodel.Metadata, runID 
 		}
 	}
 	stagingStarted := time.Now()
-	staged, err := stageInputManifestLocal(ctx, s.inputSnapshots, req.Binding, req.Invocation.Package, req.Inputs, skillDir)
+	staged, err := stageInputManifestLocal(ctx, s.inputSnapshots, req.Binding, req.Invocation.Package, req.Inputs, skillDir, req.ProjectDir, backendKind)
 	stagingDurationMS := time.Since(stagingStarted).Milliseconds()
 	if err != nil {
 		return skillExecutionAttempt{WorkDir: skillDir, Workspace: executionWorkspace, StagingDurationMS: stagingDurationMS, Err: err}
@@ -596,7 +603,9 @@ func (s *Service) runLocal(ctx context.Context, meta skillmodel.Metadata, runID 
 	if err := ensureLocalReservationDirs(outputDir, reserveResult.Reservations); err != nil {
 		return skillExecutionAttempt{WorkDir: skillDir, Staged: staged, Workspace: executionWorkspace, StagingDurationMS: stagingDurationMS, Err: err}
 	}
-	// cwd 钉在可写 Skill execution view；OUTPUT_DIR 必须与 reservation 物理根一致。
+	// CWD 钉在 skillDir：Skill scripts 在此目录 materialize，命令以 scripts/foo.py 相对路径引用。
+	// 输入文件通过 stageInputManifestLocal 在 skillDir 内建立硬链接或备份，
+	// 打通宿主工作区根目录与 skillDir 之间的路径隔离，命令可按相对路径直接访问输入文件。
 	baseEnv := skillEnv(skillDir, ws.TmpDir)
 	baseEnv["OUTPUT_DIR"] = outputDir
 	cmd := execmodel.Command{Command: req.Command, Cwd: skillDir, Shell: "auto", Env: mergeReservedEnv(baseEnv, reservedEnv)}
@@ -778,6 +787,9 @@ func normalizeCommandEntry(value string) string {
 	return clean
 }
 
+// skillEnv 构建 skill 命令执行环境变量。
+// 本地 backend（LocalSandbox/Host）和远程 backend 均可使用此函数；
+// 远程 backend 路径以 “/” 开头，本地 venv 查找会自然失败从而不注入。
 func skillEnv(workDir, tmpDir string) map[string]string {
 	env := map[string]string{
 		"WORK_DIR":   workDir,
@@ -788,28 +800,23 @@ func skillEnv(workDir, tmpDir string) map[string]string {
 		"SKILL_DIR":  workDir,
 	}
 	pyPath := filepath.ToSlash(filepath.Join(workDir, "scripts"))
-	if strings.HasPrefix(workDir, "/") {
-		pyPath = strings.TrimRight(workDir, "/") + "/scripts"
-	}
 	env["PYTHONPATH"] = pythonRuntimeSearchPath(workDir, pyPath)
 	env["NODE_PATH"] = nodeRuntimeSearchPath(workDir)
 	// 统一 Python 标准流为 UTF-8，减少 Windows 控制台 GBK 导致的 ToolResult 乱码。
 	env["PYTHONUTF8"] = "1"
 	env["PYTHONIOENCODING"] = "utf-8"
-	// 宿主：优先使用 skill-deps 下 venv，使 `python -m markitdown` 走受控解释器。
-	// 远程路径以 / 开头，不注入宿主机 venv（镜像预装）。
-	if !strings.HasPrefix(strings.TrimSpace(workDir), "/") {
-		if depRoot := skillDependencyRoot(workDir); depRoot != "" {
-			venvDir := filepath.Join(depRoot, "venv")
-			if venvPythonExists(venvDir) {
-				env["VIRTUAL_ENV"] = venvDir
-				binDir := venvBinDir(venvDir)
-				path := binDir
-				if existing := os.Getenv("PATH"); existing != "" {
-					path = binDir + string(os.PathListSeparator) + existing
-				}
-				env["PATH"] = path
+	// 优先使用 skill-deps 下 venv：远程 backend 路径以 "/" 开头，
+	// skillDependencyRoot 会返回空字符串，即自然不注入 venv。
+	if depRoot := skillDependencyRoot(workDir); depRoot != "" {
+		venvDir := filepath.Join(depRoot, "venv")
+		if venvPythonExists(venvDir) {
+			env["VIRTUAL_ENV"] = venvDir
+			binDir := venvBinDir(venvDir)
+			path := binDir
+			if existing := os.Getenv("PATH"); existing != "" {
+				path = binDir + string(os.PathListSeparator) + existing
 			}
+			env["PATH"] = path
 		}
 	}
 	return env
@@ -1135,13 +1142,81 @@ func safeRemoteRelativePath(value string) bool {
 	return true
 }
 
-func stageInputManifestLocal(ctx context.Context, reader workcontract.InputSnapshotReader, binding execmodel.ExecutionBinding, pkg skillmodel.SkillPackageSnapshot, manifest workmodel.InputManifest, destDir string) ([]string, error) {
+// stageInputManifestLocal 处理本地执行的输入 staging。
+// 行为根据 BackendKind 严格二分：
+//
+//   - BackendKindRemote（防御，不应走此函数）：从快照存储读取字节后写入 destDir
+//   - BackendKindLocalSandbox / BackendKindHost：宿主与 Skill 执行路径共享同一物理磁盘。
+//     策略：在 skillDir 中建立青向宿主源文件的硬链接（失败则备份）。
+//     这样命令以 CWD=skillDir 运行时，可以按相对路径直接访问输入文件，
+//     且不需从快照存储读取字节和重复传输文件内容。
+func stageInputManifestLocal(ctx context.Context, reader workcontract.InputSnapshotReader, binding execmodel.ExecutionBinding, pkg skillmodel.SkillPackageSnapshot, manifest workmodel.InputManifest, destDir, projectDir string, kind execmodel.BackendKind) ([]string, error) {
 	if len(manifest.Inputs) == 0 {
 		return nil, nil
 	}
 	if err := validateInputManifest(binding, pkg, manifest); err != nil {
 		return nil, err
 	}
+	// 本地 backend（LocalSandbox / Host）：宿主文件系统共享。
+	// 尝试建立硬链接（无内容复制），失败则备份（进过快照存储读取）。
+	// 硬链接多道安全：不占额外磁盘空间，不复制内容。
+	if kind != execmodel.BackendKindRemote {
+		staged := make([]string, 0, len(manifest.Inputs))
+		for _, input := range manifest.Inputs {
+			alias := inputAlias(input)
+			target := filepath.Join(destDir, filepath.FromSlash(alias))
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return nil, fmt.Errorf("创建输入目录失败 %s: %w", alias, err)
+			}
+			// 尝试从 projectDir 和 destDir 天 hardlink
+			linked := false
+			for _, srcBase := range []string{projectDir, destDir} {
+				if strings.TrimSpace(srcBase) == "" {
+					continue
+				}
+				src := filepath.Join(srcBase, filepath.FromSlash(alias))
+				info, statErr := os.Stat(src)
+				if statErr != nil || info.IsDir() {
+					continue
+				}
+				// 源文件已存在：建硬链接；若目标已存在则跳过（已由上一轮 staging 建立）。
+				if _, tErr := os.Lstat(target); tErr == nil {
+					// 目标已存在，直接使用
+					linked = true
+					break
+				}
+				if linkErr := os.Link(src, target); linkErr == nil {
+					linked = true
+					break
+				}
+				// 硬链接失败（跨设备、权限等）：直接读取并拷贝文件内容
+				data, readErr := os.ReadFile(src)
+				if readErr != nil {
+					continue
+				}
+				if writeErr := os.WriteFile(target, data, 0o644); writeErr == nil {
+					linked = true
+					break
+				}
+			}
+			if !linked {
+				// 宿主内无源文件：退化为快照存储读取（保持安全契约）
+				if reader == nil {
+					return nil, workcontract.NewError(workcontract.ErrCodeWorkspaceNotAvailable, fmt.Errorf("宿主目录中找不到输入文件 %s 且未配置 InputSnapshotReader", alias))
+				}
+				content, err := readVerifiedSnapshot(ctx, reader, input)
+				if err != nil {
+					return nil, fmt.Errorf("读取输入快照 %s 失败: %w", alias, err)
+				}
+				if writeErr := os.WriteFile(target, content, 0o644); writeErr != nil {
+					return nil, fmt.Errorf("备份输入文件 %s 失败: %w", alias, writeErr)
+				}
+			}
+			staged = append(staged, alias)
+		}
+		return staged, nil
+	}
+	// 远程 backend（防御性路径）：理论上不应通过此函数处理，应走 stageInputManifestRemote。
 	if reader == nil {
 		return nil, workcontract.NewError(workcontract.ErrCodeWorkspaceNotAvailable, fmt.Errorf("本地输入缺少 InputSnapshotReader"))
 	}

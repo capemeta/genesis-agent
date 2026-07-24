@@ -192,6 +192,13 @@ func (c *Controller) Spawn(ctx context.Context, req contract.SpawnRequest) (mode
 	childCtx = contract.WithTreeBudget(childCtx, req.Budget)
 	childCtx = contextutil.WithSessionID(childCtx, req.SessionID)
 	childCtx = contextutil.WithTenantID(childCtx, req.TenantID)
+	// 注入子智能体类型：供 promptAudience 识别 skill-fork 等特殊角色
+	if st := strings.TrimSpace(req.SubagentType); st != "" {
+		childCtx = contextutil.WithSubagentType(childCtx, st)
+	}
+	if ancestors := skillcontract.InvocationAncestors(ctx); len(ancestors) > 0 {
+		childCtx = skillcontract.WithInvocationAncestors(childCtx, ancestors)
+	}
 	instance := model.Instance{AgentID: agentID, ParentRunID: req.ParentRunID, SessionID: req.SessionID, TenantID: req.TenantID, Depth: req.Depth, SubagentType: req.SubagentType, Status: model.StatusRunning, CreatedAt: time.Now()}
 	e := &entry{instance: instance, request: req, cancel: cancel, slot: token, done: make(chan struct{}), parentCtx: ctx, manifest: manifest}
 	if err := c.limiter.Commit(token, agentID); err != nil {

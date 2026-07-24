@@ -214,3 +214,18 @@ func SkillForkDefinitionName(qualifiedSkill string) string {
 	}
 	return "skill-fork:" + qualifiedSkill
 }
+
+// SkillForkSubagentTypePrefix 是 skill-fork 子智能体 SubagentType 的固定前缀。
+// promptAudience 通过此前缀识别 AudienceSkillFork。
+const SkillForkSubagentTypePrefix = "skill-fork:"
+
+// SkillForkExecutorPrompt 返回 skill-fork 子智能体专属的执行者角色说明。
+// 此提示词作为 Definition.SystemPrompt 写入 ComposeChildSystem 的 definitionPrompt 参数，
+// 产出「# 角色说明」节，明确告知 LLM 当前是技能执行者而非调度者。
+func SkillForkExecutorPrompt() string {
+	return "当前为技能派生执行子 Run，直接执行委派任务中 <skill_instruction> 里已注入的指令：\n" +
+		"- 按 <skill_instruction> 指定的命令和策略，使用 run_skill_command 等工具完成任务\n" +
+		"- 若遇依赖缺失（failure_kind=dependency_missing），优先调用 install_skill_dependencies，完成后重试同一命令\n" +
+		"- 不持有也不调用 Skill 工具（当前运行契约中不含 Skill 工具）\n" +
+		"- 任务完成后，返回简洁结论和已登记产物；禁止提交宿主机绝对路径"
+}

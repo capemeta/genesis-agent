@@ -1,8 +1,9 @@
 # Skill 多 Invocation 与运行时侧车设计
 
-> 状态：核心链路已实现并通过三轮审查（破坏式重构，不兼容旧 Genesis Skill 扩展字段）
+> 状态：核心链路已实现并通过审查（含主 Agent 工具链解耦与第三方 Skill 自动 Fork 增强）
 >
-> 日期：2026-07-22
+> 日期：2026-07-24
+
 >
 > 适用范围：Genesis Agent 的内置、安装式及第三方 Skill 运行时
 >
@@ -863,6 +864,14 @@ Trace/Audit 至少记录：
 ### Phase 6 `[x]`：推广到 Word、Excel、PDF
 
 已按相同模型迁移 Word、Excel、PDF。只有确有差异化 Invocation 的 Skill 才创建侧车；简单第三方 Skill 使用正式默认 Invocation，不生成空 Manifest。
+
+### Phase 7 `[x]`：主 Agent 工具链解耦与第三方技能自动 Fork 增强
+
+1. **主 Agent 工具链彻底解耦**：`tool_policy.allow` 被明确界定为 **Fork 子 Agent 专属工具策略 (Subagent Tool Policy)**。主 Agent (`context=main` / `AudienceRoot`) 调用 `Skill(...)` 时仅负责派生或注入，主 Agent 自身的全局工具链（`write_file`, `Task`, `Skill` 等）保持完整可用，不再被 `InvocationAllowsTool` 锁定误伤。
+2. **第三方 Skill 无缝感知与自动 Fork**：对于无 `genesis.skill.yaml` 的标准第三方 Skill（参照 Kode / Anthropic Agent Skills 规范），运行时自动扫描包内文件快照：
+   - 若包含 `scripts/` 目录或 `.py`/`.js`/`.sh`/`.ps1` 脚本，自动推导 `agent_mode: {mode: fork}` 并赋予默认安全的子 Agent 工具白名单 (`[run_skill_command, install_skill_dependencies, list_skill_resources, read_skill_resource]`)；
+   - 若仅包含 Markdown 文档与静态资源，自动推导 `agent_mode: {mode: main}` (Inline Prompt 展开)。
+
 
 ## 13. 测试与验收标准
 

@@ -7,16 +7,37 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"genesis-agent/internal/platform/config"
 )
 
-// RuntimeLogging 聚合三类运行日志通道；进程内应只创建一次并注入。
+// RuntimeLogging 聚合四类运行日志通道；进程内应只创建一次并注入。
 type RuntimeLogging struct {
 	AgentLogger Logger
 	AuditWriter io.WriteCloser
 	UsageWriter io.WriteCloser
+	LLMWriter   io.WriteCloser
 	closers     []io.Closer
+}
+
+var (
+	globalLLMWriterMu sync.RWMutex
+	globalLLMWriter   io.Writer
+)
+
+// SetGlobalLLMWriter 设置进程级全局 LLM 日志 Writer
+func SetGlobalLLMWriter(w io.Writer) {
+	globalLLMWriterMu.Lock()
+	defer globalLLMWriterMu.Unlock()
+	globalLLMWriter = w
+}
+
+// GetGlobalLLMWriter 获取进程级全局 LLM 日志 Writer
+func GetGlobalLLMWriter() io.Writer {
+	globalLLMWriterMu.RLock()
+	defer globalLLMWriterMu.RUnlock()
+	return globalLLMWriter
 }
 
 // Close 关闭所有文件 Writer。
@@ -40,13 +61,13 @@ func (r *RuntimeLogging) Close() error {
 type RuntimeLoggingOptions struct {
 	// ConfigDir 用于解析相对 log.dir（相对配置目录的父目录，与旧 path 行为一致）。
 	ConfigDir string
-	// Quiet 为 true 时 agent 写文件；false 时 agent 写 stdout（仍可启用 audit/usage 文件）。
+	// Quiet 为 true 时 agent 写文件；false 时 agent 写 stdout（仍可启用 audit/usage/llm 文件）。
 	Quiet bool
 	// ConsoleAlso 在 Quiet 文件模式下额外 tee 到 stdout（默认 false）。
 	ConsoleAlso bool
 }
 
-// NewRuntimeLogging 按配置创建三类通道；调用方负责 Close。
+// NewRuntimeLogging 按配置创建四类通道；调用方负责 Close。
 func NewRuntimeLogging(cfg config.LogConfig, opts RuntimeLoggingOptions) (*RuntimeLogging, error) {
 	dir, err := resolveLogDir(opts.ConfigDir, cfg)
 	if err != nil {
@@ -69,7 +90,7 @@ func NewRuntimeLogging(cfg config.LogConfig, opts RuntimeLoggingOptions) (*Runti
 		level := ParseLevel(firstNonEmpty(agentCh.Level, cfg.Level))
 		format := strings.ToLower(strings.TrimSpace(agentCh.Format))
 		if opts.Quiet {
-			w, err := newChannelWriter(dir, channelStem(agentCh.File, "agent"), rotateBase, agentCh.RetainDays)
+			w, err := newChannelWriter(dir, channelStem(agentCh.File, "agent"), rotateBase, agentCh)
 			if err != nil {
 				_ = out.Close()
 				return nil, err
@@ -90,7 +111,7 @@ func NewRuntimeLogging(cfg config.LogConfig, opts RuntimeLoggingOptions) (*Runti
 	}
 
 	if ch := cfg.Channels["audit"]; ch.ChannelEnabled() {
-		w, err := newChannelWriter(dir, channelStem(ch.File, "audit"), rotateBase, ch.RetainDays)
+		w, err := newChannelWriter(dir, channelStem(ch.File, "audit"), rotateBase, ch)
 		if err != nil {
 			_ = out.Close()
 			return nil, err
@@ -100,7 +121,7 @@ func NewRuntimeLogging(cfg config.LogConfig, opts RuntimeLoggingOptions) (*Runti
 	}
 
 	if ch := cfg.Channels["usage"]; ch.ChannelEnabled() {
-		w, err := newChannelWriter(dir, channelStem(ch.File, "usage"), rotateBase, ch.RetainDays)
+		w, err := newChannelWriter(dir, channelStem(ch.File, "usage"), rotateBase, ch)
 		if err != nil {
 			_ = out.Close()
 			return nil, err
@@ -109,16 +130,33 @@ func NewRuntimeLogging(cfg config.LogConfig, opts RuntimeLoggingOptions) (*Runti
 		out.closers = append(out.closers, w)
 	}
 
+	if ch := cfg.Channels["llm"]; ch.ChannelEnabled() {
+		w, err := newChannelWriter(dir, channelStem(ch.File, "llm"), rotateBase, ch)
+		if err != nil {
+			_ = out.Close()
+			return nil, err
+		}
+		out.LLMWriter = w
+		out.closers = append(out.closers, w)
+		SetGlobalLLMWriter(w)
+	}
+
 	if out.AgentLogger == nil {
 		out.AgentLogger = NewNop()
 	}
 	return out, nil
 }
 
-func newChannelWriter(dir, name string, base RotateOptions, retainDays int) (*RotatingWriter, error) {
+func newChannelWriter(dir, name string, base RotateOptions, ch config.LogChannelConfig) (*RotatingWriter, error) {
 	opts := base
-	if retainDays > 0 {
-		opts.RetainDays = retainDays
+	if ch.RetainDays > 0 {
+		opts.RetainDays = ch.RetainDays
+	}
+	if ch.RotateOnStartEnabled() {
+		opts.RotateOnStart = true
+	}
+	if ch.LazyOpenEnabled() {
+		opts.LazyOpen = true
 	}
 	return NewRotatingWriter(dir, name, opts)
 }

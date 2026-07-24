@@ -477,11 +477,13 @@ func (r LogRotateConfig) DailyEnabled() bool {
 
 // LogChannelConfig 单通道配置。
 type LogChannelConfig struct {
-	Enabled    *bool  `mapstructure:"enabled"`
-	File       string `mapstructure:"file"`
-	Format     string `mapstructure:"format"` // agent: text|json；audit/usage: jsonl
-	RetainDays int    `mapstructure:"retain_days"`
-	Level      string `mapstructure:"level"`
+	Enabled       *bool  `mapstructure:"enabled"`
+	File          string `mapstructure:"file"`
+	Format        string `mapstructure:"format"` // agent: text|json；audit/usage: jsonl
+	RetainDays    int    `mapstructure:"retain_days"`
+	Level         string `mapstructure:"level"`
+	RotateOnStart *bool  `mapstructure:"rotate_on_start"`
+	LazyOpen      *bool  `mapstructure:"lazy_open"`
 }
 
 // ChannelEnabled 未配置时默认启用。
@@ -490,6 +492,22 @@ func (c LogChannelConfig) ChannelEnabled() bool {
 		return true
 	}
 	return *c.Enabled
+}
+
+// RotateOnStartEnabled 启动时（首次写入）是否自动滚动旧文件
+func (c LogChannelConfig) RotateOnStartEnabled() bool {
+	if c.RotateOnStart == nil {
+		return false
+	}
+	return *c.RotateOnStart
+}
+
+// LazyOpenEnabled 是否开启延迟打开（有实际 Write 才创建文件）
+func (c LogChannelConfig) LazyOpenEnabled() bool {
+	if c.LazyOpen == nil {
+		return false
+	}
+	return *c.LazyOpen
 }
 
 // ServerConfig HTTP 服务配置。
@@ -1161,6 +1179,12 @@ func applyLogDefaults(cfg *LogConfig) {
 	cfg.Channels["usage"] = mergeLogChannel(cfg.Channels["usage"], LogChannelConfig{
 		File: "usage.log", Format: "jsonl", RetainDays: 90, Level: "info",
 	})
+	rotateOnStart := true
+	lazyOpen := true
+	cfg.Channels["llm"] = mergeLogChannel(cfg.Channels["llm"], LogChannelConfig{
+		File: "llm.log", Format: "jsonl", RetainDays: 14, Level: "info",
+		RotateOnStart: &rotateOnStart, LazyOpen: &lazyOpen,
+	})
 }
 
 func mergeLogChannel(cur, def LogChannelConfig) LogChannelConfig {
@@ -1182,6 +1206,12 @@ func mergeLogChannel(cur, def LogChannelConfig) LogChannelConfig {
 	}
 	if strings.TrimSpace(cur.Level) == "" {
 		cur.Level = def.Level
+	}
+	if cur.RotateOnStart == nil {
+		cur.RotateOnStart = def.RotateOnStart
+	}
+	if cur.LazyOpen == nil {
+		cur.LazyOpen = def.LazyOpen
 	}
 	return cur
 }
